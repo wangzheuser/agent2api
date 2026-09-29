@@ -37,6 +37,22 @@ impl Drop for Worker {
 impl Worker {
     fn spawn(script: &str) -> Result<Self, &'static str> {
         let mut command = Command::new("node");
+        // 默认继承会把服务端管理员密码一起交给 SDK 宿主；仅保留运行环境。
+        command.env_clear();
+        for name in [
+            "PATH",
+            "HOME",
+            "LANG",
+            "LC_ALL",
+            "TZ",
+            "TMPDIR",
+            "AGENT2API_CHROMIUM_PATH",
+            "AGENT2API_CAPTCHA_UI_SCRIPT",
+        ] {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
         command
             .arg(script)
             .stdin(Stdio::piped())
