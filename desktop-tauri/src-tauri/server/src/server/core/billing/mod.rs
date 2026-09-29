@@ -455,6 +455,8 @@ impl BillingService {
     /// 国际版活动未开放属于正常状态，所有探测/保活失败都收敛为结果字段并记录日志，
     /// 不让自动签到任务因为上游活动开关而中断。
     pub async fn workbuddy_daily_activity(&self, session: &Value) -> Value {
+        self.log_workbuddy_activity_balance(session, "前").await;
+
         let status = self
             .call_billing(
                 BILLING_ACTIVITY_CHECKIN_STATUS,
@@ -549,6 +551,7 @@ impl BillingService {
         };
 
         let (poke_succeeded, poke_model) = self.poke_daily_activity(session).await;
+        self.log_workbuddy_activity_balance(session, "完成后").await;
         let claim_succeeded = claim
             .get("success")
             .and_then(Value::as_bool)
@@ -577,6 +580,45 @@ impl BillingService {
                 "pokeModel": poke_model,
             },
         })
+    }
+
+    /// 记录活跃保活前后的积分快照，便于核对活动奖励是否入账。
+    ///
+    /// 余额查询是旁路诊断动作：失败只记录日志，不改变活跃任务的结果。
+    async fn log_workbuddy_activity_balance(&self, session: &Value, phase: &str) {
+        let account = session
+            .get("account")
+            .and_then(Value::as_object);
+        let account_label = account
+            .and_then(|value| value.get("nickname"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                account
+                    .and_then(|value| value.get("uid"))
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+            })
+            .unwrap_or("unknown");
+
+        match self.query_credits_summary(Some(session), None).await {
+            Ok(summary) => logging::log(
+                "[Checkin]",
+                &format!(
+                    "WorkBuddy 国际版活跃保活{phase}余额（账号={account_label}，totalLeft={}，planLeft={}，bonusLeft={}）",
+                    summary.get("totalLeft").unwrap_or(&Value::Null),
+                    summary.get("planLeft").unwrap_or(&Value::Null),
+                    summary.get("bonusLeft").unwrap_or(&Value::Null),
+                ),
+            ),
+            Err(error) => logging::log(
+                "[Checkin]",
+                &format!(
+                    "WorkBuddy 国际版活跃保活{phase}余额查询失败（账号={account_label}）：{}",
+                    error.message
+                ),
+            ),
+        }
     }
 
     async fn poke_daily_activity(&self, session: &Value) -> (bool, Option<String>) {
