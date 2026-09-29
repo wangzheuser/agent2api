@@ -641,6 +641,17 @@ pub fn shim_js() -> &'static str {
         captchaRegion: captchaRegion ? String(captchaRegion) : '',
       });
     },
+    // ── ZCode 活动套餐通道的验证码令牌池 ──
+    // 与桌面端 bridge.rs 保持同一契约：headless 面板里的令牌守卫需要
+    // 读取库存，并把 WebView 铸出的令牌推回网关。缺少这两个方法时，
+    // zcode-captcha-pool.js 会静默跳过整个铸造循环，账号设置也会一直显示
+    // 「验证码令牌：读取中…」。
+    zcodeCaptchaStats: function () { return call('GET', '/api/zcode/captcha'); },
+    pushZcodeCaptchaTokens: function (tokens) {
+      return call('POST', '/api/zcode/captcha', {
+        tokens: Array.isArray(tokens) ? tokens : [],
+      });
+    },
     onLoginState: function (callback) {
       loginListeners.add(callback);
       return function () { loginListeners.delete(callback); };
