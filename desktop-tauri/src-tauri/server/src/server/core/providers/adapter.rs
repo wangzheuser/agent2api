@@ -361,6 +361,19 @@ pub trait ProviderAdapter: Send + Sync {
         client_headers: &HeaderMap,
     ) -> Result<ChatRequestPlan, GatewayError>;
 
+    /// 一次性请求凭证的提供商：重试须重新构造计划，禁止复用旧请求头。
+    fn request_is_single_use(&self, _account: &Value) -> bool { false }
+
+    /// 异步准备一次请求；需要短期凭证的提供商可等待补货，其余保持同步行为。
+    fn prepare_chat_request<'a>(
+        &'a self,
+        account: &'a Value,
+        body: &'a Value,
+        client_headers: &'a HeaderMap,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ChatRequestPlan, GatewayError>> + Send + 'a>> {
+        Box::pin(async move { self.build_chat_request(account, body, client_headers) })
+    }
+
     /// 把「映射上绑的思考等级」翻译成本家上游认识的字段与取值（模块头扩展 10）。
     ///
     /// ── 调用时机与调用者 ────────────────────────────────────────

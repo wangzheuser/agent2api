@@ -32,20 +32,15 @@ use crate::server::logging;
 use crate::server::ServerState;
 use crate::server::core::providers::zcode::captcha;
 
-/// 界面希望维持的库存目标（低于它就该补货）。
-///
-/// 取 3：一个够「下一条请求立刻有得用」，又不至于铸一堆用不掉（令牌 2 分钟就
-/// 过期，铸太多纯属浪费风控配额 —— 阿里云对铸造频率有风控，参考实现为此专门
-/// 做了限速与熔断）。高并发场景下池子会短暂见底，那时的正确行为是让请求如实
-/// 失败并提示，而不是无节制地铸。
-const POOL_TARGET: usize = 3;
+/// 桌面与 Docker 生产者使用相同库存目标与临期补货判据。
+use captcha::POOL_TARGET;
 
 /// `GET /api/zcode/captcha` —— 池子概况 + 「界面该不该铸造」的判据
-fn stats_json(state: &ServerState) -> Value {
+pub(crate) fn stats_json(state: &ServerState) -> Value {
     let mut body = captcha::stats();
     let (start_plan_accounts, account_id) = start_plan_accounts(state);
     // 先算好「库存够不够」（`body` 随后要被可变借用，读值得在借用之前取）
-    let ready = body.get("ready").and_then(Value::as_u64).unwrap_or(0);
+    let ready = body.get("fresh").and_then(Value::as_u64).unwrap_or(0);
     if let Some(object) = body.as_object_mut() {
         object.insert("target".to_string(), Value::from(POOL_TARGET as u64));
         object.insert(
@@ -73,7 +68,7 @@ fn stats_json(state: &ServerState) -> Value {
 /// 优先挑走活动套餐的：那个账号的配置一定取得到（领取流程用过同一条接口）。
 /// 一个都没有时退回任意一个启用的 ZCode 账号 —— 风控配置是共享的，从哪个账号
 /// 取都一样；连 ZCode 账号都没有才回 `None`（界面据此不铸造）。
-fn start_plan_accounts(state: &ServerState) -> (usize, Option<String>) {
+pub(crate) fn start_plan_accounts(state: &ServerState) -> (usize, Option<String>) {
     let list = state.store().list_accounts();
     let Some(accounts) = list.get("accounts").and_then(Value::as_array) else {
         return (0, None);
@@ -113,6 +108,9 @@ pub async fn get_captcha(State(state): State<ServerState>) -> Response {
 /// 批量形态是为了「一次铸好两个就一起推」：铸造本身要一两秒，逐条往返会让
 /// 库存长期贴着 0。单条（`{param, region}`）也认 —— 手工排障时那是更自然的写法。
 pub async fn push_captcha(State(state): State<ServerState>, body: Bytes) -> Response {
+    if captcha::stats().pointer("/producer/mode").and_then(Value::as_str) == Some("server") {
+        return management_error(409, "服务器生产者已接管验证码补货，请刷新管理页面");
+    }
     let payload = match parse_body(&body) {
         Ok(value) => value,
         Err(error) => return management_error(400, error.message),

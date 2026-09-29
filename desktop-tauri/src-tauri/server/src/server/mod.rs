@@ -137,6 +137,7 @@
 pub mod api;
 mod account_bootstrap;
 pub mod access;
+pub mod captcha_worker;
 pub mod altcha;
 pub mod config;
 pub mod config_migration;

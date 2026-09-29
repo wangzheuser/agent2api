@@ -413,7 +413,8 @@ function PlanChannelField({
   onChange: (next: string) => void
 }) {
   const current = zcodePlanLabel(plan)
-  const [pool, setPool] = React.useState<{ ready?: number; target?: number } | null>(null)
+  const [pool, setPool] = React.useState<{ ready?: number; target?: number; server?: boolean; failed?: boolean } | null>(null)
+  const [poolError, setPoolError] = React.useState(false)
   // 只在真的要用活动套餐时才盯着令牌池：编码套餐那条路不需要验证码令牌。
   // 5 秒一轮（与后台铸造器同一量级），弹窗关掉就停
   React.useEffect(() => {
@@ -421,8 +422,13 @@ function PlanChannelField({
     let alive = true
     const tick = () => {
       void Promise.resolve(shared().workbuddyDesktop?.zcodeCaptchaStats?.())
-        .then(stats => { if (alive && stats) setPool({ ready: Number(stats.ready) || 0, target: Number(stats.target) || 0 }) })
-        .catch(() => { /* 桥不可用时不给状态，不报错 */ })
+        .then(stats => {
+          if (!alive) return
+          setPoolError(!stats)
+          setPool(stats ? { ready: Number(stats.ready) || 0, target: Number(stats.target) || 0,
+            server: stats.producer?.mode === 'server', failed: (stats.producer?.failures || 0) > 0 } : null)
+        })
+        .catch(() => { if (alive) { setPool(null); setPoolError(true) } })
     }
     tick()
     const timer = window.setInterval(tick, 5000)
@@ -451,9 +457,10 @@ function PlanChannelField({
         </span>
       ) : null}
       {plan === ZCODE_PLAN_START ? (
-        <span className='detail' title='活动套餐的推理端点要求每条请求带一个阿里云验证码令牌；令牌由本应用在后台静默铸造，界面关闭时无法铸造'>
-          验证码令牌：{pool ? `${pool.ready} / ${pool.target || 3}` : '读取中…'}
-          {pool && pool.ready === 0 ? '（库存为空，正在补；补不上时转发会失败）' : ''}
+        <span className='detail' title='每条活动套餐请求消耗一个验证码令牌；空池时请求会限时等待补货'>
+          验证码令牌：{poolError ? '状态读取失败' : pool ? `${pool.ready} / ${pool.target || 3}` : '读取中…'}
+          {pool?.server ? '（服务器自动补货）' : ''}
+          {pool?.failed ? '（补货异常，正在恢复）' : pool?.ready === 0 ? '（正在补货，请求将等待）' : ''}
         </span>
       ) : null}
     </div>

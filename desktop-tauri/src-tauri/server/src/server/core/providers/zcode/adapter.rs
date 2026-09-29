@@ -141,6 +141,25 @@ impl ProviderAdapter for ZcodeAdapter {
     ///   · 不在这条路上发 `X-Device-Mid`：参考实现明确注明推理路径**从不**发它
     ///     （那是领取/余额那种控制面请求的要求，见 `claim.rs`）；活动套餐通道
     ///     把设备标识放进请求体的 `metadata.user_id`。
+    fn prepare_chat_request<'a>(
+        &'a self,
+        account: &'a Value,
+        body: &'a Value,
+        client_headers: &'a HeaderMap,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ChatRequestPlan, GatewayError>> + Send + 'a>> {
+        Box::pin(async move {
+            if super::plan_of(account) == super::PLAN_START {
+                super::plan::prepare_request(self.region, account, body, client_headers).await
+            } else {
+                self.build_chat_request(account, body, client_headers)
+            }
+        })
+    }
+
+    fn request_is_single_use(&self, account: &Value) -> bool {
+        super::plan_of(account) == super::PLAN_START
+    }
+
     fn build_chat_request(
         &self,
         account: &Value,

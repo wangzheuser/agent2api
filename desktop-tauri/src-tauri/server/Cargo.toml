@@ -42,7 +42,7 @@ serde_json = "1"
 # rt-multi-thread/macros 起运行时，net 监听端口，sync 传停机信号，
 # fs/io-util 读写配置与日志文件；signal 供 headless 二进制接 SIGTERM
 # （容器 stop 的优雅停机路径）
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util", "fs", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util", "fs", "signal", "process"] }
 url = "2"
 axum = "0.8"
 # 出站请求：rustls（纯 Rust，不依赖系统 openssl）+ socks5 出网代理

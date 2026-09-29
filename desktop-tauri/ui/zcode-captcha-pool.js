@@ -52,6 +52,7 @@
 
   function log(message) {
     if (window.wbApp?.debug) window.wbApp.debug(`[ZCodeCaptcha] ${message}`);
+    else console.warn(`[ZCodeCaptcha] ${message}`);
   }
 
   /** 拿一次池子概况；桥接不可用（浏览器直开界面）时返回 null，循环安静地退让 */
@@ -102,6 +103,11 @@
         schedule(BACKOFF_MIN_MS);
         return;
       }
+      // Docker 有专用生产者，网页只显示状态，避免重复生产及 SDK 场景互扰。
+      if (stats.producer?.mode === 'server') {
+        schedule(POLL_MS);
+        return;
+      }
       // 上游刚拒过令牌（3007）：库存即使「够」也不可信了，也补一轮
       const rejectedNow = Number(stats.rejected) || 0;
       const challenged = rejectedNow > lastRejected;
@@ -119,7 +125,7 @@
         return;
       }
       const target = Math.max(1, Number(stats.target) || 1);
-      const ready = Number(stats.ready) || 0;
+      const ready = Number(stats.fresh ?? stats.ready) || 0;
       const need = Math.min(MAX_PER_ROUND, Math.max(0, target - ready));
       const tokens = [];
       for (let index = 0; index < need; index += 1) {
@@ -135,7 +141,11 @@
         schedule(Math.min(BACKOFF_MIN_MS * failures, BACKOFF_MAX_MS));
         return;
       }
-      await pushTokens(tokens);
+      if (!await pushTokens(tokens)) {
+        failures += 1;
+        schedule(Math.min(BACKOFF_MIN_MS * failures, BACKOFF_MAX_MS));
+        return;
+      }
       failures = 0;
       schedule(POLL_MS);
     } catch (error) {

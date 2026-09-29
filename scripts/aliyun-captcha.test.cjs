@@ -36,7 +36,7 @@ function harness() {
     },
     body: { appendChild(element) { elements.set(element.id, element); } },
   };
-  const context = vm.createContext({ window, document, Date: { now: () => now } });
+  const context = vm.createContext({ window, document, Date: { now: () => now }, atob: value => Buffer.from(value, 'base64').toString('utf8'), console });
   vm.runInContext(source, context);
   const captcha = window.wbAliyunCaptcha;
   // 排空 SDK 初始化与业务回调中的 Promise 链；时钟只由 step 推进。
@@ -61,8 +61,69 @@ function harness() {
     assert.equal(captcha.isBusy(), true);
     return { outcome };
   }
-  return { window, context, captcha, step, begin, timers, sdk: () => sdk };
+  return { window, context, captcha, step, begin, timers, flush, sdk: () => sdk };
 }
+
+function mintHarness() {
+  const h = harness();
+  const instances = [];
+  h.window.initAliyunCaptcha = options => {
+    const instance = { destroyed: false, destroy() { this.destroyed = true; }, startTracelessVerification() {} };
+    instances.push({ options, instance });
+    options.getInstance(instance);
+  };
+  const mint = () => {
+    const result = { state: 'pending' };
+    result.promise = h.captcha.mintTraceless(config).then(
+      value => { result.state = 'resolved'; result.value = value; },
+      error => { result.state = 'rejected'; result.error = error; },
+    );
+    return result;
+  };
+  return { ...h, instances, mint };
+}
+
+test('静默验证无效串立即拒绝并允许下一次生成', async () => {
+  const h = mintHarness();
+  const old = h.mint(); await h.flush();
+  h.instances[0].options.success('invalid'); await h.flush();
+  assert.equal(old.state, 'rejected');
+  assert.equal(h.timers.size, 0);
+  const next = h.mint(); await h.flush();
+  const proof = Buffer.from(JSON.stringify({ securityToken: 'x'.repeat(220) })).toString('base64');
+  h.instances[1].options.success(proof); await next.promise;
+  assert.equal(next.value, proof);
+});
+
+test('旧实例 success/fail/onError 不改变新生成任务', async () => {
+  const h = mintHarness();
+  const old = h.mint(); await h.flush(); await h.step();
+  assert.equal(old.state, 'rejected');
+  const next = h.mint(); await h.flush();
+  h.instances[0].options.success('invalid');
+  h.instances[0].options.fail({}); h.instances[0].options.onError({});
+  await h.flush();
+  assert.equal(next.state, 'pending');
+  assert.equal(h.instances[1].instance.destroyed, false);
+  await h.step(); assert.equal(next.state, 'rejected');
+});
+
+test('静默生成并发调用不会覆盖第一个等待者', async () => {
+  const h = mintHarness();
+  const first = h.mint(), second = h.mint(); await h.flush();
+  assert.equal(first.state, 'pending'); assert.equal(second.state, 'rejected');
+  await h.step(); assert.equal(first.state, 'rejected');
+});
+
+test('初始化错误立即结束，晚到的实例被销毁且不会污染重试', async () => {
+  const h = mintHarness(); let options;
+  h.window.initAliyunCaptcha = value => { options = value; value.onError({}); };
+  const first = h.mint(); await h.flush();
+  assert.equal(first.state, 'rejected'); assert.equal(h.timers.size, 0);
+  let destroyed = false;
+  options.getInstance({ destroy() { destroyed = true; } });
+  assert.equal(destroyed, true);
+});
 
 for (const mode of ['success', 'business_false', 'request_reject', 'cancel', 'timeout', 'sdk_error', 'empty_param']) {
   test(`${mode} 结束后释放忙碌状态并恢复 ZCode 补货`, async () => {

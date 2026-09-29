@@ -157,8 +157,7 @@ pub(super) fn code_hint(code: i64) -> Option<&'static str> {
         // 风控门禁：缺验证码令牌或令牌已失效（见 `super::captcha`）
         3007 => Some(
             "上游要求人机验证（3007）：验证码令牌缺失或已失效。\
-             令牌由桌面端界面自动铸造，请确认应用界面正在运行（只跑 headless 服务时无法铸造）；\
-             若持续出现，请稍后重试",
+             已通知生产者更新令牌；若持续出现，请检查验证码生产者状态和网络",
         ),
         // 身份块缺失/不被接受：官方系统提示词没装配对（或上游改了检查口径）
         3012 => Some(
@@ -177,6 +176,41 @@ pub(super) fn code_hint(code: i64) -> Option<&'static str> {
 /// 见 `AccountStore::session_from_record`）；`body` 是编排层定稿的发送体
 /// （**已**含 `stream:true`，见 `UpstreamService::forward`）。
 pub(super) fn build_request(
+    region: Region,
+    session: &Value,
+    body: &Value,
+    client_headers: &HeaderMap,
+) -> Result<ChatRequestPlan, GatewayError> {
+    let mut plan = build_payload(region, session, body, client_headers)?;
+    attach_proof(&mut plan, super::captcha::take().ok_or_else(empty_pool_error)?);
+    Ok(plan)
+}
+
+pub(super) async fn prepare_request(
+    region: Region,
+    session: &Value,
+    body: &Value,
+    client_headers: &HeaderMap,
+) -> Result<ChatRequestPlan, GatewayError> {
+    // 先校验输入，避免错误请求消耗一次性 proof 或白等补货。
+    let mut plan = build_payload(region, session, body, client_headers)?;
+    let proof = super::captcha::acquire().await.ok_or_else(empty_pool_error)?;
+    attach_proof(&mut plan, proof);
+    Ok(plan)
+}
+
+fn empty_pool_error() -> GatewayError {
+    GatewayError::with_status(503, "ZCode 验证码补货暂不可用：等待令牌超时，请检查验证码生产者状态和网络")
+}
+
+fn attach_proof(plan: &mut ChatRequestPlan, (param, region): (String, String)) {
+    plan.headers.push((super::captcha::VERIFY_PARAM_HEADER.to_string(), param));
+    if !region.trim().is_empty() {
+        plan.headers.push((super::captcha::VERIFY_REGION_HEADER.to_string(), region));
+    }
+}
+
+fn build_payload(
     region: Region,
     session: &Value,
     body: &Value,
@@ -236,33 +270,11 @@ pub(super) fn build_request(
         override_blocks.as_ref(),
     )?;
 
-    // ── 人机验证令牌（一次一用，每个请求取一个）──────────────────
-    // 取不到就**当场失败**而不是发一个缺头的请求：上游对缺令牌的响应是
-    // 400 + 3007（一句英文），用户看到的是「网关报了个英文错」；这里的文案
-    // 才说得清「谁该补令牌、去哪儿补」。
-    let Some((captcha_param, captcha_region)) = super::captcha::take() else {
-        return Err(GatewayError::with_status(
-            503,
-            "活动套餐通道需要人机验证令牌，当前令牌池为空：\
-             令牌由桌面端界面自动铸造，请确认应用界面正在运行\
-             （headless 部署无法铸造，请在账号设置里把「使用套餐」切回编码套餐）",
-        ));
-    };
     let mut headers: Vec<(String, String)> = vec![
         ("Content-Type".to_string(), "application/json".to_string()),
         ("Authorization".to_string(), format!("Bearer {jwt}")),
         ("anthropic-version".to_string(), ANTHROPIC_VERSION.to_string()),
-        (
-            super::captcha::VERIFY_PARAM_HEADER.to_string(),
-            captcha_param,
-        ),
     ];
-    if !captcha_region.trim().is_empty() {
-        headers.push((
-            super::captcha::VERIFY_REGION_HEADER.to_string(),
-            captcha_region,
-        ));
-    }
     // 身份头与编码套餐那条同源（同一个函数、同一套取值），只是 UA 多一个
     // Anthropic SDK 后缀 —— 两处若各写一份，改一处必然漏另一处
     headers.extend(super::adapter::identity_headers(Some(ANTHROPIC_SDK_UA)));

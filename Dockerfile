@@ -78,13 +78,20 @@ RUN cd src-tauri \
 # ── 运行时 ──────────────────────────────────────────────────
 # bookworm-slim + ca-certificates（出站 HTTPS）+ curl（HEALTHCHECK）。
 # 网关链的是 rustls（纯 Rust），运行时没有任何额外的共享库要求。
+FROM node:22-bookworm-slim AS captcha-deps
+WORKDIR /worker
+COPY runtime/zcode-captcha/package*.json ./
+RUN npm ci --omit=dev --ignore-scripts
+
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends ca-certificates curl nodejs chromium xvfb tini procps \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/agent2api-server /usr/local/bin/agent2api-server
 COPY desktop-tauri/ui /app/ui
+COPY --from=captcha-deps /worker/node_modules /app/captcha-worker/node_modules
+COPY runtime/zcode-captcha/*.cjs /app/captcha-worker/
 
 # 容器内的默认形态：全网卡监听 + 数据落卷 + 自托管面板。
 # 鉴权：面板需要管理员（登录页注册或 env 预置）；未配置任何 API Key 时
@@ -93,10 +100,11 @@ COPY desktop-tauri/ui /app/ui
 ENV AGENT2API_HOST=0.0.0.0 \
     AGENT2API_PROXY_HOME=/data \
     AGENT2API_UI_DIR=/app/ui \
-    AGENT2API_CAPTCHA_ENABLED=1
+    AGENT2API_CAPTCHA_ENABLED=1 \
+    AGENT2API_ZCODE_CAPTCHA_WORKER=/app/captcha-worker/worker.cjs
 VOLUME ["/data"]
 EXPOSE 3065
 WORKDIR /app
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD curl -fsS "http://127.0.0.1:${AGENT2API_PROXY_PORT:-3065}/health" || exit 1
-ENTRYPOINT ["/usr/local/bin/agent2api-server"]
+ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/usr/local/bin/agent2api-server"]

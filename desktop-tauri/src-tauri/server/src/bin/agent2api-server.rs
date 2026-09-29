@@ -179,7 +179,15 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    runtime.block_on(wait_for_shutdown_signal());
+    runtime.block_on(async {
+        let worker = std::env::var("AGENT2API_ZCODE_CAPTCHA_WORKER").ok()
+            .filter(|path| !path.trim().is_empty()).map(|path| {
+                agent2api_server::server::core::providers::zcode::captcha::set_producer("starting", 0);
+                tokio::spawn(agent2api_server::server::captcha_worker::run(state.clone(), path))
+            });
+        wait_for_shutdown_signal().await;
+        if let Some(worker) = worker { worker.abort(); let _ = worker.await; }
+    });
     let _ = shutdown_tx.send(());
     // 给在途请求留出跑完的时间（start 内部会等 graceful shutdown 收尾）
     std::thread::sleep(std::time::Duration::from_millis(300));

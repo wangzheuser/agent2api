@@ -165,6 +165,7 @@ export type AccountsBridge = {
     minted?: number
     consumed?: number
     ttlMs?: number
+    producer?: { mode?: string; status?: string; failures?: number }
   } | null | undefined>
 }
 
