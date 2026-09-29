@@ -63,11 +63,10 @@
 //!     [`callback_server`](super::callback_server) 解决（登录时临时占用一个
 //!     登记端口并把回调转回网关），本模块只负责拼对形态。
 //!
-//! 于是回调直接挂在本网关自己的监听端口上（与 CatPaw 同一手法，见
-//! `core::login::catpaw` 的模块头）：省掉一个临时监听器，也省掉「临时端口
-//! 被占用 / 忘了关」这类故障面。回调地址里**不带** state（理由见
-//! `CALLBACK_PATH_PREFIX` 的说明）；任务关联由登录服务按变体匹配进行中的
-//! 任务完成。
+//! 本机浏览器形态会临时占用登记端口并转发到网关；远程面板形态只使用登记
+//! 端口生成 redirect，不在服务器上监听，回调由用户复制地址栏后提交到网关。
+//! 回调地址里**不带** state（理由见 `CALLBACK_PATH_PREFIX` 的说明）；任务
+//! 关联由登录服务按变体匹配进行中的任务完成。
 //!
 //! ── 安全 ────────────────────────────────────────────────────
 //! 回调落在本机 HTTP 端口上，任何本机进程都能伪造一次 GET。安全由**一次性
@@ -178,8 +177,8 @@ pub const CALLBACK_PATH_PREFIX: &str = "/auth/callback-";
 ///
 /// `callback_base` 是这一轮的**回调落点基址**（`http://localhost:<端口>`），
 /// 由调用方给出（`core::login::autoclaw` 的 `callback_endpoint` 决定用哪个
-/// 端口，本模块拿不到）。host 必须是 `localhost`、端口必须是登记过的那四个
-/// 之一（理由见 [`CALLBACK_PATH_PREFIX`] 的说明）。
+/// 端口，本模块拿不到）。Zai 的 host 和端口必须符合登记回调形态（理由见
+/// [`CALLBACK_PATH_PREFIX`] 的说明）。
 pub fn navigate_uri(callback_base: &str, vendor: Vendor) -> String {
     format!(
         "{}{}{}",
@@ -187,6 +186,40 @@ pub fn navigate_uri(callback_base: &str, vendor: Vendor) -> String {
         CALLBACK_PATH_PREFIX,
         vendor.id()
     )
+}
+
+/// 远程浏览器手动粘贴模式使用的官方登记回调基址。
+///
+/// 这个地址只用于让 Zai 通过 redirect_uri 白名单校验；远程浏览器里的
+/// `localhost` 属于用户自己的机器，回调不会直接抵达网关，最终仍由面板把
+/// 地址栏中的完整 URL 提交到受保护的登录回调接口。
+pub fn registered_callback_base() -> String {
+    format!(
+        "http://localhost:{}",
+        super::callback_server::REGISTERED_CALLBACK_PORTS[0]
+    )
+}
+
+/// 校验远程面板粘贴的 AutoClaw 回调地址。
+pub fn is_valid_manual_callback_url(url: &url::Url, vendor: Vendor) -> bool {
+    if url.scheme() != "http"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || !matches!(
+            url.host_str(),
+            Some("localhost" | "127.0.0.1" | "::1" | "[::1]")
+        )
+    {
+        return false;
+    }
+    let Some(port) = url.port() else {
+        return false;
+    };
+    if vendor == Vendor::Zai && !super::callback_server::REGISTERED_CALLBACK_PORTS.contains(&port) {
+        return false;
+    }
+    url.path() == format!("{CALLBACK_PATH_PREFIX}{}", vendor.id())
 }
 
 /// 带签名的 userapi POST（登录链路上还没有 token，因此走匿名形态）。
@@ -442,4 +475,56 @@ pub async fn exchange_code(
 /// 需要不同的形态（比如上游对 OAuth 要求 ed25519 指纹），改这里一处即可。
 pub fn new_oauth_device_id() -> String {
     new_device_id()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_valid_manual_callback_url, navigate_uri, registered_callback_base, Vendor};
+
+    #[test]
+    fn remote_zai_uses_an_official_loopback_redirect() {
+        let base = registered_callback_base();
+        assert_eq!(base, "http://localhost:18432");
+        assert_eq!(
+            navigate_uri(&base, Vendor::Zai),
+            "http://localhost:18432/auth/callback-zai"
+        );
+    }
+
+    #[test]
+    fn manual_callback_accepts_registered_loopback_urls() {
+        for host in ["localhost", "127.0.0.1", "[::1]"] {
+            let url = url::Url::parse(&format!(
+                "http://{host}:19654/auth/callback-zai?code=c&state=s"
+            ))
+            .unwrap();
+            assert!(
+                is_valid_manual_callback_url(&url, Vendor::Zai),
+                "host={:?} parsed={url}",
+                url.host_str()
+            );
+        }
+    }
+
+    #[test]
+    fn manual_callback_rejects_unregistered_targets() {
+        for raw in [
+            "https://localhost:18432/auth/callback-zai?code=c&state=s",
+            "http://localhost:3065/auth/callback-zai?code=c&state=s",
+            "http://example.com:18432/auth/callback-zai?code=c&state=s",
+            "http://localhost:18432/auth/callback-google?code=c&state=s",
+        ] {
+            let url = url::Url::parse(raw).unwrap();
+            assert!(!is_valid_manual_callback_url(&url, Vendor::Zai), "{raw}");
+        }
+    }
+
+    #[test]
+    fn manual_google_callback_keeps_accepting_a_gateway_loopback_port() {
+        let url = url::Url::parse(
+            "http://localhost:3065/auth/callback-google?code=c&state=s",
+        )
+        .unwrap();
+        assert!(is_valid_manual_callback_url(&url, Vendor::Google));
+    }
 }

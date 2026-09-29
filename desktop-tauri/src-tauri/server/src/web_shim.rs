@@ -200,8 +200,10 @@ pub fn shim_js() -> &'static str {
       : provider === 'trae' ? 'Trae'
       : provider.indexOf('accio') === 0 ? 'Accio'
       : provider === 'codearts' ? 'CodeArts' : 'AutoClaw';
-    var callbackInstruction = '授权完成后，复制授权页浏览器地址栏中的<strong>完整地址</strong>，'
-        + '粘贴到下面提交。不要复制授权页原始地址，也不要改动参数。';
+    var callbackInstruction = provider === 'autoclaw-intl'
+        ? 'AutoClaw 国际版授权完成后，浏览器可能显示 localhost 无法访问，这是预期现象。请复制地址栏中的<strong>完整回调地址</strong>，粘贴到下面提交。不要复制授权页原始地址，也不要改动参数。'
+        : '授权完成后，复制授权页浏览器地址栏中的<strong>完整地址</strong>，'
+          + '粘贴到下面提交。不要复制授权页原始地址，也不要改动参数。';
     while (true) {
       var callbackUrl = await ensureOverlay(
         label + '需要粘贴回调地址',
@@ -209,7 +211,11 @@ pub fn shim_js() -> &'static str {
         + '<div style="margin-bottom:10px;">如果授权页没有打开，请先点击：<a href="'
         + escapeHtml(authUrl) + '" target="_blank" rel="noopener" style="color:#7fa7ff;word-break:break-all;">'
         + escapeHtml(authUrl) + '</a></div>'
-        + '<input type="text" spellcheck="false" autocomplete="off" placeholder="http://127.0.0.1:…/callback?..." '
+        + '<input type="text" spellcheck="false" autocomplete="off" placeholder="'
+        + (provider === 'autoclaw-intl'
+          ? 'http://localhost:18432/auth/callback-zai?...'
+          : 'http://127.0.0.1:…/callback?...')
+        + '" '
         + 'style="width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #3a3b3f;'
         + 'border-radius:6px;background:#26272b;color:#e8e8e8;">',
         '提交回调地址'

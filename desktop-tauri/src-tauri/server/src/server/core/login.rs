@@ -723,6 +723,11 @@ impl LoginService {
             };
             let vendor = crate::server::core::providers::autoclaw::oauth::Vendor::from_id(vendor_id)
                 .ok_or_else(|| GatewayError::with_status(400, "无法识别 AutoClaw 登录方式"))?;
+            if !crate::server::core::providers::autoclaw::oauth::is_valid_manual_callback_url(
+                &parsed, vendor,
+            ) {
+                return Err(GatewayError::with_status(400, "AutoClaw 登录回调地址无效"));
+            }
             let params: std::collections::HashMap<String, String> = parsed
                 .query_pairs()
                 .map(|(key, value)| (key.into_owned(), value.into_owned()))
@@ -732,6 +737,12 @@ impl LoginService {
             }
             let upstream_state = params.get("state").map(String::as_str).unwrap_or("");
             let code = params.get("code").map(String::as_str).unwrap_or("");
+            if upstream_state.trim().is_empty() || code.trim().is_empty() {
+                return Err(GatewayError::with_status(
+                    400,
+                    "AutoClaw 登录回调缺少授权码或上游 state",
+                ));
+            }
             let Some((pending_state, _)) = self.find_autoclaw_pending_for_vendor(vendor) else {
                 return Err(GatewayError::with_status(404, "AutoClaw 登录上下文已结束，请重新发起"));
             };
