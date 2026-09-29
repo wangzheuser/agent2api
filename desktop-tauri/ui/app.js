@@ -26,7 +26,7 @@ function toast(message, type = 'ok') {
   element.className = type;
   element.style.display = 'block';
   clearTimeout(toast.timer);
-  toast.timer = setTimeout(() => { element.style.display = 'none'; }, 3500);
+  toast.timer = setTimeout(() => { element.style.display = 'none'; }, type === 'err' ? 2000 : 3500);
 }
 
 function formatTime(value) {

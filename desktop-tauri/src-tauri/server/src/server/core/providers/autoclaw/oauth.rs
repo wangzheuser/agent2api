@@ -278,6 +278,8 @@ fn describe_oauth_error(code: i64, upstream_msg: &str) -> String {
         // 换码这一跳的失败：授权码一次性 / 已过期 / 与 state 对不上。
         // 最常见的原因是「回调被重复处理」或「用户在上游页面停留太久」。
         631_001 => "授权码无效或已过期，请重新点击登录".to_string(),
+        631_003 => "当前 Z.AI 账号类型不支持 AutoClaw OAuth，请使用邮箱注册的 Z.AI 账号重新授权"
+            .to_string(),
         400_001 => "请求参数有误（登录链路内部错误，请重试）".to_string(),
         400_002 => "请求签名校验失败（本机时钟可能有偏差），请校准系统时间后重试".to_string(),
         _ => {
@@ -479,7 +481,21 @@ pub fn new_oauth_device_id() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_valid_manual_callback_url, navigate_uri, registered_callback_base, Vendor};
+    use super::{
+        describe_oauth_error, is_valid_manual_callback_url, navigate_uri, registered_callback_base,
+        Vendor,
+    };
+
+    #[test]
+    fn unsupported_zai_account_type_has_a_clear_message() {
+        assert_eq!(
+            describe_oauth_error(
+                631_003,
+                "Unsupported account type. Please use an email-registered Z.AI account."
+            ),
+            "当前 Z.AI 账号类型不支持 AutoClaw OAuth，请使用邮箱注册的 Z.AI 账号重新授权"
+        );
+    }
 
     #[test]
     fn remote_zai_uses_an_official_loopback_redirect() {
