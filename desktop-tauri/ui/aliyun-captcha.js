@@ -247,6 +247,7 @@
   function settlePending(pending, outcome) {
     if (pendingVerification !== pending || pending.settled) return false;
     pending.settled = true;
+    pendingVerification = null;
     window.clearTimeout(pending.timer);
     if (outcome.error) pending.reject(outcome.error);
     else pending.resolve(outcome.value);

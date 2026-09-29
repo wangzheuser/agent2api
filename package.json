@@ -5,6 +5,7 @@
   "type": "module",
   "private": true,
   "scripts": {
+    "test:captcha": "node --test scripts/aliyun-captcha.test.cjs",
     "build:icon": "node build/make-icon.mjs",
     "tauri:install": "npm --prefix desktop-tauri install",
     "tauri:dev": "npm --prefix desktop-tauri run dev",
