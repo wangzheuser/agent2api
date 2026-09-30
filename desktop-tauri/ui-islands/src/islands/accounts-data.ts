@@ -517,7 +517,7 @@ export async function checkinAll(): Promise<void> {
     // 失败详情：个数 + 第一条原因（各账号自己的原因记进按钮 title，可逐个悬停复看）
     const parts = [`成功领取 ${ok} 个`]
     if (already) parts.push(`今日已领取 ${already} 个`)
-    if (active) parts.push(`完成日活保活 ${active} 个`)
+    if (active) parts.push(`完成有效对话 ${active} 个（日活奖励尚未确认）`)
     if (failed.length) parts.push(`未领取 ${failed.length} 个（首个：${failed[0]}）`)
     const skipped = Number(data?.skipped) || 0
     toast(`签到完成：${parts.join('，')}`
@@ -565,7 +565,7 @@ export async function runCheckin(id: string): Promise<void> {
       checkinErrors.delete(id)
       toast(outcome.kind === 'already'
         ? `${label}：今日已领取`
-        : outcome.kind === 'active' ? `✅ ${label} 日活保活完成` : `✅ ${label} 签到成功`, 'ok')
+        : outcome.kind === 'active' ? `${label}：有效对话完成，日活奖励尚未确认` : `✅ ${label} 签到成功`, 'ok')
     }
     bump()
     // 签到会改变余额读数：此刻刷新余额（静默，见 refreshUsageAfterCheckin）。

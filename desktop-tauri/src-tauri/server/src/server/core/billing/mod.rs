@@ -31,11 +31,13 @@
 //!   commodity.rs 积分包商品码与套餐分类
 
 mod activity;
+mod activity_response;
 pub mod checkin;
 pub mod commodity;
 mod request;
 mod usage;
 
+use activity_response::consume_activity_response;
 use serde_json::{json, Map, Value};
 
 use crate::server::config;
@@ -455,7 +457,7 @@ impl BillingService {
     /// 国际版活动未开放属于正常状态，所有探测/保活失败都收敛为结果字段并记录日志，
     /// 不让自动签到任务因为上游活动开关而中断。
     pub async fn workbuddy_daily_activity(&self, session: &Value) -> Value {
-        self.log_workbuddy_activity_balance(session, "前").await;
+        let balance_before = self.log_workbuddy_activity_balance(session, "前").await;
 
         let status = self
             .call_billing(
@@ -470,13 +472,13 @@ impl BillingService {
 
         let (status_available, active, today_checked_in, status_value) = match status {
             Ok(result) => {
-                let status_available = result.code == Some(RESPONSE_CODE_OK);
-                let active = result
+                let status_available = result.code == Some(RESPONSE_CODE_OK) && !result.data.is_null();
+                let active = status_available && result
                     .data
                     .get("active")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                let today_checked_in = result
+                let today_checked_in = status_available && result
                     .data
                     .get("today_checked_in")
                     .or_else(|| result.data.get("todayCheckedIn"))
@@ -486,7 +488,7 @@ impl BillingService {
                     logging::verbose(
                         "[Checkin]",
                         &format!(
-                            "WorkBuddy 国际版活跃探测未开启（code={}）",
+                            "WorkBuddy 国际版签到活动状态查询失败（code={}）",
                             result.code.unwrap_or(-1)
                         ),
                     );
@@ -551,16 +553,20 @@ impl BillingService {
         };
 
         let (poke_succeeded, poke_model) = self.poke_daily_activity(session).await;
-        self.log_workbuddy_activity_balance(session, "完成后").await;
+        let balance_after = self.log_workbuddy_activity_balance(session, "执行后").await;
+        let balance_delta = balance_before
+            .as_ref()
+            .zip(balance_after.as_ref())
+            .and_then(|(before, after)| {
+                Some(after.get("totalLeft")?.as_i64()? - before.get("totalLeft")?.as_i64()?)
+            });
         let claim_succeeded = claim
             .get("success")
             .and_then(Value::as_bool)
             .unwrap_or(false);
         if !claim_succeeded && !today_checked_in && !active {
             claim["msg"] = Value::String(if poke_succeeded {
-                "活跃保活完成".to_string()
-            } else if status_available {
-                "活动未开启".to_string()
+                "有效对话完成，日活奖励尚未确认".to_string()
             } else {
                 "活跃保活失败".to_string()
             });
@@ -568,6 +574,15 @@ impl BillingService {
         if !poke_succeeded {
             logging::verbose("[Checkin]", "WorkBuddy 国际版免费模型活跃保活未成功");
         }
+        logging::log(
+            "[Checkin]",
+            &format!(
+                "WorkBuddy 国际版活跃结果（账号={}，statusAvailable={status_available}，active={active}，todayCheckedIn={today_checked_in}，claimSuccess={claim_succeeded}，pokeSucceeded={poke_succeeded}，balanceDelta={}，rewardStatus=unverified；余额为整数摘要，日活奖励资格及到账以上游结算为准）",
+                session.pointer("/account/nickname").and_then(Value::as_str)
+                    .or_else(|| session.pointer("/account/uid").and_then(Value::as_str)).unwrap_or("unknown"),
+                balance_delta.map(|v| v.to_string()).unwrap_or_else(|| "unknown".to_string()),
+            ),
+        );
 
         json!({
             "status": status_value,
@@ -578,6 +593,10 @@ impl BillingService {
                 "statusAvailable": status_available,
                 "pokeSucceeded": poke_succeeded,
                 "pokeModel": poke_model,
+                "balanceBefore": balance_before,
+                "balanceAfter": balance_after,
+                "balanceDelta": balance_delta,
+                "rewardStatus": "unverified",
             },
         })
     }
@@ -585,7 +604,7 @@ impl BillingService {
     /// 记录活跃保活前后的积分快照，便于核对活动奖励是否入账。
     ///
     /// 余额查询是旁路诊断动作：失败只记录日志，不改变活跃任务的结果。
-    async fn log_workbuddy_activity_balance(&self, session: &Value, phase: &str) {
+    async fn log_workbuddy_activity_balance(&self, session: &Value, phase: &str) -> Option<Value> {
         let account = session
             .get("account")
             .and_then(Value::as_object);
@@ -602,22 +621,28 @@ impl BillingService {
             .unwrap_or("unknown");
 
         match self.query_credits_summary(Some(session), None).await {
-            Ok(summary) => logging::log(
-                "[Checkin]",
-                &format!(
-                    "WorkBuddy 国际版活跃保活{phase}余额（账号={account_label}，totalLeft={}，planLeft={}，bonusLeft={}）",
-                    summary.get("totalLeft").unwrap_or(&Value::Null),
-                    summary.get("planLeft").unwrap_or(&Value::Null),
-                    summary.get("bonusLeft").unwrap_or(&Value::Null),
-                ),
-            ),
-            Err(error) => logging::log(
-                "[Checkin]",
-                &format!(
-                    "WorkBuddy 国际版活跃保活{phase}余额查询失败（账号={account_label}）：{}",
-                    error.message
-                ),
-            ),
+            Ok(summary) => {
+                logging::log(
+                    "[Checkin]",
+                    &format!(
+                        "WorkBuddy 国际版活跃保活{phase}余额（账号={account_label}，totalLeft={}，planLeft={}，bonusLeft={}）",
+                        summary.get("totalLeft").unwrap_or(&Value::Null),
+                        summary.get("planLeft").unwrap_or(&Value::Null),
+                        summary.get("bonusLeft").unwrap_or(&Value::Null),
+                    ),
+                );
+                Some(summary)
+            }
+            Err(error) => {
+                logging::log(
+                    "[Checkin]",
+                    &format!(
+                        "WorkBuddy 国际版活跃保活{phase}余额查询失败（账号={account_label}）：{}",
+                        error.message
+                    ),
+                );
+                None
+            }
         }
     }
 
@@ -659,19 +684,23 @@ impl BillingService {
                 }
             };
             let status = response.status();
-            let body_ok = tokio::time::timeout(
+            if !status.is_success() {
+                logging::verbose("[Checkin]", &format!(
+                    "WorkBuddy 国际版活跃模型 {model} 返回 HTTP {}", status.as_u16()
+                ));
+                continue;
+            }
+            let body_result = tokio::time::timeout(
                 std::time::Duration::from_millis(TIMEOUT_MS),
                 consume_activity_response(response, 1 << 20),
             )
             .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or(false);
-            if !(200..300).contains(&status.as_u16()) || !body_ok {
+            .unwrap_or(Err("响应流读取超时"));
+            if let Err(reason) = body_result {
                 logging::verbose(
                     "[Checkin]",
                     &format!(
-                        "WorkBuddy 国际版活跃模型 {model} 返回 HTTP {}",
+                        "WorkBuddy 国际版活跃模型 {model} 返回 HTTP {}，有效对话校验失败：{reason}",
                         status.as_u16()
                     ),
                 );
@@ -679,7 +708,7 @@ impl BillingService {
             }
             logging::verbose(
                 "[Checkin]",
-                &format!("WorkBuddy 国际版活跃保活成功（model={model}）"),
+                &format!("WorkBuddy 国际版活跃保活有效对话完成（model={model}，日活奖励尚未确认）"),
             );
             return (true, Some((*model).to_string()));
         }
@@ -716,12 +745,13 @@ fn is_international(session: &Value) -> bool {
 /// 国际版活跃探测响应归一化为管理 API 能直接消费的形态。
 fn normalize_activity_status(result: &BillingCall) -> Value {
     let data = &result.data;
+    let available = result.code == Some(RESPONSE_CODE_OK) && !data.is_null();
     json!({
-        "active": data
+        "active": available && data
             .get("active")
             .and_then(Value::as_bool)
             .unwrap_or(false),
-        "todayCheckedIn": data
+        "todayCheckedIn": available && data
             .get("today_checked_in")
             .or_else(|| data.get("todayCheckedIn"))
             .and_then(Value::as_bool)
@@ -731,30 +761,11 @@ fn normalize_activity_status(result: &BillingCall) -> Value {
             .or_else(|| data.get("dailyCredit"))
             .cloned()
             .unwrap_or(Value::Null),
-        "statusAvailable": result.code == Some(RESPONSE_CODE_OK) && !data.is_null(),
+        "statusAvailable": available,
         "code": result.code,
         "msg": result.msg,
         "raw": data,
     })
-}
-
-/// 消费活跃保活的 SSE 响应，限制最大读取量，避免上游异常时无界缓冲。
-async fn consume_activity_response(
-    response: reqwest::Response,
-    max_bytes: usize,
-) -> Result<bool, ()> {
-    use futures::StreamExt;
-
-    let mut stream = response.bytes_stream();
-    let mut consumed = 0usize;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| ())?;
-        consumed = consumed.saturating_add(chunk.len());
-        if consumed >= max_bytes {
-            return Ok(true);
-        }
-    }
-    Ok(true)
 }
 
 /// 将每日领取接口的原始返回转换成统一 claim 形状。
@@ -796,6 +807,18 @@ fn assert_checkin_supported(session: &Value) -> Result<(), BillingError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_status_cannot_authorize_a_claim_or_mark_checkin_complete() {
+        let result = BillingCall {
+            code: Some(403), msg: None, request_id: None,
+            data: json!({"active": true, "today_checked_in": true}), raw: None,
+        };
+        let status = normalize_activity_status(&result);
+        assert_eq!(status["statusAvailable"], false);
+        assert_eq!(status["active"], false);
+        assert_eq!(status["todayCheckedIn"], false);
+    }
 
     #[test]
     fn international_activity_status_normalizes_snake_case_fields() {

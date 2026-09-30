@@ -436,7 +436,7 @@ pub async fn run_checkin(
     logging::log(
         "[Accounts]",
         &format!(
-            "签到完成: {succeeded}/{} 个账号成功领取，{active} 个账号完成活跃保活",
+            "签到完成: {succeeded}/{} 个账号成功领取，{active} 个账号完成活跃保活有效对话（日活奖励尚未确认）",
             results.len()
         ),
     );
