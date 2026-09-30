@@ -202,12 +202,38 @@ pub(super) fn scheduled_from(map: &Map<String, Value>) -> ScheduledSettings {
             INTERVAL_MIN_MINUTES,
             INTERVAL_MAX_MINUTES,
         ),
+        zcode_auto_claim: task(
+            KEY_ZCODE_AUTO_CLAIM,
+            defaults.zcode_auto_claim.interval,
+            INTERVAL_MIN_MINUTES,
+            INTERVAL_MAX_MINUTES,
+        ),
         usage_query: task(
             KEY_USAGE_QUERY,
             defaults.usage_query.interval,
             INTERVAL_MIN_MINUTES,
             INTERVAL_MAX_MINUTES,
         ),
+    }
+}
+
+#[cfg(test)]
+mod zcode_auto_claim_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn default_on_and_interval_boundaries_preserve_explicit_disable() {
+        let defaults = scheduled_from(&Map::new()).zcode_auto_claim;
+        assert!(defaults.enabled);
+        assert_eq!(defaults.interval, 10);
+        for (input, expected) in [(1, 1), (1440, 1440), (0, 10), (1441, 10), (-1, 10)] {
+            let config = json!({"scheduledTasks":{"zcodeAutoClaim":{"enabled":false,"interval":input}}});
+            let settings = scheduled_from(config.as_object().unwrap());
+            assert!(!settings.zcode_auto_claim.enabled);
+            assert_eq!(settings.zcode_auto_claim.interval, expected);
+            assert!(settings.usage_query.enabled);
+        }
     }
 }
 

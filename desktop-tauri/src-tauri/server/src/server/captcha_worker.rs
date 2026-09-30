@@ -12,6 +12,31 @@ use crate::server::core::{
 };
 use crate::server::{api::zcode_captcha, logging, ServerState};
 
+/// 领取按目标账号临时调用同一生产者，避免挤占推理池或混用代理出口。
+pub(crate) async fn proof_for_claim(
+    store: &crate::server::core::account_store::AccountStore,
+    account_id: &str,
+    config: &claim::CaptchaConfig,
+) -> Result<(String, String), String> {
+    let script = std::env::var("AGENT2API_ZCODE_CAPTCHA_WORKER").ok()
+        .filter(|path| !path.trim().is_empty());
+    let Some(script) = script else {
+        return captcha::acquire_for_claim(account_id).await
+            .ok_or_else(|| "等待领取验证码超时，请保持桌面或管理页面运行".to_string());
+    };
+    let mut settings = json!({"prefix":config.prefix,"sceneId":config.scene_id,"region":config.region});
+    if let Some(proxy) = crate::server::core::zcode_claim::account_proxy(store, account_id) {
+        settings["proxy"] = json!({
+            "server": format!("{}://{}:{}",proxy.protocol,proxy.host,proxy.port.unwrap_or(80)),
+            "username":proxy.username,"password":proxy.password,
+        });
+    }
+    let mut worker = Worker::spawn(&script).map_err(str::to_string)?;
+    let result = worker.mint(&settings).await.map_err(str::to_string);
+    worker.stop().await;
+    result
+}
+
 struct Worker {
     child: Child,
     #[cfg(unix)]

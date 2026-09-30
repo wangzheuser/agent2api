@@ -39,6 +39,7 @@ use captcha::POOL_TARGET;
 pub(crate) fn stats_json(state: &ServerState) -> Value {
     let mut body = captcha::stats();
     let (start_plan_accounts, account_id) = start_plan_accounts(state);
+    let claim_account = captcha::claim_account_id();
     // 先算好「库存够不够」（`body` 随后要被可变借用，读值得在借用之前取）
     let ready = body.get("fresh").and_then(Value::as_u64).unwrap_or(0);
     if let Some(object) = body.as_object_mut() {
@@ -50,14 +51,14 @@ pub(crate) fn stats_json(state: &ServerState) -> Value {
         // 铸造器唯一需要的那个布尔：有账号要走这条路、且库存不足目标
         object.insert(
             "needsTokens".to_string(),
-            Value::Bool(start_plan_accounts > 0 && ready < POOL_TARGET as u64),
+            Value::Bool((start_plan_accounts > 0 || claim_account.is_some()) && ready < POOL_TARGET as u64),
         );
         // 顺手给一个**可用的账号 id**：铸造器还要拿它去问上游那份风控配置
         // （sceneId / prefix / region）。让界面自己去读账号列表会把「哪些账号
         // 能用」的判据抄第二遍 —— 那正是账号页最容易漂移的地方。
         object.insert(
             "captchaAccountId".to_string(),
-            account_id.map(Value::String).unwrap_or(Value::Null),
+            claim_account.or(account_id).map(Value::String).unwrap_or(Value::Null),
         );
     }
     body

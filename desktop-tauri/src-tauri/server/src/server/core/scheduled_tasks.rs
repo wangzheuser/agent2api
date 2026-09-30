@@ -76,7 +76,19 @@ pub const TASK_LOGS_AUTO_REFRESH: &str = config::KEY_LOGS_AUTO_REFRESH;
 pub const TASK_REQUESTS_AUTO_REFRESH: &str = config::KEY_REQUESTS_AUTO_REFRESH;
 pub const TASK_REPORT_AUTO_REFRESH: &str = config::KEY_REPORT_AUTO_REFRESH;
 
-pub const TASKS: [TaskDef; 7] = [
+pub const TASK_ZCODE_AUTO_CLAIM: &str = config::KEY_ZCODE_AUTO_CLAIM;
+
+pub const TASKS: [TaskDef; 8] = [
+    TaskDef {
+        id: TASK_ZCODE_AUTO_CLAIM,
+        label: "ZCode 自动领取套餐",
+        description: "定期检查国内版和国际版已启用账号的可领套餐，按套餐去重；领取成功后自动切换到活动套餐。默认每 10 分钟检查，支持 1～1440 分钟。",
+        unit: "minutes",
+        runner: Runner::Backend,
+        min: config::INTERVAL_MIN_MINUTES,
+        max: config::INTERVAL_MAX_MINUTES,
+        default_interval: config::DEFAULT_ZCODE_AUTO_CLAIM_MINUTES,
+    },
     TaskDef {
         id: TASK_CREDENTIAL_MAINTENANCE,
         label: "凭证自动维护",
@@ -159,6 +171,7 @@ fn settings_of(settings: config::ScheduledSettings, id: &str) -> config::Interva
         TASK_MODEL_REFRESH => settings.model_refresh,
         TASK_UPDATE_CHECK => settings.update_check,
         TASK_USAGE_QUERY => settings.usage_query,
+        TASK_ZCODE_AUTO_CLAIM => settings.zcode_auto_claim,
         TASK_LOGS_AUTO_REFRESH => settings.logs_auto_refresh,
         TASK_REQUESTS_AUTO_REFRESH => settings.requests_auto_refresh,
         TASK_REPORT_AUTO_REFRESH => settings.report_auto_refresh,
@@ -344,6 +357,11 @@ async fn run_backend(
             };
             (summary, failed == 0)
         }
+        TASK_ZCODE_AUTO_CLAIM => {
+            let summary = crate::server::core::zcode_claim::run_auto(store, manual).await?;
+            // 单账号失败在账号排期里退避，扫描本身按配置继续发现新套餐。
+            (summary, true)
+        }
         TASK_USAGE_QUERY => {
             match crate::server::core::usage_query::query_all(store, None).await {
                 Ok(report) => {
@@ -396,6 +414,17 @@ pub fn spawn(store: AccountStore, update: UpdateManager) {
                 }
                 // 到点：跑一次（`run_backend` 内部按当前间隔重新排期）。
                 // 被跳过（另一进程抢到、或在最短间隔内）不算错误，只留 verbose。
+                if task.id == TASK_ZCODE_AUTO_CLAIM {
+                    // 领取含验证码等待，独立运行；run_backend 的持久化占位防止重入。
+                    let store = store.clone();
+                    let update = update.clone();
+                    crate::spawn_task(async move {
+                        if let Err(error) = run_backend(&store, &update, task, false).await {
+                            logging::verbose("[Tasks]", &format!("{}：{error}", task.label));
+                        }
+                    });
+                    continue;
+                }
                 if let Err(error) = run_backend(&store, &update, task, false).await {
                     logging::verbose("[Tasks]", &format!("{}：{error}", task.label));
                 }

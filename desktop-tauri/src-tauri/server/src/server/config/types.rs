@@ -354,6 +354,8 @@ pub const KEY_REPORT_AUTO_REFRESH: &str = "reportAutoRefresh";
 pub const KEY_UPDATE_CHECK: &str = "updateCheck";
 /// 定时查询积分在 `scheduledTasks` 下的子键（后端定时查全部账号的余额 / 积分）
 pub const KEY_USAGE_QUERY: &str = "usageQuery";
+pub const KEY_ZCODE_AUTO_CLAIM: &str = "zcodeAutoClaim";
+pub const DEFAULT_ZCODE_AUTO_CLAIM_MINUTES: i64 = 10;
 
 /// 凭证维护默认间隔（分钟）：与改造前的硬编码 600 秒一致
 pub const DEFAULT_CREDENTIAL_MAINTENANCE_MINUTES: i64 = 10;
@@ -422,6 +424,7 @@ pub struct ScheduledSettings {
     pub report_auto_refresh: IntervalTask,
     pub update_check: IntervalTask,
     pub usage_query: IntervalTask,
+    pub zcode_auto_claim: IntervalTask,
 }
 
 impl Default for ScheduledSettings {
@@ -450,6 +453,10 @@ impl Default for ScheduledSettings {
             update_check: IntervalTask {
                 enabled: true,
                 interval: DEFAULT_UPDATE_CHECK_MINUTES,
+            },
+            zcode_auto_claim: IntervalTask {
+                enabled: true,
+                interval: DEFAULT_ZCODE_AUTO_CLAIM_MINUTES,
             },
             usage_query: IntervalTask {
                 enabled: true,

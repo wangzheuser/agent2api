@@ -156,6 +156,8 @@ services:
 
 ![定时任务页：自动签到、凭证维护、模型目录刷新等后台任务的开关与间隔](./assets/screenshots/scheduled-tasks.png)
 
+ZCode 国内版与国际版支持自动检查并领取活动套餐：默认开启，每 10 分钟检查一次，可在定时任务页配置为 1～1440 分钟。只处理已启用且具备套餐 JWT 的账号，按账号和套餐 ID 去重，领取成功后自动将该账号的「使用套餐」切换为「活动套餐」。重启沿用排期；单账号失败退避，其他账号继续检查。Docker 按需使用内置验证码生产者，桌面模式需要保持 WebView 或管理页面运行；上游验证码或活动资格限制会显示在任务结果和日志中。
+
 ---
 
 ## 项目结构
@@ -327,4 +329,3 @@ npm run build:icon         # 生成图标源图（改图标设计后执行，再
     <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=aimod-cc/agent2api&type=Date" />
   </picture>
 </a>
-

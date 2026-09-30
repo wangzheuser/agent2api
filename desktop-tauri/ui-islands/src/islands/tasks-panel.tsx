@@ -562,7 +562,7 @@ function TasksPanel() {
       }
       toast(`✅ ${task.label}：${result?.summary || '已执行'}`)
       // 凭证刷新会改账号页的有效期 / 凭证状态，顺手刷新主界面
-      if (task.id === 'credentialMaintenance') await shared().wbApp?.refresh?.()
+      if (task.id === 'credentialMaintenance' || task.id === 'zcodeAutoClaim') await shared().wbApp?.refresh?.()
       // 立即查询积分刚写下一份新快照，让账号页马上应用它 —— 否则用户点完
       // 「立即执行」切到账号页，看到的还是上一次的旧余额
       if (task.id === 'usageQuery') await shared().wbAccountsView?.syncBalancesSnapshot?.()

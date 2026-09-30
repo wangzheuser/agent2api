@@ -325,8 +325,9 @@
       // 官方活动端点），所以顺手说一句去哪儿切 —— 否则用户领完直接发请求，会
       // 拿到「套餐已到期」而完全不知道这回事（见 providers::zcode::plan）
       window.wbApp.toast(
-        '这份额度走「活动套餐」通道：若转发时提示编码套餐已到期，'
-        + '在账号设置里把「使用套餐」切到活动套餐即可',
+        result.planSwitched ? '已自动切换为「活动套餐」'
+          : `套餐已领取，请在账号设置中切换为活动套餐${result.switchError ? `：${result.switchError}` : ''}`,
+        result.planSwitched ? undefined : 'warn',
       );
       return result;
     }

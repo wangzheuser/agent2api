@@ -78,3 +78,4 @@ pub mod task_state;
 pub mod update;
 pub mod upstream;
 pub mod usage_query;
+pub mod zcode_claim;

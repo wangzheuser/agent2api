@@ -15,6 +15,30 @@ pub const POOL_TARGET: usize = 3;
 pub const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(60);
 type Proof = (String, String);
 
+static CLAIM_ACCOUNT: Mutex<Option<String>> = Mutex::new(None);
+
+struct ClaimDemand;
+impl Drop for ClaimDemand {
+    fn drop(&mut self) {
+        if let Ok(mut account) = CLAIM_ACCOUNT.lock() { *account = None; }
+    }
+}
+
+pub fn claim_account_id() -> Option<String> {
+    CLAIM_ACCOUNT.lock().ok().and_then(|account| account.clone())
+}
+
+/// 桌面领取临时唤醒页面生产者；取消或超时会撤销需求。
+pub async fn acquire_for_claim(account_id: &str) -> Option<Proof> {
+    {
+        let mut account = CLAIM_ACCOUNT.lock().ok()?;
+        if account.is_some() { return None; }
+        *account = Some(account_id.to_string());
+    }
+    let _demand = ClaimDemand;
+    acquire().await
+}
+
 struct Entry {
     proof: Proof,
     at: i64,

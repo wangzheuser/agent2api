@@ -27,10 +27,9 @@
 //!     否则用户会一直点那颗按钮、每次拿回同一句「该账号已领取过」。
 //! 响应里带上落库后的状态，前端不必为了刷新那颗按钮再拉一次账号列表。
 //!
-//! ── 为什么**不接自动领取**（定时任务里没有这一条）──────────────
-//! 领取通常要过阿里云无痕验证（`3007` 那档），而解它的唯一可行方式是 webview
-//! 里跑官方 SDK（见 `providers::zcode::claim` 的模块头）。定时任务没有那个环境，
-//! 硬发只会稳定拿回「验证码校验未通过」—— 不如如实不做，由用户在界面上点。
+//! ── 自动领取 ───────────────────────────────────────────────
+//! 手动领取由前端提供验证码；定时领取由 core::zcode_claim 调用已有生产者，
+//! 共用协议、账号上下文和领取台账。
 //!
 //! ── 出口要不要挂账号代理：**要**（与「余额查询直连」相反）────────
 //! 小浣熊的余额查询刻意直连（照抄源实现的裸 fetch），本家**不照抄那个决定**：
@@ -52,82 +51,7 @@ use crate::server::errors::management_error;
 use crate::server::http::{ok_json, parse_body};
 use crate::server::ServerState;
 
-/// 从账号记录里取出领取链路要的三样东西。
-///
-/// `jwt` 与 `deviceMid` **不走投影列**（它们是本家独有的字段，账号存储的
-/// 列只认各家共用的那几个），因此这里读的是记录的 JSON 形态而不是会话形态。
-/// `accessToken` 那条路（转发）才走会话（见 `providers::zcode::adapter`）。
-struct ClaimTarget {
-    /// 地区（决定上游 `provider` 取值与提示文案）
-    region: Region,
-    /// 套餐令牌（领取的必要条件）
-    jwt: String,
-    /// 设备标识（上游硬要求，UUID 形态；缺失时已由存储层生成并落盘）
-    device_mid: Option<String>,
-    /// 账号展示名（日志与错误文案用）
-    name: String,
-}
-
-/// 载入目标账号；缺账号或缺 jwt 时返回一句给用户的话
-///
-/// 状态码用 `i32`（与 `management_error` 同型），避免在每个调用点反复转换。
-///
-/// ── 设备标识为什么在这里「补齐」而不是报错 ────────────────────
-/// 上游把它当**硬参数**（缺了就是 3001，见 `providers::zcode::claim` 的模块头），
-/// 而手工粘贴凭证建的老账号可能没有这个字段。这不是用户能自己修的东西
-/// （他不知道该填什么，也不该被要求填一个 UUID），所以由存储层生成一次并落盘
-/// （`zcode_device_mid_or_create`），此后一直复用同一个值。
-fn load_target(state: &ServerState, account_id: &str) -> Result<ClaimTarget, (i32, String)> {
-    let record = state
-        .store()
-        .zcode_account_record(account_id)
-        .ok_or_else(|| (404, "找不到该 ZCode 账号".to_string()))?;
-    let provider_id = record
-        .get("provider")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let region = Region::from_provider_id(provider_id)
-        .ok_or_else(|| (400, "该账号不是 ZCode 账号".to_string()))?;
-    let text = |key: &str| {
-        record
-            .get(key)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .unwrap_or("")
-            .to_string()
-    };
-    let jwt = text("jwt");
-    let name = text("name");
-    if jwt.is_empty() {
-        // 明确说清是哪一样缺了：本家有两个互不替代的凭证，用户很容易以为
-        // 「填了一个就够」（见 `credentials.rs` 的模块头）
-        return Err((
-            400,
-            format!(
-                "该 ZCode {}账号没有套餐令牌（jwt），无法领取。请重新用「网页登录」添加，\
-                 或在账号里补填 Coding Plan JWT",
-                region.label()
-            ),
-        ));
-    }
-    let id = text("id");
-    let device_mid = state
-        .store()
-        .zcode_device_mid_or_create(if id.is_empty() { account_id } else { &id })
-        .filter(|value| !value.trim().is_empty());
-    Ok(ClaimTarget {
-        region,
-        jwt,
-        device_mid,
-        name,
-    })
-}
-
-/// 取该账号配置的出口代理（理由见模块头：领取**要**挂代理）
-fn account_proxy(state: &ServerState, account_id: &str) -> Option<crate::server::core::proxies::ResolvedProxy> {
-    let session = state.store().get_session_by_id(account_id)?.session;
-    crate::server::core::proxies::session_proxy(&session)
-}
+use crate::server::core::zcode_claim::{load_target, account_proxy};
 
 /// `POST /api/accounts/{id}/zcode-claim/preview`：探测当前可领的套餐。
 ///
@@ -141,11 +65,11 @@ fn account_proxy(state: &ServerState, account_id: &str) -> Option<crate::server:
 /// 是活动开抢前的正常状态（见 `providers::zcode::claim` 的模块头）。
 /// 前端应当据此显示「当前没有可领套餐」而不是报错。
 pub async fn preview(state: &ServerState, account_id: &str) -> axum::response::Response {
-    let target = match load_target(state, account_id) {
+    let target = match load_target(state.store(), account_id) {
         Ok(target) => target,
         Err((status, message)) => return management_error(status, message),
     };
-    let proxy = account_proxy(state, account_id);
+    let proxy = account_proxy(state.store(), account_id);
     let outcome = claim::preview(
         target.region,
         &target.jwt,
@@ -189,7 +113,7 @@ pub async fn captcha_config(state: &ServerState, account_id: &str) -> axum::resp
         Some(region) => region,
         None => return management_error(400, "该账号不是 ZCode 账号"),
     };
-    let proxy = account_proxy(state, account_id);
+    let proxy = account_proxy(state.store(), account_id);
     match claim::captcha_config(region, proxy.as_ref()).await {
         // `enabled: false` 或配置不全 → 前端不弹滑块（见 claim::captcha_config 的说明）
         Ok(None) => ok_json(json!({ "enabled": false })),
@@ -222,7 +146,7 @@ pub async fn claim_plan(
     account_id: &str,
     body: &Bytes,
 ) -> axum::response::Response {
-    let target = match load_target(state, account_id) {
+    let target = match load_target(state.store(), account_id) {
         Ok(target) => target,
         Err((status, message)) => return management_error(status, message),
     };
@@ -246,7 +170,7 @@ pub async fn claim_plan(
         (!value.is_empty()).then_some(value)
     };
 
-    let proxy = account_proxy(state, account_id);
+    let proxy = account_proxy(state.store(), account_id);
     let requested_plan_id = field("planId");
     let plan_id = if requested_plan_id.is_empty() {
         // 没点名就探测一次，取优先级最高的那个
@@ -303,9 +227,15 @@ pub async fn claim_plan(
                     target.name
                 ),
             );
+            let switched = state.store().update_zcode_plan(
+                account_id, &json!(crate::server::core::providers::zcode::PLAN_START),
+            );
+            let switch_error = switched.err().map(|error| error.message);
             let claimed_at = record_claim(state, account_id, &plan_id);
             ok_json(json!({
                 "ok": true,
+                "planSwitched": switch_error.is_none(),
+                "switchError": switch_error,
                 "planId": plan_id,
                 "startsAt": starts_at,
                 "endsAt": ends_at,
