@@ -1,7 +1,7 @@
-# Agent.MD — 发版流程
+# AGENTS.md — 开发、us2 部署与正式发版流程
 
-> 本文档面向维护者与 AI 代理：Agent2API（workbuddy）桌面端 + Docker 镜像的**标准发版流程**。
-> 所有发布动作都由 `.github/workflows/` 下的两个工作流自动完成，人工只负责「提交、打 tag、挂 GitHub Release、验收」。
+> 本文档面向维护者与 AI 代理：Agent2API（workbuddy）桌面端、Docker 镜像和 us2 部署流程。
+> 日常 us2 部署与正式 GitHub/Docker Hub 发版是两条不同流程，必须按对应章节执行。
 
 ## 0. 版本号约定
 
@@ -32,7 +32,56 @@ cargo check               # 或前端有改动时做一次构建自检
 - 内容取「上个 tag 以来的全部提交」综合整理（`git log vX.Y.Z..HEAD --oneline`），纯 CI/临时的调试提交归并成一条流程性描述即可；
 - 本次没有代码改动时用空提交承载：`git commit --allow-empty -F 更新日志.txt`（历史发版两种做法都有先例）。
 
-## 3. 打 tag 并推送：一条 tag 触发全部构建
+## 3. 日常 us2 部署
+
+us2 的日常部署以远程 `dev/pr-integration` 分支为唯一代码来源。项目本地分支名为
+`pr-integration`，不要把本地分支名误写成远程分支名。
+
+### 3.1 本地提交与推送
+
+1. 在本地完成代码修改、必要测试和审查。
+2. 将变更提交到本地 `pr-integration`；其他分支的变更先合并到该分支。
+3. 确认工作区没有未提交的业务改动后，推送到 us2 使用的远程分支：
+
+   ```bash
+   git status --short
+   git push origin HEAD:dev/pr-integration
+   ```
+
+   推送目标必须是 `origin/dev/pr-integration`。不得通过直接修改服务器源码来绕过 Git 推送流程。
+
+### 3.2 us2 服务器更新
+
+登录 us2 后，只在项目目录执行项目提供的更新入口：
+
+```bash
+cd /opt/docker_projects/agent2api
+./update_version.sh
+```
+
+`update_version.sh` 是服务器上的部署入口，不要求它存在于本地源码仓库。它负责调用项目的构建、替换和启动流程；不得在服务器上手工执行不受记录的容器替换、数据库卷删除或源码修改。
+
+### 3.3 部署验收
+
+更新脚本成功退出后，必须确认：
+
+- 服务器工作区已更新到预期的 `dev/pr-integration` 提交；
+- Compose 配置可渲染，目标容器处于运行/健康状态；
+- `/health`、`/v1/models`、管理面板和认证边界符合预期；
+- 至少完成一次授权范围内的真实 API 验证，并检查服务日志无新增 fatal 错误；
+- 原有数据卷、持久化配置和共享入口未被替换。
+
+健康检查、页面 200 或认证成功只能证明对应层级，不得单独宣称真实模型请求成功。
+
+### 3.4 失败与回滚
+
+部署失败时保留现场，优先使用服务器项目提供的版本化回滚入口恢复程序和配置；不得执行 `docker compose down -v`、全局 prune 或删除未知备份。回滚后重新验证容器、健康端点、认证边界和既有业务路径。
+
+### 3.5 分支口径维护
+
+当前部署入口的正常更新目标是 `origin/dev/pr-integration`。如果服务器脚本改为使用其他远程分支，必须先同步更新本节、服务器更新脚本及验证命令，不能只修改其中一处。
+
+## 4. 正式版本发布：打 tag 并推送
 
 ```bash
 git push origin main
@@ -44,17 +93,17 @@ git push origin vX.Y.Z
 
 | 工作流 | 产出 | 说明 |
 |---|---|---|
-| `build.yml`（build） | Windows NSIS 安装包 + macOS universal dmg | `macos` / `windows` 两个 job 构建并上传 artifact（macOS 包**只能在 CI 构建**，无法从 Windows 交叉编译）；安装包只挂 artifact，GitHub Release 由本地脚本挂载（见第 4 节） |
+| `build.yml`（build） | Windows NSIS 安装包 + macOS universal dmg | `macos` / `windows` 两个 job 构建并上传 artifact（macOS 包**只能在 CI 构建**，无法从 Windows 交叉编译）；安装包只挂 artifact，GitHub Release 由本地脚本挂载（见第 5 节） |
 | `docker.yml`（docker） | Docker Hub `aimodcc/agent2api:<版本>` + `:latest`（amd64 / arm64 双架构） | 手动 `workflow_dispatch` 触发时只出 `:dev` 测试 tag，不碰正式 tag |
 
-跟踪进度（手动跑 gh 前要先设代理，见第 6 节）：
+跟踪进度（手动跑 gh 前要先设代理，见第 7 节）：
 
 ```bash
 gh run list --limit 4          # 确认工作流都已触发
 gh run watch <run-id> --exit-status
 ```
 
-## 4. 发版收尾：挂 GitHub Release（本地脚本一条命令）
+## 5. 发版收尾：挂 GitHub Release（本地脚本一条命令）
 
 GitHub Release **不由 CI 发布**（Release 本来就不会自动创建），由本地脚本
 一步挂载：
@@ -68,13 +117,13 @@ bash scripts/release.sh vX.Y.Z <run-id>   # 或显式指定 run
 （= 更新日志，见第 2 节）创建 / 更新 GitHub Release 并挂附件 → 打印验收
 提示。幂等可重跑（`--clobber` 覆盖附件）。
 
-## 5. 验收清单（三处核对）
+## 6. 验收清单（三处核对）
 
-- [ ] GitHub Release：`gh release view vX.Y.Z`（手动跑 gh 前先设代理，见第 6 节）—— 正文日志齐全，exe / dmg 两个附件都在；
+- [ ] GitHub Release：`gh release view vX.Y.Z`（手动跑 gh 前先设代理，见第 7 节）—— 正文日志齐全，exe / dmg 两个附件都在；
 - [ ] Docker Hub：`aimodcc/agent2api` 的 Tags 页出现 `<版本>` 与 `latest`，Pushed 时间一致；
 - [ ] 安装包「关于」页版本号与 tag 一致。
 
-## 6. 已知坑与排查
+## 7. 已知坑与排查
 
 - **GHCR 新包默认私有**：若以后镜像改推 GHCR，首次推送后需到包设置手动改 Public（当前推的是 Docker Hub，无此问题）。
 - **gh 不读 git 的代理配置，跑 gh 前要先设代理环境变量**：`gh` 是 Go 程序，不读 `~/.gitconfig` 里的 `http(s).proxy`，也不读 Windows 系统代理（WinINET），只认 `HTTPS_PROXY` / `HTTP_PROXY` 环境变量。本机 GitHub 直连时通时不通，手动执行 gh 命令前先设：
@@ -83,4 +132,4 @@ bash scripts/release.sh vX.Y.Z <run-id>   # 或显式指定 run
   export HTTPS_PROXY=$(git config --get-urlmatch http.proxy https://github.com || git config --get https.proxy)
   ```
 
-  只设 `HTTPS_PROXY` 就够（gh 的请求全是 HTTPS，实测不读 `HTTP_PROXY`）。第 4 节的 `scripts/release.sh` 已内置这一步（从 git 配置读取后透传给 gh），用脚本发版无需手动设。代理没开时 gh 会立刻报 `proxyconnect tcp: ... connection refused` 而不回退直连 —— 与 `git push` 的表现一致。
+  只设 `HTTPS_PROXY` 就够（gh 的请求全是 HTTPS，实测不读 `HTTP_PROXY`）。第 5 节的 `scripts/release.sh` 已内置这一步（从 git 配置读取后透传给 gh），用脚本发版无需手动设。代理没开时 gh 会立刻报 `proxyconnect tcp: ... connection refused` 而不回退直连 —— 与 `git push` 的表现一致。
