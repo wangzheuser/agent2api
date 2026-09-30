@@ -53,8 +53,8 @@ use crate::server::core::proxies::ResolvedProxy;
 use crate::server::errors::GatewayError;
 
 use super::credentials::Credentials;
-use super::{auth, endpoints, refresh};
 use super::endpoints::Region;
+use super::{auth, endpoints, refresh};
 
 /// 活动类型：可领取权益（促销类活动是 `VIEW_DETAILS`，不是签到，不能领）
 const ACTION_CLAIM_BENEFIT: &str = "CLAIM_BENEFIT";
@@ -93,17 +93,21 @@ pub async fn claim_daily_checkin(
         credentials = refresh::ensure_fresh(store, account_id, true).await?;
         response = fetch_campaigns(&credentials, proxy.as_ref()).await?;
     }
-    let list = auth::payload(response, "签到活动查询")?;
+    let list = nested_data(&auth::payload(response, "签到活动查询")?).clone();
     let rows: Vec<Value> = list
         .get("campaigns")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
 
+    let now = chrono::Utc::now().timestamp();
     let mut claimable: Option<&Value> = None;
     let mut claimed = false;
     for row in &rows {
         if row.get("actionType").and_then(Value::as_str) != Some(ACTION_CLAIM_BENEFIT) {
+            continue;
+        }
+        if !campaign_is_active(row, now) {
             continue;
         }
         match row.get("claimStatus").and_then(Value::as_str) {
@@ -116,9 +120,15 @@ pub async fn claim_daily_checkin(
     let Some(target) = claimable else {
         return Ok(no_claim(region, claimed));
     };
-    let campaign_id = target.get("campaignId").and_then(Value::as_str).unwrap_or("");
+    let campaign_id = target
+        .get("campaignId")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     if campaign_id.is_empty() {
-        return Err(GatewayError::with_status(502, "Qoder 签到活动缺少活动标识，无法领取"));
+        return Err(GatewayError::with_status(
+            502,
+            "Qoder 签到活动缺少活动标识，无法领取",
+        ));
     }
 
     let url = format!(
@@ -130,7 +140,8 @@ pub async fn claim_daily_checkin(
     let mut claim = claim_campaign(&url, &credentials, proxy.as_ref()).await?;
     // 上游并发/重放时给 409 + `{"result":"ALREADY_CLAIMED"}`（参考实现实测），
     // 那不是失败，是「今天已经领过了」。
-    if !claim.ok && (claim.status == 409 || result_of(&claim).as_deref() == Some(RESULT_ALREADY_CLAIMED))
+    if !claim.ok
+        && (claim.status == 409 || result_of(&claim).as_deref() == Some(RESULT_ALREADY_CLAIMED))
     {
         return Ok(json!({
             "success": false,
@@ -143,12 +154,20 @@ pub async fn claim_daily_checkin(
         claim = claim_campaign(&url, &credentials, proxy.as_ref()).await?;
     }
     let body = auth::payload(claim, "签到领取")?;
+    let claim_body = nested_data(&body);
 
-    if body.get("status").and_then(Value::as_str) != Some(STATUS_CLAIMED) {
-        let status = body.get("status").and_then(Value::as_str).unwrap_or("未知");
+    if claim_body.get("status").and_then(Value::as_str) != Some(STATUS_CLAIMED) {
+        let status = claim_body
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("未知");
         return Ok(json!({ "success": false, "msg": format!("签到未完成（上游状态 {status}）") }));
     }
-    if body.get("replayed").and_then(Value::as_bool).unwrap_or(false) {
+    if claim_body
+        .get("replayed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
         return Ok(json!({
             "success": false,
             "alreadyCompleted": true,
@@ -156,12 +175,23 @@ pub async fn claim_daily_checkin(
         }));
     }
 
-    let reward = body
+    // POST 返回 CLAIMED 只代表接口接受了领取；再查一次活动状态，避免把
+    // 2xx 或延迟响应误报成已经到账。失败时不写本地完成标记，后续轮询可重试。
+    let confirmed = fetch_campaigns(&credentials, proxy.as_ref()).await?;
+    let confirmed = auth::payload(confirmed, "签到领取确认")?;
+    if !campaign_status(nested_data(&confirmed), campaign_id, STATUS_CLAIMED) {
+        return Ok(json!({
+            "success": false,
+            "msg": "签到未完成（领取后状态未确认）",
+        }));
+    }
+
+    let reward = claim_body
         .get("benefit")
         .and_then(|benefit| benefit.get("amount"))
         .and_then(Value::as_f64)
         .unwrap_or(DEFAULT_REWARD);
-    let valid_days = body
+    let valid_days = claim_body
         .get("benefit")
         .and_then(|benefit| benefit.get("validity"))
         .and_then(|validity| validity.get("days"))
@@ -197,7 +227,8 @@ async fn fetch_campaigns(
         None,
         &endpoints::sash_headers(&credentials.access_token),
         proxy,
-    ).await
+    )
+    .await
 }
 
 /// 领取一个活动。请求体是空对象（抓包确认：无参数），`Origin` 指向该地区门户
@@ -209,17 +240,64 @@ async fn claim_campaign(
 ) -> Result<ApiResponse, GatewayError> {
     let mut headers = endpoints::sash_headers(&credentials.access_token);
     headers.push(("content-type".to_string(), "application/json".to_string()));
-    headers.push(("origin".to_string(), credentials.region.open_api().to_string()));
+    headers.push((
+        "origin".to_string(),
+        credentials.region.web_origin().to_string(),
+    ));
     auth::request("POST", url, Some(&json!({})), &headers, proxy).await
 }
 
 /// 领取响应的 `result` 字段（并发/重放标记），拿不到给 None。
 fn result_of(response: &ApiResponse) -> Option<String> {
-    let value = response.payload.as_ref()?.get("result")?.as_str()?.trim();
+    let payload = response.payload.as_ref()?;
+    let value = nested_data(payload).get("result")?.as_str()?.trim();
     if value.is_empty() {
         None
     } else {
         Some(value.to_string())
+    }
+}
+
+/// 上游部分版本把领取结果放在 `data` 下，部分版本直接返回顶层对象。
+fn nested_data(value: &Value) -> &Value {
+    value
+        .get("data")
+        .filter(|item| item.is_object())
+        .unwrap_or(value)
+}
+
+fn campaign_status(list: &Value, campaign_id: &str, expected: &str) -> bool {
+    list.get("campaigns")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|row| {
+            row.get("campaignId").and_then(Value::as_str) == Some(campaign_id)
+                && row.get("actionType").and_then(Value::as_str) == Some(ACTION_CLAIM_BENEFIT)
+                && row.get("claimStatus").and_then(Value::as_str) == Some(expected)
+        })
+}
+
+fn campaign_is_active(row: &Value, now: i64) -> bool {
+    let start_ok = campaign_timestamp(row.get("startAt"))
+        .map(|start| start <= now)
+        .unwrap_or(true);
+    let end_ok = campaign_timestamp(row.get("endAt"))
+        .map(|end| now < end)
+        .unwrap_or(true);
+    start_ok && end_ok
+}
+
+fn campaign_timestamp(value: Option<&Value>) -> Option<i64> {
+    let value = value?;
+    let raw = value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+        .or_else(|| value.as_str()?.trim().parse::<i64>().ok())?;
+    if raw > 100_000_000_000 {
+        Some(raw / 1000)
+    } else {
+        Some(raw)
     }
 }
 
@@ -246,4 +324,39 @@ fn no_claim(region: Region, claimed: bool) -> Value {
         "success": false,
         "msg": "当前没有可领取的签到活动",
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn campaign_window_rejects_future_and_expired_rows() {
+        let now = 1_700_000_000;
+        assert!(campaign_is_active(
+            &json!({"startAt": now - 1, "endAt": now + 1}),
+            now
+        ));
+        assert!(!campaign_is_active(&json!({"startAt": now + 1}), now));
+        assert!(!campaign_is_active(&json!({"endAt": now}), now));
+        assert!(campaign_is_active(&json!({}), now));
+    }
+
+    #[test]
+    fn nested_claim_payload_and_status_are_supported() {
+        let body = json!({"data": {"status": "CLAIMED", "result": "ALREADY_CLAIMED"}});
+        assert_eq!(
+            nested_data(&body).get("status").and_then(Value::as_str),
+            Some("CLAIMED")
+        );
+        assert!(campaign_status(
+            &json!({"campaigns": [{
+                "campaignId": "c1",
+                "actionType": "CLAIM_BENEFIT",
+                "claimStatus": "CLAIMED"
+            }]}),
+            "c1",
+            STATUS_CLAIMED
+        ));
+    }
 }

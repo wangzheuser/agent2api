@@ -12,13 +12,11 @@
 //! libuv 与 tokio 的定时器都基于单调时钟，机器休眠期间都不推进，
 //! 醒来的第一次 tick 会把错过的时点补上 —— 两者在这点上是同一套语义。
 //!
-//! ── 补签（有意的行为，别「顺手优化」）────────────────────────
-//! Node 版 `start()` 的条件是**「今天还没签过」**，并不判「时间点是否已过」：
-//! 开着自动签到却在 00:01 时没开机、白天才启动 → 立刻补一次。
-//! 签到的每日额度按自然日重置，用户开着开关却整天没签到才是反直觉的结果；
-//! 上游签到接口幂等，重复调用只返回「已领取」。实测（2026-09-17）在 18:44
-//! 把 enabled 设为 true、time 设为 23:00（未来时点）时，Node 版立即执行了
-//! 一次 reason='启动补签' 的签到 —— 所以这里的条件同样只看日期键。
+//! ── 补签与活动窗口──────────────────────────────────────────
+//! 启动后仍会补签，但必须等到配置的触发时刻再执行。Qoder 的每日活动在北京
+//! 时间 10:00 刷新，若在更早的启动时刻立即补签，会把上一活动窗口误记成当天
+//! 已完成，随后错过新窗口。因此启动补签与轮询触发共用 `due_now` 的时间门控；
+//! 上游接口本身幂等，重启或失败重试时由活动状态决定是否真正发起领取。
 //!
 //! ── 配置读写 ────────────────────────────────────────────────
 //! 状态存在 config.json 的 `autoCheckin` 字段（`{enabled, time, lastFiredDate,
@@ -438,8 +436,6 @@ impl AutoCheckin {
         };
 
         let today = local_date_key(Local::now());
-        // 先落日期再执行：即便签到中途进程被杀，也不会在重启后反复补签
-        write_state(json!({ "lastFiredDate": today }));
         logging::log("[Checkin]", &format!("⏰ 定时签到开始（{reason}）"));
 
         let outcome = match checkin::run_checkin(
@@ -452,8 +448,10 @@ impl AutoCheckin {
         {
             Ok(result) => Some(self.record_success(&result, &today, reason)),
             Err(error) => {
-                // 失败也写 lastResult（failed 里放错误文案），与 Node 的 catch 分支一致
+                // 失败也写 lastResult（failed 里放错误文案），并清除本日完成标记，
+                // 让下一次轮询仍可重试。
                 write_state(json!({
+                    "lastFiredDate": Value::Null,
                     "lastResult": {
                         "at": logging::now_ms(),
                         "date": today,
@@ -489,7 +487,36 @@ impl AutoCheckin {
                 items
                     .iter()
                     .filter_map(|item| {
-                        let error = item.get("error").and_then(Value::as_str)?;
+                        let error = item.get("error").and_then(Value::as_str);
+                        let claim_message = item
+                            .get("claim")
+                            .filter(|value| {
+                                value.get("success").and_then(Value::as_bool) == Some(false)
+                                    && value.get("alreadyCompleted").and_then(Value::as_bool)
+                                        != Some(true)
+                                    && !value
+                                        .get("msg")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("")
+                                        .contains("当前没有可领取的签到活动")
+                                    && !value
+                                        .get("msg")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("")
+                                        .contains("无每日签到活动")
+                                    && !value
+                                        .get("msg")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("")
+                                        .contains("已签到")
+                                    && !value
+                                        .get("msg")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("")
+                                        .contains("已领取")
+                            })
+                            .and_then(|value| value.get("msg").and_then(Value::as_str));
+                        let error = error.or(claim_message)?;
                         let name = item
                             .get("name")
                             .and_then(Value::as_str)
@@ -513,7 +540,15 @@ impl AutoCheckin {
             "failed": failures.iter().take(5).cloned().collect::<Vec<_>>(),
             "failedCount": failures.len(),
         });
-        write_state(json!({ "lastResult": summary }));
+        let has_failures = !failures.is_empty();
+        write_state(json!({
+            "lastFiredDate": if has_failures {
+                Value::Null
+            } else {
+                Value::String(today.to_string())
+            },
+            "lastResult": summary
+        }));
         logging::log(
             "[Checkin]",
             &format!(
@@ -589,15 +624,17 @@ impl AutoCheckin {
 
     /// 启动调度（对应 Node 版 start）。
     ///
-    /// 开启状态下立即检查一次：**只看「今天签过没有」，不看时点是否已过**
-    /// （理由见模块头部「补签」）。
+    /// 开启状态下检查一次；只有配置的触发时刻已到且今天尚未完成时才补签。
     pub fn start(&self) {
         let state = read_state();
         if !state.enabled {
             return;
         }
         self.schedule();
-        if state.last_fired_date.as_deref() != Some(local_date_key(Local::now()).as_str()) {
+        let now = Local::now();
+        if state.last_fired_date.as_deref() != Some(local_date_key(now).as_str())
+            && due_now(&state.time, now).is_some()
+        {
             let service = self.clone();
             crate::spawn_task(async move {
                 service.fire("启动补签").await;
@@ -679,7 +716,17 @@ impl AutoCheckin {
 
         let before = read_state();
         write_state(Value::Object(patch));
-        let after = read_state();
+        let mut after = read_state();
+        let today = local_date_key(Local::now());
+        // 修改到更晚的时间时，旧的同日执行标记不能挡住新的触发点。
+        // 只有在新时间尚未到达时清理，避免把已经完成的当日任务无条件重跑。
+        if before.time != after.time
+            && before.last_fired_date.as_deref() == Some(today.as_str())
+            && due_now(&after.time, Local::now()).is_none()
+        {
+            write_state(json!({ "lastFiredDate": Value::Null }));
+            after = read_state();
+        }
         if before.enabled != after.enabled {
             logging::log(
                 "[Checkin]",
