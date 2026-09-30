@@ -225,6 +225,19 @@ pub enum UpstreamErrorClass {
     },
 }
 
+/// HTTP 2xx 响应首段的业务判定。
+///
+/// 有些提供商会在 HTTP 200 的响应体里返回业务错误。编排层在把首个字节交给
+/// 下游之前调用这个钩子；`Pending` 表示还需要更多字节，`Ready` 表示可以把
+/// 已读前缀和剩余流交给既有的 Chat/Anthropic 转换链，`Failure` 则回到统一的
+/// 账号限额/换号分支。
+#[derive(Clone, Debug)]
+pub enum SuccessHead {
+    Pending,
+    Ready,
+    Failure(UpstreamErrorClass),
+}
+
 /// 一次「可退避重试」的建议（见模块头扩展 1）。
 ///
 /// 适配器把「要不要退避重试」连同**原因**一起给出，编排层负责睡这一觉、
@@ -473,6 +486,15 @@ pub trait ProviderAdapter: Send + Sync {
     /// `upstream::request::read_upstream_error`），因为「怎么读一个 HTTP 错误体」
     /// 是协议层的事、与哪一家无关。
     fn classify_error(&self, status: u16, error_body: &Value) -> UpstreamErrorClass;
+
+    /// 判定 HTTP 2xx 响应首段是否已经携带业务错误。
+    ///
+    /// 默认提供商的 2xx 语义没有额外信封，直接放行；需要在响应体里识别业务
+    /// 限额的提供商覆写此方法。编排层只在 `Pending` 时继续预读，且仅在任何
+    /// 下游字节发送前把 `Failure` 送入统一错误处理。
+    fn inspect_success_head(&self, _body: &[u8]) -> SuccessHead {
+        SuccessHead::Ready
+    }
 
     /// 会话式转发（`attempt_stateful`）失败后的分类。
     ///

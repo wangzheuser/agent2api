@@ -68,8 +68,21 @@ impl AnthropicToChatStream {
                 std::io::Error::other(crate::server::core::egress::describe_error_detail(&error))
             })
         });
-        let guarded = super::stall::idle_guard(
+        Self::from_stream(
             Box::pin(described),
+            model,
+            telemetry,
+        )
+    }
+
+    /// 构造已从 `reqwest::Response` 预读过首段的 Anthropic 字节流。
+    pub fn from_stream(
+        inner: futures::stream::BoxStream<'static, Result<Bytes, std::io::Error>>,
+        model: &str,
+        telemetry: &Arc<crate::server::core::upstream::usage::RequestTelemetry>,
+    ) -> Self {
+        let guarded = super::stall::idle_guard(
+            inner,
             Duration::from_millis(crate::server::config::timeout_settings().stream_idle_ms()),
         );
         Self {

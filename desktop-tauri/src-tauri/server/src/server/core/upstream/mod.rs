@@ -489,8 +489,19 @@ impl ForwardStream {
         });
         // 流式响应空闲超时（设置页「请求超时」第三项）：逐分片计时，
         // 收到新数据即重置；计时器在流启动时就武装（见 stall 的模块头）
+        Self::from_stream(Box::pin(inner), slot, connection, telemetry, model_rewrite)
+    }
+
+    /// 构造已从 `reqwest::Response` 预读过首段的字节流。
+    pub(super) fn from_stream(
+        inner: futures::stream::BoxStream<'static, Result<Bytes, std::io::Error>>,
+        slot: Option<InFlightGuard>,
+        connection: ConnectionGuard,
+        telemetry: Arc<usage::RequestTelemetry>,
+        model_rewrite: Option<ModelRewrite>,
+    ) -> Self {
         let guarded = stall::idle_guard(
-            Box::pin(inner),
+            inner,
             std::time::Duration::from_millis(
                 crate::server::config::timeout_settings().stream_idle_ms(),
             ),

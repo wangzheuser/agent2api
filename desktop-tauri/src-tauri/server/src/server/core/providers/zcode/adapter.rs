@@ -35,7 +35,8 @@ use crate::server::core::account_store::AccountStore;
 use crate::server::errors::GatewayError;
 
 use super::super::adapter::{
-    ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, ReasoningPatch, UpstreamErrorClass,
+    ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, ReasoningPatch, SuccessHead,
+    UpstreamErrorClass,
 };
 use super::super::content_block;
 use super::super::ProviderKind;
@@ -56,6 +57,7 @@ pub static ZCODE_INTL_ADAPTER: ZcodeAdapter = ZcodeAdapter { region: Region::Int
 
 /// ZCode 两个地区共用的思考等级字段。
 const REASONING_FIELD: &str = "reasoning_effort";
+const SUCCESS_HEAD_LIMIT: usize = 64 * 1024;
 
 impl ZcodeAdapter {
     /// 本实例的地区（供 `adapter_for` 之外的调用点自查，例如领取任务的选路）
@@ -261,6 +263,36 @@ impl ProviderAdapter for ZcodeAdapter {
         content_block::classify_or_fatal(status, error_body, message, code)
     }
 
+    /// ZCode occasionally answers with HTTP 200 while placing the quota failure
+    /// in the first JSON object of the response body. The common forwarding loop
+    /// must see that envelope before it sends any downstream bytes so the regular
+    /// account cooldown and rotation path can run.
+    fn inspect_success_head(&self, body: &[u8]) -> SuccessHead {
+        let Some(value) = first_json_value(body) else {
+            return if body.len() >= SUCCESS_HEAD_LIMIT {
+                SuccessHead::Ready
+            } else {
+                SuccessHead::Pending
+            };
+        };
+        let code = value.get("code").and_then(Value::as_i64);
+        let message = value
+            .get("msg")
+            .or_else(|| value.get("message"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        if code == Some(1005) && message == "exceed quota limit" {
+            return SuccessHead::Failure(UpstreamErrorClass::QuotaLimited {
+                reset_at: None,
+                message: format!("上游返回 200: {message}"),
+                upstream_code: Some(1005),
+                status: 429,
+            });
+        }
+        SuccessHead::Ready
+    }
+
     /// 取可用令牌：只读账号会话里的 `accessToken`，**不续期**（见模块头）。
     fn ensure_access_token<'a>(
         &'a self,
@@ -331,6 +363,19 @@ impl ProviderAdapter for ZcodeAdapter {
     > {
         Box::pin(async move { super::balance::query_usage(store, account_id).await })
     }
+}
+
+/// 从可能带有 SSE 前缀/后缀的字节中解析首个 JSON 值。
+///
+/// `Deserializer::into_iter` 会在第一个值结束处停止，因此既能识别裸 JSON
+/// 业务信封，也能处理后面紧跟 `data:` 的正常流，不要求整个响应体是一个 JSON。
+fn first_json_value(body: &[u8]) -> Option<Value> {
+    let text = String::from_utf8_lossy(body);
+    let start = text.find('{')?;
+    serde_json::Deserializer::from_str(&text[start..])
+        .into_iter::<Value>()
+        .next()
+        .and_then(Result::ok)
 }
 
 /// 从账号会话里读访问令牌。

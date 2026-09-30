@@ -163,3 +163,38 @@ fn messages_budget_and_responses_nested_effort_reach_zcode() {
     let body = ingress("responses", "GLM-5.3-FLASH", Some("xhigh"), true);
     assert_eq!(wire(&ZCODE_INTL_ADAPTER, &body)["reasoning_effort"], "max");
 }
+
+#[test]
+fn http_200_quota_envelopes_are_blocked_before_downstream_bytes() {
+    for adapter in [&ZCODE_ADAPTER, &ZCODE_INTL_ADAPTER] {
+        assert!(matches!(
+            adapter.inspect_success_head(br#"{"code":1005,"msg":"exceed "#),
+            SuccessHead::Pending
+        ));
+        match adapter.inspect_success_head(
+            br#"{"code":1005,"msg":"exceed quota limit"}data: {"choices":[]}"#,
+        ) {
+            SuccessHead::Failure(UpstreamErrorClass::QuotaLimited {
+                status,
+                upstream_code,
+                message,
+                ..
+            }) => {
+                assert_eq!(status, 429);
+                assert_eq!(upstream_code, Some(1005));
+                assert!(message.contains("exceed quota limit"));
+            }
+            other => panic!("ZCode HTTP 200 限额信封必须在首包门失败，得到 {other:?}"),
+        }
+        assert!(matches!(
+            adapter.inspect_success_head(
+                br#"data: {"choices":[{"delta":{"content":"ok"}}]}\n\n"#,
+            ),
+            SuccessHead::Ready
+        ));
+        assert!(matches!(
+            adapter.inspect_success_head(br#"{"code":1005,"msg":"other"}"#),
+            SuccessHead::Ready
+        ));
+    }
+}
