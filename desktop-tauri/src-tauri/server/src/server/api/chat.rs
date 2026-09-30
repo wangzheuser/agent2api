@@ -233,7 +233,8 @@ pub async fn chat_completions(
             )
             .into_response()
         }
-        Ok(ForwardOutcome::Completion { body }) => {
+        Ok(ForwardOutcome::Completion { mut body }) => {
+            pipeline::fill_usage_from_telemetry(&mut body, &telemetry);
             // 响应正文在记账前抄一份（完整 JSON 文本；序列化失败给 None，
             // 那一侧少存一份正文不影响明细）
             let raw_response = serde_json::to_string(&body).ok();

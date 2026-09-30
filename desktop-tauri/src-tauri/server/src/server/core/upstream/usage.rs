@@ -26,7 +26,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::server::logging;
 
@@ -37,28 +37,125 @@ pub struct UsageTokens {
     pub completion: i64,
     pub total: i64,
     pub cache_read: i64,
+    pub prompt_present: bool,
+    pub completion_present: bool,
+    pub total_present: bool,
+    pub cache_read_present: bool,
 }
 
 /// 从 usage 对象里提取 token 数（字段名兼容见模块头部）。
 ///
-/// 返回 None 只有一种情况：`usage` 不是对象（null / 数字 / 字符串 / 数组）。
-/// 对象内单个字段缺失按 0 算；`total_tokens` 缺失时按 prompt + completion 补。
+/// 返回 None 的情况包括：`usage` 不是对象，或对象里没有任何统一 token
+/// 计数（例如只带 reasoning 明细）。对象内单个字段缺失按 0 算；
+/// `total_tokens` 缺失时按 prompt + completion 补。
 pub fn extract_usage(usage: &Value) -> Option<UsageTokens> {
     let object = usage.as_object()?;
-    let prompt = number_field(object.get("prompt_tokens"))
-        .or_else(|| number_field(object.get("input_tokens")))
-        .unwrap_or(0);
-    let completion = number_field(object.get("completion_tokens"))
-        .or_else(|| number_field(object.get("output_tokens")))
-        .unwrap_or(0);
-    let total = number_field(object.get("total_tokens")).unwrap_or(prompt + completion);
-    let cache_read = object
-        .get("prompt_tokens_details")
-        .and_then(|details| number_field(details.get("cached_tokens")))
-        .or_else(|| number_field(object.get("cache_read_tokens")))
-        .or_else(|| number_field(object.get("cache_read_input_tokens")))
-        .unwrap_or(0);
-    Some(UsageTokens { prompt, completion, total, cache_read })
+    let prompt_field = number_field(object.get("prompt_tokens"))
+        .or_else(|| number_field(object.get("input_tokens")));
+    let completion_field = number_field(object.get("completion_tokens"))
+        .or_else(|| number_field(object.get("output_tokens")));
+    let total_field = number_field(object.get("total_tokens"));
+    let cache_candidates = [
+        object
+            .get("prompt_tokens_details")
+            .and_then(|details| number_field(details.get("cached_tokens"))),
+        number_field(object.get("prompt_cache_hit_tokens")),
+        number_field(object.get("cache_read_tokens")),
+        number_field(object.get("cache_read_input_tokens")),
+    ];
+    let cache_field = cache_candidates
+        .iter()
+        .copied()
+        .flatten()
+        .find(|value| *value > 0);
+    let cache_field_present = cache_candidates.iter().any(Option::is_some);
+    // Trae 的 token_usage 事件会以 {"usage": {...}} 挂到下一帧，且部分
+    // provider 会发送只有扩展明细的 usage 对象。递归拆一层嵌套，并拒绝
+    // 没有任何统一 token 计数的对象，避免把旁路快照覆盖成全 0。
+    if prompt_field.is_none()
+        && completion_field.is_none()
+        && total_field.is_none()
+        && !cache_field.is_some_and(|value| value > 0)
+    {
+        return object.get("usage").and_then(extract_usage);
+    }
+    let prompt = prompt_field.unwrap_or(0);
+    let completion = completion_field.unwrap_or(0);
+    let total = total_field.unwrap_or(prompt + completion);
+    let cache_read = cache_field.unwrap_or(0);
+    Some(UsageTokens {
+        prompt,
+        completion,
+        total,
+        cache_read,
+        prompt_present: prompt_field.is_some(),
+        completion_present: completion_field.is_some(),
+        total_present: total_field.is_some(),
+        cache_read_present: cache_field_present,
+    })
+}
+
+/// 把请求旁路快照折回标准 Chat usage，供协议响应层在上游 usage 帧已经被
+/// 统计但尚未（或无法）直接透传时补齐响应。全 0 快照表示没有真实证据，
+/// 调用方应继续保留原有的缺省 / null 行为。
+pub fn usage_value(snapshot: &TelemetrySnapshot) -> Option<Value> {
+    // 只把旁路实际收到的字段写回响应。部分 usage 帧（例如只带
+    // completion_tokens）不能把转换器已经拿到的 prompt/output 清成 0。
+    let prompt_present = snapshot.prompt_tokens_present || snapshot.prompt_tokens > 0;
+    let completion_present = snapshot.completion_tokens_present || snapshot.completion_tokens > 0;
+    let total_present = snapshot.total_tokens_present || snapshot.total_tokens > 0;
+    let cache_read_present = snapshot.cache_read_tokens_present || snapshot.cache_read_tokens > 0;
+    let has_input_evidence = prompt_present || cache_read_present;
+    if !has_input_evidence {
+        return None;
+    }
+    let prompt = snapshot.prompt_tokens.max(0);
+    let completion = snapshot.completion_tokens.max(0);
+    let mut usage = json!({});
+    if prompt_present {
+        usage["prompt_tokens"] = Value::from(prompt);
+    }
+    if completion_present {
+        usage["completion_tokens"] = Value::from(completion);
+    }
+    if total_present || (prompt_present && completion_present) {
+        usage["total_tokens"] = Value::from(snapshot.total_tokens.max(prompt + completion));
+    }
+    if cache_read_present && snapshot.cache_read_tokens > 0 {
+        usage["prompt_tokens_details"] = json!({
+            "cached_tokens": snapshot.cache_read_tokens,
+        });
+    }
+    Some(usage)
+}
+
+/// 用内部真实统计补齐协议转换器已有的 usage，同时保留上游提供的扩展明细。
+///
+/// telemetry 只保存统一的 prompt/completion/total/cache-read 四项，直接覆盖
+/// 上游 usage 会丢失 reasoning 或 cache-creation 等协议专属字段，因此这里只
+/// 覆盖统一计数，嵌套明细按字段合并。
+pub fn merge_usage(existing: Option<&Value>, authoritative: &Value) -> Value {
+    let mut merged = existing
+        .filter(|value| value.is_object())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let Some(merged_object) = merged.as_object_mut() else {
+        return authoritative.clone();
+    };
+    let Some(authoritative_object) = authoritative.as_object() else {
+        return merged;
+    };
+    for (key, value) in authoritative_object {
+        if let (Some(current), Some(incoming)) = (
+            merged_object.get_mut(key).and_then(Value::as_object_mut),
+            value.as_object(),
+        ) {
+            current.extend(incoming.clone());
+        } else {
+            merged_object.insert(key.clone(), value.clone());
+        }
+    }
+    merged
 }
 
 /// 取数值字段：`as_i64` 对 `1.0` 这类浮点形态会失败，所以再补一次 f64 转换
@@ -68,6 +165,247 @@ fn number_field(value: Option<&Value>) -> Option<i64> {
     value
         .as_i64()
         .or_else(|| value.as_f64().map(|number| number as i64))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_value_preserves_prompt_completion_and_cache() {
+        let snapshot = TelemetrySnapshot {
+            prompt_tokens: 183_284,
+            completion_tokens: 237,
+            total_tokens: 183_521,
+            cache_read_tokens: 183_040,
+            ..TelemetrySnapshot::default()
+        };
+        assert_eq!(
+            usage_value(&snapshot),
+            Some(json!({
+                "prompt_tokens": 183_284,
+                "completion_tokens": 237,
+                "total_tokens": 183_521,
+                "prompt_tokens_details": { "cached_tokens": 183_040 },
+            }))
+        );
+    }
+
+    #[test]
+    fn usage_value_returns_none_without_real_usage() {
+        assert_eq!(usage_value(&TelemetrySnapshot::default()), None);
+    }
+
+    #[test]
+    fn usage_value_ignores_completion_only_partial_usage() {
+        let snapshot = TelemetrySnapshot {
+            completion_tokens: 237,
+            total_tokens: 237,
+            ..TelemetrySnapshot::default()
+        };
+        assert_eq!(usage_value(&snapshot), None);
+    }
+
+    #[test]
+    fn usage_value_keeps_prompt_only_partial_usage_without_inventing_output() {
+        let snapshot = TelemetrySnapshot {
+            prompt_tokens: 100,
+            prompt_tokens_present: true,
+            ..TelemetrySnapshot::default()
+        };
+        assert_eq!(
+            usage_value(&snapshot),
+            Some(json!({ "prompt_tokens": 100 }))
+        );
+    }
+
+    #[test]
+    fn extract_usage_reads_trae_nested_usage_and_ignores_details_only() {
+        let nested = json!({
+            "usage": {
+                "prompt_tokens": 183_284,
+                "completion_tokens": 237,
+                "total_tokens": 183_521,
+                "prompt_tokens_details": { "cached_tokens": 183_040 },
+            }
+        });
+        let tokens = extract_usage(&nested).expect("nested usage");
+        assert_eq!(
+            tokens,
+            UsageTokens {
+                prompt: 183_284,
+                completion: 237,
+                total: 183_521,
+                cache_read: 183_040,
+                prompt_present: true,
+                completion_present: true,
+                total_present: true,
+                cache_read_present: true,
+            }
+        );
+        assert_eq!(
+            extract_usage(&json!({
+                "prompt_tokens": 183_284,
+                "completion_tokens": 237,
+                "prompt_cache_hit_tokens": 183_040,
+            }))
+            .map(|tokens| tokens.cache_read),
+            Some(183_040)
+        );
+        assert_eq!(
+            extract_usage(&json!({
+                "prompt_tokens": 183_284,
+                "completion_tokens": 237,
+                "prompt_tokens_details": { "cached_tokens": 0 },
+                "prompt_cache_hit_tokens": 183_040,
+            }))
+            .map(|tokens| tokens.cache_read),
+            Some(183_040)
+        );
+        assert_eq!(
+            extract_usage(&json!({
+                "prompt_tokens": 100,
+                "completion_tokens": 2,
+                "prompt_cache_hit_tokens": 0,
+                "cache_read_tokens": 20,
+            }))
+            .map(|tokens| tokens.cache_read),
+            Some(20)
+        );
+        assert_eq!(extract_usage(&json!({ "completion_tokens_details": { "reasoning_tokens": 9 } })), None);
+    }
+
+    #[test]
+    fn merge_usage_preserves_protocol_specific_details() {
+        let existing = json!({
+            "prompt_tokens": 1,
+            "completion_tokens": 2,
+            "completion_tokens_details": { "reasoning_tokens": 7 },
+        });
+        let authoritative = json!({
+            "prompt_tokens": 183_284,
+            "completion_tokens": 237,
+            "total_tokens": 183_521,
+            "prompt_tokens_details": { "cached_tokens": 183_040 },
+        });
+        assert_eq!(
+            merge_usage(Some(&existing), &authoritative),
+            json!({
+                "prompt_tokens": 183_284,
+                "completion_tokens": 237,
+                "total_tokens": 183_521,
+                "completion_tokens_details": { "reasoning_tokens": 7 },
+                "prompt_tokens_details": { "cached_tokens": 183_040 },
+            })
+        );
+    }
+
+    #[test]
+    fn report_usage_keeps_real_prompt_when_a_later_frame_is_partial() {
+        let telemetry = RequestTelemetry::new();
+        telemetry.report_usage(&json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 3,
+            "total_tokens": 103,
+            "prompt_tokens_details": { "cached_tokens": 20 },
+        }));
+        telemetry.report_usage(&json!({ "completion_tokens": 4 }));
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.prompt_tokens, 100);
+        assert_eq!(snapshot.completion_tokens, 4);
+        assert_eq!(snapshot.total_tokens, 104);
+        assert_eq!(snapshot.cache_read_tokens, 20);
+    }
+
+    #[test]
+    fn report_usage_does_not_erase_cache_when_final_frame_omits_details() {
+        let telemetry = RequestTelemetry::new();
+        telemetry.report_usage(&json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 3,
+            "total_tokens": 103,
+            "prompt_tokens_details": { "cached_tokens": 20 },
+        }));
+        telemetry.report_usage(&json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 4,
+            "total_tokens": 104,
+        }));
+        assert_eq!(telemetry.snapshot().cache_read_tokens, 20);
+    }
+
+    #[test]
+    fn report_usage_does_not_erase_real_counts_with_zero_partial_fields() {
+        let telemetry = RequestTelemetry::new();
+        telemetry.report_usage(&json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 3,
+            "total_tokens": 103,
+            "prompt_tokens_details": { "cached_tokens": 20 },
+        }));
+        telemetry.report_usage(&json!({
+            "prompt_tokens": 0,
+            "completion_tokens": 4,
+            "total_tokens": 4,
+            "prompt_tokens_details": { "cached_tokens": 0 },
+        }));
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.prompt_tokens, 100);
+        assert_eq!(snapshot.completion_tokens, 4);
+        assert_eq!(snapshot.total_tokens, 103);
+        assert_eq!(snapshot.cache_read_tokens, 20);
+    }
+
+    #[test]
+    fn report_usage_does_not_invent_total_for_prompt_only_frame() {
+        let telemetry = RequestTelemetry::new();
+        telemetry.report_usage(&json!({ "prompt_tokens": 100 }));
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.prompt_tokens, 100);
+        assert_eq!(snapshot.total_tokens, 0);
+        assert!(!snapshot.total_tokens_present);
+    }
+
+    #[test]
+    fn report_usage_accepts_a_smaller_complete_retry_snapshot() {
+        let telemetry = RequestTelemetry::new();
+        telemetry.report_usage(&json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120,
+            "prompt_tokens_details": { "cached_tokens": 20 },
+        }));
+        telemetry.report_usage(&json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 2,
+            "total_tokens": 12,
+            "prompt_tokens_details": { "cached_tokens": 0 },
+        }));
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.prompt_tokens, 10);
+        assert_eq!(snapshot.completion_tokens, 2);
+        assert_eq!(snapshot.total_tokens, 12);
+        assert_eq!(snapshot.cache_read_tokens, 0);
+    }
+
+    #[test]
+    fn report_usage_accepts_zero_output_from_a_complete_snapshot() {
+        let telemetry = RequestTelemetry::new();
+        telemetry.report_usage(&json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120,
+        }));
+        telemetry.report_usage(&json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 0,
+            "total_tokens": 10,
+        }));
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.prompt_tokens, 10);
+        assert_eq!(snapshot.completion_tokens, 0);
+        assert_eq!(snapshot.total_tokens, 10);
+    }
 }
 
 /// 在途请求当前所处的**转发阶段**（请求日志状态列的第一个读数）。
@@ -182,6 +520,10 @@ pub struct TelemetrySnapshot {
     pub completion_tokens: i64,
     pub total_tokens: i64,
     pub cache_read_tokens: i64,
+    pub prompt_tokens_present: bool,
+    pub completion_tokens_present: bool,
+    pub total_tokens_present: bool,
+    pub cache_read_tokens_present: bool,
     /// 上游首帧到达的**绝对时刻**（毫秒 Unix 时间戳；None = 全程没有帧到达，
     /// 例如转发前就失败 / 请求尚未开始下发）。
     ///
@@ -929,7 +1271,8 @@ impl RequestTelemetry {
         self.flush_live(&guard);
     }
 
-    /// 上报一次 usage（覆盖式，最后一次为准；字段名兼容见 `extract_usage`）。
+    /// 上报一次 usage（逐字段覆盖，最后一次显式值为准；字段名兼容见
+    /// `extract_usage`）。部分帧缺少的 prompt/cache 不清零已有统计。
     ///
     /// **不做在途回写**：进行中行在前端不显示用量（`usageCell` 对进行中的行给空），
     /// 而 usage 通常只在上游最后一个 chunk 才出现 —— 收尾记账紧接着就会写它。
@@ -937,11 +1280,54 @@ impl RequestTelemetry {
         let Some(tokens) = extract_usage(usage) else {
             return;
         };
+        if !tokens.prompt_present
+            && !tokens.completion_present
+            && !tokens.total_present
+            && !tokens.cache_read_present
+        {
+            return;
+        }
         let mut guard = self.lock();
-        guard.prompt_tokens = tokens.prompt;
-        guard.completion_tokens = tokens.completion;
-        guard.total_tokens = tokens.total;
-        guard.cache_read_tokens = tokens.cache_read;
+        if tokens.prompt_present && (tokens.prompt > 0 || guard.prompt_tokens == 0) {
+            guard.prompt_tokens = tokens.prompt;
+            guard.prompt_tokens_present = true;
+        }
+        if tokens.completion_present
+            && (tokens.completion > 0
+                || (tokens.prompt_present && tokens.prompt > 0)
+                || guard.completion_tokens == 0)
+        {
+            guard.completion_tokens = tokens.completion;
+            guard.completion_tokens_present = true;
+        }
+        if tokens.total_present {
+            // 带正 prompt 的帧代表一次新的完整统计，即使它来自重试且总量
+            // 小于此前失败尝试，也必须覆盖旧值；prompt=0 的零字段帧仍只
+            // 能作为 partial，不能抹掉已有真实 total。
+            if (tokens.prompt_present && tokens.prompt > 0)
+                || tokens.total >= guard.total_tokens
+                || guard.total_tokens == 0
+            {
+                guard.total_tokens = tokens.total;
+                guard.total_tokens_present = true;
+            }
+        } else if tokens.completion_present
+            && (tokens.prompt_present || guard.prompt_tokens_present)
+        {
+            let total = guard.prompt_tokens.saturating_add(guard.completion_tokens);
+            if total > 0 || guard.total_tokens == 0 {
+                guard.total_tokens = total;
+                guard.total_tokens_present = true;
+            }
+        }
+        if tokens.cache_read_present
+            && (tokens.cache_read > 0
+                || (tokens.prompt_present && tokens.prompt > 0)
+                || guard.cache_read_tokens == 0)
+        {
+            guard.cache_read_tokens = tokens.cache_read;
+            guard.cache_read_tokens_present = true;
+        }
     }
 
     /// 记一次「上游首帧已到达」。

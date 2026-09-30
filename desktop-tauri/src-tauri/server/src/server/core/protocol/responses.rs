@@ -22,12 +22,15 @@
 //! `{type:"reasoning", summary:[{type:"summary_text", text}]}` 项。
 //! 回程（Responses → Chat）时把 reasoning 项折回 `reasoning_content`。
 
+use std::sync::Arc;
+
 use serde_json::{json, Map, Value};
 
 use super::{
     content_parts, content_text, event_frame, freeform, is_truthy, json_text, random_id,
     string_field, string_value, tool_plan, SseLineBuffer, FIELD_ENCRYPTED_CONTENT,
 };
+use crate::server::core::upstream::usage::{merge_usage, usage_value, RequestTelemetry};
 use crate::server::logging;
 
 /// 无法跨协议转换时的错误文案（`Err` 的载荷）。
@@ -1021,6 +1024,7 @@ pub fn usage_to_responses(usage: Option<&Value>) -> Value {
     let cached = number(&[
         "prompt_tokens_details.cached_tokens",
         "prompt_cache_hit_tokens",
+        "cache_read_tokens",
         "cache_read_input_tokens",
     ]);
     // 嵌套明细要单独取（上面的点号键取不到，这里补一次）
@@ -1108,6 +1112,7 @@ pub struct ResponsesStream {
     finish_reason: Option<String>,
     /// 已完成的 output 项（收尾时按 output_index 排序进 response.output）
     output_items: Vec<(i64, Value)>,
+    telemetry: Option<Arc<RequestTelemetry>>,
 }
 
 #[derive(Default)]
@@ -1158,7 +1163,12 @@ impl ResponsesStream {
             usage: None,
             finish_reason: None,
             output_items: Vec::new(),
+            telemetry: None,
         }
+    }
+
+    pub fn set_telemetry(&mut self, telemetry: Arc<RequestTelemetry>) {
+        self.telemetry = Some(telemetry);
     }
 
     /// 吃一段上游字节，吐出要下发的 SSE 字节
@@ -1194,6 +1204,7 @@ impl ResponsesStream {
         if self.finished {
             return out;
         }
+        self.sync_telemetry_usage();
         self.finished = true;
         out.extend(self.emit_created());
         out.extend(self.close_reasoning());
@@ -1272,8 +1283,9 @@ impl ResponsesStream {
             }
         }
         if let Some(usage) = chunk.get("usage").filter(|value| value.is_object()) {
-            self.usage = Some(usage.clone());
+            self.usage = Some(merge_usage(self.usage.as_ref(), usage));
         }
+        self.sync_telemetry_usage();
         let choice = chunk.pointer("/choices/0");
         if let Some(finish) = choice
             .and_then(|choice| choice.get("finish_reason"))
@@ -1326,6 +1338,15 @@ impl ResponsesStream {
             }
         }
         out
+    }
+
+    fn sync_telemetry_usage(&mut self) {
+        let Some(telemetry) = &self.telemetry else {
+            return;
+        };
+        if let Some(usage) = usage_value(&telemetry.snapshot()) {
+            self.usage = Some(merge_usage(self.usage.as_ref(), &usage));
+        }
     }
 
     fn consume_tool(&mut self, call: &Value) -> Vec<bytes::Bytes> {
@@ -1758,6 +1779,7 @@ pub struct ResponsesCollector {
     finish_reason: Option<String>,
     id: String,
     created: i64,
+    telemetry: Option<Arc<RequestTelemetry>>,
 }
 
 impl ResponsesCollector {
@@ -1771,7 +1793,12 @@ impl ResponsesCollector {
             finish_reason: None,
             id: String::new(),
             created: logging::now_ms() / 1000,
+            telemetry: None,
         }
+    }
+
+    pub fn set_telemetry(&mut self, telemetry: Arc<RequestTelemetry>) {
+        self.telemetry = Some(telemetry);
     }
 
     pub fn push(&mut self, chunk: &[u8]) {
@@ -1804,7 +1831,7 @@ impl ResponsesCollector {
             self.created = created;
         }
         if let Some(usage) = chunk.get("usage").filter(|value| value.is_object()) {
-            self.usage = Some(usage.clone());
+            self.usage = Some(merge_usage(self.usage.as_ref(), usage));
         }
         let choice = chunk.pointer("/choices/0");
         if let Some(finish) = choice
@@ -1845,7 +1872,8 @@ impl ResponsesCollector {
     }
 
     /// 收成一个 Responses 响应对象
-    pub fn into_response(self, model: &str, request: &Value) -> Value {
+    pub fn into_response(mut self, model: &str, request: &Value) -> Value {
+        self.sync_telemetry_usage();
         let plan = tool_plan::plan_tools(request);
         let mut output: Vec<Value> = Vec::new();
         if !self.reasoning.is_empty() {
@@ -1894,10 +1922,118 @@ impl ResponsesCollector {
         }
         body
     }
+
+    fn sync_telemetry_usage(&mut self) {
+        let Some(telemetry) = &self.telemetry else {
+            return;
+        };
+        if let Some(usage) = usage_value(&telemetry.snapshot()) {
+            self.usage = Some(merge_usage(self.usage.as_ref(), &usage));
+        }
+    }
 }
 
 impl Default for ResponsesCollector {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chat_frame(value: Value) -> Vec<u8> {
+        format!("data: {}\n\n", serde_json::to_string(&value).unwrap()).into_bytes()
+    }
+
+    fn event_values(frames: &[bytes::Bytes]) -> Vec<Value> {
+        frames
+            .iter()
+            .filter_map(|frame| {
+                let text = std::str::from_utf8(frame).ok()?;
+                let data = text.lines().find_map(|line| line.strip_prefix("data: "))?;
+                serde_json::from_str(data).ok()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn usage_to_responses_maps_cache_details_only_when_present() {
+        let usage = usage_to_responses(Some(&json!({
+            "prompt_tokens": 183_284,
+            "completion_tokens": 237,
+            "total_tokens": 183_521,
+            "prompt_tokens_details": { "cached_tokens": 183_040 },
+        })));
+        assert_eq!(usage["input_tokens"], 183_284);
+        assert_eq!(usage["output_tokens"], 237);
+        assert_eq!(usage["input_tokens_details"]["cached_tokens"], 183_040);
+
+        let without_cache = usage_to_responses(Some(&json!({
+            "prompt_tokens": 12,
+            "completion_tokens": 3,
+            "total_tokens": 15,
+        })));
+        assert!(without_cache.get("input_tokens_details").is_none());
+    }
+
+    #[test]
+    fn streaming_and_non_streaming_usage_match() {
+        let chunk = chat_frame(json!({
+            "id": "chat-3",
+            "choices": [{ "delta": { "content": "ok" }, "finish_reason": "stop" }],
+            "usage": {
+                "prompt_tokens": 183_284,
+                "completion_tokens": 237,
+                "total_tokens": 183_521,
+                "prompt_tokens_details": { "cached_tokens": 183_040 },
+            },
+        }));
+        let request = json!({ "model": "glm", "input": "hi" });
+
+        let mut stream = ResponsesStream::new("glm", &request);
+        let mut frames = stream.push(&chunk);
+        frames.extend(stream.finish());
+        let completed = event_values(&frames)
+            .into_iter()
+            .find(|event| event["type"] == "response.completed")
+            .unwrap();
+        let stream_usage = &completed["response"]["usage"];
+
+        let mut collector = ResponsesCollector::new();
+        collector.push(&chunk);
+        collector.finish();
+        let body = collector.into_response("glm", &request);
+        assert_eq!(stream_usage, &body["usage"]);
+        assert_eq!(body["usage"]["input_tokens"], 183_284);
+        assert_eq!(body["usage"]["output_tokens"], 237);
+        assert_eq!(body["usage"]["input_tokens_details"]["cached_tokens"], 183_040);
+    }
+
+    #[test]
+    fn telemetry_fallback_keeps_existing_usage_details() {
+        let telemetry = std::sync::Arc::new(RequestTelemetry::new());
+        telemetry.report_usage(&json!({
+            "prompt_tokens": 183_284,
+            "completion_tokens": 237,
+            "total_tokens": 183_521,
+            "prompt_tokens_details": { "cached_tokens": 183_040 },
+        }));
+        let chunk = chat_frame(json!({
+            "id": "chat-4",
+            "choices": [{ "delta": { "content": "ok" }, "finish_reason": "stop" }],
+            "usage": { "completion_tokens_details": { "reasoning_tokens": 9 } },
+        }));
+        let request = json!({ "model": "glm", "input": "hi" });
+        let mut collector = ResponsesCollector::new();
+        collector.set_telemetry(telemetry);
+        collector.push(&chunk);
+        collector.finish();
+        let body = collector.into_response("glm", &request);
+        assert_eq!(body["usage"]["input_tokens"], 183_284);
+        assert_eq!(body["usage"]["output_tokens"], 237);
+        assert_eq!(body["usage"]["input_tokens_details"]["cached_tokens"], 183_040);
+        assert_eq!(body["usage"]["output_tokens_details"]["reasoning_tokens"], 9);
     }
 }

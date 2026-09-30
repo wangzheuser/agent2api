@@ -231,11 +231,15 @@ pub async fn responses_endpoint(
             let context = RecordContext { status: i64::from(status.as_u16()), ..context };
             if stream {
                 let mut machine = responses::ResponsesStream::new(&model, &request);
+                machine.set_telemetry(context.telemetry.clone());
                 let transformed = pipeline::transformed_stream(
                     source,
                     context,
                     pipeline::terminal::RESPONSES,
-                    move |chunk| machine.push(chunk),
+                    move |chunk| match chunk {
+                        Some(chunk) => machine.push(chunk),
+                        None => machine.finish(),
+                    },
                 );
                 // 收尾移交给响应流（守卫不再兜底；令牌保持登记到流结束）
                 guard.handoff();
@@ -243,6 +247,7 @@ pub async fn responses_endpoint(
             }
             // 下游要非流式：内部收流，聚合成本协议的 JSON
             let mut collector = responses::ResponsesCollector::new();
+            collector.set_telemetry(context.telemetry.clone());
             collect_stream(source, &mut |chunk| collector.push(chunk)).await;
             collector.finish();
             let body = collector.into_response(&model, &request);
@@ -256,7 +261,8 @@ pub async fn responses_endpoint(
             guard.complete();
             json_response(body)
         }
-        Ok(ForwardOutcome::Completion { body: chat }) => {
+        Ok(ForwardOutcome::Completion { body: mut chat }) => {
+            pipeline::fill_usage_from_telemetry(&mut chat, &context.telemetry);
             // 上游走了聚合路径（本不该发生：我们恒要流式，但 CatPaw 等
             // 有状态适配器可能直接给 Completion）。照样翻译，不丢请求。
             let response = responses::responses_from_chat(&chat, &requested_model, &original);
@@ -399,17 +405,22 @@ pub async fn messages_endpoint(
             let context = RecordContext { status: i64::from(status.as_u16()), ..context };
             if stream {
                 let mut machine = anthropic::AnthropicStream::new(&model);
+                machine.set_telemetry(context.telemetry.clone());
                 let transformed = pipeline::transformed_stream(
                     source,
                     context,
                     pipeline::terminal::ANTHROPIC,
-                    move |chunk| machine.push(chunk),
+                    move |chunk| match chunk {
+                        Some(chunk) => machine.push(chunk),
+                        None => machine.finish(),
+                    },
                 );
                 // 收尾移交给响应流（守卫不再兜底；令牌保持登记到流结束）
                 guard.handoff();
                 return sse_response(status, transformed);
             }
             let mut collector = anthropic::AnthropicCollector::new();
+            collector.set_telemetry(context.telemetry.clone());
             collect_stream(source, &mut |chunk| collector.push(chunk)).await;
             collector.finish();
             let body = collector.into_response(&model);
@@ -423,7 +434,8 @@ pub async fn messages_endpoint(
             guard.complete();
             json_response(body)
         }
-        Ok(ForwardOutcome::Completion { body: chat }) => {
+        Ok(ForwardOutcome::Completion { body: mut chat }) => {
+            pipeline::fill_usage_from_telemetry(&mut chat, &context.telemetry);
             let response = anthropic::anthropic_from_chat(&chat, &requested_model);
             let context = RecordContext {
                 raw_response: serde_json::to_string(&response).ok(),

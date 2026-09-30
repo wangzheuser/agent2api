@@ -3,7 +3,7 @@
     {
       "input": "event: metadata\ndata: {\"session_id\":\"s1\",\"prompt_completion_id\":\"p1\"}\n\nevent: output\ndata: {\"response\":\"你\"}\n\nevent: output\ndata: {\"response\":\"好\"}\n\nevent: token_usage\ndata: {\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\nevent: done\ndata: {\"finish_reason\":\"stop\"}\n\n",
       "name": "纯文本三段 + done + usage",
-      "output": "{\"choices\":[{\"finish_reason\":\"stop\",\"index\":0,\"message\":{\"content\":\"你好\",\"role\":\"assistant\"}}],\"created\":\u003cCREATED\u003e,\"id\":\"\u003cID\u003e\",\"model\":\"\",\"object\":\"chat.completion\",\"usage\":{\"usage\":{\"completion_tokens\":2,\"prompt_tokens\":3,\"total_tokens\":5}}}"
+      "output": "{\"choices\":[{\"finish_reason\":\"stop\",\"index\":0,\"message\":{\"content\":\"你好\",\"role\":\"assistant\"}}],\"created\":\u003cCREATED\u003e,\"id\":\"\u003cID\u003e\",\"model\":\"\",\"object\":\"chat.completion\",\"usage\":{\"completion_tokens\":2,\"prompt_tokens\":3,\"total_tokens\":5}}"
     },
     {
       "input": "event: output\ndata: {\"reasoning_content\":\"想想\"}\n\nevent: done\ndata: {\"finish_reason\":\"stop\"}\n\n",
@@ -63,7 +63,7 @@
     {
       "input": "event: token_usage\ndata: {\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
       "name": "usage 之后没有 done",
-      "output": "{\"choices\":[{\"finish_reason\":\"stop\",\"index\":0,\"message\":{\"content\":\"\",\"role\":\"assistant\"}}],\"created\":\u003cCREATED\u003e,\"id\":\"\u003cID\u003e\",\"model\":\"\",\"object\":\"chat.completion\",\"usage\":{\"usage\":{\"completion_tokens\":1,\"prompt_tokens\":1,\"total_tokens\":2}}}"
+      "output": "{\"choices\":[{\"finish_reason\":\"stop\",\"index\":0,\"message\":{\"content\":\"\",\"role\":\"assistant\"}}],\"created\":\u003cCREATED\u003e,\"id\":\"\u003cID\u003e\",\"model\":\"\",\"object\":\"chat.completion\",\"usage\":{\"completion_tokens\":1,\"prompt_tokens\":1,\"total_tokens\":2}}"
     },
     {
       "input": "event: output\ndata: {not json}\n\nevent: done\ndata: {\"finish_reason\":\"stop\"}\n\n",
@@ -884,7 +884,7 @@
       "frames": [
         "data: {\"choices\":[{\"delta\":{\"content\":\"你\"},\"index\":0}],\"created\":\u003cCREATED\u003e,\"id\":\"\u003cID\u003e\",\"model\":\"\",\"object\":\"chat.completion.chunk\"}",
         "data: {\"choices\":[{\"delta\":{\"content\":\"好\"},\"index\":0}],\"created\":\u003cCREATED\u003e,\"id\":\"\u003cID\u003e\",\"model\":\"\",\"object\":\"chat.completion.chunk\"}",
-        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}],\"created\":\u003cCREATED\u003e,\"id\":\"\u003cID\u003e\",\"model\":\"\",\"object\":\"chat.completion.chunk\",\"usage\":{\"usage\":{\"completion_tokens\":2,\"prompt_tokens\":3,\"total_tokens\":5}}}",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}],\"created\":\u003cCREATED\u003e,\"id\":\"\u003cID\u003e\",\"model\":\"\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":2,\"prompt_tokens\":3,\"total_tokens\":5}}",
         "data: [DONE]"
       ],
       "input": "event: metadata\ndata: {\"session_id\":\"s1\",\"prompt_completion_id\":\"p1\"}\n\nevent: output\ndata: {\"response\":\"你\"}\n\nevent: output\ndata: {\"response\":\"好\"}\n\nevent: token_usage\ndata: {\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\nevent: done\ndata: {\"finish_reason\":\"stop\"}\n\n",

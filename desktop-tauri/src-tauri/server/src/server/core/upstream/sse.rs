@@ -27,8 +27,8 @@
 //! ── usage 旁路提取（请求统计）────────────────────────────────
 //! 本状态机是 SSE 逐行解析的**唯一入口**，所以 usage 提取挂在这里
 //! （`handle_line` 里那一段）：只读一眼 JSON 的 `usage` 成员、写进
-//! `usage::RequestTelemetry`，完全不参与帧的构造 —— 帧内容与不接钩子时
-//! 逐字节一致（详见该处的注释）。
+//! `usage::RequestTelemetry`；只有上游缺少真实输入/缓存字段时，才在
+//! `[DONE]` 前补一个标准 Chat usage 末帧。
 //!
 //! ── model 名回写（Agent2API W3-T4）────────────────────────────
 //! 小浣熊上游会把响应 chunk 的 `model` 换成它自己的内部名，而客户端认的是自己
@@ -41,11 +41,11 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::server::logging;
 
-use super::usage::RequestTelemetry;
+use super::usage::{extract_usage, usage_value, RequestTelemetry};
 
 /// 思考（reasoning_content）帧合并阈值（照抄 Node 的 REASONING_COALESCE_CHARS）
 pub const REASONING_COALESCE_CHARS: usize = 60;
@@ -87,6 +87,12 @@ pub struct ReasoningCoalescer {
     telemetry: Option<Arc<RequestTelemetry>>,
     /// model 名回写参数（可选；见模块头）。None = 原样透传上游的 model 字段
     rewrite: Option<ModelRewrite>,
+    /// 上游 usage 已经下发的字段；只在旁路有额外真实字段时追加末帧，
+    /// 避免重复下发完整 usage。
+    usage_has_prompt: bool,
+    usage_has_cache: bool,
+    usage_has_output: bool,
+    done_seen: bool,
 }
 
 impl Default for ReasoningCoalescer {
@@ -103,6 +109,10 @@ impl ReasoningCoalescer {
             tail: Vec::new(),
             telemetry: None,
             rewrite: None,
+            usage_has_prompt: false,
+            usage_has_cache: false,
+            usage_has_output: false,
+            done_seen: false,
         }
     }
 
@@ -150,6 +160,11 @@ impl ReasoningCoalescer {
             out.push(self.coalesced_frame());
             self.acc.clear();
         }
+        if !self.done_seen {
+            if let Some(frame) = self.telemetry_usage_frame() {
+                out.push(frame);
+            }
+        }
         out
     }
 
@@ -165,9 +180,13 @@ impl ReasoningCoalescer {
         }
         let data = line[5..].trim();
         if data == "[DONE]" {
+            self.done_seen = true;
             if !self.acc.is_empty() {
                 out.push(self.coalesced_frame());
                 self.acc.clear();
+            }
+            if let Some(frame) = self.telemetry_usage_frame() {
+                out.push(frame);
             }
             out.push(Bytes::from_static(b"data: [DONE]\n\n"));
             return;
@@ -180,15 +199,17 @@ impl ReasoningCoalescer {
         if chunk.is_object() {
             // ── usage 旁路提取（请求统计）──────────────────────────
             // 位置放在「已确定这是合法 JSON 对象」之后、「本行还没被改写」之前。
-            // 为什么**不会影响透传**：这里只读 `chunk` 的一个成员并把它拷进
-            // 另一个结构体，既不修改 `chunk` 也不参与下面 `out` 的构造 ——
-            // 无论命中与否，本函数吐出的帧都与不接这个钩子时逐字节一致。
-            // 提取失败（usage 缺失/非对象）静默跳过：统计少记一条可以接受，
-            // 因此这里没有错误分支，也就没有「异常帧被吞掉」的可能。
+            // 提取失败（usage 缺失/非对象）静默跳过；缺失字段在 [DONE] 前由
+            // telemetry_usage_frame 按真实统计补齐。
             if let Some(telemetry) = &self.telemetry {
                 if let Some(usage) = chunk.get("usage") {
                     telemetry.report_usage(usage);
                 }
+            }
+            if let Some(tokens) = chunk.get("usage").and_then(extract_usage) {
+                self.usage_has_prompt |= tokens.prompt > 0;
+                self.usage_has_cache |= tokens.cache_read > 0;
+                self.usage_has_output |= tokens.completion > 0;
             }
             // 元数据取上游最近一帧的有效值（Node: `if (chunkObj.id) meta.id = ...`）
             if let Some(id) = chunk.get("id").filter(|value| is_truthy(value)) {
@@ -287,6 +308,71 @@ impl ReasoningCoalescer {
         }
     }
 
+    fn telemetry_usage_frame(&self) -> Option<Frame> {
+        let usage = usage_value(&self.telemetry.as_ref()?.snapshot())?;
+        let has_prompt = usage
+            .get("prompt_tokens")
+            .and_then(Value::as_i64)
+            .is_some_and(|value| value > 0);
+        let has_cache = usage
+            .pointer("/prompt_tokens_details/cached_tokens")
+            .and_then(Value::as_i64)
+            .is_some_and(|value| value > 0);
+        let has_output = usage
+            .get("completion_tokens")
+            .and_then(Value::as_i64)
+            .is_some_and(|value| value > 0);
+        let total = usage
+            .get("total_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let output = usage
+            .get("completion_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        if !has_prompt && !has_cache && total <= 0 && output <= 0 {
+            return None;
+        }
+        if (!has_prompt || !self.usage_has_prompt)
+            || (has_cache && !self.usage_has_cache)
+            || (has_output && !self.usage_has_output)
+        {
+            // 有旁路字段且上游缺任一真实字段时补帧。
+        } else {
+            return None;
+        }
+        let id = self
+            .meta
+            .id
+            .clone()
+            .filter(|value| is_truthy(value))
+            .unwrap_or_else(|| Value::String(format!("wb-usage-{}", logging::now_ms())));
+        let created = self
+            .meta
+            .created
+            .clone()
+            .filter(|value| is_truthy(value))
+            .unwrap_or_else(|| Value::from(logging::now_ms() / 1000));
+        let model = match &self.meta.model {
+            _ if self.rewrite.is_some() => Value::String(
+                self.rewrite
+                    .as_ref()
+                    .map(|rewrite| rewrite.requested.clone())
+                    .unwrap_or_default(),
+            ),
+            Some(value) if is_truthy(value) => value.clone(),
+            _ => Value::String(String::new()),
+        };
+        Some(sse_frame(&json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [],
+            "usage": usage,
+        })))
+    }
+
     /// 合并帧：`{id, object:'chat.completion.chunk', created, model, choices:[...]}`
     ///
     /// id/created 的兜底文案照抄 Node（`wb-coalesce-<毫秒>` / 当前秒）。
@@ -353,5 +439,122 @@ fn is_truthy(value: &Value) -> bool {
         Value::Number(number) => number.as_f64().map(|item| item != 0.0).unwrap_or(false),
         Value::String(text) => !text.is_empty(),
         Value::Array(_) | Value::Object(_) => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(value: Value) -> Vec<u8> {
+        format!("data: {}\n\n", serde_json::to_string(&value).unwrap()).into_bytes()
+    }
+
+    #[test]
+    fn appends_missing_chat_input_usage_before_done() {
+        let telemetry = Arc::new(RequestTelemetry::new());
+        telemetry.report_usage(&json!({
+            "prompt_tokens": 183_284,
+            "completion_tokens": 237,
+            "total_tokens": 183_521,
+            "prompt_tokens_details": { "cached_tokens": 183_040 },
+        }));
+        let mut coalescer = ReasoningCoalescer::with_telemetry(telemetry);
+        let mut frames = coalescer.push(&frame(json!({
+            "id": "chat-1",
+            "model": "glm",
+            "choices": [{ "delta": { "content": "ok" }, "finish_reason": null }],
+        })));
+        frames.extend(coalescer.push(b"data: [DONE]\n\n"));
+        let text = frames
+            .iter()
+            .map(|frame| String::from_utf8_lossy(frame))
+            .collect::<String>();
+        assert!(text.contains("\"prompt_tokens\":183284"));
+        assert!(text.contains("\"completion_tokens\":237"));
+        assert!(text.contains("\"cached_tokens\":183040"));
+        assert!(text.find("\"usage\"").unwrap() < text.find("data: [DONE]").unwrap());
+    }
+
+    #[test]
+    fn does_not_duplicate_complete_chat_usage() {
+        let telemetry = Arc::new(RequestTelemetry::new());
+        let mut coalescer = ReasoningCoalescer::with_telemetry(telemetry);
+        let mut frames = coalescer.push(&frame(json!({
+            "id": "chat-2",
+            "choices": [],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12 },
+        })));
+        frames.extend(coalescer.push(b"data: [DONE]\n\n"));
+        let usage_frames = frames
+            .iter()
+            .filter(|frame| String::from_utf8_lossy(frame).contains("\"usage\""))
+            .count();
+        assert_eq!(usage_frames, 1);
+    }
+
+    #[test]
+    fn completes_prompt_only_usage_from_later_telemetry() {
+        let telemetry = Arc::new(RequestTelemetry::new());
+        let mut coalescer = ReasoningCoalescer::with_telemetry(telemetry.clone());
+        let mut frames = coalescer.push(&frame(json!({
+            "id": "chat-3",
+            "choices": [],
+            "usage": { "prompt_tokens": 100 },
+        })));
+        telemetry.report_usage(&json!({ "completion_tokens": 4 }));
+        frames.extend(coalescer.push(b"data: [DONE]\n\n"));
+        let text = frames
+            .iter()
+            .map(|frame| String::from_utf8_lossy(frame))
+            .collect::<String>();
+        assert!(text.contains("\"prompt_tokens\":100"));
+        assert!(text.contains("\"completion_tokens\":4"));
+    }
+
+    #[test]
+    fn does_not_append_usage_again_after_done_at_eof() {
+        let telemetry = Arc::new(RequestTelemetry::new());
+        telemetry.report_usage(&json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 2,
+            "total_tokens": 12,
+        }));
+        let mut coalescer = ReasoningCoalescer::with_telemetry(telemetry);
+        let mut frames = coalescer.push(b"data: [DONE]\n\n");
+        frames.extend(coalescer.finish());
+        let usage_frames = frames
+            .iter()
+            .filter(|frame| String::from_utf8_lossy(frame).contains("\"usage\""))
+            .count();
+        assert_eq!(usage_frames, 1);
+    }
+
+    #[test]
+    fn appends_authoritative_usage_after_an_upstream_zero_usage_frame() {
+        let telemetry = Arc::new(RequestTelemetry::new());
+        let mut coalescer = ReasoningCoalescer::with_telemetry(telemetry.clone());
+        let mut frames = coalescer.push(&frame(json!({
+            "id": "chat-4",
+            "choices": [],
+            "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 },
+        })));
+        telemetry.report_usage(&json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 4,
+            "total_tokens": 104,
+        }));
+        frames.extend(coalescer.push(b"data: [DONE]\n\n"));
+        let usage_frames = frames
+            .iter()
+            .filter(|frame| String::from_utf8_lossy(frame).contains("\"usage\""))
+            .count();
+        assert_eq!(usage_frames, 2);
+        let text = frames
+            .iter()
+            .map(|frame| String::from_utf8_lossy(frame))
+            .collect::<String>();
+        assert!(text.contains("\"prompt_tokens\":100"));
+        assert!(text.contains("\"completion_tokens\":4"));
     }
 }

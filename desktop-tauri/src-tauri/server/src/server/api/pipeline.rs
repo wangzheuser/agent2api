@@ -57,6 +57,21 @@ const ERROR_SUMMARY_CHARS: usize = 200;
 /// HTTP 状态早就发出去了（2xx），明细里只能靠这条文案解释「为什么没有 token」。
 pub const STREAM_ABORTED: &str = "响应流未完整下发（客户端中断或服务退出）";
 
+/// 给已经聚合完成的 Chat 响应补齐旁路采到的真实 usage。
+///
+/// 某些适配器直接返回 `ForwardOutcome::Completion`，不经过 Responses /
+/// Anthropic 的 collector；这里沿用同一合并规则，既补齐统一计数，也保留
+/// 上游已有的协议专属明细。
+pub fn fill_usage_from_telemetry(body: &mut Value, telemetry: &RequestTelemetry) {
+    let Some(authoritative) = usage::usage_value(&telemetry.snapshot()) else {
+        return;
+    };
+    let merged = usage::merge_usage(body.get("usage"), &authoritative);
+    if let Some(object) = body.as_object_mut() {
+        object.insert("usage".to_string(), merged);
+    }
+}
+
 /// 一条「本协议收尾帧」的字节特征（见 [`RecordingStream`] 的说明）。
 ///
 /// 由**调用方**按自己那条协议给出（三条入口各知道自己发什么收尾），本模块
@@ -842,8 +857,8 @@ impl Drop for RecordingStream {
 ///   转换器 → RecordingStream → axum Body
 /// 首响时刻因此是「转换后的第一帧到达客户端」的时刻，与客户端感知一致。
 ///
-/// `transform` 是一个「吃字节吐字节」的闭包：转换状态机自己持有，
-/// 本函数不认识任何协议。
+/// `transform` 是一个「吃字节吐字节」的闭包：传入 `Some` 时处理上游字节，
+/// 传入 `None` 时收尾转换状态机。本函数不认识任何协议。
 ///
 /// `terminals` 是**本协议收尾帧的字节特征**，由调用方按自己那条入口给出
 /// （见 [`RecordingStream`] 的说明）—— 本函数同样只当字节比对，不做协议判断。
@@ -856,18 +871,39 @@ pub fn transformed_stream(
     source: Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin>,
     context: RecordContext,
     terminals: TerminalFrames,
-    mut transform: impl FnMut(&[u8]) -> Vec<Bytes> + Send + 'static,
+    transform: impl FnMut(Option<&[u8]>) -> Vec<Bytes> + Send + 'static,
 ) -> Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin> {
     use futures::StreamExt;
-    // 上游字节流 → 转换后的帧流
-    let converted = source.flat_map(move |item| {
-        let frames = match item {
-            Ok(chunk) => transform(&chunk),
-            // 上游断流：把错误原样透出（由 axum 结束连接）
-            Err(error) => return futures::stream::iter(vec![Err(error)]).boxed(),
-        };
-        futures::stream::iter(frames.into_iter().map(Ok)).boxed()
-    });
+    // 上游字节流 → 转换后的帧流。用 unfold 保留转换器状态，并在源流正常
+    // EOF 时显式调用一次收尾回调；否则 Anthropic 等需要等待末帧 usage 的
+    // 转换器会把尚未释放的内容留在内存里，最终整条响应消失。
+    let converted = futures::stream::unfold(
+        (source, std::collections::VecDeque::new(), transform, false),
+        |(mut source, mut pending, mut transform, mut done)| async move {
+            loop {
+                if let Some(item) = pending.pop_front() {
+                    return Some((item, (source, pending, transform, done)));
+                }
+                if done {
+                    return None;
+                }
+                match source.next().await {
+                    Some(Ok(chunk)) => {
+                        pending.extend(transform(Some(&chunk)).into_iter().map(Ok));
+                    }
+                    Some(Err(error)) => {
+                        done = true;
+                        return Some((Err(error), (source, pending, transform, done)));
+                    }
+                    None => {
+                        done = true;
+                        pending.extend(transform(None).into_iter().map(Ok));
+                    }
+                }
+            }
+        },
+    )
+    .boxed();
     Box::new(RecordingStream::with_terminals(Box::new(converted), context, terminals))
 }
 

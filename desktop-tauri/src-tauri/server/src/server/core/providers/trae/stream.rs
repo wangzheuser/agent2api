@@ -182,7 +182,7 @@ impl SoloStream {
                 vec![self.chunk(Value::Object(delta), None)]
             }
             SoloEvent::TokenUsage(usage) => {
-                self.pending_usage = Some(usage);
+                self.pending_usage = Some(flatten_usage(usage));
                 Vec::new()
             }
             SoloEvent::Done { finish_reason } => {
@@ -307,7 +307,7 @@ pub fn aggregate(text: &str, id: &str, created: i64) -> Result<Value, StreamErro
                     merge_tool_calls(&mut calls, calls_value);
                 }
             }
-            SoloEvent::TokenUsage(payload) => usage = Some(payload),
+            SoloEvent::TokenUsage(payload) => usage = Some(flatten_usage(payload)),
             SoloEvent::Done { finish_reason: reason } => {
                 if !reason.is_empty() {
                     finish_reason = reason;
@@ -343,6 +343,16 @@ pub fn aggregate(text: &str, id: &str, created: i64) -> Result<Value, StreamErro
         response.insert("usage".to_string(), usage);
     }
     Ok(Value::Object(response))
+}
+
+/// SOLO 的 token_usage 有两个版本：有的返回直接 usage 对象，有的把它包成
+/// `{ "usage": { ... } }`。对外统一成 Chat usage，避免三种协议各自再猜一层。
+fn flatten_usage(payload: Value) -> Value {
+    payload
+        .get("usage")
+        .filter(|value| value.is_object())
+        .cloned()
+        .unwrap_or(payload)
 }
 
 /// 按 `index` 合并流式 tool_call 片段：`id` / `type` / `function.name` 直覆盖，
@@ -496,6 +506,18 @@ mod tests {
         // 参考实现把 usage 欠在下一帧上；没有下一帧就随它去。
         let frames = run("event: token_usage\ndata: {\"prompt_tokens\":1}\n\n");
         assert_eq!(vec!["data: [DONE]".to_string()], frames, "不能凭空造一个带 usage 的 finish 帧");
+    }
+
+    #[test]
+    fn nested_token_usage_is_flattened_for_chat_protocols() {
+        let frames = run(
+            "event: token_usage\ndata: {\"usage\":{\"prompt_tokens\":183284,\"completion_tokens\":237,\"total_tokens\":183521,\"prompt_tokens_details\":{\"cached_tokens\":183040}}}\n\nevent: done\ndata: {\"finish_reason\":\"stop\"}\n\n",
+        );
+        assert!(frames.iter().any(|frame| {
+            frame.contains("\"prompt_tokens\":183284")
+                && frame.contains("\"cached_tokens\":183040")
+                && !frame.contains("\"usage\":{\"prompt_tokens\"")
+        }));
     }
 
     #[test]

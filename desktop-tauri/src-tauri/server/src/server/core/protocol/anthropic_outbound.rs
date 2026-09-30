@@ -454,7 +454,7 @@ fn thinking_budget(effort: &str) -> Option<i64> {
 ///   - `content_block_delta`：`text_delta` → `delta.content`；
 ///     `thinking_delta` → `delta.reasoning_content`；
 ///     `input_json_delta` → `delta.tool_calls[…]`；`signature_delta` 丢弃
-///   - `message_delta` → 记 stop_reason 与 `usage.output_tokens`
+///   - `message_delta` → 记 stop_reason 与 usage 的 input/cache/output 字段
 ///   - `message_stop` → 收尾帧 + usage 帧 + `data: [DONE]`
 ///   - `error` → `data: {"error":{…}}` + `data: [DONE]`（与 ForwardStream
 ///     的断流收尾同形状，聚合器据此转 502）
@@ -662,6 +662,15 @@ impl ChatFromAnthropicStream {
                     }
                 }
                 if let Some(usage) = event.get("usage").filter(|usage| usage.is_object()) {
+                    if let Some(input) = usage.get("input_tokens").and_then(Value::as_i64) {
+                        self.input_tokens = input;
+                    }
+                    if let Some(cache_read) = usage.get("cache_read_input_tokens").and_then(Value::as_i64) {
+                        self.cache_read = cache_read;
+                    }
+                    if let Some(cache_creation) = usage.get("cache_creation_input_tokens").and_then(Value::as_i64) {
+                        self.cache_creation = cache_creation;
+                    }
                     if let Some(output) = usage.get("output_tokens").and_then(Value::as_i64) {
                         self.output_tokens = output;
                     }
@@ -703,17 +712,24 @@ impl ChatFromAnthropicStream {
         // chat 口径：input_tokens 含缓存部分（`usage_to_anthropic` 的反向
         // 不等式 —— 那边是「减掉缓存」，这边加回来）
         let prompt_tokens = self.input_tokens + self.cache_read + self.cache_creation;
+        let mut usage = json!({
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": self.output_tokens,
+            "total_tokens": prompt_tokens + self.output_tokens,
+        });
+        if self.cache_read > 0 {
+            usage["prompt_tokens_details"] = json!({ "cached_tokens": self.cache_read });
+        }
+        if self.cache_creation > 0 {
+            usage["cache_creation_input_tokens"] = Value::from(self.cache_creation);
+        }
         out.push(chat_frame(&json!({
             "id": self.id,
             "object": "chat.completion.chunk",
             "created": self.created,
             "model": self.model,
             "choices": [],
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": self.output_tokens,
-                "total_tokens": prompt_tokens + self.output_tokens,
-            },
+            "usage": usage,
         })));
         out.push(bytes::Bytes::from_static(b"data: [DONE]\n\n"));
         out
