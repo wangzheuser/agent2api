@@ -487,7 +487,10 @@ impl AutoCheckin {
                 items
                     .iter()
                     .filter_map(|item| {
-                        let error = item.get("error").and_then(Value::as_str);
+                        let error = item
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .filter(|message| !is_benign_completion_message(message));
                         let claim_message = item
                             .get("claim")
                             .filter(|value| {
@@ -766,6 +769,39 @@ impl AutoCheckin {
     /// 正在执行中返回 None —— 路由层翻成「签到正在执行中，请稍候」。
     pub async fn run_now(&self) -> Option<Value> {
         self.fire("手动触发").await
+    }
+}
+
+/// 计费签到接口把「今天已经完成」作为 HTTP 错误返回；这类结果不会阻塞
+/// 下一次活动窗口，也不应让定时任务进入高频重试。
+fn is_benign_completion_message(message: &str) -> bool {
+    [
+        "当前没有可领取的签到活动",
+        "无每日签到活动",
+        "今天已签到",
+        "今日已签到",
+        "今日已领取",
+        "已签到",
+        "已领取",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_benign_completion_message;
+
+    #[test]
+    fn completed_checkin_errors_do_not_trigger_retries() {
+        assert!(is_benign_completion_message(
+            "计费接口返回 HTTP 400: 今天已签到，请明天再来"
+        ));
+        assert!(is_benign_completion_message("今日已领取"));
+        assert!(is_benign_completion_message("当前没有可领取的签到活动"));
+        assert!(!is_benign_completion_message(
+            "计费接口返回 HTTP 401: 凭证已过期"
+        ));
     }
 }
 
