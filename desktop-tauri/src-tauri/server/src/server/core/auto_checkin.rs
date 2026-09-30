@@ -491,10 +491,12 @@ impl AutoCheckin {
                             .get("error")
                             .and_then(Value::as_str)
                             .filter(|message| !is_benign_completion_message(message));
+                        let activity_succeeded = activity_keepalive_succeeded(item);
                         let claim_message = item
                             .get("claim")
                             .filter(|value| {
-                                value.get("success").and_then(Value::as_bool) == Some(false)
+                                !activity_succeeded
+                                    && value.get("success").and_then(Value::as_bool) == Some(false)
                                     && value.get("alreadyCompleted").and_then(Value::as_bool)
                                         != Some(true)
                                     && !value
@@ -788,9 +790,18 @@ fn is_benign_completion_message(message: &str) -> bool {
     .any(|marker| message.contains(marker))
 }
 
+fn activity_keepalive_succeeded(item: &Value) -> bool {
+    item.get("activity")
+        .and_then(|value| value.get("pokeSucceeded"))
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_benign_completion_message;
+    use serde_json::json;
+
+    use super::{activity_keepalive_succeeded, is_benign_completion_message};
 
     #[test]
     fn completed_checkin_errors_do_not_trigger_retries() {
@@ -802,6 +813,17 @@ mod tests {
         assert!(!is_benign_completion_message(
             "计费接口返回 HTTP 401: 凭证已过期"
         ));
+    }
+
+    #[test]
+    fn successful_activity_keepalive_does_not_trigger_retries() {
+        assert!(activity_keepalive_succeeded(&json!({
+            "activity": { "pokeSucceeded": true },
+            "claim": { "success": false, "msg": "有效对话完成，日活奖励尚未确认" }
+        })));
+        assert!(!activity_keepalive_succeeded(&json!({
+            "activity": { "pokeSucceeded": false }
+        })));
     }
 }
 
