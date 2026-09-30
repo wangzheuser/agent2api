@@ -101,10 +101,13 @@ pub fn extract_usage(usage: &Value) -> Option<UsageTokens> {
 pub fn usage_value(snapshot: &TelemetrySnapshot) -> Option<Value> {
     // 只把旁路实际收到的字段写回响应。部分 usage 帧（例如只带
     // completion_tokens）不能把转换器已经拿到的 prompt/output 清成 0。
-    let prompt_present = snapshot.prompt_tokens_present || snapshot.prompt_tokens > 0;
-    let completion_present = snapshot.completion_tokens_present || snapshot.completion_tokens > 0;
-    let total_present = snapshot.total_tokens_present || snapshot.total_tokens > 0;
-    let cache_read_present = snapshot.cache_read_tokens_present || snapshot.cache_read_tokens > 0;
+    // presence 标志只说明上游写过该键；显式全零帧常是占位帧，不能作为
+    // 覆盖已有真实统计的证据；没有正输入/cache 证据时仍交给原有响应层
+    // 处理 output-only 或缺失 usage 的情况。
+    let prompt_present = snapshot.prompt_tokens > 0;
+    let completion_present = snapshot.completion_tokens > 0;
+    let total_present = snapshot.total_tokens > 0;
+    let cache_read_present = snapshot.cache_read_tokens > 0;
     let has_input_evidence = prompt_present || cache_read_present;
     if !has_input_evidence {
         return None;
@@ -201,6 +204,17 @@ mod tests {
         let snapshot = TelemetrySnapshot {
             completion_tokens: 237,
             total_tokens: 237,
+            ..TelemetrySnapshot::default()
+        };
+        assert_eq!(usage_value(&snapshot), None);
+    }
+
+    #[test]
+    fn usage_value_ignores_explicit_zero_placeholder_fields() {
+        let snapshot = TelemetrySnapshot {
+            prompt_tokens_present: true,
+            completion_tokens_present: true,
+            total_tokens_present: true,
             ..TelemetrySnapshot::default()
         };
         assert_eq!(usage_value(&snapshot), None);
