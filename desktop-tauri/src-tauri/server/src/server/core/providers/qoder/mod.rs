@@ -81,6 +81,62 @@ use self::chat::Translator;
 use self::stream::SseEvent;
 
 pub struct QoderAdapter;
+
+fn refresh_outcome_summary(
+    region: endpoints::Region,
+    outcome: &ModelRefreshOutcome,
+) -> String {
+    if outcome.refreshed {
+        return format!("{}已更新 {} 个", region.label(), outcome.count);
+    }
+    if let Some(message) = outcome.message.as_deref() {
+        return format!("{}失败：{}", region.label(), message);
+    }
+    format!("{}沿用缓存", region.label())
+}
+
+fn merge_region_outcomes(
+    primary: ModelRefreshOutcome,
+    secondary: ModelRefreshOutcome,
+) -> ModelRefreshOutcome {
+    if primary.refreshed || secondary.refreshed {
+        return ModelRefreshOutcome::refreshed(primary.count.saturating_add(secondary.count));
+    }
+    let reasons: Vec<&str> = [primary.message.as_deref(), secondary.message.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect();
+    if reasons.is_empty() {
+        ModelRefreshOutcome::unchanged()
+    } else {
+        ModelRefreshOutcome::failed(format!(
+            "Qoder 分地区目录刷新失败：{}",
+            reasons.join("；")
+        ))
+    }
+}
+
+fn find_other_region_account(
+    store: &AccountStore,
+    primary_region: endpoints::Region,
+) -> Option<(Value, credentials::Credentials)> {
+    let accounts = store
+        .list_accounts()
+        .get("accounts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    accounts
+        .iter()
+        .filter(|account| account.get("provider").and_then(Value::as_str) == Some("qoder"))
+        .filter_map(|account| account.get("id").and_then(Value::as_str))
+        .filter_map(|account_id| store.qoder_account_record(account_id))
+        .filter_map(|record| {
+            let credentials = credentials::Credentials::from_payload(&record).ok()?;
+            (credentials.region != primary_region).then_some((record, credentials))
+        })
+        .next()
+}
 pub static QODER_ADAPTER: QoderAdapter = QoderAdapter;
 
 /// 映射上绑的思考等级注入到请求体的哪个键。
@@ -260,8 +316,9 @@ impl ProviderAdapter for QoderAdapter {
         true
     }
 
-    /// 刷新模型目录：用**库里第一个可用 Qoder 账号**的凭证（目录接口要签名，
-    /// 没有账号就拿不到 —— 与源实现「必须登录」的前置条件一致）。
+    /// 刷新模型目录：自动刷新会按地区各用一个可用 Qoder 账号；指定账号时只刷
+    /// 该账号所属地区。目录接口要签名，没有账号就拿不到 —— 与源实现「必须登录」
+    /// 的前置条件一致。
     ///
     /// `force` 一路透传给 `models::refresh`：`false` 走 1 小时 TTL 早退（自动
     /// 路径），`true` 真打上游（用户手动点刷新）。
@@ -298,7 +355,43 @@ impl ProviderAdapter for QoderAdapter {
                 Ok(proxy) => proxy,
                 Err(error) => return ModelRefreshOutcome::failed(error.message),
             };
-            models::refresh(&credentials, proxy.as_ref(), force).await
+            let primary_region = credentials.region;
+            let primary = models::refresh(&credentials, proxy.as_ref(), force).await;
+            if account_id.is_empty() {
+                if let Some((secondary_record, secondary_credentials)) =
+                    find_other_region_account(store, primary_region)
+                {
+                    let secondary_region = secondary_credentials.region;
+                    let secondary = match auth::account_proxy(&secondary_record) {
+                        Ok(secondary_proxy) => {
+                            models::refresh(
+                                &secondary_credentials,
+                                secondary_proxy.as_ref(),
+                                force,
+                            )
+                            .await
+                        }
+                        Err(error) => ModelRefreshOutcome::failed(error.message),
+                    };
+                    logging::log(
+                        "[Models]",
+                        &format!(
+                            "Qoder 分地区目录刷新摘要（{}；{}）",
+                            refresh_outcome_summary(primary_region, &primary),
+                            refresh_outcome_summary(secondary_region, &secondary)
+                        ),
+                    );
+                    return merge_region_outcomes(primary, secondary);
+                }
+                logging::log(
+                    "[Models]",
+                    &format!(
+                        "Qoder 分地区目录刷新摘要（{}；未找到另一地区可用账号）",
+                        refresh_outcome_summary(primary_region, &primary)
+                    ),
+                );
+            }
+            primary
         })
     }
 
@@ -798,4 +891,48 @@ async fn drive_aggregate(
     // 冲刷拆解器的尾巴，再成形（少了这一步，回答末尾会少几个字符）
     translator.finish();
     Ok(translator.completion_body())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{merge_region_outcomes, refresh_outcome_summary};
+    use crate::server::core::providers::adapter::ModelRefreshOutcome;
+    use crate::server::core::providers::qoder::endpoints::Region;
+
+    #[test]
+    fn region_refresh_merge_keeps_a_success_when_the_other_region_fails() {
+        let merged = merge_region_outcomes(
+            ModelRefreshOutcome::refreshed(14),
+            ModelRefreshOutcome::failed("global timeout"),
+        );
+        assert!(merged.refreshed);
+        assert_eq!(merged.count, 14);
+        assert!(merged.message.is_none());
+    }
+
+    #[test]
+    fn region_refresh_merge_reports_failures_when_no_region_refreshes() {
+        let merged = merge_region_outcomes(
+            ModelRefreshOutcome::failed("cn timeout"),
+            ModelRefreshOutcome::failed("global timeout"),
+        );
+        assert!(!merged.refreshed);
+        assert_eq!(merged.count, 0);
+        assert_eq!(
+            merged.message.as_deref(),
+            Some("Qoder 分地区目录刷新失败：cn timeout；global timeout")
+        );
+    }
+
+    #[test]
+    fn refresh_summary_exposes_region_and_cache_state() {
+        assert_eq!(
+            refresh_outcome_summary(Region::Cn, &ModelRefreshOutcome::refreshed(14)),
+            "中国版已更新 14 个"
+        );
+        assert_eq!(
+            refresh_outcome_summary(Region::Global, &ModelRefreshOutcome::unchanged()),
+            "国际版沿用缓存"
+        );
+    }
 }

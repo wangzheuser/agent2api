@@ -479,6 +479,10 @@ impl AutoCheckin {
         let active = number("active");
         let total = number("total");
         let skipped = number("skipped");
+        let available = result
+            .get("available")
+            .and_then(Value::as_u64)
+            .unwrap_or(total.saturating_add(skipped));
         // 失败明细：`名字（错误）`，名字缺失时退到 id，再退到「未知账号」
         let failures: Vec<String> = result
             .get("results")
@@ -540,6 +544,8 @@ impl AutoCheckin {
             "succeeded": succeeded,
             "active": active,
             "total": total,
+            "eligible": total,
+            "available": available,
             "skipped": skipped,
             // 只留前 5 条：面板展示用，避免 config.json 被长列表撑大（Node 同）
             "failed": failures.iter().take(5).cloned().collect::<Vec<_>>(),
@@ -557,12 +563,7 @@ impl AutoCheckin {
         logging::log(
             "[Checkin]",
             &format!(
-                "定时签到完成: {succeeded}/{total} 个账号成功领取{}{}{}",
-                if skipped > 0 {
-                    format!("，跳过 {skipped} 个")
-                } else {
-                    String::new()
-                },
+                "定时签到完成：成功 {succeeded}/{available} 个（实际执行 {total}，跳过 {skipped}）{}{}",
                 if failures.is_empty() {
                     String::new()
                 } else {
@@ -572,7 +573,7 @@ impl AutoCheckin {
                     format!("，活跃保活 {active} 个")
                 } else {
                     String::new()
-                },
+                }
             ),
         );
         summary
@@ -637,17 +638,26 @@ impl AutoCheckin {
         }
         self.schedule();
         let now = Local::now();
-        if state.last_fired_date.as_deref() != Some(local_date_key(now).as_str())
-            && due_now(&state.time, now).is_some()
-        {
+        let today = local_date_key(now);
+        let due = due_now(&state.time, now).is_some();
+        if state.last_fired_date.as_deref() != Some(today.as_str()) && due {
             let service = self.clone();
             crate::spawn_task(async move {
                 service.fire("启动补签").await;
             });
-        } else {
+        } else if state.last_fired_date.as_deref() == Some(today.as_str()) {
             logging::verbose(
                 "[Checkin]",
                 &format!("定时签到已于今日执行，下次 {}", state.time),
+            );
+        } else {
+            logging::verbose(
+                "[Checkin]",
+                &format!(
+                    "定时签到尚未到点（当前 {}，计划 {}），今天到点后执行",
+                    now.format("%H:%M:%S"),
+                    state.time
+                ),
             );
         }
     }

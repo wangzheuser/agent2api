@@ -51,6 +51,7 @@ use crate::server::core::account_store::AccountStore;
 use crate::server::core::auth_http::ApiResponse;
 use crate::server::core::proxies::ResolvedProxy;
 use crate::server::errors::GatewayError;
+use crate::server::logging;
 
 use super::credentials::Credentials;
 use super::endpoints::Region;
@@ -86,6 +87,11 @@ pub async fn claim_daily_checkin(
     let mut credentials = refresh::ensure_fresh(store, account_id, false).await?;
     let (record, _) = refresh::snapshot(store, account_id)?;
     let region = credentials.region;
+    let display = record
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(account_id);
     let proxy = auth::account_proxy(&record)?;
 
     let mut response = fetch_campaigns(&credentials, proxy.as_ref()).await?;
@@ -117,8 +123,32 @@ pub async fn claim_daily_checkin(
         }
     }
 
+    logging::log(
+        "[Checkin]",
+        &format!(
+            "Qoder 签到检查（账号={}，地区={}，活动数={}，可领取={}，已领取={}）",
+            display,
+            region.label(),
+            rows.len(),
+            claimable.is_some(),
+            claimed
+        ),
+    );
+
     let Some(target) = claimable else {
-        return Ok(no_claim(region, claimed));
+        let result = no_claim(region, claimed);
+        let status = if claimed { "already_claimed" } else { "no_claimable" };
+        logging::log(
+            "[Checkin]",
+            &format!(
+                "Qoder 签到结果（账号={}，地区={}，状态={}，说明={}）",
+                display,
+                region.label(),
+                status,
+                result.get("msg").and_then(Value::as_str).unwrap_or("未知")
+            ),
+        );
+        return Ok(result);
     };
     let campaign_id = target
         .get("campaignId")
@@ -143,6 +173,14 @@ pub async fn claim_daily_checkin(
     if !claim.ok
         && (claim.status == 409 || result_of(&claim).as_deref() == Some(RESULT_ALREADY_CLAIMED))
     {
+        logging::log(
+            "[Checkin]",
+            &format!(
+                "Qoder 签到结果（账号={}，地区={}，状态=already_claimed，说明=今日已领取）",
+                display,
+                region.label()
+            ),
+        );
         return Ok(json!({
             "success": false,
             "alreadyCompleted": true,
@@ -161,6 +199,15 @@ pub async fn claim_daily_checkin(
             .get("status")
             .and_then(Value::as_str)
             .unwrap_or("未知");
+        logging::log(
+            "[Checkin]",
+            &format!(
+                "Qoder 签到结果（账号={}，地区={}，状态=claim_not_completed，上游状态={}）",
+                display,
+                region.label(),
+                status
+            ),
+        );
         return Ok(json!({ "success": false, "msg": format!("签到未完成（上游状态 {status}）") }));
     }
     if claim_body
@@ -168,6 +215,14 @@ pub async fn claim_daily_checkin(
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
+        logging::log(
+            "[Checkin]",
+            &format!(
+                "Qoder 签到结果（账号={}，地区={}，状态=already_claimed，说明=今日已领取）",
+                display,
+                region.label()
+            ),
+        );
         return Ok(json!({
             "success": false,
             "alreadyCompleted": true,
@@ -180,6 +235,14 @@ pub async fn claim_daily_checkin(
     let confirmed = fetch_campaigns(&credentials, proxy.as_ref()).await?;
     let confirmed = auth::payload(confirmed, "签到领取确认")?;
     if !campaign_status(nested_data(&confirmed), campaign_id, STATUS_CLAIMED) {
+        logging::log(
+            "[Checkin]",
+            &format!(
+                "Qoder 签到结果（账号={}，地区={}，状态=claim_unconfirmed，说明=领取后状态未确认）",
+                display,
+                region.label()
+            ),
+        );
         return Ok(json!({
             "success": false,
             "msg": "签到未完成（领取后状态未确认）",
@@ -202,6 +265,16 @@ pub async fn claim_daily_checkin(
         Some(days) if days > 0.0 => format!("获得 {reward} credits，{days} 天有效"),
         _ => format!("获得 {reward} credits"),
     };
+    logging::log(
+        "[Checkin]",
+        &format!(
+            "Qoder 签到结果（账号={}，地区={}，状态=claimed_confirmed，奖励={} credits，valid_days={}）",
+            display,
+            region.label(),
+            reward,
+            valid_days.map(|days| days.to_string()).unwrap_or_else(|| "unknown".to_string())
+        ),
+    );
     Ok(json!({
         "success": true,
         "msg": msg,

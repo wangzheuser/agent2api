@@ -336,7 +336,10 @@ fn claim_result(
             json!({ "id": id, "name": name, "claim": claim, "error": Value::Null })
         }
         Err(message) => {
-            logging::verbose("[Accounts]", &format!("账号 {id} 签到失败: {message}"));
+            logging::log(
+                "[Accounts]",
+                &format!("账号 {display}: 签到失败（{message}）"),
+            );
             json!({
                 "id": id,
                 "name": name,
@@ -427,24 +430,31 @@ pub async fn run_checkin(
                 .unwrap_or(false)
         })
         .count();
+    let eligible = results.len();
+    let available = eligible + skipped;
     if skipped > 0 {
         logging::log(
             "[Accounts]",
-            &format!("已跳过 {skipped} 个账号（不支持签到/活跃任务或不在签到范围内）"),
+            &format!(
+                "签到目标解析：可用 {available} 个，可执行 {eligible} 个，跳过 {skipped} 个（不支持签到/活跃任务或不在签到范围内）"
+            ),
         );
     }
     logging::log(
         "[Accounts]",
         &format!(
-            "签到完成: {succeeded}/{} 个账号成功领取，{active} 个账号完成活跃保活有效对话（日活奖励尚未确认）",
-            results.len()
+            "签到完成：成功 {succeeded}/{available} 个（实际执行 {eligible}，跳过 {skipped}），{active} 个账号完成活跃保活有效对话（日活奖励尚未确认）"
         ),
     );
     Ok(json!({
         "results": results,
         "succeeded": succeeded,
         "active": active,
-        "total": results.len(),
+        // `total` 保持原有语义：实际执行的账号数；新增 `available` 让面板和
+        // 日志可以准确解释「成功/总数」与「跳过」的关系。
+        "total": eligible,
+        "eligible": eligible,
+        "available": available,
         "skipped": skipped,
     }))
 }

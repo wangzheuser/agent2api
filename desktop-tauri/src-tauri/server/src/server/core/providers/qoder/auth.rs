@@ -22,10 +22,19 @@ pub async fn request(
     send_raw(method, url, body, headers, proxy, Some(REQUEST_TIMEOUT_MS))
         .await
         .map_err(|error| {
+            let detail = crate::server::core::egress::describe_error_detail(&error);
             if error.is_timeout() {
-                GatewayError::with_status(504, "Qoder 请求超时，请检查网络后重试").with_code("qoder_transport")
+                GatewayError::with_status(
+                    504,
+                    format!("Qoder 请求超时，请检查网络后重试（{detail}）"),
+                )
+                .with_code("qoder_transport")
             } else {
-                GatewayError::with_status(502, "无法连接 Qoder，请检查网络或账号代理设置").with_code("qoder_transport")
+                GatewayError::with_status(
+                    502,
+                    format!("无法连接 Qoder，请检查网络或账号代理设置（{detail}）"),
+                )
+                .with_code("qoder_transport")
             }
         })
 }
