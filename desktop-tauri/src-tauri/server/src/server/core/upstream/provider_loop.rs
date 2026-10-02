@@ -115,13 +115,11 @@ struct OutboundFailure {
 /// 已通过 HTTP 状态与提供商首包业务判定的响应。
 ///
 /// `reqwest::Response` 一旦预读了首段就不能把已消费的字节放回去，因此统一把
-/// 头部元数据和可继续消费的字节流交给下游。首包失败在构造这个结构之前返回，
+/// 状态码和可继续消费的字节流交给下游。首包失败在构造这个结构之前返回，
 /// 所以不会有任何下游字节已经发出。
 struct PreparedResponse {
     status: u16,
-    headers: reqwest::header::HeaderMap,
     stream: futures::stream::BoxStream<'static, Result<Bytes, std::io::Error>>,
-    response_attached: bool,
 }
 
 /// **原地重发**的退避预算（见 `send_with_retry` 的说明）。
@@ -904,7 +902,7 @@ async fn attempt_queue(
                 adapter,
                 &transport,
                 &mut budget,
-                capture.as_deref(),
+                capture.as_ref(),
                 ctx.telemetry,
                 degraded,
                 adapter.request_is_single_use(&session),
@@ -1265,15 +1263,6 @@ async fn attempt_queue(
             ),
         );
 
-        // ── 调试模式：响应头到手（必须在 consume response 之前）──────────
-        // 状态码与响应头在这里定稿；响应体由后续的流 / 聚合函数逐段补进同一个
-        // 采集器（见 `ForwardStream` / `aggregate_sse_completion`）。
-        if let Some(capture) = ctx.telemetry.capture() {
-            if !response.response_attached {
-                capture.attach_response(response.status, &response.headers);
-            }
-        }
-
         // ── 上游响应协议（适配器在构造请求时一并给出）──────────────────
         // 绝大多数上游说 chat SSE（`ForwardStream` / 聚合器的默认输入）；
         // ZCode 的活动套餐通道说 Anthropic，先过一层翻译折成 chat 帧
@@ -1291,7 +1280,6 @@ async fn attempt_queue(
             > = Box::pin(super::translate::AnthropicToChatStream::from_stream(
                 response.stream,
                 &wire_model,
-                ctx.telemetry,
             ));
             if ctx.stream {
                 return Ok(ForwardOutcome::Stream {
@@ -1855,18 +1843,15 @@ fn gateway_error_from_class(class: &UpstreamErrorClass) -> GatewayError {
 async fn prepare_success_response(
     mut response: reqwest::Response,
     adapter: &dyn ProviderAdapter,
-    capture: Option<&crate::server::core::debug_traffic::TrafficCapture>,
+    capture: Option<&std::sync::Arc<crate::server::core::debug_traffic::TrafficCapture>>,
 ) -> Result<PreparedResponse, OutboundFailure> {
     let status = response.status().as_u16();
     let headers = response.headers().clone();
     let mut prefix = Vec::<Bytes>::new();
     let mut head = Vec::<u8>::new();
     let needs_head = matches!(adapter.inspect_success_head(&[]), SuccessHead::Pending);
-    let response_attached = needs_head && capture.is_some();
-    if response_attached {
-        if let Some(capture) = capture {
-            capture.attach_response(status, &headers);
-        }
+    if let Some(capture) = capture {
+        capture.attach_response(status, &headers);
     }
 
     if needs_head {
@@ -1917,12 +1902,11 @@ async fn prepare_success_response(
             std::io::Error::other(crate::server::core::egress::describe_error_detail(&error))
         })
     });
+    let rest = super::capture_stream(Box::pin(rest), capture.cloned());
     let stream = futures::stream::iter(prefix.into_iter().map(Ok)).chain(rest);
     Ok(PreparedResponse {
         status,
-        headers,
         stream: Box::pin(stream),
-        response_attached,
     })
 }
 
@@ -1957,7 +1941,7 @@ async fn send_with_retry(
     adapter: &dyn ProviderAdapter,
     transport: &TransportRequest,
     budget: &mut RetryBudget,
-    capture: Option<&crate::server::core::debug_traffic::TrafficCapture>,
+    capture: Option<&std::sync::Arc<crate::server::core::debug_traffic::TrafficCapture>>,
     telemetry: &crate::server::core::upstream::usage::RequestTelemetry,
     degraded: bool,
     single_use: bool,
@@ -2019,7 +2003,7 @@ async fn send_with_retry(
         // 分类仍按状态码走（classify_error 只看 status 也能给出结论）。
         let detail = {
             let budget = Duration::from_millis(config::timeout_settings().body_ms());
-            match tokio::time::timeout(budget, read_upstream_error(response, capture)).await {
+            match tokio::time::timeout(budget, read_upstream_error(response, capture.map(|value| value.as_ref()))).await {
                 Ok(detail) => detail,
                 Err(_elapsed) => super::request::UpstreamErrorDetail {
                     code: None,
@@ -2092,6 +2076,76 @@ mod single_use_tests {
     use futures::TryStreamExt;
     use std::sync::{Arc, Mutex};
     use axum::{routing::post, Router, Json, extract::State, http::HeaderMap};
+
+    #[tokio::test]
+    async fn cache_creation_raw_capture_is_exact_for_prefetched_and_translated_streams() {
+        use crate::server::core::{debug_traffic::TrafficCapture, upstream::{
+            aggregate::aggregate_frame_stream, connections::{ConnectionGuard, Connections},
+            translate::AnthropicToChatStream, usage::RequestTelemetry, ForwardStream,
+        }};
+        let native = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"sample\",\"usage\":{\"input_tokens\":50,\"cache_read_input_tokens\":20,\"cache_creation_input_tokens\":30}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"样例\"}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let chat = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"样例\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":7,\"prompt_tokens_details\":{\"cached_tokens\":20},\"cache_creation_input_tokens\":30}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        for is_native in [false, true] {
+            for streaming in [false, true] {
+                let body = if is_native { native } else { chat };
+                let split = body.find("\n\n").unwrap() + 2;
+                let app = Router::new().route("/", post(move || async move {
+                    let first = futures::stream::once(async move {
+                        Ok::<_, std::io::Error>(Bytes::from_static(&body.as_bytes()[..split]))
+                    });
+                    let rest = futures::stream::once(async move {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        Ok::<_, std::io::Error>(Bytes::from_static(&body.as_bytes()[split..]))
+                    });
+                    axum::body::Body::from_stream(first.chain(rest))
+                }));
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+                let transport = TransportRequest {
+                    url: format!("http://{address}/"), headers: Vec::new(), payload: "{}".into(), proxy: None,
+                };
+                let telemetry = Arc::new(RequestTelemetry::new());
+                let capture = Arc::new(TrafficCapture::begin("sample"));
+                telemetry.set_capture(capture.clone());
+                let adapter = &crate::server::core::providers::zcode::adapter::ZCODE_ADAPTER;
+                let mut budget = RetryBudget::new(0);
+                let response = send_with_retry(adapter, &transport, &mut budget, Some(&capture), &telemetry, false, false)
+                    .await.ok().expect("本地 SSE 应通过首包检查");
+                let input = if is_native {
+                    Box::pin(AnthropicToChatStream::from_stream(response.stream, "sample")) as futures::stream::BoxStream<_>
+                } else { response.stream };
+                if streaming {
+                    let connection = ConnectionGuard::new(Connections::new());
+                    let stream = if is_native {
+                        ForwardStream::from_translated(input, None, connection, telemetry.clone(), None)
+                    } else {
+                        ForwardStream::from_stream(input, None, connection, telemetry.clone(), None)
+                    };
+                    let chunks = stream.try_collect::<Vec<_>>().await.unwrap();
+                    let output = chunks.iter().flat_map(|chunk| chunk.iter().copied()).collect::<Vec<_>>();
+                    assert!(String::from_utf8_lossy(&output).contains("样例"));
+                    assert!(output.ends_with(b"data: [DONE]\n\n"));
+                } else {
+                    let result = aggregate_frame_stream(input, telemetry.clone(), None).await.unwrap();
+                    assert_eq!(result.body["choices"][0]["message"]["content"], "样例");
+                    assert_eq!(result.body["usage"]["cache_creation_input_tokens"], 30);
+                }
+                assert_eq!(capture.captured_body(), body.as_bytes(), "native={is_native} streaming={streaming}");
+                assert_eq!(telemetry.snapshot().cache_creation_tokens, Some(30));
+                server.abort();
+            }
+        }
+    }
 
     #[tokio::test]
     async fn one_time_proof_retries_return_for_rebuild_while_normal_requests_reuse_transport() {

@@ -581,6 +581,7 @@ pub fn record_entry(context: &RecordContext, fallback_error: Option<String>) {
     entry.completion_tokens = snapshot.completion_tokens;
     entry.total_tokens = snapshot.total_tokens;
     entry.cache_read_tokens = snapshot.cache_read_tokens;
+    entry.cache_creation_tokens = snapshot.cache_creation_tokens;
     context.stats.record(entry);
     // 原始正文落库（request_raw 表）：与明细同 id、同开始时刻。独立于 record
     // 的一次写入（大字段不进记账热路径，理由见 `RequestStats::store_raw`）；
@@ -595,7 +596,8 @@ pub fn record_entry(context: &RecordContext, fallback_error: Option<String>) {
     logging::verbose(
         "[Stats]",
         &format!(
-            "记一条请求: model={} status={} {duration_ms}ms 首响={} attempts={attempts} tokens={}+{}（缓存 {}）",
+            "记一条请求: id={} model={} status={} {duration_ms}ms 首响={} attempts={attempts} 输入(含缓存)={} 输出={} 总计={} 缓存读取={} 缓存创建={}（仅记录上游用量）",
+            snapshot.id,
             if context.model.is_empty() { "(未指定)" } else { &context.model },
             context.status,
             first_response_ms
@@ -603,7 +605,9 @@ pub fn record_entry(context: &RecordContext, fallback_error: Option<String>) {
                 .unwrap_or_else(|| "-".to_string()),
             snapshot.prompt_tokens,
             snapshot.completion_tokens,
+            snapshot.total_tokens,
             snapshot.cache_read_tokens,
+            snapshot.cache_creation_tokens.map(|value| value.to_string()).unwrap_or_else(|| "未上报".to_string()),
         ),
     );
 }

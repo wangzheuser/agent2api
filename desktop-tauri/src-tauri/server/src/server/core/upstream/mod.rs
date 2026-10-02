@@ -56,6 +56,18 @@ pub mod stall;
 pub mod translate;
 pub mod usage;
 
+/// 仅在原始响应入口采集；预读前缀已采集过，重放和协议转换不再追加。
+pub(super) fn capture_stream(
+    stream: futures::stream::BoxStream<'static, Result<bytes::Bytes, std::io::Error>>,
+    capture: Option<std::sync::Arc<crate::server::core::debug_traffic::TrafficCapture>>,
+) -> futures::stream::BoxStream<'static, Result<bytes::Bytes, std::io::Error>> {
+    use futures::StreamExt;
+    let Some(capture) = capture else { return stream; };
+    stream.inspect(move |item| {
+        if let Ok(bytes) = item { capture.push(bytes); }
+    }).boxed()
+}
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -461,12 +473,6 @@ pub struct ForwardStream {
     _connection: ConnectionGuard,
     /// usage / 尝试次数的旁路槽：与合并器共用同一份（见 `ForwardStream::new`）
     telemetry: Arc<usage::RequestTelemetry>,
-    /// 调试模式的采集器（构造时取一次，None = 未开启调试模式）。
-    ///
-    /// 在这里缓存而不是每个分片现取（`telemetry.capture()`）：采集发生在
-    /// **每个上游 chunk** 上，每次都加锁取一遍是纯浪费；而一条请求的采集器
-    /// 在转发开始时就装好了，中途不会变。
-    capture: Option<Arc<crate::server::core::debug_traffic::TrafficCapture>>,
 }
 
 impl ForwardStream {
@@ -489,10 +495,11 @@ impl ForwardStream {
         });
         // 流式响应空闲超时（设置页「请求超时」第三项）：逐分片计时，
         // 收到新数据即重置；计时器在流启动时就武装（见 stall 的模块头）
-        Self::from_stream(Box::pin(inner), slot, connection, telemetry, model_rewrite)
+        let inner = capture_stream(Box::pin(inner), telemetry.capture());
+        Self::from_stream(inner, slot, connection, telemetry, model_rewrite)
     }
 
-    /// 构造已从 `reqwest::Response` 预读过首段的字节流。
+    /// 构造已在原始入口采集、可能预读过首段的字节流。
     pub(super) fn from_stream(
         inner: futures::stream::BoxStream<'static, Result<Bytes, std::io::Error>>,
         slot: Option<InFlightGuard>,
@@ -536,8 +543,6 @@ impl ForwardStream {
         // 于是本流的 `poll_next` 拿不到 `Ready(None)` —— 客户端收全帧后
         // 连接不关闭、一直等在那里（详见 `cancellable` 的说明）。
         let inner = cancellation::cancellable(inner, telemetry.cancel_token());
-        // 采集器在构造时取一次（见字段说明）
-        let capture = telemetry.capture();
         Self {
             inner,
             coalescer: ReasoningCoalescer::with_telemetry(telemetry.clone())
@@ -547,7 +552,6 @@ impl ForwardStream {
             _slot: slot,
             _connection: connection,
             telemetry,
-            capture,
         }
     }
 }
@@ -576,12 +580,6 @@ impl Stream for ForwardStream {
                     }
                 }
                 std::task::Poll::Ready(Some(Ok(bytes))) => {
-                    // 调试模式：把**上游原始字节**旁路给采集器 —— 在合并器
-                    // 之前，因为用户要看的是上游原样吐出来的东西，而不是
-                    // 我们改写 / 合并后的帧（那正是「上游到底发了什么」要回答的）
-                    if let Some(capture) = &self.capture {
-                        capture.push(&bytes);
-                    }
                     for frame in self.coalescer.push(&bytes[..]) {
                         self.pending.push_back(frame);
                     }

@@ -91,6 +91,7 @@ pub struct ReasoningCoalescer {
     /// 避免重复下发完整 usage。
     usage_has_prompt: bool,
     usage_has_cache: bool,
+    usage_cache_creation: Option<i64>,
     usage_has_output: bool,
     done_seen: bool,
 }
@@ -111,6 +112,7 @@ impl ReasoningCoalescer {
             rewrite: None,
             usage_has_prompt: false,
             usage_has_cache: false,
+            usage_cache_creation: None,
             usage_has_output: false,
             done_seen: false,
         }
@@ -209,6 +211,9 @@ impl ReasoningCoalescer {
             if let Some(tokens) = chunk.get("usage").and_then(extract_usage) {
                 self.usage_has_prompt |= tokens.prompt > 0;
                 self.usage_has_cache |= tokens.cache_read > 0;
+                if tokens.cache_creation.is_some() {
+                    self.usage_cache_creation = tokens.cache_creation;
+                }
                 self.usage_has_output |= tokens.completion > 0;
             }
             // 元数据取上游最近一帧的有效值（Node: `if (chunkObj.id) meta.id = ...`）
@@ -322,6 +327,7 @@ impl ReasoningCoalescer {
             .get("completion_tokens")
             .and_then(Value::as_i64)
             .is_some_and(|value| value > 0);
+        let creation = usage.get("cache_creation_input_tokens").and_then(Value::as_i64);
         let total = usage
             .get("total_tokens")
             .and_then(Value::as_i64)
@@ -330,11 +336,12 @@ impl ReasoningCoalescer {
             .get("completion_tokens")
             .and_then(Value::as_i64)
             .unwrap_or(0);
-        if !has_prompt && !has_cache && total <= 0 && output <= 0 {
+        if !has_prompt && !has_cache && creation.is_none() && total <= 0 && output <= 0 {
             return None;
         }
         if (!has_prompt || !self.usage_has_prompt)
             || (has_cache && !self.usage_has_cache)
+            || (creation.is_some() && creation != self.usage_cache_creation)
             || (has_output && !self.usage_has_output)
         {
             // 有旁路字段且上游缺任一真实字段时补帧。
@@ -445,6 +452,25 @@ fn is_truthy(value: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_creation_from_telemetry_is_sent_before_done_including_zero_updates() {
+        for (initial, final_value) in [(None, 0), (Some(0), 30), (Some(30), 0)] {
+            let telemetry = Arc::new(RequestTelemetry::new());
+            let mut coalescer = ReasoningCoalescer::with_telemetry(telemetry.clone());
+            let mut usage = json!({"prompt_tokens": 100, "completion_tokens": 7});
+            if let Some(value) = initial { usage["cache_creation_input_tokens"] = json!(value); }
+            coalescer.push(&frame(json!({"choices": [], "usage": usage})));
+            telemetry.report_usage(&json!({"prompt_tokens": 100, "cache_creation_input_tokens": final_value}));
+            let frames = coalescer.push(b"data: [DONE]\n\n");
+            assert_eq!(frames.len(), 2);
+            let text = std::str::from_utf8(&frames[0]).unwrap();
+            let value: Value = serde_json::from_str(text.trim().strip_prefix("data: ").unwrap()).unwrap();
+            assert_eq!(value["usage"]["cache_creation_input_tokens"], final_value);
+            assert_eq!(frames[1].as_ref(), b"data: [DONE]\n\n");
+            assert!(coalescer.finish().is_empty());
+        }
+    }
 
     fn frame(value: Value) -> Vec<u8> {
         format!("data: {}\n\n", serde_json::to_string(&value).unwrap()).into_bytes()

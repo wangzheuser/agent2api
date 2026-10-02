@@ -606,27 +606,18 @@ pub fn usage_to_anthropic(usage: Option<&Value>) -> Value {
                 &["cache_read_input_tokens", "cache_read_tokens", "prompt_cache_hit_tokens"],
             )
         });
-    let cache_creation = usage
-        .pointer("/prompt_tokens_details/cache_creation_tokens")
-        .map(number)
-        .filter(|value| *value > 0)
-        .unwrap_or_else(|| {
-            json_number_of(
-                usage,
-                &["cache_creation_input_tokens", "cache_creation_tokens"],
-            )
-        });
+    let cache_creation = crate::server::core::upstream::usage::cache_creation_tokens(usage);
     let input = json_number_of(usage, &["prompt_tokens", "input_tokens"]);
     let mut out = json!({
         // Anthropic 的 input_tokens 不含缓存读取和创建部分。
-        "input_tokens": (input - cached - cache_creation).max(0),
+        "input_tokens": (input - cached - cache_creation.unwrap_or(0)).max(0),
         "output_tokens": json_number_of(usage, &["completion_tokens", "output_tokens"]),
     });
     if cached > 0 {
         out["cache_read_input_tokens"] = Value::from(cached);
     }
-    if cache_creation > 0 {
-        out["cache_creation_input_tokens"] = Value::from(cache_creation);
+    if let Some(creation) = cache_creation {
+        out["cache_creation_input_tokens"] = Value::from(creation);
     }
     out
 }
@@ -634,7 +625,7 @@ pub fn usage_to_anthropic(usage: Option<&Value>) -> Value {
 // ─── 流式：Chat SSE → Anthropic SSE ─────────────────────────
 
 /// 在末帧 usage 到达前暂存的最大下行字节数。超过上限后恢复正常实时下发；
-/// 这种极端情况下 message_delta 仍会带最终 input/cache，避免无界缓存。
+/// 此时 message_start 仅能使用已有用量证据，避免无界缓存。
 const MAX_DEFERRED_BYTES: usize = 1024 * 1024;
 
 /// Chat 的 SSE 字节流 → Anthropic 的 SSE 字节流（状态机）。
@@ -1241,6 +1232,51 @@ pub fn responses_error_code(status: u16) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_creation_stream_usage_is_independent_of_network_splits() {
+        use crate::server::core::upstream::sse::ReasoningCoalescer;
+        for creation in [None, Some(0), Some(30)] {
+            let mut usage = json!({"prompt_tokens": 100, "completion_tokens": 7,
+                "prompt_tokens_details": {"cached_tokens": 20}});
+            if let Some(value) = creation {
+                usage["cache_creation_input_tokens"] = json!(value);
+            }
+            let mut input = chat_frame(json!({"choices": [{"delta": {"content": "样例"}}]}));
+            input.extend(chat_frame(json!({"choices": [], "usage": usage})));
+            input.extend_from_slice(b"data: [DONE]\n\n");
+            for split in 0..=input.len() {
+                let telemetry = Arc::new(RequestTelemetry::new());
+                let mut upstream = ReasoningCoalescer::with_telemetry(telemetry.clone());
+                let mut downstream = AnthropicStream::new("sample");
+                downstream.set_telemetry(telemetry);
+                let mut frames = Vec::new();
+                for part in [&input[..split], &input[split..]] {
+                    for frame in upstream.push(part) {
+                        frames.extend(downstream.push(&frame));
+                    }
+                }
+                for frame in upstream.finish() {
+                    frames.extend(downstream.push(&frame));
+                }
+                frames.extend(downstream.finish());
+                let events = event_values(&frames);
+                let start = events.iter().find(|event| event["type"] == "message_start").unwrap();
+                let actual = &start["message"]["usage"];
+                assert_eq!(actual["input_tokens"], 80 - creation.unwrap_or(0), "split={split}");
+                assert_eq!(actual["cache_read_input_tokens"], 20);
+                assert_eq!(actual.get("cache_creation_input_tokens").and_then(Value::as_i64), creation, "split={split}");
+                assert_eq!(events.iter().filter(|e| e["type"] == "message_stop").count(), 1);
+                let delta = events.iter().find(|e| e["type"] == "message_delta").unwrap();
+                assert_eq!(delta["usage"], json!({"output_tokens": 7}));
+            }
+            let mut collector = AnthropicCollector::new();
+            collector.push(&input);
+            collector.finish();
+            let response = collector.into_response("sample");
+            assert_eq!(response["usage"], usage_to_anthropic(Some(&usage)));
+        }
+    }
 
     fn chat_frame(value: Value) -> Vec<u8> {
         format!("data: {}\n\n", serde_json::to_string(&value).unwrap()).into_bytes()

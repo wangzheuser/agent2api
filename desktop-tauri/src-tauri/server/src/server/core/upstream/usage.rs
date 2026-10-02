@@ -30,13 +30,14 @@ use serde_json::{json, Value};
 
 use crate::server::logging;
 
-/// 一次上报的用量（四种 token 计数，字段名对应存储契约）
+/// 一次上报的用量（字段名对应存储契约）。创建量缺失与显式 0 分开保存。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct UsageTokens {
     pub prompt: i64,
     pub completion: i64,
     pub total: i64,
     pub cache_read: i64,
+    pub cache_creation: Option<i64>,
     pub prompt_present: bool,
     pub completion_present: bool,
     pub total_present: bool,
@@ -69,6 +70,7 @@ pub fn extract_usage(usage: &Value) -> Option<UsageTokens> {
         .flatten()
         .find(|value| *value > 0);
     let cache_field_present = cache_candidates.iter().any(Option::is_some);
+    let cache_creation = cache_creation_tokens(usage);
     // Trae 的 token_usage 事件会以 {"usage": {...}} 挂到下一帧，且部分
     // provider 会发送只有扩展明细的 usage 对象。递归拆一层嵌套，并拒绝
     // 没有任何统一 token 计数的对象，避免把旁路快照覆盖成全 0。
@@ -76,6 +78,7 @@ pub fn extract_usage(usage: &Value) -> Option<UsageTokens> {
         && completion_field.is_none()
         && total_field.is_none()
         && !cache_field.is_some_and(|value| value > 0)
+        && cache_creation.is_none()
     {
         return object.get("usage").and_then(extract_usage);
     }
@@ -88,11 +91,23 @@ pub fn extract_usage(usage: &Value) -> Option<UsageTokens> {
         completion,
         total,
         cache_read,
+        cache_creation,
         prompt_present: prompt_field.is_some(),
         completion_present: completion_field.is_some(),
         total_present: total_field.is_some(),
         cache_read_present: cache_field_present,
     })
+}
+
+/// 已知的缓存创建字段别名；只接受上游数值，不以未缓存输入估算。
+pub fn cache_creation_tokens(usage: &Value) -> Option<i64> {
+    let candidates = [
+        number_field(usage.pointer("/prompt_tokens_details/cache_creation_tokens")),
+        number_field(usage.get("cache_creation_input_tokens")),
+        number_field(usage.get("cache_creation_tokens")),
+    ];
+    candidates.iter().copied().flatten().find(|value| *value > 0)
+        .or_else(|| candidates.into_iter().flatten().find(|value| *value == 0))
 }
 
 /// 把请求旁路快照折回标准 Chat usage，供协议响应层在上游 usage 帧已经被
@@ -108,7 +123,8 @@ pub fn usage_value(snapshot: &TelemetrySnapshot) -> Option<Value> {
     let completion_present = snapshot.completion_tokens > 0;
     let total_present = snapshot.total_tokens > 0;
     let cache_read_present = snapshot.cache_read_tokens > 0;
-    let has_input_evidence = prompt_present || cache_read_present;
+    let has_input_evidence = prompt_present || cache_read_present
+        || snapshot.cache_creation_tokens.is_some_and(|value| value > 0);
     if !has_input_evidence {
         return None;
     }
@@ -129,13 +145,15 @@ pub fn usage_value(snapshot: &TelemetrySnapshot) -> Option<Value> {
             "cached_tokens": snapshot.cache_read_tokens,
         });
     }
+    if let Some(creation) = snapshot.cache_creation_tokens {
+        usage["cache_creation_input_tokens"] = Value::from(creation);
+    }
     Some(usage)
 }
 
 /// 用内部真实统计补齐协议转换器已有的 usage，同时保留上游提供的扩展明细。
 ///
-/// telemetry 只保存统一的 prompt/completion/total/cache-read 四项，直接覆盖
-/// 上游 usage 会丢失 reasoning 或 cache-creation 等协议专属字段，因此这里只
+/// telemetry 只保存统一计数，直接覆盖上游 usage 会丢失 reasoning 等明细，因此这里只
 /// 覆盖统一计数，嵌套明细按字段合并。
 pub fn merge_usage(existing: Option<&Value>, authoritative: &Value) -> Value {
     let mut merged = existing
@@ -158,6 +176,17 @@ pub fn merge_usage(existing: Option<&Value>, authoritative: &Value) -> Value {
             merged_object.insert(key.clone(), value.clone());
         }
     }
+    if let Some(creation) = cache_creation_tokens(authoritative) {
+        // 不同帧可能使用不同别名；同步已有别名，防止旧的正数盖过新报告的 0。
+        merged_object.insert("cache_creation_input_tokens".to_string(), Value::from(creation));
+        if let Some(value) = merged_object.get_mut("cache_creation_tokens") {
+            *value = Value::from(creation);
+        }
+        if let Some(value) = merged_object.get_mut("prompt_tokens_details")
+            .and_then(|details| details.get_mut("cache_creation_tokens")) {
+            *value = Value::from(creation);
+        }
+    }
     merged
 }
 
@@ -173,6 +202,46 @@ fn number_field(value: Option<&Value>) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_creation_telemetry_preserves_reported_zero_and_missing() {
+        for creation in [None, Some(0), Some(30)] {
+            let telemetry = RequestTelemetry::new();
+            let mut usage = json!({"prompt_tokens": 100, "completion_tokens": 7});
+            if let Some(value) = creation {
+                usage["cache_creation_input_tokens"] = json!(value);
+            }
+            telemetry.report_usage(&usage);
+            telemetry.report_usage(&json!({"completion_tokens": 8}));
+            let restored = usage_value(&telemetry.snapshot()).unwrap();
+            assert_eq!(restored.get("cache_creation_input_tokens").and_then(Value::as_i64), creation);
+        }
+    }
+
+    #[test]
+    fn cache_creation_aliases_partial_frames_and_zero_placeholders() {
+        for field in [
+            json!({"prompt_tokens_details": {"cache_creation_tokens": 30}}),
+            json!({"cache_creation_input_tokens": 30}),
+            json!({"cache_creation_tokens": 30}),
+            json!({"usage": {"cache_creation_input_tokens": 30}}),
+        ] {
+            let telemetry = RequestTelemetry::new();
+            telemetry.report_usage(&json!({"prompt_tokens": 100}));
+            telemetry.report_usage(&field);
+            telemetry.report_usage(&json!({"prompt_tokens": 0, "completion_tokens": 0, "cache_creation_input_tokens": 0}));
+            assert_eq!(telemetry.snapshot().cache_creation_tokens, Some(30));
+            telemetry.report_usage(&json!({"prompt_tokens": 90, "cache_creation_input_tokens": 0}));
+            assert_eq!(telemetry.snapshot().cache_creation_tokens, Some(0));
+        }
+        for invalid in [serde_json::Value::Null, json!(-1), json!("30")] {
+            assert_eq!(cache_creation_tokens(&json!({"cache_creation_input_tokens": invalid})), None);
+        }
+        let previous = json!({"prompt_tokens_details": {"cache_creation_tokens": 30, "cached_tokens": 20}});
+        let merged = merge_usage(Some(&previous), &json!({"cache_creation_input_tokens": 0}));
+        assert_eq!(cache_creation_tokens(&merged), Some(0));
+        assert_eq!(merged["prompt_tokens_details"]["cached_tokens"], 20);
+    }
 
     #[test]
     fn usage_value_preserves_prompt_completion_and_cache() {
@@ -251,6 +320,7 @@ mod tests {
                 completion: 237,
                 total: 183_521,
                 cache_read: 183_040,
+                cache_creation: None,
                 prompt_present: true,
                 completion_present: true,
                 total_present: true,
@@ -534,6 +604,8 @@ pub struct TelemetrySnapshot {
     pub completion_tokens: i64,
     pub total_tokens: i64,
     pub cache_read_tokens: i64,
+    /// None = 上游未报告，Some(0) = 上游明确报告为零。
+    pub cache_creation_tokens: Option<i64>,
     pub prompt_tokens_present: bool,
     pub completion_tokens_present: bool,
     pub total_tokens_present: bool,
@@ -864,9 +936,8 @@ pub struct RequestTelemetry {
     inner: Mutex<TelemetrySnapshot>,
     /// 调试模式的原始报文采集器（`core::debug_traffic`；None = 未开启调试模式）。
     ///
-    /// 挂在这里而不是层层传参：流式路径的采集发生在 `ForwardStream::poll_next`
-    /// （handler 早已返回），非流式发生在聚合函数里，两者手上都只有 telemetry
-    /// —— 转发层在**即将发送前**把它装进来，两条路径各自从同一个槽位取。
+    /// 挂在这里供原始响应入口取用；协议转换与聚合层不重复采集。
+    /// 转发层在即将发送前装入，原始字节流持有 Arc 直到消费结束或取消。
     ///
     /// 独立一把锁（不与 `inner` 共用）：采集器的读写都在转发热路径上，
     /// 与「记账字段」的锁分开可以避免两处互不相关的写互相等待。
@@ -1298,6 +1369,7 @@ impl RequestTelemetry {
             && !tokens.completion_present
             && !tokens.total_present
             && !tokens.cache_read_present
+            && tokens.cache_creation.is_none()
         {
             return;
         }
@@ -1341,6 +1413,12 @@ impl RequestTelemetry {
         {
             guard.cache_read_tokens = tokens.cache_read;
             guard.cache_read_tokens_present = true;
+        }
+        if let Some(creation) = tokens.cache_creation {
+            // 与读取计数同口径：完整统计可覆盖，零占位帧不抹掉真实创建量。
+            if creation > 0 || tokens.prompt > 0 || guard.cache_creation_tokens.unwrap_or(0) == 0 {
+                guard.cache_creation_tokens = Some(creation);
+            }
         }
     }
 

@@ -142,6 +142,9 @@ pub struct RequestEntry {
     pub total_tokens: i64,
     #[serde(rename = "cacheReadTokens", default)]
     pub cache_read_tokens: i64,
+    /// 上游未上报或旧记录为 null；显式 0 不与缺失混淆。
+    #[serde(rename = "cacheCreationTokens", default)]
+    pub cache_creation_tokens: Option<i64>,
     /// 实际承载本次请求的 provider id（架构文档 §3.6）。
     ///
     /// ── 为什么是 `String` + 空串而不是 `Option<String>` ─────────
@@ -381,6 +384,7 @@ impl RequestEntry {
         copy.completion_tokens = 0;
         copy.total_tokens = 0;
         copy.cache_read_tokens = 0;
+        copy.cache_creation_tokens = copy.cache_creation_tokens.map(|_| 0);
         copy
     }
 }
@@ -409,6 +413,7 @@ pub struct NewRequestEntry {
     pub completion_tokens: i64,
     pub total_tokens: i64,
     pub cache_read_tokens: i64,
+    pub cache_creation_tokens: Option<i64>,
     /// 实际承载本次请求的 provider id（Agent2API 改造 W2b-T3 新增填入，
     /// W4 接上持久化：见 `normalize` 末尾的透传）。
     ///
@@ -449,6 +454,7 @@ impl NewRequestEntry {
             completion_tokens: 0,
             total_tokens: 0,
             cache_read_tokens: 0,
+            cache_creation_tokens: None,
             provider: None,
             client_model: String::new(),
             upstream_model: String::new(),
@@ -507,6 +513,7 @@ impl NewRequestEntry {
             completion_tokens: token(self.completion_tokens),
             total_tokens: token(self.total_tokens),
             cache_read_tokens: token(self.cache_read_tokens),
+            cache_creation_tokens: self.cache_creation_tokens.map(token),
             provider,
             // 双名透传（trim 的理由与 provider 相同：空白不该造出一个
             // 「看起来不同的名字」）；空串语义 = 没有点名 / 没有发出去

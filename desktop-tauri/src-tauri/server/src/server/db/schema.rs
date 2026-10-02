@@ -193,7 +193,9 @@ pub fn is_reserved(key: &str) -> bool {
 /// 见 [`V6_SCHEMA`]。同样是既有表加列（ALTER 两连）。这两列只在**在途**
 /// 期间有值，收尾时一律清空（见 `request_stats::sql` 的各条收尾语句）——
 /// 「有没有阶段」因此就是「这一行还在跑」的第二个读数，与 status=0 同进同退。
-pub const SCHEMA_VERSION: i64 = 6;
+///
+/// v7：缓存创建计数，NULL 与显式 0 分开保存（见 [`V7_SCHEMA`]）。
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
@@ -526,6 +528,10 @@ ALTER TABLE requests ADD COLUMN phase TEXT NOT NULL DEFAULT '';
 ALTER TABLE requests ADD COLUMN phase_started_at INTEGER;
 ";
 
+/// 版本 7：创建量允许 NULL，旧记录保持“未上报”，不回填猜测值。
+/// 只追加列；旧程序的显式列查询和写入保持兼容。
+const V7_SCHEMA: &str = "ALTER TABLE requests ADD COLUMN cache_creation_tokens INTEGER;";
+
 /// 把库升到 [`SCHEMA_VERSION`]（幂等：已是最新版时什么都不做）。
 ///
 /// 返回 `rusqlite::Result` 而不是本模块自造的字符串错误：调用方 `Db::open`
@@ -585,6 +591,31 @@ fn apply_version(conn: &Connection, version: i64) -> rusqlite::Result<()> {
         5 => conn.execute_batch(V5_SCHEMA),
         // v6：requests 补阶段与阶段计时两列（在途请求的状态列读数，见 V6_SCHEMA）
         6 => conn.execute_batch(V6_SCHEMA),
+        7 => conn.execute_batch(V7_SCHEMA),
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_creation_migration_preserves_legacy_rows_and_old_writers() {
+        let conn = Connection::open_in_memory().unwrap();
+        for version in 1..=6 { apply_version(&conn, version).unwrap(); }
+        conn.pragma_update(None, "user_version", 6).unwrap();
+        conn.execute("INSERT INTO requests (ts, model, status, prompt_tokens, cache_read_tokens) VALUES (1, 'legacy', 200, 100, 20)", []).unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+        let legacy: (i64, i64, Option<i64>) = conn.query_row(
+            "SELECT prompt_tokens, cache_read_tokens, cache_creation_tokens FROM requests WHERE model='legacy'",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(legacy, (100, 20, None));
+        conn.execute("INSERT INTO requests (ts, model, status) VALUES (2, 'old-writer', 200)", []).unwrap();
+        let missing: Option<i64> = conn.query_row("SELECT cache_creation_tokens FROM requests WHERE model='old-writer'", [], |row| row.get(0)).unwrap();
+        assert_eq!(missing, None);
+        assert_eq!(conn.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0)).unwrap(), "ok");
     }
 }

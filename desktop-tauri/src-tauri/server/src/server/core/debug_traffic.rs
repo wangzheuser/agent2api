@@ -505,7 +505,7 @@ pub struct TrafficCapture {
 struct CaptureState {
     entry: TrafficEntry,
     /// 响应体累积（落库时移到 entry.response_body）
-    body: String,
+    body: Vec<u8>,
     /// 是否真的发过上游请求（`reset_request` 置位）。
     ///
     /// 未置位 = 请求在到达转发层之前就失败了（没有可用账号、模型不存在…），
@@ -523,7 +523,7 @@ impl TrafficCapture {
         Self {
             state: std::sync::Mutex::new(CaptureState {
                 entry: blank_entry(id, "", "", &[], &Value::Null),
-                body: String::new(),
+                body: Vec::new(),
                 sent: false,
                 done: false,
             }),
@@ -558,6 +558,7 @@ impl TrafficCapture {
         let mut guard = self.lock();
         guard.entry.status = Some(status);
         guard.body.clear();
+        guard.entry.truncated = false;
         let pairs = headers
             .iter()
             .map(|(name, value)| (name.as_str(), value.to_str().unwrap_or("[binary]")));
@@ -566,14 +567,17 @@ impl TrafficCapture {
 
     /// 响应体分片（流式逐 chunk、非流式逐 chunk 都走这里）。
     ///
-    /// 累积到单条上限就不再追加（`truncated` 标记由落库时的检查补）——
-    /// 超长响应不该让内存无上限增长。
+    /// 按字节累积到上限并标记截断；落库时统一解码，避免 UTF-8 跨分片损坏。
     pub fn push(&self, chunk: &[u8]) {
         let mut guard = self.lock();
-        if guard.body.len() >= MAX_ENTRY_BYTES {
-            return;
-        }
-        guard.body.push_str(&String::from_utf8_lossy(chunk));
+        let keep = chunk.len().min(MAX_ENTRY_BYTES.saturating_sub(guard.body.len()));
+        guard.body.extend_from_slice(&chunk[..keep]);
+        guard.entry.truncated |= keep < chunk.len();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn captured_body(&self) -> Vec<u8> {
+        self.lock().body.clone()
     }
 
     /// 落库（幂等：第二次调用什么都不做）。
@@ -591,7 +595,7 @@ impl TrafficCapture {
         }
         let body = std::mem::take(&mut guard.body);
         if !body.is_empty() {
-            guard.entry.response_body = Some(body);
+            guard.entry.response_body = Some(String::from_utf8_lossy(&body).into_owned());
         }
         record(guard.entry.clone());
     }
@@ -606,6 +610,27 @@ impl TrafficCapture {
 impl Drop for TrafficCapture {
     fn drop(&mut self) {
         self.finish();
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+
+    #[test]
+    fn raw_capture_keeps_utf8_fragments_and_reports_actual_truncation() {
+        let capture = TrafficCapture::begin("sample");
+        for byte in "缓存创建".as_bytes() { capture.push(&[*byte]); }
+        assert_eq!(String::from_utf8(capture.captured_body()).unwrap(), "缓存创建");
+        capture.attach_response(200, &reqwest::header::HeaderMap::new());
+        capture.push(&vec![b'a'; MAX_ENTRY_BYTES]);
+        assert!(!capture.lock().entry.truncated);
+        capture.push(b"b");
+        assert!(capture.lock().entry.truncated);
+        assert_eq!(capture.captured_body().len(), MAX_ENTRY_BYTES);
+        capture.attach_response(200, &reqwest::header::HeaderMap::new());
+        assert!(!capture.lock().entry.truncated);
+        assert!(capture.captured_body().is_empty());
     }
 }
 

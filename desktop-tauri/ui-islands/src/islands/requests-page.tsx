@@ -71,6 +71,7 @@ type RequestEntry = {
   clientReasoning?: string; upstreamReasoning?: string
   durationMs?: number; firstResponseMs?: number | null
   promptTokens?: number; completionTokens?: number; totalTokens?: number; cacheReadTokens?: number
+  cacheCreationTokens?: number | null
   attempts?: number; attemptDetails?: unknown[]; sensitiveHits?: unknown[]
   phase?: string; phaseElapsedMs?: number | null; phaseStartedAt?: number | null
 }
@@ -869,12 +870,13 @@ function requestCell(entry: RequestEntry, column: VisibleColumn): React.ReactNod
         return (
           <span key={key} className={className} title='失败请求不记录用量'>
             <span className='req-usage-line'>in: - / out: - / all: -</span>
-            <span className='req-usage-line sub'>缓存读取: - / 命中率: -</span>
+            <span className='req-usage-line sub'>缓存读取: - / 创建: - / 命中率: -</span>
           </span>
         )
       }
       const line1 = `in: ${formatTokens(entry.promptTokens)} / out: ${formatTokens(entry.completionTokens)} / all: ${formatTokens(entry.totalTokens)}`
-      const line2 = `缓存读取: ${formatTokens(entry.cacheReadTokens)} / 命中率: ${cacheRate(entry)}`
+      const creation = entry.cacheCreationTokens == null ? '未上报' : formatTokens(entry.cacheCreationTokens)
+      const line2 = `缓存读取: ${formatTokens(entry.cacheReadTokens)} / 创建: ${creation} / 命中率: ${cacheRate(entry)}`
       return (
         <span key={key} className={className} title={`${line1}\n${line2}`}>
           <span className='req-usage-line'>{line1}</span>

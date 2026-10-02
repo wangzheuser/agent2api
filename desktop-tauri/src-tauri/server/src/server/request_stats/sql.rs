@@ -70,7 +70,7 @@ use super::report::normalize_status_filter;
 const REQUEST_COLUMNS: &str = "id, ts, model, account_id, account_name, status, duration_ms, \
      first_response_ms, attempts, error, prompt_tokens, completion_tokens, total_tokens, \
      cache_read_tokens, provider, client_model, upstream_model, attempt_details, sensitive_hits, \
-     client_reasoning, upstream_reasoning, phase, phase_started_at";
+     client_reasoning, upstream_reasoning, phase, phase_started_at, cache_creation_tokens";
 
 // `request_daily`（按天聚合）那一支的列常量、编解码与读-改-写语句在
 // `daily.rs` —— 两张表的语句分文件后各自独立演化。
@@ -118,6 +118,7 @@ fn decode_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestEntry> {
         // 读出来是 '' 与 NULL —— 与「不在途」在写入侧收敛成同一组值
         phase: row.get(21)?,
         phase_started_at: row.get(22)?,
+        cache_creation_tokens: row.get(23)?,
     })
 }
 
@@ -584,7 +585,8 @@ pub(super) fn update_running_request(
          duration_ms = ?7, first_response_ms = ?8, attempts = ?9, error = ?10, prompt_tokens = ?11, \
          completion_tokens = ?12, total_tokens = ?13, cache_read_tokens = ?14, provider = ?15, \
          client_model = ?16, upstream_model = ?17, attempt_details = ?18, sensitive_hits = ?19, \
-         client_reasoning = ?20, upstream_reasoning = ?21, phase = '', phase_started_at = NULL \
+         client_reasoning = ?20, upstream_reasoning = ?21, phase = '', phase_started_at = NULL, \
+         cache_creation_tokens = ?22 \
          WHERE id = ?1 AND status = 0",
         params![
             entry.id,
@@ -608,6 +610,7 @@ pub(super) fn update_running_request(
             encode_json_list(&entry.sensitive_hits),
             entry.client_reasoning,
             entry.upstream_reasoning,
+            entry.cache_creation_tokens,
         ],
     )
 }
@@ -625,9 +628,9 @@ pub(super) fn insert_request(conn: &Connection, entry: &RequestEntry) -> rusqlit
         "INSERT INTO requests (id, ts, model, account_id, account_name, status, duration_ms, \
          first_response_ms, attempts, error, prompt_tokens, completion_tokens, total_tokens, \
          cache_read_tokens, provider, client_model, upstream_model, attempt_details, \
-         sensitive_hits, client_reasoning, upstream_reasoning) \
+         sensitive_hits, client_reasoning, upstream_reasoning, cache_creation_tokens) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-         ?18, ?19, ?20, ?21)",
+         ?18, ?19, ?20, ?21, ?22)",
         params![
             entry.id,
             entry.ts,
@@ -650,6 +653,7 @@ pub(super) fn insert_request(conn: &Connection, entry: &RequestEntry) -> rusqlit
             encode_json_list(&entry.sensitive_hits),
             entry.client_reasoning,
             entry.upstream_reasoning,
+            entry.cache_creation_tokens,
         ],
     )?;
     Ok(())
@@ -828,6 +832,37 @@ pub(super) fn count_raw_matching(
 /// 清空全部原始正文（`clear()` / `mode=all` 全清时与明细一起清）
 pub(super) fn delete_all_raw(conn: &Connection) -> rusqlite::Result<usize> {
     conn.execute("DELETE FROM request_raw", [])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::request_stats::record::NewRequestEntry;
+
+    #[test]
+    fn cache_creation_round_trips_insert_update_and_json_without_filling_unknown() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::server::db::schema::migrate(&conn).unwrap();
+        for (index, creation) in [None, Some(0), Some(30)].into_iter().enumerate() {
+            let mut entry = NewRequestEntry::new("sample", 200);
+            entry.id = format!("cache-{index}");
+            entry.prompt_tokens = 100;
+            entry.cache_read_tokens = 20;
+            entry.cache_creation_tokens = creation;
+            let finished = entry.normalize();
+            insert_request(&conn, &finished).unwrap();
+            let select = format!("SELECT {REQUEST_COLUMNS} FROM requests WHERE id=?1");
+            let loaded = conn.query_row(&select, [&finished.id], decode_request).unwrap();
+            assert_eq!(loaded.cache_creation_tokens, creation);
+            assert_eq!(serde_json::to_value(&loaded).unwrap()["cacheCreationTokens"], serde_json::json!(creation));
+
+            conn.execute("UPDATE requests SET status=0, cache_creation_tokens=NULL WHERE id=?1", [&finished.id]).unwrap();
+            assert_eq!(update_running_request(&conn, &finished).unwrap(), 1);
+            let loaded = conn.query_row(&select, [&finished.id], decode_request).unwrap();
+            assert_eq!(loaded.cache_creation_tokens, creation);
+            assert_eq!((loaded.prompt_tokens, loaded.cache_read_tokens), (100, 20));
+        }
+    }
 }
 
 // ─── 聚合：读-改-写 ─────────────────────────────────────────

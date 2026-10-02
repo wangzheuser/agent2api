@@ -99,6 +99,7 @@ type RequestRow = {
   completionTokens?: unknown
   totalTokens?: unknown
   cacheReadTokens?: unknown
+  cacheCreationTokens?: number | null
   /** 模型名与推理等级：下游 / 上游各一份 */
   model?: unknown
   clientModel?: unknown
@@ -468,7 +469,10 @@ function DetailPane({ row }: { row: RequestRow | null }) {
         </Field>
         <Field label='令牌'>
           输入 {fmtTokens(row.promptTokens)} · 输出 {fmtTokens(row.completionTokens)} · 总计{' '}
-          {fmtTokens(row.totalTokens)} · 缓存读 {fmtTokens(row.cacheReadTokens)}
+          {fmtTokens(row.totalTokens)} · 缓存读 {fmtTokens(row.cacheReadTokens)} · 缓存创建{' '}
+          <span title='创建量仅使用上游报告值；未上报或旧记录显示“未上报”，显式 0 表示上游报告为零'>
+            {row.cacheCreationTokens == null ? '未上报' : fmtTokens(row.cacheCreationTokens)}
+          </span>
         </Field>
         <Field label='错误'>
           {row.error ? <span className='text-destructive'>{String(row.error)}</span> : '—'}

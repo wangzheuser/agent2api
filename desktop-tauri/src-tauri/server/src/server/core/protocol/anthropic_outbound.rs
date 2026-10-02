@@ -472,7 +472,7 @@ pub struct ChatFromAnthropicStream {
     tools: BTreeMap<i64, bool>,
     input_tokens: i64,
     cache_read: i64,
-    cache_creation: i64,
+    cache_creation: Option<i64>,
     output_tokens: i64,
     /// 已映射成 chat 口径的 finish_reason（`message_delta` 里给）
     finish_reason: Option<String>,
@@ -490,7 +490,7 @@ impl ChatFromAnthropicStream {
             tools: BTreeMap::new(),
             input_tokens: 0,
             cache_read: 0,
-            cache_creation: 0,
+            cache_creation: None,
             output_tokens: 0,
             finish_reason: None,
         }
@@ -553,10 +553,7 @@ impl ChatFromAnthropicStream {
                         .get("cache_read_input_tokens")
                         .and_then(Value::as_i64)
                         .unwrap_or(0);
-                    self.cache_creation = usage
-                        .get("cache_creation_input_tokens")
-                        .and_then(Value::as_i64)
-                        .unwrap_or(0);
+                    self.cache_creation = crate::server::core::upstream::usage::cache_creation_tokens(usage);
                 }
                 self.start()
             }
@@ -668,8 +665,8 @@ impl ChatFromAnthropicStream {
                     if let Some(cache_read) = usage.get("cache_read_input_tokens").and_then(Value::as_i64) {
                         self.cache_read = cache_read;
                     }
-                    if let Some(cache_creation) = usage.get("cache_creation_input_tokens").and_then(Value::as_i64) {
-                        self.cache_creation = cache_creation;
+                    if let Some(cache_creation) = crate::server::core::upstream::usage::cache_creation_tokens(usage) {
+                        self.cache_creation = Some(cache_creation);
                     }
                     if let Some(output) = usage.get("output_tokens").and_then(Value::as_i64) {
                         self.output_tokens = output;
@@ -711,7 +708,7 @@ impl ChatFromAnthropicStream {
         out.push(self.finish_frame(&finish_reason));
         // chat 口径：input_tokens 含缓存部分（`usage_to_anthropic` 的反向
         // 不等式 —— 那边是「减掉缓存」，这边加回来）
-        let prompt_tokens = self.input_tokens + self.cache_read + self.cache_creation;
+        let prompt_tokens = self.input_tokens + self.cache_read + self.cache_creation.unwrap_or(0);
         let mut usage = json!({
             "prompt_tokens": prompt_tokens,
             "completion_tokens": self.output_tokens,
@@ -720,8 +717,8 @@ impl ChatFromAnthropicStream {
         if self.cache_read > 0 {
             usage["prompt_tokens_details"] = json!({ "cached_tokens": self.cache_read });
         }
-        if self.cache_creation > 0 {
-            usage["cache_creation_input_tokens"] = Value::from(self.cache_creation);
+        if let Some(creation) = self.cache_creation {
+            usage["cache_creation_input_tokens"] = Value::from(creation);
         }
         out.push(chat_frame(&json!({
             "id": self.id,
@@ -790,5 +787,33 @@ impl ChatFromAnthropicStream {
             "model": self.model,
             "choices": [{ "index": 0, "delta": {}, "finish_reason": finish_reason }],
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_creation_native_round_trip_preserves_zero_missing_and_partial_usage() {
+        for creation in [None, Some(0), Some(30)] {
+            let mut usage = json!({"input_tokens": 50, "cache_read_input_tokens": 20});
+            if let Some(value) = creation { usage["cache_creation_input_tokens"] = json!(value); }
+            let start = json!({"type": "message_start", "message": {"usage": usage}});
+            let end = json!({"type": "message_delta", "usage": {"output_tokens": 7}});
+            let input = format!("data: {start}\n\ndata: {end}\n\ndata: {{\"type\":\"message_stop\"}}\n\n");
+            let mut stream = ChatFromAnthropicStream::new("sample");
+            let frames = stream.push(input.as_bytes());
+            let chat_usage = frames.iter().filter_map(|frame| {
+                let text = std::str::from_utf8(frame).ok()?.trim().strip_prefix("data: ")?;
+                serde_json::from_str::<Value>(text).ok()?.get("usage").cloned()
+            }).next().unwrap();
+            assert_eq!(chat_usage["prompt_tokens"], 70 + creation.unwrap_or(0));
+            let restored = super::super::anthropic::usage_to_anthropic(Some(&chat_usage));
+            assert_eq!(restored["input_tokens"], 50);
+            assert_eq!(restored["cache_read_input_tokens"], 20);
+            assert_eq!(restored["output_tokens"], 7);
+            assert_eq!(restored.get("cache_creation_input_tokens").and_then(Value::as_i64), creation);
+        }
     }
 }

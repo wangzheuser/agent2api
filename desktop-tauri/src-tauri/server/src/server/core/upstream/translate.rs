@@ -15,8 +15,7 @@
 //!      通道说 Anthropic，多一层协议分派壳没有第二个消费者；
 //!   2. `model` 传**上游真名**（与自定义家一致）：帧里的 `model` 由下游的
 //!      回写层按适配器的 `sse_model_rewrite()` 决定要不要改回请求名；
-//!   3. 调试采集在这里采**上游原始字节**（翻译前），与 chat 路径「采上游原样
-//!      吐出的东西」的语义一致 —— 翻译后的 chat 帧只是网关内部的中间形态。
+//!   3. 调试采集由原始响应入口负责；这里只翻译，不重复采集已预读的字节。
 //!
 //! ── 硬盘约束 ────────────────────────────────────────────────
 //! release 是 `panic=abort`：本文件零 unwrap/expect/panic。
@@ -48,8 +47,6 @@ pub struct AnthropicToChatStream {
     pending: VecDeque<Bytes>,
     /// 上游已结束（不再 poll 上游，把 pending 与收尾帧吐完即 None）
     upstream_done: bool,
-    /// 调试模式的采集器（None = 未开启）
-    capture: Option<Arc<crate::server::core::debug_traffic::TrafficCapture>>,
 }
 
 impl AnthropicToChatStream {
@@ -68,18 +65,13 @@ impl AnthropicToChatStream {
                 std::io::Error::other(crate::server::core::egress::describe_error_detail(&error))
             })
         });
-        Self::from_stream(
-            Box::pin(described),
-            model,
-            telemetry,
-        )
+        Self::from_stream(super::capture_stream(Box::pin(described), telemetry.capture()), model)
     }
 
     /// 构造已从 `reqwest::Response` 预读过首段的 Anthropic 字节流。
     pub fn from_stream(
         inner: futures::stream::BoxStream<'static, Result<Bytes, std::io::Error>>,
         model: &str,
-        telemetry: &Arc<crate::server::core::upstream::usage::RequestTelemetry>,
     ) -> Self {
         let guarded = super::stall::idle_guard(
             inner,
@@ -90,7 +82,6 @@ impl AnthropicToChatStream {
             machine: ChatFromAnthropicStream::new(model),
             pending: VecDeque::new(),
             upstream_done: false,
-            capture: telemetry.capture(),
         }
     }
 }
@@ -119,9 +110,6 @@ impl Stream for AnthropicToChatStream {
                     }
                 }
                 Poll::Ready(Some(Ok(bytes))) => {
-                    if let Some(capture) = &self.capture {
-                        capture.push(&bytes);
-                    }
                     for frame in self.machine.push(&bytes[..]) {
                         self.pending.push_back(frame);
                     }
