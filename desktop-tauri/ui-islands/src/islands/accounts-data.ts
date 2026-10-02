@@ -565,7 +565,7 @@ export async function runCheckin(id: string): Promise<void> {
       checkinErrors.delete(id)
       toast(outcome.kind === 'already'
         ? `${label}：今日已领取`
-        : outcome.kind === 'active' ? `${label}：有效对话完成，日活奖励尚未确认` : `✅ ${label} 签到成功`, 'ok')
+        : outcome.kind === 'active' ? `${label}：网页会话完成，日活奖励尚未确认` : `✅ ${label} 签到成功`, 'ok')
     }
     bump()
     // 签到会改变余额读数：此刻刷新余额（静默，见 refreshUsageAfterCheckin）。

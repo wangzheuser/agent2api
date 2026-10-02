@@ -36,6 +36,7 @@ pub mod checkin;
 pub mod commodity;
 mod request;
 mod usage;
+mod web_activity;
 
 use activity_response::consume_activity_response;
 use serde_json::{json, Map, Value};
@@ -552,7 +553,16 @@ impl BillingService {
             json!({ "success": false, "code": 0, "msg": "活动未开启" })
         };
 
-        let (poke_succeeded, poke_model) = self.poke_daily_activity(session).await;
+        let (api_poke_succeeded, poke_model) = self.poke_daily_activity(session).await;
+        let web = web_activity::run(session, poke_model.as_deref().unwrap_or(
+            crate::server::core::providers::workbuddy::DAILY_ACTIVITY_FREE_MODELS[0],
+        )).await;
+        let poke_succeeded = web.success;
+        logging::log("[Checkin]", &format!(
+            "WorkBuddy 国际版网页保活（conversation={}，status={}，outputChunks={}，elapsedMs={}，success={}，error={}）",
+            web.conversation_id.as_deref().unwrap_or("none"), web.status, web.output_chunks,
+            web.elapsed_ms, web.success, web.error.as_deref().unwrap_or("none"),
+        ));
         let balance_after = self.log_workbuddy_activity_balance(session, "执行后").await;
         let balance_delta = balance_before
             .as_ref()
@@ -566,13 +576,13 @@ impl BillingService {
             .unwrap_or(false);
         if !claim_succeeded && !today_checked_in && !active {
             claim["msg"] = Value::String(if poke_succeeded {
-                "有效对话完成，日活奖励尚未确认".to_string()
+                "网页会话完成，日活奖励尚未确认".to_string()
             } else {
-                "活跃保活失败".to_string()
+                format!("网页保活失败：{}", web.error.as_deref().unwrap_or("会话未完成"))
             });
         }
         if !poke_succeeded {
-            logging::verbose("[Checkin]", "WorkBuddy 国际版免费模型活跃保活未成功");
+            logging::verbose("[Checkin]", "WorkBuddy 国际版网页活跃保活未成功");
         }
         logging::log(
             "[Checkin]",
@@ -592,7 +602,9 @@ impl BillingService {
                 "todayCheckedIn": today_checked_in,
                 "statusAvailable": status_available,
                 "pokeSucceeded": poke_succeeded,
+                "apiPokeSucceeded": api_poke_succeeded,
                 "pokeModel": poke_model,
+                "web": web,
                 "balanceBefore": balance_before,
                 "balanceAfter": balance_after,
                 "balanceDelta": balance_delta,

@@ -200,7 +200,7 @@ fn describe_proxy(proxy: &ResolvedProxy) -> &str {
 /// 反过来，构造**直连** Client 时必须显式 `.no_proxy()`：reqwest 默认会去读
 /// 环境变量里的代理设置，不关掉的话用户机器上设了 `HTTPS_PROXY` 就会
 /// 「配置为直连却走了代理」。
-fn build_client(proxy: Option<&ResolvedProxy>, timeouts: &TimeoutSettings) -> Result<reqwest::Client, String> {
+fn build_client(proxy: Option<&ResolvedProxy>, timeouts: &TimeoutSettings, redirects: bool) -> Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_millis(timeouts.connect_ms()))
         // 单次读取超时（等响应头 + 数据块间隔的传输层后备，取两项设置的大者）；
@@ -211,6 +211,9 @@ fn build_client(proxy: Option<&ResolvedProxy>, timeouts: &TimeoutSettings) -> Re
         .user_agent(DEFAULT_USER_AGENT)
         .pool_idle_timeout(Some(Duration::from_secs(90)))
         .pool_max_idle_per_host(8);
+    if !redirects {
+        builder = builder.redirect(reqwest::redirect::Policy::none());
+    }
 
     match proxy {
         None => {
@@ -235,6 +238,11 @@ fn build_client(proxy: Option<&ResolvedProxy>, timeouts: &TimeoutSettings) -> Re
     builder
         .build()
         .map_err(|error| format!("创建 HTTP 客户端失败: {error}"))
+}
+
+/// 复用账号出口配置，但禁用重定向且构造失败不回退直连，供短时凭据通道使用。
+pub(crate) fn client_without_redirects(proxy: Option<&ResolvedProxy>) -> Result<reqwest::Client, String> {
+    build_client(proxy, &crate::server::config::timeout_settings(), false)
 }
 
 /// 取（或创建）某个出口对应的 Client；`proxy` 为 None 时是直连客户端。
@@ -264,7 +272,7 @@ pub fn client_for(proxy: Option<&ResolvedProxy>) -> Arc<reqwest::Client> {
         }
     }
     // ② 未命中才构造（锁外，可能阻塞）
-    let client = Arc::new(build_client(proxy, &timeouts).unwrap_or_else(|error| {
+    let client = Arc::new(build_client(proxy, &timeouts, true).unwrap_or_else(|error| {
         // 这条**保留在运行日志**（不像同类的「账号代理不可用」那样进请求日志）：
         // 它每个出口缓存条目最多触发一次 —— 构造失败的兜底 Client 也会被缓存
         // （见下面 ③），后续请求直接命中缓存、不再走到这里，所以条数**不随

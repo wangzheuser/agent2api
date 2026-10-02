@@ -649,7 +649,7 @@ export function ActionsCell({ account, atFront }: { account: AccountRecord; atFr
           <Button variant='outline' size='xs'
             title={checkinFailed
               ? `上次${activeOnly ? '日活任务' : '签到'}失败：${checkinFailed}（点此重试）`
-              : activeOnly ? '检测免费模型有效对话；API 保活不保证奖励资格，日活奖励通常次日由上游结算' : '为该账号签到'}
+              : activeOnly ? '执行免费模型探测及网页会话；官方日活要求客户端有效对话，网页保活不代表奖励到账' : '为该账号签到'}
             onClick={() => void runCheckin(account.id)}>
             {activeOnly ? '活跃保活' : '签到'}
           </Button>
