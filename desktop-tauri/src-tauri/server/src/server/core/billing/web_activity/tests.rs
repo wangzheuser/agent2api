@@ -127,6 +127,13 @@ async fn acp_waits_for_rpc_ack_and_consumes_fragmented_sse() {
                         "data: {}\n\n",
                         json!({"jsonrpc":"2.0","id":body["id"],"result":result})
                     ));
+                    // 实际沙箱的 session/prompt 在 POST 上返回 200 SSE，不走 GET 事件流。
+                    if body["id"] == 3 {
+                        return HttpResponse::builder()
+                            .header("content-type", "text/event-stream")
+                            .body(Body::from(data))
+                            .unwrap();
+                    }
                     // 每字节分片，覆盖 CRLF 与 UTF-8 边界。
                     tokio::spawn(async move {
                         for byte in data.bytes() {
@@ -135,7 +142,15 @@ async fn acp_waits_for_rpc_ack_and_consumes_fragmented_sse() {
                             }
                         }
                     });
-                    StatusCode::ACCEPTED
+                    // 部分沙箱用空 200 确认接收，结果仍在 GET SSE 上返回。
+                    HttpResponse::builder()
+                        .status(if body["id"] == 2 {
+                            StatusCode::OK
+                        } else {
+                            StatusCode::ACCEPTED
+                        })
+                        .body(Body::empty())
+                        .unwrap()
                 }
             },
         ),

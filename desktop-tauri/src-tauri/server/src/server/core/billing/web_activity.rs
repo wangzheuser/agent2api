@@ -113,7 +113,7 @@ async fn send(request: RequestBuilder, stage: &str) -> Result<Response, String> 
     Ok(response)
 }
 
-async fn json_body(mut response: Response) -> Result<Value, String> {
+async fn read_body(mut response: Response) -> Result<Vec<u8>, String> {
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|_| "响应读取失败")? {
         if chunk.len() > MAX_BYTES.saturating_sub(body.len()) {
@@ -121,11 +121,13 @@ async fn json_body(mut response: Response) -> Result<Value, String> {
         }
         body.extend_from_slice(&chunk);
     }
-    serde_json::from_slice(&body).map_err(|_| "响应不是有效 JSON".to_string())
+    Ok(body)
 }
 
 async fn console(request: RequestBuilder, stage: &str) -> Result<Value, String> {
-    let value = json_body(send(request, stage).await?).await?;
+    let body = read_body(send(request, stage).await?).await?;
+    let value: Value =
+        serde_json::from_slice(&body).map_err(|_| format!("{stage}响应不是有效 JSON"))?;
     if value.get("code").and_then(Value::as_i64) != Some(0) {
         return Err(format!(
             "{stage}业务失败（code={}）",
@@ -310,15 +312,39 @@ impl AcpChannel<'_> {
             method,
         )
         .await?;
-        let mut direct = if response.status() == reqwest::StatusCode::ACCEPTED {
-            None
-        } else {
-            Some(json_body(response).await?)
-        };
+        // ACP 可用 202 或空 200 确认接收，结果走 GET SSE；也可在 POST 上直接
+        // 返回 JSON / SSE。HTTP 接收确认本身不代表 RPC 已成功执行。
+        let streamed = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("text/event-stream"));
+        let mut post_events = None;
+        let mut direct = None;
+        if response.status() != reqwest::StatusCode::ACCEPTED {
+            if streamed {
+                post_events = Some(Events::new(response));
+            } else {
+                let body = read_body(response).await?;
+                if !body.iter().all(u8::is_ascii_whitespace) {
+                    direct = Some(
+                        serde_json::from_slice(&body)
+                            .map_err(|_| format!("{method}响应不是有效 JSON"))?,
+                    );
+                }
+            }
+        }
         loop {
             let event = match direct.take() {
                 Some(v) => v,
-                None => self.events.next().await?,
+                None => match post_events.as_mut() {
+                    Some(events) => tokio::select! {
+                        biased;
+                        event = self.events.next() => event?,
+                        event = events.next() => event?,
+                    },
+                    None => self.events.next().await?,
+                },
             };
             if let Some(result) = process_event(&event, id, &mut self.output_chunks)? {
                 return Ok(result);
