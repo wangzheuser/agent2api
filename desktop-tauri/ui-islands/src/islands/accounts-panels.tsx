@@ -7,7 +7,7 @@
  * 22+84 算式、`.acct-actions` 的四颗按钮预算…）。迁移只换**控件**，布局类名原样保留：
  * 换掉的控件走组件库（Button / Badge / Switch / Checkbox / Select / Popover），
  * 而 `.prio-stepper`（数字框 + 两枚箭头的合并控件）、`.pbadge`（按 provider 上色的
- * 徽章）、`.usage-sum`（读数，不可点）这三处组件库没有对应件，保持原标记形态 ——
+ * 徽章）、`.usage-sum`（余额读数，WorkBuddy 双击查看明细）这三处组件库没有对应件，保持原标记形态 ——
  * 见最终报告的「组件库缺口」。
  *
  * ── 优先级控件的方向语义（**极易搞反，改动时先读这里**）──────────
@@ -45,9 +45,10 @@ import {
   supportsWelfare, welfareDoneTitle, welfareStateOf, welfareTodoTitle,
 } from './accounts-domain'
 import { PRIORITY_MAX, PRIORITY_MIN, priorityOf } from './accounts-columns'
+import { creditDetailsOf, formatCreditAmount } from './accounts-credit-details'
 import {
   PROXY_CUSTOM_CURRENT, PROXY_CUSTOM_EDIT, applyProxyPick, checkinErrorOf,
-  commitPriority, connectionsOf, maskName, moveAccount, openSettingsDialog, poolError,
+  commitPriority, connectionsOf, maskName, moveAccount, openCreditsDialog, openSettingsDialog, poolError,
   proxyPoolSnapshot, queryUsageOnce, runCheckin, setAccountEnabled, setPanelOpen,
   startCodeArtsWelfare, startZcodeClaim, toggleNamesHidden, usageEntries, usageFailureOf,
 } from './accounts-data'
@@ -296,6 +297,15 @@ function usageSummary(entry: UsageEntry): { text: string; kind: string; title: s
   if (typeof entry !== 'object' || entry === null) return { text: '无数据', kind: 'muted', title: String(entry) }
   const data = entry as Record<string, unknown>
   if (Object.prototype.hasOwnProperty.call(data, 'totalLeft')) {
+    const details = creditDetailsOf(entry)
+    if (details) {
+      const total = details.unlimited ? '∞' : formatCreditAmount(details.remaining)
+      return {
+        text: `${details.complete ? '可用' : '已读取'} ${total}`,
+        kind: details.complete ? 'ok' : 'warn',
+        title: details.complete ? `可用积分 ${total}` : '积分包明细不完整，请打开查看后刷新',
+      }
+    }
     const total = data.unlimited ? '∞' : numberText(data.totalLeft)
     return {
       text: `可用 ${total}`,
@@ -400,7 +410,8 @@ function numberOrNull(value: unknown): number | null {
 }
 
 /**
- * 余额列：**只放读数**（不可点）—— 查询按钮住在操作列，这一列纯粹是
+ * 余额列：WorkBuddy 双击查看积分包，其余提供商保持原读数；查询按钮住在操作列。
+ * 这一列仍用于
  * 「一眼看出还剩多少」。刻意不换成组件库的 Badge：它是读数而不是状态徽章，
  * 样式全在 `.usage-sum` 里（四档语义色：ok / bad / muted / warn —— `warn` 是
  * 「读到了但不完整」那一档，见上面 `usageSummary` 的半次失败分支）。
@@ -418,6 +429,24 @@ export function UsageCell({ account }: { account: AccountRecord }) {
   }
   const entry = usageEntries().get(account.id)
   const summary = usageSummary(entry)
+  if (providerOf(account) === 'workbuddy') {
+    return (
+      <button type='button' className={`usage-sum credit-balance-trigger ${summary.kind}`}
+        title={`${summary.title}；双击查看积分包明细（Enter / Space 打开）`}
+        aria-label={`${summary.text}，查看积分包明细`} aria-haspopup='dialog'
+        onDoubleClick={event => {
+          event.stopPropagation()
+          openCreditsDialog(account.id, event.currentTarget)
+        }}
+        onClick={event => {
+          event.stopPropagation()
+          // 原生按钮键盘激活的 detail 为 0；触屏使用单击，避免双击缩放。
+          if (event.detail === 0 || window.matchMedia('(pointer: coarse)').matches) {
+            openCreditsDialog(account.id, event.currentTarget)
+          }
+        }}>{summary.text}</button>
+    )
+  }
   // 失败 / 未配置那些档不画进度条：读数本身就不是「还剩多少」，
   // 给它配个进度条会把一句错误装饰成一条可信的读数
   const pool = summary.kind === 'ok' || summary.kind === 'warn' ? usagePool(entry) : null

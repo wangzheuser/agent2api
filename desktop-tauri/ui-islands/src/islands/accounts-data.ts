@@ -37,6 +37,7 @@ import {
 } from './accounts-domain'
 import * as domain from './accounts-domain'
 import { clampPriority, priorityOf } from './accounts-columns'
+import { creditDetailsOf } from './accounts-credit-details'
 import {
   allAccounts, bump, findAccount, getStore, isPicked, openPanelsFor, panelOpen, patch,
 } from './accounts-store'
@@ -52,12 +53,86 @@ export const NOT_CONFIGURED_CODE = 'usage_not_configured'
 
 /**
  * 余额的结果缓存：**原地可变**的 Map，改完调 bump() 通知。
- * 为什么不像其余状态那样每次换新对象：写 `null`（「查询中」）这个中间态必须让视图立刻
- * 看到，而它是高频小改动（每次点按钮 / 每轮批量），每次拷贝一份纯属浪费。
+ * 高频小改动后调 bump；WorkBuddy 明细刷新保留旧值，通过 usageInflight 标注刷新中。
  */
 const usageMap = new Map<string, UsageEntry>()
+const successfulUsage = new Map<string, UsageEntry>()
+const usageIdentities = new Map<string, string>()
+const usageAppliedAt = new Map<string, number>()
+const usageRequestVersions = new Map<string, number>()
+const usageReceivedAt = new Map<string, number>()
+// 身份变化后，后端定时快照可能仍保留旧身份的行；当前身份单查成功前隔离它。
+const usageSnapshotBlocked = new Set<string>()
+let usageSequence = 0
+type BalancesResult = { results?: Array<Record<string, unknown>> } | null | undefined
+type UsageRequest = { identity: string; sequence: number; promise: Promise<BalancesResult> }
+const usageRequests = new Map<string, UsageRequest>()
+let usageBatch: Promise<BalancesResult> | null = null
 
 export const usageEntries = (): ReadonlyMap<string, UsageEntry> => usageMap
+
+/** 仅保存成功响应；当前错误仍由 usageEntries 提供，弹窗显式标注旧数据。 */
+export function lastSuccessfulUsage(id: string): UsageEntry {
+  ensureUsageIdentity(id)
+  return successfulUsage.get(id)
+}
+
+/** 新鲜度使用本地接收时刻；服务端 fetchedAt 只用于服务端快照排序与显示。 */
+export function creditDetailsFresh(id: string, now = Date.now()): boolean {
+  ensureUsageIdentity(id)
+  const details = creditDetailsOf(usageMap.get(id))
+  const receivedAt = usageReceivedAt.get(id)
+  return Boolean(details?.complete && receivedAt !== undefined && now >= receivedAt && now - receivedAt < 60_000)
+}
+
+function accountUsageIdentity(account: AccountRecord): string {
+  return JSON.stringify([domain.providerOf(account), account.uid, account.edition, account.addedAt, account.tokenTail])
+}
+
+function clearUsageCache(id: string): void {
+  usageMap.delete(id)
+  successfulUsage.delete(id)
+  usageAppliedAt.delete(id)
+  usageRequestVersions.delete(id)
+  usageReceivedAt.delete(id)
+  usageRequests.delete(id)
+  usageSnapshotBlocked.add(id)
+}
+
+function ensureUsageIdentity(id: string): string | null {
+  const account = findAccount(id)
+  if (!account) return null
+  const identity = accountUsageIdentity(account)
+  const previous = usageIdentities.get(id)
+  if (previous !== undefined && previous !== identity) {
+    clearUsageCache(id)
+  }
+  usageIdentities.set(id, identity)
+  return identity
+}
+
+function creditFetchedAt(entry: UsageEntry): number {
+  const details = entry && typeof entry === 'object' ? entry.creditDetails : null
+  const at = details && typeof details === 'object' ? (details as Record<string, unknown>).fetchedAt : null
+  return serverTimestamp(at)
+}
+
+function rowQueriedAt(row: Record<string, unknown>): number {
+  return serverTimestamp(row.queriedAt)
+}
+
+function serverTimestamp(at: unknown): number {
+  return typeof at === 'number' && Number.isFinite(at) && at > 0 ? at : 0
+}
+
+function writeUsage(id: string, entry: UsageEntry, at: number, receivedAt = Date.now()): void {
+  usageMap.set(id, entry)
+  usageAppliedAt.set(id, at)
+  if (entry && typeof entry === 'object' && !usageFailureOf(entry)) {
+    successfulUsage.set(id, entry)
+    usageReceivedAt.set(id, receivedAt)
+  }
+}
 
 /**
  * 上一次签到/日活任务的**失败原因**（按账号 id）。
@@ -214,6 +289,23 @@ export function openSettingsDialog(id: string): void {
   patch({ dialog: { kind: 'settings', id } })
 }
 
+export function openCreditsDialog(id: string, returnFocus?: HTMLElement | null): void {
+  const account = findAccount(id)
+  if (!account || domain.providerOf(account) !== domain.DEFAULT_PROVIDER_ID) return
+  ensureUsageIdentity(id)
+  patch({ dialog: { kind: 'credits', id, returnFocus } })
+  void refreshCreditDetails(id)
+}
+
+/** 明细复用现有余额请求；手动刷新忽略 60 秒新鲜度，但仍合并在途请求。 */
+export async function refreshCreditDetails(id: string, force = false): Promise<void> {
+  const account = findAccount(id)
+  if (!account || domain.providerOf(account) !== domain.DEFAULT_PROVIDER_ID) return
+  ensureUsageIdentity(id)
+  if (!force && creditDetailsFresh(id)) return
+  try { await queryUsageFor(id) } catch { /* 查询层已经保存错误；弹窗展示错误与上次成功数据。 */ }
+}
+
 export function closeDialog(): void {
   patch({ dialog: null })
 }
@@ -229,17 +321,33 @@ export function openBatchDialog(ids: string[], action = 'enable'): void {
 /** 清掉已删除账号的本地缓存（app.js 每次 refresh 后调用） */
 export function refreshCaches(validIds: Set<string>): void {
   let touched = false
-  for (const id of [...usageMap.keys()]) if (!validIds.has(id)) { usageMap.delete(id); touched = true }
+  const invalidated = new Set<string>()
+  for (const id of [...usageIdentities.keys()]) {
+    const account = findAccount(id)
+    if (!validIds.has(id) || !account) {
+      clearUsageCache(id)
+      usageIdentities.delete(id)
+      touched = true
+      invalidated.add(id)
+    } else if (usageIdentities.get(id) !== accountUsageIdentity(account)) {
+      ensureUsageIdentity(id)
+      touched = true
+      invalidated.add(id)
+    }
+  }
+  for (const account of allAccounts()) if (validIds.has(account.id)) ensureUsageIdentity(account.id)
   for (const id of [...checkinErrors.keys()]) if (!validIds.has(id)) { checkinErrors.delete(id); touched = true }
   const panels = new Map(getStore().panels)
   for (const id of [...panels.keys()]) if (!validIds.has(id)) { panels.delete(id); touched = true }
   const connections = new Map(getStore().connections)
   for (const id of [...connections.keys()]) if (!validIds.has(id)) { connections.delete(id); touched = true }
   const inflight = new Set(getStore().usageInflight)
-  for (const id of [...inflight]) if (!validIds.has(id)) { inflight.delete(id); touched = true }
+  for (const id of [...inflight]) if (!validIds.has(id) || !usageRequests.has(id)) { inflight.delete(id); touched = true }
   const selected = new Set(getStore().selected)
   for (const id of [...selected]) if (!validIds.has(id)) { selected.delete(id); touched = true }
-  if (touched) patch({ panels, connections, usageInflight: inflight, selected })
+  const dialog = getStore().dialog
+  const closeCredits = dialog?.kind === 'credits' && (!validIds.has(dialog.id) || invalidated.has(dialog.id))
+  if (touched || closeCredits) patch({ panels, connections, usageInflight: inflight, selected, ...(closeCredits ? { dialog: null } : {}) })
 }
 
 /* ─── 连接数（实时，2 秒一轮）────────────────────
@@ -318,12 +426,38 @@ function cacheEntryOf(row: Record<string, unknown>): UsageEntry {
 }
 
 /** 把一批余额结果写进列表缓存（定时快照、批量查询与外部调用共用）。返回写入条数。 */
-export function applyBalances(balances: { results?: Array<Record<string, unknown>> } | null | undefined): number {
+export function applyBalances(
+  balances: { at?: number; serverNow?: number; results?: Array<Record<string, unknown>> } | null | undefined,
+  identities?: ReadonlyMap<string, string>,
+  requestVersions?: ReadonlyMap<string, number>,
+): number {
   const rows = Array.isArray(balances?.results) ? balances.results : []
   let applied = 0
   for (const row of rows) {
     if (!row?.id) continue
-    usageMap.set(String(row.id), cacheEntryOf(row))
+    const id = String(row.id)
+    const account = findAccount(id)
+    const identity = ensureUsageIdentity(id)
+    if (!account || !identity || (identities && identities.get(id) !== identity)) continue
+    if (requestVersions && requestVersions.get(id) !== (usageRequestVersions.get(id) || 0)) continue
+    const entry = cacheEntryOf(row)
+    const workbuddy = domain.providerOf(account) === domain.DEFAULT_PROVIDER_ID
+    const queriedAt = workbuddy ? rowQueriedAt(row) : 0
+    const snapshotAt = serverTimestamp(balances?.at)
+    const serverNow = serverTimestamp(balances?.serverNow)
+    const at = queriedAt || creditFetchedAt(entry) || snapshotAt
+    if (workbuddy) {
+      // 每账号 queriedAt 排序，旧格式成功回退 fetchedAt，不用整批时间替代行完成时间。
+      const appliedAt = usageAppliedAt.get(id) || 0
+      if (usageSnapshotBlocked.has(id) || usageRequests.has(id) || (appliedAt > 0 && at <= appliedAt)) continue
+      // 旧格式失败只有整批时间，慢账号会把旧失败的轮次抬新，不能覆盖已有新版明细。
+      if (!queriedAt && usageFailureOf(entry) && creditDetailsOf(successfulUsage.get(id))) continue
+    }
+    // 当前服务端时间与行完成时间同源；旧服务端缺 serverNow 时不把持久快照当新鲜。
+    const age = serverNow
+      ? Math.max(0, serverNow - (creditFetchedAt(entry) || queriedAt || at))
+      : snapshotAt ? Infinity : 0
+    writeUsage(id, entry, at, Date.now() - age)
     applied++
   }
   if (applied) bump()
@@ -344,12 +478,14 @@ export function applyBalances(balances: { results?: Array<Record<string, unknown
 let lastSnapshotAt = 0
 export async function syncBalancesSnapshot(): Promise<boolean> {
   try {
+    const identities = new Map(allAccounts().map(account => [account.id, ensureUsageIdentity(account.id)!]))
+    const requestVersions = new Map([...identities.keys()].map(id => [id, usageRequestVersions.get(id) || 0]))
     const data = await shared().workbuddyDesktop?.getBalancesSnapshot?.()
-    const at = Number(data?.at) || 0
+    const at = serverTimestamp(data?.at)
     // at = 0 表示本进程还没定时查过（刚启动、或任务被关掉）—— 不覆盖已有缓存
-    if (!at || at === lastSnapshotAt) return false
+    if (!at || at <= lastSnapshotAt) return false
     lastSnapshotAt = at
-    if (!applyBalances(data)) return false
+    if (!applyBalances(data, identities, requestVersions)) return false
     return true
   } catch {
     // 静默：下一次轮询自然重试；账号页保持上一轮的结果不变
@@ -366,33 +502,79 @@ export async function syncBalancesSnapshot(): Promise<boolean> {
  * —— 用户分不清是禁用了还是上游挂了。所以单查带 id 走后端那条**不看启用状态**的分支。
  * 批量（`id` 缺省）仍是「全部启用账号」，行为与改造前一致。
  */
-export async function queryUsageFor(id?: string | null): Promise<{ results?: Array<Record<string, unknown>> } | null | undefined> {
-  const data = await shared().workbuddyDesktop?.getAllBalances?.(id || undefined)
-  const rows = Array.isArray(data?.results) ? data.results : []
-  const returned = new Set<string>()
-  for (const row of rows) {
-    if (!row?.id) continue
-    const rowId = String(row.id)
-    if (id && rowId !== id) continue
-    returned.add(rowId)
-    usageMap.set(rowId, cacheEntryOf(row))
-  }
+export async function queryUsageFor(id?: string | null): Promise<BalancesResult> {
   if (id) {
-    // 后端返回了 0 行才是真的「没数据」（账号刚被删、或 provider 不认这个 id）
-    if (!returned.has(id)) usageMap.set(id, '未返回余额数据')
-    bump()
-    return data
-  }
-  // 只给**批量目标集合内的**账号补「未返回」：后端的目标集合是「启用 + 有余额概念」，
-  // 缺失一行才是异常。禁用账号不在集合里，补它等于把「这行没参与本轮查询」说成
-  // 「上游没给数据」—— 与单查那个 bug 同源。
-  for (const account of allAccounts()) {
-    if (!returned.has(account.id) && supportsUsage(account) && account.enabled !== false) {
-      usageMap.set(account.id, '未返回余额数据')
+    const identity = ensureUsageIdentity(id)
+    if (!identity) return undefined
+    const current = usageRequests.get(id)
+    if (current?.identity === identity) return current.promise
+  } else {
+    if (usageBatch) return usageBatch
+    // 批量端点不能排除某个账号；先等已有单查，避免同账号并发打上游。
+    if (usageRequests.size) {
+      await Promise.allSettled([...new Set([...usageRequests.values()].map(request => request.promise))])
+      return queryUsageFor(null)
     }
   }
-  bump()
-  return data
+  const targets = id ? [findAccount(id)!] : allAccounts().filter(account => supportsUsage(account) && account.enabled !== false)
+  const requests = new Map<string, UsageRequest>()
+  const promise: Promise<BalancesResult> = Promise.resolve().then(async () => {
+    try {
+      const data = await shared().workbuddyDesktop?.getAllBalances?.(id || undefined)
+      const rows = Array.isArray(data?.results) ? data.results : []
+      const returned = new Set<string>()
+      for (const row of rows) {
+        if (!row?.id) continue
+        const rowId = String(row.id)
+        const request = requests.get(rowId)
+        if (!request || !isCurrentUsageRequest(rowId, request)) continue
+        returned.add(rowId)
+        const entry = cacheEntryOf(row)
+        // 本请求身份与代次已校验；浏览器时钟不参与服务端 fetchedAt 的排序。
+        const workbuddy = domain.providerOf(findAccount(rowId)) === domain.DEFAULT_PROVIDER_ID
+        const at = (workbuddy ? rowQueriedAt(row) : 0) || creditFetchedAt(entry) || usageAppliedAt.get(rowId) || 0
+        writeUsage(rowId, entry, at)
+        if (creditDetailsOf(entry)) usageSnapshotBlocked.delete(rowId)
+      }
+      for (const [rowId, request] of requests) {
+        if (!returned.has(rowId) && isCurrentUsageRequest(rowId, request)) writeUsage(rowId, '未返回余额数据', usageAppliedAt.get(rowId) || 0)
+      }
+      bump()
+      return data
+    } catch (error) {
+      for (const [rowId, request] of requests) {
+        if (isCurrentUsageRequest(rowId, request)) writeUsage(rowId, `查询失败：${errorMessage(error)}`, usageAppliedAt.get(rowId) || 0)
+      }
+      bump()
+      throw error
+    } finally {
+      const inflight = new Set(getStore().usageInflight)
+      for (const [rowId, request] of requests) {
+        if (usageRequests.get(rowId) === request) {
+          usageRequests.delete(rowId)
+          inflight.delete(rowId)
+        }
+      }
+      if (usageBatch === promise) usageBatch = null
+      patch({ usageInflight: inflight })
+    }
+  })
+  for (const account of targets) {
+    const identity = ensureUsageIdentity(account.id)!
+    const request = { identity, sequence: ++usageSequence, promise }
+    requests.set(account.id, request)
+    usageRequests.set(account.id, request)
+    usageRequestVersions.set(account.id, request.sequence)
+    // WorkBuddy 刷新保留旧值；其他提供商沿用「查询中」中间态。
+    if (domain.providerOf(account) !== domain.DEFAULT_PROVIDER_ID) usageMap.set(account.id, null)
+  }
+  if (!id) usageBatch = promise
+  patch({ usageInflight: new Set([...getStore().usageInflight, ...requests.keys()]) })
+  return promise
+}
+
+function isCurrentUsageRequest(id: string, request: UsageRequest): boolean {
+  return ensureUsageIdentity(id) === request.identity && usageRequests.get(id)?.sequence === request.sequence
 }
 
 /**
@@ -406,9 +588,6 @@ export async function queryAllUsage(): Promise<void> {
   const targets = allAccounts().filter(account => supportsUsage(account) && account.enabled !== false)
   if (!targets.length) { toast('暂无可查询余额的账号', 'err'); return }
   patch({ usageBusy: true })
-  // 先写「查询中」再重绘：余额列立刻显示查询中，结果回来了直接换成读数
-  targets.forEach(account => usageMap.set(account.id, null))
-  bump()
   try {
     const rows = (await queryUsageFor(null))?.results || []
     const ok = rows.filter(row => row.usage).length
@@ -421,8 +600,6 @@ export async function queryAllUsage(): Promise<void> {
       : `已更新 ${ok}/${rows.length} 个账号，${failed} 个失败`, failed ? 'err' : 'ok')
   } catch (error) {
     const message = errorMessage(error)
-    targets.forEach(account => usageMap.set(account.id, `查询失败：${message}`))
-    bump()
     toast(`余额查询失败：${message}`, 'err')
   } finally {
     patch({ usageBusy: false })
@@ -580,32 +757,11 @@ export async function runCheckin(id: string): Promise<void> {
   }
 }
 
-/**
- * 查询一个账号余额的执行体：在途去重 + 「查询中」中间态。异常**照原样抛给调用方**
- * —— 失败怎么落缓存、要不要播报由调用方定，两个调用点的口径不同：
- *   · 行上「余额」按钮（`queryUsageOnce`）→ 失败落进余额列 + 红色 toast；
- *   · 签到后的自动刷新（`refreshUsageAfterCheckin`）→ 只落缓存，不播报。
- */
-async function runUsageQuery(id: string): Promise<void> {
-  if (getStore().usageInflight.has(id)) return
-  const inflight = new Set(getStore().usageInflight)
-  inflight.add(id)
-  usageMap.set(id, null)
-  patch({ usageInflight: inflight })
-  try {
-    await queryUsageFor(id)
-  } finally {
-    const next = new Set(getStore().usageInflight)
-    next.delete(id)
-    patch({ usageInflight: next })
-  }
-}
-
 /** 行上「余额」按钮：在途去重（同一账号同时发几份一模一样的上游请求，界面上看不出区别） */
 export async function queryUsageOnce(id: string): Promise<void> {
   if (getStore().usageInflight.has(id)) return
   try {
-    await runUsageQuery(id)
+    await queryUsageFor(id)
     // 缓存的四种形态（见 usageFailureOf）：undefined/null/字符串/对象，对象里再分
     // 「未配置」与「失败」—— 提示语要跟着这个分叉走
     const failure = usageFailureOf(usageMap.get(id))
@@ -613,8 +769,6 @@ export async function queryUsageOnce(id: string): Promise<void> {
     else if (failure) toast(`余额查询失败：${failure.message}`, 'err')
     else toast('✅ 已更新余额')
   } catch (error) {
-    usageMap.set(id, `查询失败：${errorMessage(error)}`)
-    bump()
     toast(`余额查询失败：${errorMessage(error)}`, 'err')
   }
 }
@@ -647,26 +801,17 @@ export async function refreshUsageAfterCheckin(id?: string): Promise<void> {
     const account = findAccount(id)
     if (!account || !supportsUsage(account)) return
     try {
-      await runUsageQuery(id)
-    } catch (error) {
-      usageMap.set(id, `查询失败：${errorMessage(error)}`)
-      bump()
-    }
+      await queryUsageFor(id)
+    } catch { /* 查询层已经保存失败，不覆盖其他动作的 toast。 */ }
     return
   }
   if (getStore().usageBusy) return
   const targets = allAccounts().filter(account => supportsUsage(account) && account.enabled !== false)
   if (!targets.length) return
   patch({ usageBusy: true })
-  targets.forEach(account => usageMap.set(account.id, null))
-  bump()
   try {
     await queryUsageFor(null)
-  } catch (error) {
-    const message = errorMessage(error)
-    targets.forEach(account => usageMap.set(account.id, `查询失败：${message}`))
-    bump()
-  } finally {
+  } catch { /* 查询层已经保存失败。 */ } finally {
     patch({ usageBusy: false })
   }
 }

@@ -10,13 +10,16 @@
 
 use serde_json::{json, Map, Value};
 
-use crate::server::core::endpoints::RESPONSE_CODE_OK;
 use crate::server::core::account_store::state::json_number;
+use crate::server::core::endpoints::RESPONSE_CODE_OK;
 
-use super::commodity::{self, codes, is_bonus, is_daily_credit, is_plan_base, label_of, plan_priority};
+use super::commodity::{
+    self, codes, is_bonus, is_daily_credit, is_plan_base, label_of, plan_priority,
+};
+use super::credit_details;
 use super::request::{
-    js_int_string, js_truthy, number_or_zero, parse_time, time_or_null, to_int,
-    timestamp_json, CallOptions, BILLING_DOSAGE_NOTIFY, BILLING_ENTERPRISE_USAGE,
+    js_int_string, js_truthy, number_or_zero, parse_time, time_or_null, timestamp_json, to_int,
+    user_resource_page, CallOptions, BILLING_DOSAGE_NOTIFY, BILLING_ENTERPRISE_USAGE,
     BILLING_USER_RESOURCE,
 };
 use super::{BillingError, BillingService};
@@ -43,6 +46,18 @@ impl BillingService {
                 other => js_truthy(other),
             })
             .unwrap_or(false);
+        let enterprise_type = active
+            .get("account")
+            .and_then(|account| account.get("type"))
+            .and_then(Value::as_str)
+            .map(|kind| matches!(kind, "enterprise" | "ultimate" | "exclusive"))
+            .unwrap_or(false);
+        if enterprise_type && !is_enterprise {
+            return Err(BillingError::new(
+                "企业账号缺少企业信息，请更新账号资料后重试",
+                502,
+            ));
+        }
         if is_enterprise {
             self.get_enterprise_usage(&active).await
         } else {
@@ -56,21 +71,68 @@ impl BillingService {
         session: &Value,
         locale: Option<&str>,
     ) -> Result<Value, BillingError> {
-        let result = self
-            .call_billing(
-                BILLING_USER_RESOURCE,
-                CallOptions { session: Some(session), locale, ..Default::default() },
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut resources = Vec::new();
+        let mut seen_pages: Vec<Vec<Value>> = Vec::new();
+        let mut issues = Vec::new();
+        let mut first_data = Value::Null;
+        for page in 1..=20 {
+            let body = user_resource_page(page);
+            let call = tokio::time::timeout_at(
+                deadline,
+                self.call_billing(
+                    BILLING_USER_RESOURCE,
+                    CallOptions {
+                        session: Some(session),
+                        locale,
+                        body: Some(&body),
+                        ..Default::default()
+                    },
+                ),
             )
-            .await?;
-        // 结果路径：data.Response.Data.Accounts[]
-        let resources: Vec<Value> = result
-            .data
-            .get("Response")
-            .and_then(|value| value.get("Data"))
-            .and_then(|value| value.get("Accounts"))
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
+            .await;
+            let result = match call {
+                Ok(Ok(result)) => result,
+                // 身份失败交回既有刷新通道，不能拼接两种身份取得的页面。
+                Ok(Err(error)) if error.status_code == 401 || page == 1 => return Err(error),
+                Err(_) if page == 1 => {
+                    return Err(BillingError::new("积分查询超过总时间预算", 504))
+                }
+                _ => {
+                    credit_details::issue(&mut issues, "truncated");
+                    break;
+                }
+            };
+            let items = match resource_accounts(&result.data) {
+                Ok(items) => items,
+                Err(error) if page == 1 => return Err(error),
+                Err(_) => {
+                    credit_details::issue(&mut issues, "truncated");
+                    break;
+                }
+            };
+            if page == 1 {
+                first_data = result.data.clone();
+            }
+            if !items.is_empty()
+                && seen_pages
+                    .iter()
+                    .any(|seen| resource_pages_overlap(seen, items))
+            {
+                credit_details::issue(&mut issues, "truncated");
+                break;
+            }
+            resources.extend(items.iter().cloned());
+            if items.len() < 100 {
+                break;
+            }
+            seen_pages.push(items.clone());
+            if page == 20 {
+                credit_details::issue(&mut issues, "truncated");
+            }
+        }
+        let credit_details =
+            credit_details::personal(&resources, chrono::Utc::now().timestamp_millis(), issues);
 
         let mut plan_resources: Vec<Value> = resources
             .iter()
@@ -153,9 +215,17 @@ impl BillingService {
             if diff != 0 {
                 return diff.cmp(&0);
             }
-            let sort_a = a.get("__expireSort").and_then(Value::as_f64).unwrap_or(f64::INFINITY);
-            let sort_b = b.get("__expireSort").and_then(Value::as_f64).unwrap_or(f64::INFINITY);
-            sort_a.partial_cmp(&sort_b).unwrap_or(std::cmp::Ordering::Equal)
+            let sort_a = a
+                .get("__expireSort")
+                .and_then(Value::as_f64)
+                .unwrap_or(f64::INFINITY);
+            let sort_b = b
+                .get("__expireSort")
+                .and_then(Value::as_f64)
+                .unwrap_or(f64::INFINITY);
+            sort_a
+                .partial_cmp(&sort_b)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
         // 去掉内部排序辅助字段（它不属于契约）
         for item in plan_resources.iter_mut() {
@@ -251,16 +321,31 @@ impl BillingService {
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             "resources": plan_resources,
-            "raw": result.data,
+            "raw": first_data,
+            "creditDetails": credit_details,
         }))
     }
 
     /// 企业账号：POST /v2/billing/meter/get-enterprise-user-usage
     pub async fn get_enterprise_usage(&self, session: &Value) -> Result<Value, BillingError> {
+        if !session
+            .get("account")
+            .and_then(|account| account.get("enterpriseId"))
+            .map(js_truthy)
+            .unwrap_or(false)
+        {
+            return Err(BillingError::new(
+                "企业账号缺少企业信息，请更新账号资料后重试",
+                502,
+            ));
+        }
         let result = self
             .call_billing(
                 BILLING_ENTERPRISE_USAGE,
-                CallOptions { session: Some(session), ..Default::default() },
+                CallOptions {
+                    session: Some(session),
+                    ..Default::default()
+                },
             )
             .await?;
         // Node: `result.raw ?? {}` → `data?.data || data || result.data || responseData`
@@ -270,7 +355,11 @@ impl BillingService {
             .and_then(|value| value.get("data"))
             .or_else(|| response_data.get("data"))
             .or_else(|| {
-                if result.data.is_null() { None } else { Some(&result.data) }
+                if result.data.is_null() {
+                    None
+                } else {
+                    Some(&result.data)
+                }
             })
             .cloned()
             .unwrap_or_else(|| response_data.clone());
@@ -288,6 +377,8 @@ impl BillingService {
             "enterprise"
         };
 
+        let credit_details =
+            credit_details::enterprise(&usage_data, chrono::Utc::now().timestamp_millis());
         let limit_num = usage_data.get("limitNum").and_then(Value::as_f64);
         if let Some(limit_num) = limit_num {
             let credit = usage_data
@@ -298,9 +389,7 @@ impl BillingService {
             // 注意：判断的是**原始值**的真值，然后才 parseTime（可能得 0）——
             // 所以有值但解析失败时给的是 0，不是 null
             let refresh_at = match usage_data.get("cycleResetTime") {
-                Some(value) if js_truthy(value) => {
-                    Value::from(parse_time(Some(value)))
-                }
+                Some(value) if js_truthy(value) => Value::from(parse_time(Some(value))),
                 _ => Value::Null,
             };
             if limit_num == -1.0 {
@@ -315,6 +404,7 @@ impl BillingService {
                     "refreshAt": refresh_at,
                     "resources": [],
                     "raw": usage_data,
+                    "creditDetails": credit_details,
                 }));
             }
             return Ok(json!({
@@ -327,6 +417,7 @@ impl BillingService {
                 "refreshAt": refresh_at,
                 "resources": [],
                 "raw": usage_data,
+                "creditDetails": credit_details,
             }));
         }
         Ok(json!({
@@ -338,6 +429,7 @@ impl BillingService {
             "usageUsed": "0",
             "resources": [],
             "raw": if usage_data.is_null() { Value::Null } else { usage_data },
+            "creditDetails": credit_details,
         }))
     }
 
@@ -353,7 +445,11 @@ impl BillingService {
         session: Option<&Value>,
     ) -> Result<Option<i64>, BillingError> {
         let usage = self.query_usage(session, None).await?;
-        if usage.get("unlimited").and_then(Value::as_bool).unwrap_or(false) {
+        if usage
+            .get("unlimited")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
             return Ok(None);
         }
         match usage.get("usageLeft").and_then(to_int) {
@@ -374,9 +470,15 @@ impl BillingService {
         locale: Option<&str>,
     ) -> Result<Value, BillingError> {
         let usage = self.query_usage(session, locale).await?;
-        let kind = usage.get("kind").and_then(Value::as_str).unwrap_or("personal");
+        let kind = usage
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("personal");
         if kind == "enterprise" {
-            let unlimited = usage.get("unlimited").and_then(Value::as_bool).unwrap_or(false);
+            let unlimited = usage
+                .get("unlimited")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             return Ok(json!({
                 "kind": "enterprise",
                 "unlimited": unlimited,
@@ -387,6 +489,7 @@ impl BillingService {
                 },
                 "planLeft": Value::Null,
                 "bonusLeft": Value::Null,
+                "creditDetails": usage.get("creditDetails").cloned().unwrap_or(Value::Null),
             }));
         }
         let mut total_left: i64 = 0;
@@ -410,6 +513,7 @@ impl BillingService {
             "totalLeft": total_left,
             "planLeft": plan_left,
             "bonusLeft": bonus_left,
+            "creditDetails": usage.get("creditDetails").cloned().unwrap_or(Value::Null),
         }))
     }
 
@@ -421,7 +525,11 @@ impl BillingService {
         let result = self
             .call_billing(
                 BILLING_DOSAGE_NOTIFY,
-                CallOptions { session, expect_code_ok: false, ..Default::default() },
+                CallOptions {
+                    session,
+                    expect_code_ok: false,
+                    ..Default::default()
+                },
             )
             .await?;
         if result.code == Some(RESPONSE_CODE_OK) {
@@ -431,3 +539,48 @@ impl BillingService {
         }
     }
 }
+
+/// 空数组是合法零余额；结构缺失或业务错误不能静默变成零。
+fn resource_accounts(data: &Value) -> Result<&Vec<Value>, BillingError> {
+    for candidate in [Some(data), data.get("data")].into_iter().flatten() {
+        if candidate
+            .pointer("/Response/Error")
+            .filter(|error| !error.is_null())
+            .is_some()
+        {
+            return Err(BillingError::new("积分资源接口返回业务错误", 502));
+        }
+        if let Some(accounts) = candidate
+            .pointer("/Response/Data/Accounts")
+            .or_else(|| candidate.get("accounts"))
+        {
+            return accounts
+                .as_array()
+                .ok_or_else(|| BillingError::new("积分响应的 Accounts 结构无效", 502));
+        }
+    }
+    Err(BillingError::new("积分响应缺少 Accounts 结构", 502))
+}
+
+fn resource_pages_overlap(a: &[Value], b: &[Value]) -> bool {
+    if a == b {
+        return true;
+    }
+    let identities = |items: &[Value]| -> Option<Vec<String>> {
+        let mut ids: Vec<String> = items
+            .iter()
+            .map(|item| match item.get("ResourceId")? {
+                Value::String(id) if !id.is_empty() => Some(id.clone()),
+                Value::Number(id) => Some(id.to_string()),
+                _ => None,
+            })
+            .collect::<Option<_>>()?;
+        ids.sort();
+        Some(ids)
+    };
+    // 忽略请求间变化的金额与排序；整页重复或部分身份重叠均停止，避免双计。
+    matches!((identities(a), identities(b)), (Some(a), Some(b)) if a.iter().any(|id| b.contains(id)))
+}
+
+#[cfg(test)]
+mod tests;

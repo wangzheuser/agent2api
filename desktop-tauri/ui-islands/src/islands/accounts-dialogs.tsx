@@ -18,6 +18,7 @@
  */
 
 import * as React from 'react'
+import { AccountsCreditDialog } from './accounts-credit-dialog'
 import {
   Button,
   Dialog,
@@ -931,7 +932,7 @@ function BatchDialog({ ids, action, onClose }: { ids: string[]; action: string; 
 /* ─── 供页面调用的入口 ───────────────────────── */
 
 /**
- * 两个弹窗的宿主：按 store 里的 dialog 状态挂载。
+ * 账号弹窗的宿主：按 store 里的 dialog 状态挂载。
  * 弹窗走组件库的 Dialog（Esc / 点遮罩关闭、焦点陷阱、滚动锁定都内建），关闭即卸载 ——
  * index.html 里那两个常驻的 `#account-modal` / `#batch-modal` 因此不再需要。
  */
@@ -940,6 +941,10 @@ export function AccountsDialogs() {
   if (!store.dialog) return null
   if (store.dialog.kind === 'settings') {
     return <AccountSettingsDialog key={store.dialog.id} id={store.dialog.id} onClose={closeDialog} />
+  }
+  if (store.dialog.kind === 'credits') {
+    return <AccountsCreditDialog key={store.dialog.id} id={store.dialog.id}
+      returnFocus={store.dialog.returnFocus} onClose={closeDialog} />
   }
   return <BatchDialog key={store.dialog.ids.join(',')} ids={store.dialog.ids} action={store.dialog.action}
     onClose={closeDialog} />

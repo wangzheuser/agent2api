@@ -26,9 +26,10 @@ import {
   type AccountFilter,
 } from './accounts-domain'
 
-/** 弹窗状态：账号设置（单个）/ 批量操作（多选 + 动作），关闭即 null */
+/** 弹窗状态：账号设置 / 积分包明细 / 批量操作，关闭即 null */
 export type AccountsDialog =
   | { kind: 'settings'; id: string }
+  | { kind: 'credits'; id: string; returnFocus?: HTMLElement | null }
   | { kind: 'batch'; ids: string[]; action: string }
   | null
 

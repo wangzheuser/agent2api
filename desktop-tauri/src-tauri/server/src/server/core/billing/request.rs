@@ -39,8 +39,13 @@ fn empty_body() -> Value {
 /// 个人积分包的固定请求体（对照 workbuddy-endpoints.mjs 的 BILLING.userResource.body，
 /// ProductCode=p_tcaca 为 WorkBuddy 产品码）
 fn user_resource_body() -> Value {
+    user_resource_page(1)
+}
+
+/// 分页只改页号，保留既有有效期与商品筛选条件。
+pub(super) fn user_resource_page(page: u32) -> Value {
     json!({
-        "PageNumber": 1,
+        "PageNumber": page,
         "PageSize": 100,
         "ProductCode": "p_tcaca",
         "Status": [0, 3],

@@ -111,7 +111,7 @@ async fn query_usage_for(store: &AccountStore, account: &Value) -> Value {
     } else {
         Err(UsageFailure::NoCredentials)
     };
-    match outcome {
+    let mut row = match outcome {
         Ok(usage) => json!({ "id": id, "name": name, "usage": usage, "error": Value::Null }),
         // Node 的这条早退 `return` **不含 name 键**（只有 catch 分支才带）
         Err(UsageFailure::NoCredentials) => {
@@ -121,7 +121,12 @@ async fn query_usage_for(store: &AccountStore, account: &Value) -> Value {
             logging::verbose("[Accounts]", &format!("账号 {id} 余额查询失败: {message}"));
             json!({ "id": id, "name": name, "usage": Value::Null, "error": message, "code": code })
         }
+    };
+    // 批量快照可能等待其他慢账号；按本账号完成时间排序，避免旧失败覆盖新余额。
+    if account.get("provider").and_then(Value::as_str).unwrap_or("workbuddy") == "workbuddy" {
+        row["queriedAt"] = Value::from(logging::now_ms());
     }
+    row
 }
 
 /// 查询一个账号的余额 / 积分（**按账号所属 provider 分流到适配器**）。
@@ -288,15 +293,19 @@ pub fn store_snapshot(report: Value) -> (usize, usize) {
 pub fn snapshot() -> Value {
     if let Ok(slot) = snapshot_slot().lock() {
         if let Some(value) = slot.as_ref() {
-            return value.clone();
+            let mut response = value.clone();
+            response["serverNow"] = Value::from(logging::now_ms());
+            return response;
         }
     }
-    let restored = task_state::read(SNAPSHOT_KEY)
+    let mut restored = task_state::read(SNAPSHOT_KEY)
         .ok()
         .and_then(|state| state.value)
         .unwrap_or_else(|| json!({ "at": 0, "results": [], "skipped": 0 }));
     if let Ok(mut slot) = snapshot_slot().lock() {
         *slot = Some(restored.clone());
     }
+    // 当前服务端时刻只用于计算快照年龄，不持久化，也不与浏览器时钟比较。
+    restored["serverNow"] = Value::from(logging::now_ms());
     restored
 }

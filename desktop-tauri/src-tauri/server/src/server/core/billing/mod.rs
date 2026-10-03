@@ -34,6 +34,7 @@ mod activity;
 mod activity_response;
 pub mod checkin;
 pub mod commodity;
+mod credit_details;
 mod request;
 mod usage;
 mod web_activity;
