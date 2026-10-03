@@ -33,6 +33,77 @@ async function fixture(accounts = [{ id: 'A', uid: 'uA', provider: 'workbuddy', 
   return { api, state, calls, pending, tick, usage, result }
 }
 
+test('overview expiry clock follows the server sample despite browser clock skew', async () => {
+  const f = await fixture(), originalNow = Date.now
+  const local = 1791000000000, server = local + 4 * 3600000
+  try {
+    Date.now = () => local
+    f.api.applyBalances(f.result('A', f.usage(10, server)))
+    const sample = f.api.creditOverviewSample(f.state.accounts.accounts[0], local + 30_000)
+    assert.equal(sample.asOf, server + 30_000)
+    assert.equal(sample.fresh, true)
+    assert.equal(f.api.creditOverviewSample(f.state.accounts.accounts[0], local - 1).asOf, null)
+  } finally { Date.now = originalNow }
+})
+
+test('overview snapshot clock includes snapshot age and leaves legacy clocks unknown', async () => {
+  const f = await fixture(), server = Date.now() + 4 * 3600000
+  f.api.applyBalances({ at: server, serverNow: server, ...f.result('A', f.usage(10, server - 120_000)) })
+  const sample = f.api.creditOverviewSample(f.state.accounts.accounts[0])
+  assert.ok(Math.abs(sample.asOf - server) < 1000)
+  assert.equal(sample.fresh, false)
+  f.api.applyBalances({ at: server + 1, ...f.result('A', f.usage(12, server + 1)) })
+  assert.equal(f.api.creditOverviewSample(f.state.accounts.accounts[0]).asOf, null)
+})
+
+test('overview refresh caps concurrency at three, includes disabled, and excludes other providers', async () => {
+  const accounts = ['A', 'B', 'C', 'D', 'E'].map(id => ({ id, uid: id, enabled: id !== 'D' }))
+  accounts.push({ id: 'other', provider: 'catpaw' })
+  const f = await fixture(accounts)
+  const running = f.api.refreshCreditOverview(['A', 'A', 'B', 'C', 'D', 'E', 'other'])
+  await f.tick(); assert.deepEqual(f.calls, ['A', 'B', 'C'])
+  f.pending[0].resolve(f.result('A', f.usage(1))); await f.tick()
+  assert.deepEqual(f.calls, ['A', 'B', 'C', 'D'])
+  f.pending[1].reject(new Error('one account failed')); await f.tick()
+  assert.deepEqual(f.calls, ['A', 'B', 'C', 'D', 'E'])
+  for (let i = 2; i < 5; i++) f.pending[i].resolve(f.result(f.calls[i], f.usage(1)))
+  await running
+  assert.equal(f.api.getStore().usageInflight.size, 0)
+  assert.ok(f.api.creditOverviewSample(accounts[1]).failed)
+})
+
+test('closing overview stops queued refreshes while current shared requests finish', async () => {
+  const f = await fixture(['A', 'B', 'C', 'D'].map(id => ({ id })))
+  const controller = new AbortController()
+  const running = f.api.refreshCreditOverview(['A', 'B', 'C', 'D'], controller.signal)
+  await f.tick(); controller.abort()
+  f.pending.forEach((pending, i) => pending.resolve(f.result(f.calls[i], f.usage(1))))
+  await running
+  assert.deepEqual(f.calls, ['A', 'B', 'C'])
+})
+
+test('queued overview targets skip accounts whose identity changes before dispatch', async () => {
+  const f = await fixture(['A', 'B', 'C', 'D'].map(id => ({ id, uid: id })))
+  const running = f.api.refreshCreditOverview(['A', 'B', 'C', 'D'])
+  await f.tick()
+  f.state.accounts.accounts[3] = { id: 'D', uid: 'new-owner' }
+  f.pending.forEach((pending, i) => pending.resolve(f.result(f.calls[i], f.usage(1))))
+  await running
+  assert.deepEqual(f.calls, ['A', 'B', 'C'])
+})
+
+test('overview shares an existing detail refresh and clears old identity samples', async () => {
+  const f = await fixture()
+  const detail = f.api.refreshCreditDetails('A', true)
+  const overview = f.api.refreshCreditOverview(['A'])
+  await f.tick(); assert.deepEqual(f.calls, ['A'])
+  f.pending[0].resolve(f.result('A', f.usage(10)))
+  await Promise.all([detail, overview])
+  f.state.accounts.accounts[0].uid = 'another-identity'
+  const sample = f.api.creditOverviewSample(f.state.accounts.accounts[0])
+  assert.equal(sample.details, null); assert.equal(sample.asOf, null)
+})
+
 test('fresh details reopen without a request; force bypasses freshness and preserves old data', async () => {
   const f = await fixture()
   const previous = f.usage(12)

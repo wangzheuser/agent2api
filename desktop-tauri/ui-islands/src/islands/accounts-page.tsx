@@ -65,7 +65,7 @@ import { checkinableAccounts, isDesktopAccount, isEnabled, supportsUsage } from 
 import { ACCOUNT_COLUMNS, bindColumnGrips, columnWidths } from './accounts-columns'
 import {
   allAccounts, checkinAll, clearLimits, clearSelection, ensureProxyPoolOptions,
-  getStore, installAccountsApi, normalizeFilter, openBatchDialog, panelOpen, providerSummaryList,
+  getStore, installAccountsApi, normalizeFilter, openBatchDialog, panelOpen, patch, providerSummaryList,
   queryAllUsage, rowContext, seats, segmentCounts, setAllPicked, setProviderFilter, setSegmentFilter,
   snapshot, startConnectionsPolling, subscribe, togglePick, visibleList,
 } from './accounts-data'
@@ -314,6 +314,9 @@ function AccountsPage() {
               disabled={store.checkinBusy || !checkinableAccounts(all).length}
               title='为全部可签到的账号串行签到'
               onClick={() => void checkinAll()}>{store.checkinBusy ? '签到中…' : '全部签到'}</Button>
+            <Button id='btn-credit-overview' variant='outline'
+              disabled={!all.some(account => !account.provider || account.provider === 'workbuddy')}
+              onClick={event => patch({ dialog: { kind: 'credit-overview', returnFocus: event.currentTarget } })}>积分总览</Button>
           </div>
         </div>
 

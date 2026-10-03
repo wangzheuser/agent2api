@@ -38,6 +38,7 @@ import {
 import * as domain from './accounts-domain'
 import { clampPriority, priorityOf } from './accounts-columns'
 import { creditDetailsOf } from './accounts-credit-details'
+import type { CreditSample } from './accounts-credit-overview'
 import {
   allAccounts, bump, findAccount, getStore, isPicked, openPanelsFor, panelOpen, patch,
 } from './accounts-store'
@@ -83,6 +84,18 @@ export function creditDetailsFresh(id: string, now = Date.now()): boolean {
   const details = creditDetailsOf(usageMap.get(id))
   const receivedAt = usageReceivedAt.get(id)
   return Boolean(details?.complete && receivedAt !== undefined && now >= receivedAt && now - receivedAt < 60_000)
+}
+
+/** 总览读取同一份缓存；用服务端采样时间推进到期判断，避免浏览器时钟偏移。 */
+export function creditOverviewSample(account: AccountRecord, now = Date.now()): CreditSample {
+  ensureUsageIdentity(account.id)
+  const entry = usageMap.get(account.id)
+  const failed = Boolean(usageFailureOf(entry))
+  const details = creditDetailsOf(entry) || ((failed || !entry) ? creditDetailsOf(successfulUsage.get(account.id)) : null)
+  const receivedAt = usageReceivedAt.get(account.id)
+  return { account, details, failed, fresh: creditDetailsFresh(account.id, now),
+    asOf: details && receivedAt !== undefined && Number.isFinite(receivedAt) && now >= receivedAt
+      ? details.fetchedAt + now - receivedAt : null }
 }
 
 function accountUsageIdentity(account: AccountRecord): string {
@@ -308,6 +321,23 @@ export async function refreshCreditDetails(id: string, force = false): Promise<v
 
 export function closeDialog(): void {
   patch({ dialog: null })
+}
+
+/** 当前范围显式刷新（含禁用账号）；复用单账号请求去重，关闭总览后停止排队。 */
+export async function refreshCreditOverview(ids: string[], signal?: AbortSignal): Promise<void> {
+  const targets = [...new Set(ids)].flatMap(id => {
+    const account = findAccount(id)
+    return account && domain.providerOf(account) === domain.DEFAULT_PROVIDER_ID
+      ? [{ id, identity: accountUsageIdentity(account) }] : []
+  })
+  let next = 0
+  await Promise.all(Array.from({ length: Math.min(3, targets.length) }, async () => {
+    while (!signal?.aborted && next < targets.length) {
+      const target = targets[next++]
+      const account = findAccount(target.id)
+      if (account && accountUsageIdentity(account) === target.identity) await refreshCreditDetails(target.id, true)
+    }
+  }))
 }
 
 export function openBatchDialog(ids: string[], action = 'enable'): void {

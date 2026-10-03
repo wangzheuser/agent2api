@@ -19,6 +19,7 @@
 
 import * as React from 'react'
 import { AccountsCreditDialog } from './accounts-credit-dialog'
+import { AccountsCreditOverviewDialog } from './accounts-credit-overview-dialog'
 import {
   Button,
   Dialog,
@@ -945,6 +946,9 @@ export function AccountsDialogs() {
   if (store.dialog.kind === 'credits') {
     return <AccountsCreditDialog key={store.dialog.id} id={store.dialog.id}
       returnFocus={store.dialog.returnFocus} onClose={closeDialog} />
+  }
+  if (store.dialog.kind === 'credit-overview') {
+    return <AccountsCreditOverviewDialog returnFocus={store.dialog.returnFocus} onClose={closeDialog} />
   }
   return <BatchDialog key={store.dialog.ids.join(',')} ids={store.dialog.ids} action={store.dialog.action}
     onClose={closeDialog} />

@@ -145,7 +145,7 @@ export function AccountsCreditDialog({ id, onClose, returnFocus }: {
     previous && typeof previous === 'object' ? previous : null
 
   return <Dialog open onOpenChange={open => { if (!open) onClose() }}>
-    <DialogContent className='w-[min(680px,calc(100vw-32px))] max-h-[calc(100dvh-32px)] credits-dialog'
+    <DialogContent overlayForceRender className='w-[min(680px,calc(100vw-32px))] max-h-[calc(100dvh-32px)] credits-dialog'
       finalFocus={() => originalFocus.current?.isConnected ? originalFocus.current : false}>
       <DialogHeader><DialogTitle>积分包明细{account ? ` · ${shownName}` : ''}</DialogTitle></DialogHeader>
       <DialogBody className='credits-body' aria-busy={busy}>

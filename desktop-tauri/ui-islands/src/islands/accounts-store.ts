@@ -30,6 +30,7 @@ import {
 export type AccountsDialog =
   | { kind: 'settings'; id: string }
   | { kind: 'credits'; id: string; returnFocus?: HTMLElement | null }
+  | { kind: 'credit-overview'; returnFocus: HTMLElement }
   | { kind: 'batch'; ids: string[]; action: string }
   | null
 

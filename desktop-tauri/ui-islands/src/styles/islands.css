@@ -19,6 +19,20 @@
 
 /* WorkBuddy 积分明细：沿用主题变量，仅约束此弹窗的行与真实比例分段。 */
 .credits-dialog { color: var(--text); }
+.overview-controls { display: flex; flex-wrap: wrap; gap: 12px; justify-content: space-between; }
+.overview-edition { padding: 14px 0; border-top: 1px solid var(--border); }
+.credit-overview .overview-summary { grid-template-columns: 1.2fr 1fr 1fr; gap: 12px; }
+.overview-summary strong { font-size: 22px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.overview-buckets { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0 18px; }
+.overview-buckets button { height: auto; white-space: normal; padding: 6px 8px; font-size: 11px; border: 1px solid var(--border); border-radius: var(--r-md); color: var(--text-2); background: var(--surface); }
+.overview-buckets button[aria-pressed='true'] { border-color: var(--primary); color: var(--primary); background: var(--surface-2); }
+.overview-buckets button:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.overview-buckets button:disabled { opacity: .5; }
+.overview-account .credits-amount { display: flex; flex-direction: column; }
+@media (max-width: 520px) {
+  .credit-overview .overview-summary { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+  .overview-controls { flex-direction: column; align-items: flex-start; }
+}
 .credit-balance-trigger.usage-sum { display: block; max-width: 100%; height: auto; min-height: 0; padding: 0; border: 0; border-radius: 2px; background: transparent; box-shadow: none; font-size: 11.5px; text-align: left; }
 .credit-balance-trigger.usage-sum.ok, .credit-balance-trigger.usage-sum.warn { font-weight: 600; }
 .credit-balance-trigger.usage-sum:hover:not(:disabled) { background: transparent; border-color: transparent; text-decoration: underline; text-underline-offset: 3px; }
