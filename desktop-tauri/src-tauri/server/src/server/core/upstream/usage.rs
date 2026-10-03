@@ -44,6 +44,14 @@ pub struct UsageTokens {
     pub cache_read_present: bool,
 }
 
+/// 实扣只接受上游数值；递归一层兼容已有 usage 信封，不猜测倍率。
+pub fn upstream_credits(usage: &Value) -> Option<f64> {
+    usage.get("credit").and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .or_else(|| usage.get("usage").and_then(|nested| nested.get("credit"))
+            .and_then(Value::as_f64).filter(|value| value.is_finite() && *value >= 0.0))
+}
+
 /// 从 usage 对象里提取 token 数（字段名兼容见模块头部）。
 ///
 /// 返回 None 的情况包括：`usage` 不是对象，或对象里没有任何统一 token
@@ -202,6 +210,52 @@ fn number_field(value: Option<&Value>) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn workbuddy_credit_is_observed_from_stream_and_aggregate_without_rewriting() {
+        let chunk = json!({"id":"fixture","model":"fixture-model","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"credit":0.125}});
+        let frame = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+        let telemetry = Arc::new(RequestTelemetry::new());
+        telemetry.note_attempt(Some("a"),"A","workbuddy");
+        let mut stream = super::super::sse::ReasoningCoalescer::with_telemetry(telemetry.clone());
+        let frames = stream.push(frame.as_bytes());
+        let first: Value = serde_json::from_str(std::str::from_utf8(&frames[0]).unwrap().trim().strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(first["usage"],chunk["usage"]);
+        assert_eq!(telemetry.snapshot().upstream_credits,Some(0.125));
+        let aggregate_telemetry=Arc::new(RequestTelemetry::new());
+        aggregate_telemetry.note_attempt(Some("a"),"A","workbuddy");
+        let input=futures::stream::iter(vec![Ok(bytes::Bytes::from(frame))]);
+        let aggregate=super::super::aggregate::aggregate_frame_stream(Box::pin(input),aggregate_telemetry.clone(),None).await.unwrap();
+        assert_eq!(aggregate.body["usage"]["credit"],json!(0.125));
+        assert_eq!(aggregate_telemetry.snapshot().upstream_credits,Some(0.125));
+    }
+
+    #[test]
+    fn workbuddy_credit_preserves_zero_missing_and_attempt_identity() {
+        let telemetry = RequestTelemetry::new();
+        telemetry.note_attempt(Some("a"), "A", "workbuddy");
+        telemetry.note_workbuddy_account(Some(&json!({"uid":"a","edition":"cn"})));
+        telemetry.report_usage(&json!({"credit":0.125,"total_tokens":100}));
+        telemetry.report_usage(&json!({"completion_tokens":9}));
+        assert_eq!(telemetry.snapshot().upstream_credits, Some(0.125));
+        assert_eq!(telemetry.snapshot().workbuddy_cost_tokens, Some(100));
+        telemetry.report_usage(&json!({"usage":{"credit":0.0}}));
+        assert_eq!(telemetry.snapshot().upstream_credits, Some(0.0));
+        for invalid in [json!(null), json!(-1), json!("0.2")] {
+            assert_eq!(upstream_credits(&json!({"credit":invalid})), None);
+        }
+        telemetry.note_attempt(Some("b"), "B", "workbuddy");
+        assert_eq!(telemetry.snapshot().upstream_credits, None);
+        assert_eq!(telemetry.snapshot().workbuddy_identity, None);
+        assert_eq!(telemetry.snapshot().workbuddy_cost_tokens, None);
+        telemetry.note_workbuddy_account(Some(&json!({"uid":"b","edition":"intl"})));
+        telemetry.report_usage(&json!({"credit":0.25}));
+        assert_eq!(telemetry.snapshot().workbuddy_identity,crate::server::core::workbuddy_policy::identity(&json!({"uid":"b","edition":"intl"})));
+        assert_eq!(telemetry.snapshot().workbuddy_cost_tokens,None);
+        telemetry.note_attempt(Some("c"), "C", "raccoon");
+        telemetry.report_usage(&json!({"credit":9}));
+        assert_eq!(telemetry.snapshot().upstream_credits, None);
+    }
 
     #[test]
     fn cache_creation_telemetry_preserves_reported_zero_and_missing() {
@@ -606,6 +660,10 @@ pub struct TelemetrySnapshot {
     pub cache_read_tokens: i64,
     /// None = 上游未报告，Some(0) = 上游明确报告为零。
     pub cache_creation_tokens: Option<i64>,
+    /// 最终尝试上游明确报告的积分，独立于 token；缺失与零分开。
+    pub upstream_credits: Option<f64>,
+    pub workbuddy_identity: Option<String>,
+    pub workbuddy_cost_tokens: Option<i64>,
     pub prompt_tokens_present: bool,
     pub completion_tokens_present: bool,
     pub total_tokens_present: bool,
@@ -1147,6 +1205,9 @@ impl RequestTelemetry {
     pub fn note_attempt(&self, account_id: Option<&str>, account_name: &str, provider: &str) {
         let mut guard = self.lock();
         guard.attempts += 1;
+        guard.upstream_credits = None;
+        guard.workbuddy_identity = None;
+        guard.workbuddy_cost_tokens = None;
         guard.account_id = account_id.unwrap_or("").to_string();
         guard.account_name = account_name.to_string();
         if !provider.is_empty() {
@@ -1154,6 +1215,11 @@ impl RequestTelemetry {
         }
         // 在途回写：选路一确定，进行中行就该显示「谁在承载」
         self.flush_live(&guard);
+    }
+
+    /// 在本轮账号确定后绑定身份，换号之后不把上次实扣记到新账号。
+    pub fn note_workbuddy_account(&self, account: Option<&Value>) {
+        self.lock().workbuddy_identity = account.and_then(crate::server::core::workbuddy_policy::identity);
     }
 
     /// 追加一条**尝试明细**（这一轮发给了谁；结果稍后由
@@ -1362,6 +1428,10 @@ impl RequestTelemetry {
     /// **不做在途回写**：进行中行在前端不显示用量（`usageCell` 对进行中的行给空），
     /// 而 usage 通常只在上游最后一个 chunk 才出现 —— 收尾记账紧接着就会写它。
     pub fn report_usage(&self, usage: &Value) {
+        if let Some(credit) = upstream_credits(usage) {
+            let mut guard = self.lock();
+            if guard.provider.as_deref() == Some("workbuddy") { guard.upstream_credits = Some(credit); }
+        }
         let Some(tokens) = extract_usage(usage) else {
             return;
         };
@@ -1374,6 +1444,11 @@ impl RequestTelemetry {
             return;
         }
         let mut guard = self.lock();
+        if guard.provider.as_deref() == Some("workbuddy") && tokens.total_present && tokens.total > 0 {
+            guard.workbuddy_cost_tokens = Some(tokens.total);
+        } else if guard.provider.as_deref() == Some("workbuddy") && tokens.prompt_present && tokens.completion_present {
+            guard.workbuddy_cost_tokens = Some(tokens.prompt.saturating_add(tokens.completion));
+        }
         if tokens.prompt_present && (tokens.prompt > 0 || guard.prompt_tokens == 0) {
             guard.prompt_tokens = tokens.prompt;
             guard.prompt_tokens_present = true;

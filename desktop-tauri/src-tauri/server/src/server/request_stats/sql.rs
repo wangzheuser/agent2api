@@ -70,7 +70,7 @@ use super::report::normalize_status_filter;
 const REQUEST_COLUMNS: &str = "id, ts, model, account_id, account_name, status, duration_ms, \
      first_response_ms, attempts, error, prompt_tokens, completion_tokens, total_tokens, \
      cache_read_tokens, provider, client_model, upstream_model, attempt_details, sensitive_hits, \
-     client_reasoning, upstream_reasoning, phase, phase_started_at, cache_creation_tokens";
+     client_reasoning, upstream_reasoning, phase, phase_started_at, cache_creation_tokens, upstream_credits";
 
 // `request_daily`（按天聚合）那一支的列常量、编解码与读-改-写语句在
 // `daily.rs` —— 两张表的语句分文件后各自独立演化。
@@ -119,6 +119,7 @@ fn decode_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestEntry> {
         phase: row.get(21)?,
         phase_started_at: row.get(22)?,
         cache_creation_tokens: row.get(23)?,
+        upstream_credits: row.get(24)?,
     })
 }
 
@@ -586,7 +587,7 @@ pub(super) fn update_running_request(
          completion_tokens = ?12, total_tokens = ?13, cache_read_tokens = ?14, provider = ?15, \
          client_model = ?16, upstream_model = ?17, attempt_details = ?18, sensitive_hits = ?19, \
          client_reasoning = ?20, upstream_reasoning = ?21, phase = '', phase_started_at = NULL, \
-         cache_creation_tokens = ?22 \
+         cache_creation_tokens = ?22, upstream_credits = ?23 \
          WHERE id = ?1 AND status = 0",
         params![
             entry.id,
@@ -611,6 +612,7 @@ pub(super) fn update_running_request(
             entry.client_reasoning,
             entry.upstream_reasoning,
             entry.cache_creation_tokens,
+            entry.upstream_credits,
         ],
     )
 }
@@ -628,9 +630,9 @@ pub(super) fn insert_request(conn: &Connection, entry: &RequestEntry) -> rusqlit
         "INSERT INTO requests (id, ts, model, account_id, account_name, status, duration_ms, \
          first_response_ms, attempts, error, prompt_tokens, completion_tokens, total_tokens, \
          cache_read_tokens, provider, client_model, upstream_model, attempt_details, \
-         sensitive_hits, client_reasoning, upstream_reasoning, cache_creation_tokens) \
+         sensitive_hits, client_reasoning, upstream_reasoning, cache_creation_tokens, upstream_credits) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-         ?18, ?19, ?20, ?21, ?22)",
+         ?18, ?19, ?20, ?21, ?22, ?23)",
         params![
             entry.id,
             entry.ts,
@@ -654,6 +656,7 @@ pub(super) fn insert_request(conn: &Connection, entry: &RequestEntry) -> rusqlit
             entry.client_reasoning,
             entry.upstream_reasoning,
             entry.cache_creation_tokens,
+            entry.upstream_credits,
         ],
     )?;
     Ok(())
@@ -838,6 +841,26 @@ pub(super) fn delete_all_raw(conn: &Connection) -> rusqlite::Result<usize> {
 mod tests {
     use super::*;
     use crate::server::request_stats::record::NewRequestEntry;
+
+    #[test]
+    fn upstream_credit_round_trips_zero_fraction_missing_and_failed_receipts() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::server::db::schema::migrate(&conn).unwrap();
+        for (index, credit) in [None, Some(0.0), Some(0.125)].into_iter().enumerate() {
+            let mut entry = NewRequestEntry::new("sample", 502);
+            entry.id = format!("credit-{index}");
+            entry.upstream_credits = credit;
+            let finished = entry.normalize();
+            insert_request(&conn, &finished).unwrap();
+            let select = format!("SELECT {REQUEST_COLUMNS} FROM requests WHERE id=?1");
+            let loaded = conn.query_row(&select, [&finished.id], decode_request).unwrap();
+            assert_eq!(loaded.upstream_credits, credit);
+            assert_eq!(serde_json::to_value(&loaded).unwrap()["upstreamCredits"], serde_json::json!(credit));
+            conn.execute("UPDATE requests SET status=0, upstream_credits=NULL WHERE id=?1", [&finished.id]).unwrap();
+            assert_eq!(update_running_request(&conn, &finished).unwrap(), 1);
+            assert_eq!(conn.query_row(&select, [&finished.id], decode_request).unwrap().upstream_credits, credit);
+        }
+    }
 
     #[test]
     fn cache_creation_round_trips_insert_update_and_json_without_filling_unknown() {

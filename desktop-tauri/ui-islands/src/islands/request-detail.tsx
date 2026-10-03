@@ -100,6 +100,7 @@ type RequestRow = {
   totalTokens?: unknown
   cacheReadTokens?: unknown
   cacheCreationTokens?: number | null
+  upstreamCredits?: number | null
   /** 模型名与推理等级：下游 / 上游各一份 */
   model?: unknown
   clientModel?: unknown
@@ -474,6 +475,11 @@ function DetailPane({ row }: { row: RequestRow | null }) {
             {row.cacheCreationTokens == null ? '未上报' : fmtTokens(row.cacheCreationTokens)}
           </span>
         </Field>
+        {(row.provider === 'workbuddy' || row.upstreamCredits != null) && <Field label='实扣积分'>
+          <span title='仅展示上游明确报告的扣费；缺失与显式 0 分开，不由 token 推算'>
+            {typeof row.upstreamCredits === 'number' && Number.isFinite(row.upstreamCredits) && row.upstreamCredits >= 0 ? row.upstreamCredits.toLocaleString('zh-CN', { maximumFractionDigits: 6 }) : '未上报'}
+          </span>
+        </Field>}
         <Field label='错误'>
           {row.error ? <span className='text-destructive'>{String(row.error)}</span> : '—'}
         </Field>

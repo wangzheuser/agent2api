@@ -145,6 +145,9 @@ pub struct RequestEntry {
     /// 上游未上报或旧记录为 null；显式 0 不与缺失混淆。
     #[serde(rename = "cacheCreationTokens", default)]
     pub cache_creation_tokens: Option<i64>,
+    /// 上游明确报告的积分实扣，失败请求也保留实际回执；未上报为 null。
+    #[serde(rename = "upstreamCredits", default)]
+    pub upstream_credits: Option<f64>,
     /// 实际承载本次请求的 provider id（架构文档 §3.6）。
     ///
     /// ── 为什么是 `String` + 空串而不是 `Option<String>` ─────────
@@ -414,6 +417,7 @@ pub struct NewRequestEntry {
     pub total_tokens: i64,
     pub cache_read_tokens: i64,
     pub cache_creation_tokens: Option<i64>,
+    pub upstream_credits: Option<f64>,
     /// 实际承载本次请求的 provider id（Agent2API 改造 W2b-T3 新增填入，
     /// W4 接上持久化：见 `normalize` 末尾的透传）。
     ///
@@ -455,6 +459,7 @@ impl NewRequestEntry {
             total_tokens: 0,
             cache_read_tokens: 0,
             cache_creation_tokens: None,
+            upstream_credits: None,
             provider: None,
             client_model: String::new(),
             upstream_model: String::new(),
@@ -514,6 +519,7 @@ impl NewRequestEntry {
             total_tokens: token(self.total_tokens),
             cache_read_tokens: token(self.cache_read_tokens),
             cache_creation_tokens: self.cache_creation_tokens.map(token),
+            upstream_credits: self.upstream_credits.filter(|value| value.is_finite() && *value >= 0.0),
             provider,
             // 双名透传（trim 的理由与 provider 相同：空白不该造出一个
             // 「看起来不同的名字」）；空串语义 = 没有点名 / 没有发出去

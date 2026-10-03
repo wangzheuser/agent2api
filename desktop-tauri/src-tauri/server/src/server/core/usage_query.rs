@@ -126,6 +126,14 @@ async fn query_usage_for(store: &AccountStore, account: &Value) -> Value {
     if account.get("provider").and_then(Value::as_str).unwrap_or("workbuddy") == "workbuddy" {
         row["queriedAt"] = Value::from(logging::now_ms());
     }
+    // 身份在请求期间可能被替换；旧响应不写入新账号的保底/临期快照。
+    if let Some(before) = super::workbuddy_policy::identity(account) {
+        let current = store.list_accounts();
+        if current["accounts"].as_array().is_some_and(|accounts| accounts.iter().any(|item|
+            item["id"].as_str() == Some(id.as_str()) && super::workbuddy_policy::identity(item).as_ref() == Some(&before))) {
+            super::workbuddy_policy::observe_usage(account, &row["usage"]);
+        }
+    }
     row
 }
 

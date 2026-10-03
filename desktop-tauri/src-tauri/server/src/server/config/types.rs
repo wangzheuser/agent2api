@@ -356,6 +356,9 @@ pub const KEY_UPDATE_CHECK: &str = "updateCheck";
 pub const KEY_USAGE_QUERY: &str = "usageQuery";
 pub const KEY_ZCODE_AUTO_CLAIM: &str = "zcodeAutoClaim";
 pub const DEFAULT_ZCODE_AUTO_CLAIM_MINUTES: i64 = 10;
+/// 国内个人账号的福利巡检，账号还须单独启用自动领奖或旅行。
+pub const KEY_WORKBUDDY_GROWTH: &str = "workbuddyGrowth";
+pub const DEFAULT_WORKBUDDY_GROWTH_MINUTES: i64 = 60;
 
 /// 凭证维护默认间隔（分钟）：与改造前的硬编码 600 秒一致
 pub const DEFAULT_CREDENTIAL_MAINTENANCE_MINUTES: i64 = 10;
@@ -411,7 +414,7 @@ pub struct IntervalTask {
     pub interval: i64,
 }
 
-/// 七条间隔型任务的配置（设置页「定时任务」区域）。
+/// 间隔型任务的配置（设置页「定时任务」区域）。
 ///
 /// 与 `RetentionSettings` 同一取舍：几个值总是一起用（GET 一次返回、各自循环
 /// 各取所需），打包成一个 `Copy` 值让调用方一次拿到、不必多次读锁。
@@ -425,6 +428,7 @@ pub struct ScheduledSettings {
     pub update_check: IntervalTask,
     pub usage_query: IntervalTask,
     pub zcode_auto_claim: IntervalTask,
+    pub workbuddy_growth: IntervalTask,
 }
 
 impl Default for ScheduledSettings {
@@ -457,6 +461,10 @@ impl Default for ScheduledSettings {
             zcode_auto_claim: IntervalTask {
                 enabled: true,
                 interval: DEFAULT_ZCODE_AUTO_CLAIM_MINUTES,
+            },
+            workbuddy_growth: IntervalTask {
+                enabled: false,
+                interval: DEFAULT_WORKBUDDY_GROWTH_MINUTES,
             },
             usage_query: IntervalTask {
                 enabled: true,

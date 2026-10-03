@@ -10,6 +10,8 @@ import {
 import { displayNameOf } from './accounts-domain'
 import { formatCreditAmount } from './accounts-credit-details'
 import { AccountsCreditDialog } from './accounts-credit-dialog'
+import { AccountsGrowthOverview } from './accounts-growth-overview'
+import { growthAccountKey } from './accounts-growth-data'
 import {
   CREDIT_BUCKETS, creditScopeAccounts, sortCreditOverviewRows, summarizeCreditOverview,
   type CreditBucket, type CreditOverviewRow, type CreditScope,
@@ -34,20 +36,20 @@ function rowStatus(row: CreditOverviewRow): string {
 export function AccountsCreditOverviewDialog({ onClose, returnFocus }: { onClose: () => void; returnFocus: HTMLElement }) {
   const store = React.useSyncExternalStore(subscribe, getStore, getStore)
   const [scope, setScope] = React.useState<CreditScope>('all')
+  const [tab, setTab] = React.useState('credits')
   const [sort, setSort] = React.useState('expiry')
   const [filter, setFilter] = React.useState<{ edition: string; bucket: CreditBucket } | null>(null)
   const [, setNow] = React.useState(Date.now)
   const [refreshing, setRefreshing] = React.useState(false)
   const refresh = React.useRef<AbortController | null>(null)
-  const [detail, setDetail] = React.useState<{ account: AccountRecord; trigger: HTMLElement } | null>(null)
+  const [detail, setDetail] = React.useState<{ account: AccountRecord; trigger: HTMLElement; tab?: 'growth' } | null>(null)
   const closeDetail = React.useCallback(() => setDetail(null), [])
   const all = allAccounts()
   const visibleIds = new Set(visibleList().map(account => account.id))
   const accounts = creditScopeAccounts(all, scope, visibleIds, store.selected)
   const groups = summarizeCreditOverview(accounts.map(account => creditOverviewSample(account)))
   const currentDetail = detail && findAccount(detail.account.id)
-  const sameIdentity = detail && currentDetail && ['provider', 'uid', 'edition', 'addedAt', 'tokenTail']
-    .every(field => detail.account[field] === currentDetail[field])
+  const sameIdentity = detail && currentDetail && growthAccountKey(detail.account) === growthAccountKey(currentDetail)
 
   React.useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 15000)
@@ -96,16 +98,19 @@ export function AccountsCreditOverviewDialog({ onClose, returnFocus }: { onClose
       <DialogHeader><DialogTitle>积分总览</DialogTitle></DialogHeader>
       <DialogBody className='credits-body'>
         <DialogDescription className='credits-description'>WorkBuddy 国内／国际分别汇总个人积分，企业额度逐账号展示。点击账号查看积分包明细。</DialogDescription>
+        <SegmentedControl aria-label='总览内容' value={tab} options={[{ value: 'credits', label: '积分到期' }, { value: 'growth', label: '福利待办' }]} onValueChange={setTab} />
         <div className='overview-controls'>
           <SegmentedControl aria-label='积分汇总范围' value={scope} disabled={refreshing} options={[
             { value: 'all', label: '全部', count: creditScopeAccounts(all, 'all', visibleIds, store.selected).length },
             { value: 'filtered', label: '当前筛选', count: creditScopeAccounts(all, 'filtered', visibleIds, store.selected).length },
             { value: 'selected', label: '已选账号', count: creditScopeAccounts(all, 'selected', visibleIds, store.selected).length },
           ]} onValueChange={value => { setScope(value as CreditScope); setFilter(null) }} />
-          <SegmentedControl aria-label='总览列表排序' value={sort} options={[
+          {tab === 'credits' && <SegmentedControl aria-label='总览列表排序' value={sort} options={[
             { value: 'expiry', label: '最近到期' }, { value: 'original', label: '账号顺序' },
-          ]} onValueChange={setSort} />
+          ]} onValueChange={setSort} />}
         </div>
+        {tab === 'growth' ? <AccountsGrowthOverview key={accounts.map(growthAccountKey).join('|')} accounts={accounts} namesHidden={store.namesHidden}
+          onDetail={(account, trigger) => setDetail({ account: { ...account }, trigger, tab: 'growth' })} /> : <>
         <p className='credits-note'>当前范围 {accounts.length} 个账号（含禁用账号）。排序仅影响此弹窗；7 天内包含 24 小时内，分布条各段互不重叠。</p>
         {!accounts.length && <p role='status' className='credits-empty-bar'>当前范围没有 WorkBuddy 账号。</p>}
         {groups.map(group => {
@@ -140,13 +145,14 @@ export function AccountsCreditOverviewDialog({ onClose, returnFocus }: { onClose
           </section>
         })}
         <p className='credits-timezone'>显示时区：{dateFormat.resolvedOptions().timeZone}。未知到期及待确认时区单独列示；不完整数据不参与合计，缓存中的已到期积分会排除。企业额度不合并为可共享余额。</p>
+        </>}
       </DialogBody>
       <DialogFooter className='credits-footer'>
-        <span className='credits-note mr-auto' role='status'>{refreshing ? '正在刷新当前范围，最多同时查询 3 个账号…' : '显示已有查询结果，可手动刷新当前范围。'}</span>
-        <Button variant='outline' disabled={refreshing || !accounts.length} onClick={() => void refreshScope()}>{refreshing ? '刷新中…' : '刷新当前范围'}</Button>
+        <span className='credits-note mr-auto' role='status'>{tab === 'growth' ? '范围变化后重新查询；国际与企业不参与国内福利。' : refreshing ? '正在刷新当前范围，最多同时查询 3 个账号…' : '显示已有查询结果，可手动刷新当前范围。'}</span>
+        {tab === 'credits' && <Button variant='outline' disabled={refreshing || !accounts.length} onClick={() => void refreshScope()}>{refreshing ? '刷新中…' : '刷新当前范围'}</Button>}
         <Button variant='outline' onClick={onClose}>关闭</Button>
       </DialogFooter>
     </DialogContent>
-    {detail && sameIdentity && <AccountsCreditDialog key={detail.account.id} id={detail.account.id} onClose={closeDetail} returnFocus={detail.trigger} />}
+    {detail && sameIdentity && <AccountsCreditDialog key={detail.account.id} id={detail.account.id} onClose={closeDetail} returnFocus={detail.trigger} initialTab={detail.tab} />}
   </Dialog>
 }

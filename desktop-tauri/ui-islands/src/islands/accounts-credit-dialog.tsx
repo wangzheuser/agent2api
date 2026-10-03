@@ -1,7 +1,7 @@
 import * as React from 'react'
 import {
   Button, Dialog, DialogBody, DialogContent, DialogDescription, DialogFooter,
-  DialogHeader, DialogTitle, Tooltip, TooltipContent, TooltipProvider, TooltipTrigger,
+  DialogHeader, DialogTitle, SegmentedControl, Tooltip, TooltipContent, TooltipProvider, TooltipTrigger,
 } from '@ui'
 import {
   creditDetailsFresh, findAccount, getStore, lastSuccessfulUsage, maskName, refreshCreditDetails,
@@ -9,6 +9,8 @@ import {
 } from './accounts-data'
 import { displayNameOf, editionSuffix } from './accounts-domain'
 import { creditDetailsOf, formatCreditAmount, type WorkBuddyCreditSegment } from './accounts-credit-details'
+import { growthAccountKey, supportsGrowth } from './accounts-growth-data'
+import { AccountsGrowthPanel, WorkBuddyPolicyPanel } from './accounts-growth-panel'
 
 const HOUR = 3600000
 const issueLabels: Record<string, string> = {
@@ -51,10 +53,11 @@ function toneOf(segment: WorkBuddyCreditSegment, now: number): string {
   return 'normal'
 }
 
-export function AccountsCreditDialog({ id, onClose, returnFocus }: {
+export function AccountsCreditDialog({ id, onClose, returnFocus, initialTab = 'credits' }: {
   id: string
   onClose: () => void
   returnFocus?: HTMLElement | null
+  initialTab?: 'credits' | 'growth'
 }) {
   const store = React.useSyncExternalStore(subscribe, getStore, getStore)
   const account = findAccount(id)
@@ -65,11 +68,13 @@ export function AccountsCreditDialog({ id, onClose, returnFocus }: {
   const busy = store.usageInflight.has(id)
   const [now, setNow] = React.useState(Date.now)
   const [selected, setSelected] = React.useState<string | null>(null)
+  const [tab, setTab] = React.useState(initialTab)
   const rows = React.useRef(new Map<string, HTMLButtonElement>())
   const originalFocus = React.useRef(returnFocus || (document.activeElement instanceof HTMLElement ? document.activeElement : null))
   const name = displayNameOf(account)
   const shownName = store.namesHidden ? maskName(name) : name
   const enterprise = details?.kind === 'enterprise'
+  const growthEnabled = !!account && supportsGrowth(account) && !enterprise
 
   React.useEffect(() => { void refreshCreditDetails(id) }, [id])
   React.useEffect(() => {
@@ -147,10 +152,11 @@ export function AccountsCreditDialog({ id, onClose, returnFocus }: {
   return <Dialog open onOpenChange={open => { if (!open) onClose() }}>
     <DialogContent overlayForceRender className='w-[min(680px,calc(100vw-32px))] max-h-[calc(100dvh-32px)] credits-dialog'
       finalFocus={() => originalFocus.current?.isConnected ? originalFocus.current : false}>
-      <DialogHeader><DialogTitle>积分包明细{account ? ` · ${shownName}` : ''}</DialogTitle></DialogHeader>
+      <DialogHeader><DialogTitle>{tab === 'growth' && growthEnabled ? '成长福利' : '积分包明细'}{account ? ` · ${shownName}` : ''}</DialogTitle></DialogHeader>
       <DialogBody className='credits-body' aria-busy={busy}>
         <DialogDescription className='credits-description'>WorkBuddy {editionSuffix(account)} · {enterprise ? '企业周期额度' : '个人积分包'}</DialogDescription>
-        {!account ? <p role='status'>账号已不存在。</p> : <>
+        {growthEnabled && <SegmentedControl aria-label='账号积分内容' value={tab} options={[{ value: 'credits', label: '积分包' }, { value: 'growth', label: '成长福利' }]} onValueChange={value => setTab(value as 'credits' | 'growth')} />}
+        {tab === 'growth' && growthEnabled && account ? <AccountsGrowthPanel key={growthAccountKey(account)} account={account} namesHidden={store.namesHidden} /> : !account ? <p role='status'>账号已不存在。</p> : <>
           {failure && <div className='credits-alert' role='alert'>刷新失败：{store.namesHidden ? '当前账号余额查询失败，请重试。' : failure.message}
             {details && <span>以下为上次成功查询的数据。</span>}</div>}
           {busy && <p className='credits-note' role='status'>{details ? '正在刷新当前账号，保留上次成功查询的数据…' : '正在查询当前账号积分明细…'}</p>}
@@ -200,11 +206,12 @@ export function AccountsCreditDialog({ id, onClose, returnFocus }: {
             {legacy && <p>原余额摘要：{legacy.unlimited ? '不限量' : typeof legacy.totalLeft === 'number' ? formatCreditAmount(legacy.totalLeft) : '未知'}{failure ? '（上次成功查询）' : ''}</p>}
             <p>{failure ? '请重试当前账号。' : '当前服务器或缓存未返回新版积分明细，可刷新当前账号后重试。'}</p>
           </div>}
+          {!enterprise && !account.enterpriseId && account.type !== 'enterprise' && !growthEnabled && <WorkBuddyPolicyPanel key={growthAccountKey(account)} account={account} />}
         </>}
       </DialogBody>
       <DialogFooter className='credits-footer'>
-        <span className='credits-note mr-auto' aria-live='polite'>{busy ? '刷新中' : failure ? '刷新失败' : stale ? '上次成功查询' : details ? '当前查询结果' : '暂无明细'}</span>
-        <Button variant='outline' disabled={busy || !account} onClick={() => { void refreshCreditDetails(id, true) }}>{failure ? '重试当前账号' : '刷新当前账号'}</Button>
+        <span className='credits-note mr-auto' aria-live='polite'>{tab === 'growth' && growthEnabled ? '关闭后已发出的操作仍会完成。' : busy ? '刷新中' : failure ? '刷新失败' : stale ? '上次成功查询' : details ? '当前查询结果' : '暂无明细'}</span>
+        {!(tab === 'growth' && growthEnabled) && <Button variant='outline' disabled={busy || !account} onClick={() => { void refreshCreditDetails(id, true) }}>{failure ? '重试当前账号' : '刷新当前账号'}</Button>}
         <Button variant='outline' onClick={onClose}>关闭</Button>
       </DialogFooter>
     </DialogContent>

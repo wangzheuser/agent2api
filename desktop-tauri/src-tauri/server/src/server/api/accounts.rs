@@ -226,6 +226,10 @@ pub async fn dispatch(
 
     // ② 固定子路径（Node 版把它们放在 `<id>` 通配之前的原因）
     match (method.as_str(), rest) {
+        ("GET", "workbuddy/growth") => return super::accounts_growth::state(&state, query).await,
+        ("POST", "workbuddy/growth/action") => return super::accounts_growth::action(&state, body).await,
+        ("GET", "workbuddy/policy") => return super::accounts_growth::policy(&state, query),
+        ("PATCH", "workbuddy/policy") => return super::accounts_growth::patch_policy(&state, query, body),
         ("GET", "export") => return export_accounts(&state),
         ("POST", "import") => return import_accounts(&state, body).await,
         ("POST", "current") => return set_current(&state, body).await,

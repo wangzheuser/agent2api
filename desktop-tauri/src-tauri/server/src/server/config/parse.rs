@@ -155,7 +155,7 @@ pub(super) fn task_enabled(task: &Map<String, Value>, default: bool) -> bool {
     task.get("enabled").and_then(Value::as_bool).unwrap_or(default)
 }
 
-/// 由原始 JSON 解析六条间隔型任务（缺字段各自用默认值）
+/// 由原始 JSON 解析间隔型任务（缺字段各自用默认值）
 pub(super) fn scheduled_from(map: &Map<String, Value>) -> ScheduledSettings {
     let defaults = ScheduledSettings::default();
     let task = |key: &str, interval: i64, min: i64, max: i64| {
@@ -208,6 +208,14 @@ pub(super) fn scheduled_from(map: &Map<String, Value>) -> ScheduledSettings {
             INTERVAL_MIN_MINUTES,
             INTERVAL_MAX_MINUTES,
         ),
+        workbuddy_growth: {
+            let object = task_object(map, KEY_WORKBUDDY_GROWTH);
+            IntervalTask {
+                enabled: task_enabled(&object, defaults.workbuddy_growth.enabled),
+                interval: interval_field(&object, defaults.workbuddy_growth.interval,
+                    INTERVAL_MIN_MINUTES, INTERVAL_MAX_MINUTES),
+            }
+        },
         usage_query: task(
             KEY_USAGE_QUERY,
             defaults.usage_query.interval,
@@ -234,6 +242,29 @@ mod zcode_auto_claim_tests {
             assert_eq!(settings.zcode_auto_claim.interval, expected);
             assert!(settings.usage_query.enabled);
         }
+    }
+}
+
+#[cfg(test)]
+mod workbuddy_growth_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn welfare_automation_requires_explicit_enable_and_preserves_existing_defaults() {
+        let defaults = scheduled_from(&Map::new());
+        assert!(!defaults.workbuddy_growth.enabled);
+        assert_eq!(defaults.workbuddy_growth.interval, 60);
+        assert!(defaults.usage_query.enabled);
+        for enabled in [Value::Null, json!(false), json!("true"), json!(true)] {
+            let raw = json!({"scheduledTasks":{"workbuddyGrowth":{"enabled":enabled,"interval":0}}});
+            let actual = scheduled_from(raw.as_object().unwrap()).workbuddy_growth;
+            assert_eq!(actual.enabled, enabled == json!(true));
+            assert_eq!(actual.interval, 60);
+        }
+        let raw = json!({"scheduledTasks":{"workbuddyGrowth":{"enabled":true,"interval":1440}}});
+        assert_eq!(scheduled_from(raw.as_object().unwrap()).workbuddy_growth,
+            IntervalTask { enabled: true, interval: 1440 });
     }
 }
 

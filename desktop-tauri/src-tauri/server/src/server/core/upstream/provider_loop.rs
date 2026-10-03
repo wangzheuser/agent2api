@@ -760,6 +760,7 @@ async fn attempt_queue(
             &attempt_account,
             provider_id,
         );
+        if provider_id == "workbuddy" { ctx.telemetry.note_workbuddy_account(Some(&session)); }
         // 尝试明细的「起头」：本轮的承载者定了，结果稍后由下面两个出口补上
         // （成功出口 / 失败出口）。与 note_attempt 必须成对且在它之后 ——
         // 明细的条数因此恒等于 attempts，前端「共 N 次尝试」与链长对得上。
@@ -1393,6 +1394,7 @@ async fn attempt_custom(
     );
     ctx.telemetry
         .note_attempt(target.account_id.as_deref(), &attempt_account, &provider_id);
+    ctx.telemetry.note_workbuddy_account(target.account.as_ref());
     ctx.telemetry
         .note_attempt_started(&provider_id, &attempt_account);
     if let Some(notice) = target.proxy_notice.as_deref() {
@@ -1567,6 +1569,7 @@ async fn attempt_stateful(
     );
     ctx.telemetry
         .note_attempt(target.account_id.as_deref(), &attempt_account, provider_id);
+    ctx.telemetry.note_workbuddy_account(target.account.as_ref());
     // 尝试明细的起头：与 note_attempt 配对（同上一条注释的说明）。
     // 本路径的定稿在下面 match 的两个分支里 —— 有状态 provider 没有账号轮换，
     // 所以一轮就是一条明细，链路至多一项（`provider_loop` 的 `'accounts` 循环

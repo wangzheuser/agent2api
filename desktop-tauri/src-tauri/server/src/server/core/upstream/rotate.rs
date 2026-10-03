@@ -63,9 +63,16 @@ pub(super) async fn session_for(
     provider: &str,
     account_id: Option<&str>,
 ) -> Result<Value, GatewayError> {
+    // 取到实际会话后再核对一次，也覆盖账号删除后的默认会话与并发身份替换。
+    let checked = |session: Value| {
+        if provider == "workbuddy" && crate::server::core::workbuddy_policy::RoutePolicy::load()
+            .blocked_reason(&session, "", logging::now_ms()).is_some() {
+            Err(GatewayError::with_status(503, "WorkBuddy 积分保底生效或余额待刷新，当前会话已暂停转发"))
+        } else { Ok(session) }
+    };
     if let Some(id) = account_id {
         if let Some(entry) = service.store.get_session_by_id(id) {
-            return Ok(entry.session);
+            return checked(entry.session);
         }
         // 指定账号在两次读盘之间被删掉：回落到该 provider 的默认登录态
         // （对应 Node 的 `?? await requireSession()`）
@@ -76,7 +83,7 @@ pub(super) async fn session_for(
         .await
         .map_err(|error| error.to_gateway_error())?;
     match session {
-        Some(session) if has_access_token(&session) => Ok(session),
+        Some(session) if has_access_token(&session) => checked(session),
         _ => Err(GatewayError::with_status(
             401,
             "当前没有可用登录态：请先在桌面端完成登录",
@@ -137,15 +144,18 @@ pub(super) async fn select_target_account(
         excluded.push(id);
     }
 
+    let policy = crate::server::core::workbuddy_policy::RoutePolicy::load();
+    let policy_blocked = accounts.iter().any(|account| policy.blocked_reason(account, &keys.for_account(account), now).is_some());
     let enabled: Vec<Value> = accounts
         .iter()
         .filter(|account| !matches!(account.get("enabled"), Some(Value::Bool(false))))
+        .filter(|account| policy.blocked_reason(account, &keys.for_account(account), now).is_none())
         .cloned()
         .collect();
     if enabled.is_empty() {
         return Err(GatewayError::with_status(
             503,
-            "所有账号均已禁用，无账号可转发：请在账号页启用至少一个账号",
+            if policy_blocked { "WorkBuddy 积分保底生效或余额待刷新，无可用账号转发" } else { "所有账号均已禁用，无账号可转发：请在账号页启用至少一个账号" },
         ));
     }
 
@@ -202,6 +212,10 @@ pub(super) async fn select_target_account(
                 return Ok(with_proxy_notice(account, entry.proxy, entry.proxy_error, id));
             }
         }
+    }
+    // 有账号被保底排除时，绝不通过默认登录态重新借到受保护账号。
+    if policy_blocked {
+        return Err(GatewayError::with_status(503, "WorkBuddy 积分保底生效或余额待刷新，无可用账号转发"));
     }
     Ok(RouteTarget {
         provider: providers.first().copied().unwrap_or_default().to_string(),
@@ -421,6 +435,53 @@ pub(super) fn pick_next_account(
     let accounts = accounts_in_providers(service, providers);
     let counts = connection_counts(service);
     routing::pick_account_by_priority(&accounts, keys, &counts, tried_ids, logging::now_ms())
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+    use crate::server::core::{account_store::AccountStore, auth::AuthService, task_state, workbuddy_policy};
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn credit_floor_blocks_normal_cooldown_squeeze_and_default_session_routes() {
+        let (db, _temp) = crate::server::db::test_temp::TempDb::open("workbuddy-policy-routing");
+        task_state::install(Some(db.clone()));
+        let store = AccountStore::with_db(Some(db));
+        let add = |uid: &str| store.add_account(&json!({"account":{"uid":uid},"auth":{"accessToken":"fixture-token"},"edition":"cn"}),Some(uid)).unwrap();
+        let a = add("policy-route-a"); let b = add("policy-route-b");
+        let a_id = a["id"].as_str().unwrap(); let b_id = b["id"].as_str().unwrap();
+        let identity_a = workbuddy_policy::identity(&a).unwrap();
+        let identity_b = workbuddy_policy::identity(&b).unwrap();
+        let service = UpstreamService::new(store.clone(),AuthService::for_store(store.clone()));
+        let keys = routing::CooldownKeys::new("fixture-model");
+        let initial = select_target_account(&service,&["workbuddy"],&keys,&[]).await.unwrap();
+        assert_eq!(initial.account_id.as_deref(),Some(a_id));
+        workbuddy_policy::patch_policy(a_id,&identity_a,&json!({"creditFloor":10})).unwrap();
+        let now = logging::now_ms();
+        let usage = json!({"creditDetails":{"kind":"personal","complete":true,"remaining":10,"fetchedAt":now,"segments":[]}});
+        workbuddy_policy::observe_usage(&a,&usage);
+        assert!(matches!(session_for(&service,"workbuddy",Some(a_id)).await,Err(error) if error.status_code==503));
+        let normal = select_target_account(&service,&["workbuddy"],&keys,&[]).await.unwrap();
+        assert_eq!(normal.account_id.as_deref(),Some(b_id));
+        store.mark_rate_limited(b_id,"fixture-model",429,None,Some((now+60_000) as f64),"fixture cooldown");
+        let cooling = select_target_account(&service,&["workbuddy"],&keys,&[]).await.unwrap();
+        assert_eq!(cooling.account_id.as_deref(),Some(b_id));
+        store.update_account(b_id,&json!({"maxConcurrent":1})).unwrap();
+        let mut connection = super::super::connections::ConnectionGuard::new(service.connections());
+        connection.rebind(Some(b_id.to_string()));
+        let squeezed = select_target_account(&service,&["workbuddy"],&keys,&[]).await.unwrap();
+        assert_eq!(squeezed.account_id.as_deref(),Some(b_id));
+        // 唯一未受保护的账号已经试过时，旧逻辑会返回默认会话，借回 A。
+        let failed = select_target_account(&service,&["workbuddy"],&keys,&[b_id.to_string()]).await;
+        assert!(matches!(failed,Err(error) if error.status_code==503));
+        workbuddy_policy::patch_policy(b_id,&identity_b,&json!({"creditFloor":0})).unwrap();
+        let all_blocked = select_target_account(&service,&["workbuddy"],&keys,&[]).await;
+        assert!(matches!(all_blocked,Err(error) if error.status_code==503));
+        workbuddy_policy::patch_policy(a_id,&identity_a,&json!({"creditFloor":null})).unwrap();
+        let restored = select_target_account(&service,&["workbuddy"],&keys,&[]).await.unwrap();
+        assert_eq!(restored.account_id.as_deref(),Some(a_id));
+    }
 }
 
 /// 该账号对该模型此前是否处于限额状态（用于「已恢复可用」日志的去噪）。

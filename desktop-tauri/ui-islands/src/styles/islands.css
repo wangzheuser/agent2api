@@ -19,6 +19,26 @@
 
 /* WorkBuddy 积分明细：沿用主题变量，仅约束此弹窗的行与真实比例分段。 */
 .credits-dialog { color: var(--text); }
+.growth-panel, .growth-tasks, .growth-policy-form, .growth-adopt, .growth-result { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.growth-actions, .growth-tier, .growth-overview-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.growth-tier, .growth-overview-row { justify-content: space-between; }
+.growth-tier { padding: 8px 0; font-size: 12px; }
+.growth-card, .growth-result { padding: 12px; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface); min-width: 0; overflow-wrap: anywhere; }
+.growth-card h4 { margin: 0; font-size: 12px; }
+.growth-card p { margin: 6px 0; }
+.growth-panel a { color: var(--primary); font-size: 12px; text-decoration: underline; }
+.growth-policy { border-top: 1px solid var(--border); padding-top: 10px; }
+.growth-policy summary { cursor: pointer; font-size: 12px; padding: 6px 0; }
+.growth-policy-form { margin-top: 10px; }
+.growth-panel label, .growth-policy label { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 12px; }
+.growth-panel input[type='checkbox'], .growth-policy input[type='checkbox'] { width: auto; accent-color: var(--primary); }
+.growth-panel select, .growth-policy select, .growth-policy input[type='number'] { max-width: 100%; min-width: 0; background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: var(--r-md); padding: 6px; font-size: 12px; }
+.growth-result { background: var(--surface-2); font-size: 12px; }
+.growth-result[data-status='failed'], .growth-result[data-status='uncertain'], .growth-result[data-status='pending'] { border-color: var(--warn-bd); }
+.growth-result ul { margin: 0; padding-left: 18px; font-size: 11px; line-height: 1.7; }
+.growth-policy summary:focus-visible, .growth-panel select:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.growth-overview-row > div { min-width: 0; flex: 1 1 160px; }
+.growth-panel button { max-width: 100%; height: auto; white-space: normal; }
 .overview-controls { display: flex; flex-wrap: wrap; gap: 12px; justify-content: space-between; }
 .overview-edition { padding: 14px 0; border-top: 1px solid var(--border); }
 .credit-overview .overview-summary { grid-template-columns: 1.2fr 1fr 1fr; gap: 12px; }

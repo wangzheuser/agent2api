@@ -537,8 +537,10 @@ pub fn record_entry(context: &RecordContext, fallback_error: Option<String>) {
         .map(|at| (at - context.started_at).max(0));
     let error = snapshot
         .error
+        .clone()
         .or(fallback_error)
         .map(|text| truncate_chars(&text, ERROR_SUMMARY_CHARS));
+    crate::server::core::workbuddy_policy::observe_cost(&snapshot, (200..300).contains(&context.status) && error.is_none());
     let attempts = snapshot.attempts.max(1);
     let mut entry = NewRequestEntry::new(context.model.clone(), context.status);
     entry.ts = Some(context.started_at);
@@ -582,6 +584,7 @@ pub fn record_entry(context: &RecordContext, fallback_error: Option<String>) {
     entry.total_tokens = snapshot.total_tokens;
     entry.cache_read_tokens = snapshot.cache_read_tokens;
     entry.cache_creation_tokens = snapshot.cache_creation_tokens;
+    entry.upstream_credits = snapshot.upstream_credits;
     context.stats.record(entry);
     // 原始正文落库（request_raw 表）：与明细同 id、同开始时刻。独立于 record
     // 的一次写入（大字段不进记账热路径，理由见 `RequestStats::store_raw`）；

@@ -195,7 +195,7 @@ pub fn is_reserved(key: &str) -> bool {
 /// 「有没有阶段」因此就是「这一行还在跑」的第二个读数，与 status=0 同进同退。
 ///
 /// v7：缓存创建计数，NULL 与显式 0 分开保存（见 [`V7_SCHEMA`]）。
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
@@ -532,6 +532,9 @@ ALTER TABLE requests ADD COLUMN phase_started_at INTEGER;
 /// 只追加列；旧程序的显式列查询和写入保持兼容。
 const V7_SCHEMA: &str = "ALTER TABLE requests ADD COLUMN cache_creation_tokens INTEGER;";
 
+// v8 只加可空列；旧版列名读写及更高版本放行机制保持兼容。
+const V8_SCHEMA: &str = "ALTER TABLE requests ADD COLUMN upstream_credits REAL;";
+
 /// 把库升到 [`SCHEMA_VERSION`]（幂等：已是最新版时什么都不做）。
 ///
 /// 返回 `rusqlite::Result` 而不是本模块自造的字符串错误：调用方 `Db::open`
@@ -592,6 +595,7 @@ fn apply_version(conn: &Connection, version: i64) -> rusqlite::Result<()> {
         // v6：requests 补阶段与阶段计时两列（在途请求的状态列读数，见 V6_SCHEMA）
         6 => conn.execute_batch(V6_SCHEMA),
         7 => conn.execute_batch(V7_SCHEMA),
+        8 => conn.execute_batch(V8_SCHEMA),
         _ => Ok(()),
     }
 }
@@ -599,6 +603,25 @@ fn apply_version(conn: &Connection, version: i64) -> rusqlite::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credit_migration_allows_legacy_readers_and_writers() {
+        let conn = Connection::open_in_memory().unwrap();
+        for version in 1..=7 { apply_version(&conn, version).unwrap(); }
+        conn.pragma_update(None, "user_version", 7).unwrap();
+        conn.execute("INSERT INTO requests (ts,model,status) VALUES (1,'legacy',200)", []).unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+        conn.execute("INSERT INTO requests (ts,model,status) VALUES (2,'old-writer',200)", []).unwrap();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM requests WHERE upstream_credits IS NULL", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 2);
+        conn.execute("UPDATE requests SET upstream_credits=0.125 WHERE model='legacy'", []).unwrap();
+        // v7 的列名读写继续成功，并保留新列；旧版 migrate 对更高版本直接返回。
+        conn.execute("UPDATE requests SET cache_creation_tokens=0 WHERE model='legacy'", []).unwrap();
+        let observed: (String, Option<i64>, Option<f64>) = conn.query_row("SELECT model,cache_creation_tokens,upstream_credits FROM requests WHERE ts=1", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+        assert_eq!(observed, ("legacy".into(),Some(0),Some(0.125)));
+        assert_eq!(conn.query_row("PRAGMA integrity_check", [], |row| row.get::<_,String>(0)).unwrap(),"ok");
+    }
 
     #[test]
     fn cache_creation_migration_preserves_legacy_rows_and_old_writers() {

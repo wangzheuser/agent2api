@@ -77,8 +77,19 @@ pub const TASK_REQUESTS_AUTO_REFRESH: &str = config::KEY_REQUESTS_AUTO_REFRESH;
 pub const TASK_REPORT_AUTO_REFRESH: &str = config::KEY_REPORT_AUTO_REFRESH;
 
 pub const TASK_ZCODE_AUTO_CLAIM: &str = config::KEY_ZCODE_AUTO_CLAIM;
+pub const TASK_WORKBUDDY_GROWTH: &str = config::KEY_WORKBUDDY_GROWTH;
 
-pub const TASKS: [TaskDef; 8] = [
+pub const TASKS: [TaskDef; 9] = [
+    TaskDef {
+        id: TASK_WORKBUDDY_GROWTH,
+        label: "WorkBuddy 福利巡检",
+        description: "仅巡检已单独开启自动领奖或猫猫旅行的国内个人账号。默认关闭，每 60 分钟检查；不自动领养、补签、抽奖或发送对话。",
+        unit: "minutes",
+        runner: Runner::Backend,
+        min: config::INTERVAL_MIN_MINUTES,
+        max: config::INTERVAL_MAX_MINUTES,
+        default_interval: config::DEFAULT_WORKBUDDY_GROWTH_MINUTES,
+    },
     TaskDef {
         id: TASK_ZCODE_AUTO_CLAIM,
         label: "ZCode 自动领取套餐",
@@ -172,6 +183,7 @@ fn settings_of(settings: config::ScheduledSettings, id: &str) -> config::Interva
         TASK_UPDATE_CHECK => settings.update_check,
         TASK_USAGE_QUERY => settings.usage_query,
         TASK_ZCODE_AUTO_CLAIM => settings.zcode_auto_claim,
+        TASK_WORKBUDDY_GROWTH => settings.workbuddy_growth,
         TASK_LOGS_AUTO_REFRESH => settings.logs_auto_refresh,
         TASK_REQUESTS_AUTO_REFRESH => settings.requests_auto_refresh,
         TASK_REPORT_AUTO_REFRESH => settings.report_auto_refresh,
@@ -362,6 +374,10 @@ async fn run_backend(
             // 单账号失败在账号排期里退避，扫描本身按配置继续发现新套餐。
             (summary, true)
         }
+        TASK_WORKBUDDY_GROWTH => {
+            let summary = crate::server::core::workbuddy_growth::scheduled_run(store).await?;
+            (summary, true)
+        }
         TASK_USAGE_QUERY => {
             match crate::server::core::usage_query::query_all(store, None).await {
                 Ok(report) => {
@@ -414,7 +430,7 @@ pub fn spawn(store: AccountStore, update: UpdateManager) {
                 }
                 // 到点：跑一次（`run_backend` 内部按当前间隔重新排期）。
                 // 被跳过（另一进程抢到、或在最短间隔内）不算错误，只留 verbose。
-                if task.id == TASK_ZCODE_AUTO_CLAIM {
+                if matches!(task.id, TASK_ZCODE_AUTO_CLAIM | TASK_WORKBUDDY_GROWTH) {
                     // 领取含验证码等待，独立运行；run_backend 的持久化占位防止重入。
                     let store = store.clone();
                     let update = update.clone();

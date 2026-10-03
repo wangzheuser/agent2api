@@ -35,6 +35,7 @@ mod activity_response;
 pub mod checkin;
 pub mod commodity;
 mod credit_details;
+pub mod growth;
 mod request;
 mod usage;
 mod web_activity;

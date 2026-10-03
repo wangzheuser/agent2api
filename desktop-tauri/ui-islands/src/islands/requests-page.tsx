@@ -1,6 +1,7 @@
 import * as React from 'react'
 import { flushSync } from 'react-dom'
 import { createRoot } from 'react-dom/client'
+import { amountText } from './accounts-growth-data'
 import {
   Badge, BadgeDot, Button, SegmentedControl, Toggle,
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
@@ -72,6 +73,7 @@ type RequestEntry = {
   durationMs?: number; firstResponseMs?: number | null
   promptTokens?: number; completionTokens?: number; totalTokens?: number; cacheReadTokens?: number
   cacheCreationTokens?: number | null
+  upstreamCredits?: number | null
   attempts?: number; attemptDetails?: unknown[]; sensitiveHits?: unknown[]
   phase?: string; phaseElapsedMs?: number | null; phaseStartedAt?: number | null
 }
@@ -865,12 +867,14 @@ function requestCell(entry: RequestEntry, column: VisibleColumn): React.ReactNod
     case 'usage': {
       // 进行中：用量要等收尾才记账，此刻没有任何读数可给 —— 留空比「-」更准确
       if (isRunning(entry)) return <span key={key} className={className} />
+      const credit = entry.provider === 'workbuddy' || entry.upstreamCredits != null ? `实扣积分: ${amountText(entry.upstreamCredits, '未上报')}` : ''
       // 失败请求的 token 由后端一律清零，写「0」会让人以为真的消耗了这些量
       if (!isOk(entry)) {
         return (
-          <span key={key} className={className} title='失败请求不记录用量'>
+          <span key={key} className={className} title={`失败请求不记录 token 用量${credit ? `；${credit}` : ''}`}>
             <span className='req-usage-line'>in: - / out: - / all: -</span>
             <span className='req-usage-line sub'>缓存读取: - / 创建: - / 命中率: -</span>
+            {credit && <span className='req-usage-line sub'>{credit}</span>}
           </span>
         )
       }
@@ -878,9 +882,10 @@ function requestCell(entry: RequestEntry, column: VisibleColumn): React.ReactNod
       const creation = entry.cacheCreationTokens == null ? '未上报' : formatTokens(entry.cacheCreationTokens)
       const line2 = `缓存读取: ${formatTokens(entry.cacheReadTokens)} / 创建: ${creation} / 命中率: ${cacheRate(entry)}`
       return (
-        <span key={key} className={className} title={`${line1}\n${line2}`}>
+        <span key={key} className={className} title={`${line1}\n${line2}${credit ? `\n${credit}` : ''}`}>
           <span className='req-usage-line'>{line1}</span>
           <span className='req-usage-line sub'>{line2}</span>
+          {credit && <span className='req-usage-line sub'>{credit}</span>}
         </span>
       )
     }

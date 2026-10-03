@@ -175,10 +175,17 @@ pub fn rate_limit_reset_at(account: &Value, keys: &CooldownKeys<'_>, now: i64) -
 /// 账号是否可用于转发：启用 + 未被该模型限额。
 /// `reason` ∈ `Some("disabled")` | `Some("rate-limited")` | `None`（可用）。
 pub fn account_usability(account: &Value, keys: &CooldownKeys<'_>, now: i64) -> AccountUsability {
+    usability_with_policy(account, keys, now, &super::workbuddy_policy::RoutePolicy::load())
+}
+
+fn usability_with_policy(account: &Value, keys: &CooldownKeys<'_>, now: i64, policy: &super::workbuddy_policy::RoutePolicy) -> AccountUsability {
     // Node: `account?.enabled === false` —— 只有显式 false 才算禁用，
     // 缺失/字符串 "false"/0 都视为启用（与 account-store 的 enabled() 同口径）
     if matches!(account.get("enabled"), Some(Value::Bool(false))) {
         return AccountUsability { usable: false, reason: Some("disabled") };
+    }
+    if let Some(reason) = policy.blocked_reason(account, &keys.for_account(account), now) {
+        return AccountUsability { usable: false, reason: Some(reason) };
     }
     if is_rate_limited(account, keys, now) {
         return AccountUsability { usable: false, reason: Some("rate-limited") };
@@ -235,6 +242,7 @@ pub fn pick_account_by_priority(
     exclude_ids: &[String],
     now: i64,
 ) -> Option<Value> {
+    let policy = super::workbuddy_policy::RoutePolicy::load();
     let mut candidates: Vec<Value> = accounts
         .iter()
         .filter(|account| {
@@ -244,7 +252,7 @@ pub fn pick_account_by_priority(
             if exclude_ids.iter().any(|excluded| excluded == id) {
                 return false;
             }
-            account_usability(account, keys, now).usable
+            usability_with_policy(account, keys, now, &policy).usable
                 // 并发过滤放在 usability 之后：先答「这个账号让不让你用」，
                 // 再答「它忙不忙」—— 禁用 / 限流的原因不变，这里只追加一条。
                 && !at_concurrency_limit(account, id, counts)
@@ -255,6 +263,7 @@ pub fn pick_account_by_priority(
         return None;
     }
     candidates.sort_by(compare_by_priority);
+    policy.reorder(&mut candidates, &keys.for_provider("workbuddy"), now);
     candidates.into_iter().next()
 }
 
