@@ -296,16 +296,16 @@ function usageSummary(entry: UsageEntry): { text: string; kind: string; title: s
   }
   if (typeof entry !== 'object' || entry === null) return { text: '无数据', kind: 'muted', title: String(entry) }
   const data = entry as Record<string, unknown>
-  if (Object.prototype.hasOwnProperty.call(data, 'totalLeft')) {
-    const details = creditDetailsOf(entry)
-    if (details) {
-      const total = details.unlimited ? '∞' : formatCreditAmount(details.remaining)
-      return {
-        text: `${details.complete ? '可用' : '已读取'} ${total}`,
-        kind: details.complete ? 'ok' : 'warn',
-        title: details.complete ? `可用积分 ${total}` : '积分包明细不完整，请打开查看后刷新',
-      }
+  const details = creditDetailsOf(entry)
+  if (details) {
+    const total = details.unlimited ? '∞' : formatCreditAmount(details.remaining)
+    return {
+      text: `${details.complete ? '可用' : '已读取'} ${total}`,
+      kind: details.complete ? 'ok' : 'warn',
+      title: details.complete ? `可用积分 ${total}` : '积分包明细不完整，请打开查看后刷新',
     }
+  }
+  if (Object.prototype.hasOwnProperty.call(data, 'totalLeft')) {
     const total = data.unlimited ? '∞' : numberText(data.totalLeft)
     return {
       text: `可用 ${total}`,
@@ -429,7 +429,7 @@ export function UsageCell({ account }: { account: AccountRecord }) {
   }
   const entry = usageEntries().get(account.id)
   const summary = usageSummary(entry)
-  if (providerOf(account) === 'workbuddy') {
+  if (providerOf(account) === 'workbuddy' || providerOf(account) === 'qoder') {
     return (
       <button type='button' className={`usage-sum credit-balance-trigger ${summary.kind}`}
         title={`${summary.title}；双击查看积分包明细（Enter / Space 打开）`}

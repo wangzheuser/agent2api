@@ -89,10 +89,8 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   // 那一家就会掉进 GENERIC_FEATURES（症状：余额按钮消失、标识列显示成空）
   autoclaw: { usage: true, checkin: true, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt' },
   'autoclaw-intl': { usage: true, checkin: true, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt', emailAsName: true },
-  // Qoder 的签到**只有中国版有**（国际版这个地区没有签到计划，见 providers::qoder::checkin）。
-  // 能力位照样写 true —— 国际版账号由 supportsCheckin 的第二道判据（edition !== 'intl'，
-  // Qoder 的公开形态带该字段）单独排除，明细面板给出「国际版暂无签到活动」的说明；
-  // 中国版里没有被下发活动的账号（Free 套餐实测如此）会在点签到后得到一条中性提示。
+  // Qoder 两个地区都走 campaigns；有没有活动由上游实时列表决定。
+  // 没有被下发活动的账号（Free 套餐实测如此）会得到一条中性提示。
   qoder: { usage: true, checkin: true, edition: true, identifier: 'userId', expiry: 'expiresAt', emailAsName: true },
   // Cline 两条键：同一家上游按计费通道拆成两个 provider，账号形态完全一样（见
   // providers::cline::models）。查表按 id 精确匹配，只登记一个会让另一家掉进兜底
@@ -281,8 +279,8 @@ export function accountEdition(account: AccountRecord | null | undefined): 'cn' 
  * 该账号是否参与签到目标集合。
  *
  * WorkBuddy 国际版没有国内版的普通签到按钮，但参考客户端把它接到同一个
- * 调度入口：探测/领取日活奖励后，再用免费模型完成一次活跃保活。因此它也要
- * 进入目标集合；Qoder 国际版仍按「非 intl」排除。
+ * 调度入口：探测/领取日活奖励后，再用免费模型完成一次活跃保活；Qoder 两个
+ * 地区都由 campaigns 实时判断活动状态。
  *
  * 与后端同源同口径：`billing::checkin::supports_checkin` 也是这条判据，
  * 两处任一改动都要同时改（批量签到的目标集合由后端算，前端这处只决定按钮）。
@@ -290,7 +288,7 @@ export function accountEdition(account: AccountRecord | null | undefined): 'cn' 
 export function supportsCheckin(account: AccountRecord | null | undefined): boolean {
   const provider = providerOf(account)
   if (!providerFeatures(provider).checkin) return false
-  if (provider === DEFAULT_PROVIDER_ID) return true
+  if (provider === DEFAULT_PROVIDER_ID || provider === 'qoder') return true
   return accountEdition(account) !== 'intl'
 }
 

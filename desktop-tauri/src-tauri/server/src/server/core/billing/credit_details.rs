@@ -307,7 +307,7 @@ fn segment(
     }
 }
 
-pub(super) fn personal(accounts: &[Value], fetched_at: i64, mut issues: Vec<String>) -> Value {
+pub(crate) fn personal(accounts: &[Value], fetched_at: i64, mut issues: Vec<String>) -> Value {
     let mut segments = Vec::new();
     let mut trusted_remaining = 0.0;
     let mut all_amounts_known = true;
@@ -465,7 +465,7 @@ fn period_key(period: &Value, index: usize) -> String {
     }
 }
 
-pub(super) fn enterprise(data: &Value, fetched_at: i64) -> Value {
+pub(crate) fn enterprise(data: &Value, fetched_at: i64) -> Value {
     let limit = data.get("limitNum").and_then(finite_number);
     let credit = data
         .get("credit")

@@ -7,7 +7,7 @@ import {
   creditDetailsFresh, findAccount, getStore, lastSuccessfulUsage, maskName, refreshCreditDetails,
   subscribe, usageEntries, usageFailureOf,
 } from './accounts-data'
-import { displayNameOf, editionSuffix } from './accounts-domain'
+import { displayNameOf, editionSuffix, providerOf } from './accounts-domain'
 import { creditDetailsOf, formatCreditAmount, type WorkBuddyCreditSegment } from './accounts-credit-details'
 import { growthAccountKey, supportsGrowth } from './accounts-growth-data'
 import { AccountsGrowthPanel, WorkBuddyPolicyPanel } from './accounts-growth-panel'
@@ -75,6 +75,7 @@ export function AccountsCreditDialog({ id, onClose, returnFocus, initialTab = 'c
   const shownName = store.namesHidden ? maskName(name) : name
   const enterprise = details?.kind === 'enterprise'
   const growthEnabled = !!account && supportsGrowth(account) && !enterprise
+  const providerLabel = providerOf(account) === 'qoder' ? 'Qoder' : 'WorkBuddy'
 
   React.useEffect(() => { void refreshCreditDetails(id) }, [id])
   React.useEffect(() => {
@@ -154,7 +155,7 @@ export function AccountsCreditDialog({ id, onClose, returnFocus, initialTab = 'c
       finalFocus={() => originalFocus.current?.isConnected ? originalFocus.current : false}>
       <DialogHeader><DialogTitle>{tab === 'growth' && growthEnabled ? '成长福利' : '积分包明细'}{account ? ` · ${shownName}` : ''}</DialogTitle></DialogHeader>
       <DialogBody className='credits-body' aria-busy={busy}>
-        <DialogDescription className='credits-description'>WorkBuddy {editionSuffix(account)} · {enterprise ? '企业周期额度' : '个人积分包'}</DialogDescription>
+        <DialogDescription className='credits-description'>{providerLabel} {editionSuffix(account)} · {enterprise ? '企业周期额度' : '个人积分包'}</DialogDescription>
         {growthEnabled && <SegmentedControl aria-label='账号积分内容' value={tab} options={[{ value: 'credits', label: '积分包' }, { value: 'growth', label: '成长福利' }]} onValueChange={value => setTab(value as 'credits' | 'growth')} />}
         {tab === 'growth' && growthEnabled && account ? <AccountsGrowthPanel key={growthAccountKey(account)} account={account} namesHidden={store.namesHidden} /> : !account ? <p role='status'>账号已不存在。</p> : <>
           {failure && <div className='credits-alert' role='alert'>刷新失败：{store.namesHidden ? '当前账号余额查询失败，请重试。' : failure.message}

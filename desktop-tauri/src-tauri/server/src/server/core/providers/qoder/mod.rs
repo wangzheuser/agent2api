@@ -43,7 +43,7 @@
 //!   stream.rs      上游 SSE 信封解包 + 思考标签拆解（跨分片）
 //!   piping.rs      流式首帧预读 + 流式透传（issue #8 的换号修复在这）
 //!   chat.rs        转发编排（构造 → 发送 → 翻译）与 delta 翻译器
-//!   checkin.rs     每日签到（中国版的活动领取；国际版没有签到计划）
+//!   checkin.rs     每日签到（两个地区统一的活动领取）
 //!
 //! ── panic=abort ────────────────────────────────────────────
 //! 本模块在对话链路上，绝不 unwrap/expect/panic。
@@ -531,6 +531,8 @@ impl ProviderAdapter for QoderAdapter {
             let mut queue_waited_ms: u64 = 0;
             // 鉴权失败后的强制续期只做一次（见 refresh_after_auth）
             let mut auth_retries: usize = 0;
+            // 国际版在连接/TLS/可重试 5xx 时依次尝试候选网关；中国版只有一台。
+            let mut gateway_index: usize = 0;
 
             // ── 为什么这里是一个循环 ────────────────────────────────
             // 上游对免费模型走排队制，繁忙时会用 403 + 业务码 10605 回一句
@@ -543,7 +545,12 @@ impl ProviderAdapter for QoderAdapter {
                 // 每轮都重新构造：COSY 签名覆盖 request_id 与请求体，**重放同一
                 // 份签名**会被上游判成重复请求（403 / code 103），所以退避之后
                 // 必须换一份新的 request_id 与签名。
-                let plan = chat::build_plan(&context.credentials, body, &model_name)?;
+                let gateways = context
+                    .credentials
+                    .region
+                    .inference_bases(&context.credentials.access_token);
+                let gateway = gateways.get(gateway_index).copied().unwrap_or(gateways[0]);
+                let plan = chat::build_plan_with_base(&context.credentials, body, &model_name, gateway)?;
 
                 logging::verbose(
                     "[Qoder]",
@@ -568,7 +575,22 @@ impl ProviderAdapter for QoderAdapter {
                     capture.reset_request(&plan.url, "qoder", &headers, body);
                 }
 
-                let response = chat::send(&plan, effective_proxy.as_ref()).await?;
+                let response = match chat::send(&plan, effective_proxy.as_ref()).await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        if chat::retryable_gateway_error(&error)
+                            && gateway_index + 1 < gateways.len()
+                        {
+                            gateway_index += 1;
+                            logging::log(
+                                "[Qoder]",
+                                &format!("推理网关传输失败，切换候选网关 {}", gateways[gateway_index]),
+                            );
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                };
                 if let Some(capture) = capture.as_deref() {
                     capture.attach_response(response.status().as_u16(), response.headers());
                 }
@@ -583,9 +605,20 @@ impl ProviderAdapter for QoderAdapter {
                             context =
                                 refresh_after_auth(store, &account_id, &mut auth_retries, error, telemetry)
                                     .await?;
+                            gateway_index = 0;
                             continue;
                         }
                         chat::AttemptError::Fatal(error) => {
+                            if chat::retryable_gateway_error(&error)
+                                && gateway_index + 1 < gateways.len()
+                            {
+                                gateway_index += 1;
+                                logging::log(
+                                    "[Qoder]",
+                                    &format!("推理网关返回 5xx，切换候选网关 {}", gateways[gateway_index]),
+                                );
+                                continue;
+                            }
                             // 限额信号落冷却（见 `record_limited`）：编排层在会话式
                             // 路径上看不到分类，只有适配器知道这一条是额度类错误
                             if error.status_code == 429 {
@@ -665,9 +698,22 @@ impl ProviderAdapter for QoderAdapter {
                             context =
                                 refresh_after_auth(store, &account_id, &mut auth_retries, error, telemetry)
                                     .await?;
+                            gateway_index = 0;
                             continue;
                         }
-                        Err(chat::AttemptError::Fatal(error)) => return Err(error),
+                        Err(chat::AttemptError::Fatal(error)) => {
+                            if chat::retryable_gateway_error(&error)
+                                && gateway_index + 1 < gateways.len()
+                            {
+                                gateway_index += 1;
+                                logging::log(
+                                    "[Qoder]",
+                                    &format!("推理网关流式响应失败，切换候选网关 {}", gateways[gateway_index]),
+                                );
+                                continue;
+                            }
+                            return Err(error);
+                        }
                     }
                 }
 
@@ -693,9 +739,22 @@ impl ProviderAdapter for QoderAdapter {
                     Err(chat::AttemptError::Auth(error)) => {
                         context = refresh_after_auth(store, &account_id, &mut auth_retries, error, telemetry)
                             .await?;
+                        gateway_index = 0;
                         continue;
                     }
-                    Err(chat::AttemptError::Fatal(error)) => return Err(error),
+                    Err(chat::AttemptError::Fatal(error)) => {
+                        if chat::retryable_gateway_error(&error)
+                            && gateway_index + 1 < gateways.len()
+                        {
+                            gateway_index += 1;
+                            logging::log(
+                                "[Qoder]",
+                                &format!("推理网关流式响应失败，切换候选网关 {}", gateways[gateway_index]),
+                            );
+                            continue;
+                        }
+                        return Err(error);
+                    }
                 }
             }
         })
@@ -898,6 +957,7 @@ mod tests {
     use super::{merge_region_outcomes, refresh_outcome_summary};
     use crate::server::core::providers::adapter::ModelRefreshOutcome;
     use crate::server::core::providers::qoder::endpoints::Region;
+    use crate::server::errors::GatewayError;
 
     #[test]
     fn region_refresh_merge_keeps_a_success_when_the_other_region_fails() {
@@ -934,5 +994,28 @@ mod tests {
             refresh_outcome_summary(Region::Global, &ModelRefreshOutcome::unchanged()),
             "国际版沿用缓存"
         );
+    }
+
+    #[test]
+    fn inference_gateway_order_matches_token_family_and_keeps_cn_single_homed() {
+        assert_eq!(
+            Region::Global.inference_bases("jt-token"),
+            &["https://api2.qoder.sh/", "https://api1.qoder.sh/", "https://api3.qoder.sh/"]
+        );
+        assert_eq!(
+            Region::Global.inference_bases("dt-token"),
+            &["https://api3.qoder.sh/", "https://api2.qoder.sh/", "https://api1.qoder.sh/"]
+        );
+        assert_eq!(Region::Cn.inference_bases("jt-token"), &["https://gateway.qoder.com.cn/"]);
+    }
+
+    #[test]
+    fn gateway_failover_ignores_auth_quota_and_client_errors() {
+        assert!(super::chat::retryable_gateway_error(&GatewayError::with_status(502, "timeout")));
+        assert!(!super::chat::retryable_gateway_error(&GatewayError::with_status(401, "denied")));
+        assert!(!super::chat::retryable_gateway_error(&GatewayError::with_status(429, "quota")));
+        assert!(!super::chat::retryable_gateway_error(
+            &GatewayError::with_status(502, "bad request").with_optional_code(Some(403))
+        ));
     }
 }

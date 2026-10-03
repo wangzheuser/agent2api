@@ -28,6 +28,7 @@
 use serde_json::{json, Map, Value};
 
 use crate::server::core::account_store::AccountStore;
+use crate::server::core::billing::credit_details;
 use crate::server::core::proxies::ResolvedProxy;
 use crate::server::errors::GatewayError;
 
@@ -95,6 +96,80 @@ fn expiry_of(raw: &Value) -> Option<Value> {
         }
     }
     Some(value.clone())
+}
+
+/// Qoder 的额度接口只有桶级合计；把每个已知桶投影成一个积分段，复用账号页
+/// 已有的到期分段协议。`resetTime` / `resetAt` 是周期重置，不当作积分到期时间。
+fn qoder_expiry(bucket: &Value) -> Option<Value> {
+    for key in ["expiresAt", "expireAt", "endAt", "endTime", "validUntil"] {
+        let Some(value) = bucket.get(key).filter(|value| !value.is_null()) else {
+            continue;
+        };
+        if let Some(ms) = number(Some(value)) {
+            if ms <= 0.0 || ms >= EXPIRY_SENTINEL_MS {
+                continue;
+            }
+        }
+        return Some(value.clone());
+    }
+    None
+}
+
+fn qoder_segment(raw: &Value, key: &str, label: &str, unit: &str) -> Option<Value> {
+    let bucket = raw.get(key).filter(|value| value.is_object())?;
+    let mut item = Map::new();
+    item.insert("ResourceId".to_string(), Value::String(format!("qoder:{key}")));
+    item.insert("PackageCode".to_string(), Value::String(key.to_string()));
+    item.insert("PackageName".to_string(), Value::String(label.to_string()));
+    if let Some(value) = number(bucket.get("remaining")) {
+        item.insert("Remaining".to_string(), Value::from(value));
+    }
+    if let Some(value) = number(bucket.get("total")) {
+        item.insert("Amount".to_string(), Value::from(value));
+    }
+    if let Some(value) = qoder_expiry(bucket) {
+        item.insert("EndTime".to_string(), value);
+    }
+    // 保留单位只用于调试/后续兼容，不参与积分计算。
+    item.insert("Unit".to_string(), Value::String(unit.to_string()));
+    Some(Value::Object(item))
+}
+
+fn qoder_credit_details(raw: &Value, fetched_at: i64, unit: &str) -> Value {
+    let mut resources = Vec::new();
+    if let Some(item) = qoder_segment(raw, "userQuota", "订阅额度", unit) {
+        resources.push(item);
+    }
+    if let Some(item) = qoder_segment(raw, "addOnQuota", "个人资源包", unit) {
+        resources.push(item);
+    }
+    let issues = if resources.is_empty() {
+        vec!["invalid_amount".to_string()]
+    } else {
+        Vec::new()
+    };
+    let mut details = credit_details::personal(&resources, fetched_at, issues);
+    if resources.is_empty() {
+        details["complete"] = Value::Bool(false);
+        details["remaining"] = Value::Null;
+        details["unattributedRemaining"] = Value::Null;
+    }
+    details
+}
+
+fn reset_at_of(raw: &Value) -> Option<Value> {
+    raw.get("userQuota")
+        .and_then(|bucket| {
+            ["resetTime", "resetAt", "refreshAt"]
+                .iter()
+                .find_map(|key| bucket.get(*key).filter(|value| !value.is_null()))
+        })
+        .or_else(|| {
+            ["resetTime", "resetAt", "refreshAt"]
+                .iter()
+                .find_map(|key| raw.get(*key).filter(|value| !value.is_null()))
+        })
+        .cloned()
 }
 
 /// 套餐名（`plan_tier_name`）。**best-effort**：失败只让这一行不显示，
@@ -176,10 +251,53 @@ pub async fn query(store: &AccountStore, account_id: &str) -> Result<Value, Gate
     if let Some(value) = expiry_of(&raw) {
         subscription.insert("expireAt".to_string(), value);
     }
+    if let Some(value) = reset_at_of(&raw) {
+        subscription.insert("resetAt".to_string(), value);
+    }
+    let credit_details = qoder_credit_details(
+        &raw,
+        chrono::Utc::now().timestamp_millis(),
+        unit,
+    );
     Ok(json!({
         "available": available,
         "unit": unit,
         "wallets": wallets,
         "subscription": subscription,
+        "creditDetails": credit_details,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qoder_buckets_become_independent_segments_without_misreading_reset_time() {
+        let now = 1_790_985_600_000_i64;
+        let details = qoder_credit_details(
+            &json!({
+                "userQuota": {"total": 300, "remaining": 225, "resetTime": "2026-10-04T00:00:00Z"},
+                "addOnQuota": {"total": 100, "remaining": 80, "expiresAt": now + 86_400_000}
+            }),
+            now,
+            "credits",
+        );
+        assert_eq!(details["remaining"], 305.0);
+        assert_eq!(details["complete"], true);
+        let segments = details["segments"].as_array().expect("segments");
+        let user = segments.iter().find(|item| item["packageCode"] == "userQuota").expect("user quota");
+        let addon = segments.iter().find(|item| item["packageCode"] == "addOnQuota").expect("add-on quota");
+        assert_eq!(user["expiryStatus"], "unknown");
+        assert_eq!(user["expiresAt"], Value::Null);
+        assert_eq!(addon["expiresAt"], now + 86_400_000);
+    }
+
+    #[test]
+    fn missing_qoder_buckets_are_incomplete_instead_of_verified_zero() {
+        let details = qoder_credit_details(&json!({}), 1_790_985_600_000, "credits");
+        assert_eq!(details["remaining"], Value::Null);
+        assert_eq!(details["complete"], false);
+        assert_eq!(details["issues"], json!(["invalid_amount"]));
+    }
 }

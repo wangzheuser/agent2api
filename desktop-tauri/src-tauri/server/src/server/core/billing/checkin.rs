@@ -67,8 +67,9 @@ impl std::fmt::Display for CheckinError {
 /// 计算账号是否进入自动/手动签到目标集合。
 ///
 /// WorkBuddy 国际版虽然没有国内版的常规签到面板，但参考客户端把它接到同一
-/// `DailyCheckin` 调度器，执行「活动探测 + 条件领取 + 免费对话保活」，因此按
-/// provider + edition 联合判断放行。其它 provider 继续沿用各自的地区能力判据。
+/// `DailyCheckin` 调度器，执行「活动探测 + 条件领取 + 免费对话保活」；Qoder 两个
+/// 地区都从实时 campaigns 判断是否有可领取活动。因此这两家按 provider 放行，
+/// 其它 provider 继续沿用各自的地区能力判据。
 ///
 /// Accio 系（两个地区）**整家**也没有签到活动：上游客户端全包检索不到
 /// 「签到 / checkin / 每日任务」的任何痕迹（见 `providers::accio` 的模块头）。
@@ -84,6 +85,11 @@ pub fn supports_checkin(account: &Value) -> bool {
         .unwrap_or(crate::server::core::providers::DEFAULT_PROVIDER_ID);
     // WorkBuddy 国内版走计费签到，国际版走每日活跃任务；两者都复用本入口。
     if provider == crate::server::core::providers::DEFAULT_PROVIDER_ID {
+        return true;
+    }
+    // Qoder 两个地区共用 campaigns 入口；有没有活动由上游实时列表决定，
+    // 不能再按 edition 把国际版提前过滤掉。
+    if provider == "qoder" {
         return true;
     }
     // AutoClaw 国际版也有独立的 daily_signin 任务链路，不能被通用 intl 判据挡掉。
@@ -202,7 +208,7 @@ pub fn resolve_checkin_targets(
 ///   - **小浣熊**：桌面登录积分链路（`providers::raccoon::balance::claim_daily_grant`）；
 ///   - **AutoClaw**：通用任务接口的 `daily_signin` 任务
 ///     （`providers::autoclaw::checkin::claim_daily_signin`）；
-///   - **Qoder**：活动（campaign）领取链路，只有中国版有
+///   - **Qoder**：活动（campaign）领取链路，两个地区共用
 ///     （`providers::qoder::checkin::claim_daily_checkin`）。
 ///
 /// 拿一家的 token 去打另一家的签到接口只会稳定报错，所以这条分派是必需的而不是
@@ -241,8 +247,8 @@ pub async fn checkin_for(store: &AccountStore, billing: &BillingService, account
             claim_result(id, name, &display, true, claim)
         }
         "qoder" => {
-            // 中国版的每日权益以活动（campaign）形式下发；国际版由
-            // `supports_checkin` 挡在普通签到分支，保持其它提供商的地区判据。
+            // 两个地区的每日权益都以活动（campaign）形式下发；有没有活动由
+            // 上游实时列表决定。
             let claim =
                 crate::server::core::providers::qoder::checkin::claim_daily_checkin(store, &id)
                     .await
@@ -476,10 +482,14 @@ mod tests {
     }
 
     #[test]
-    fn unrelated_international_providers_remain_excluded() {
-        assert!(!supports_checkin(&json!({
+    fn qoder_both_regions_are_checked_by_campaigns_but_accio_stays_excluded() {
+        assert!(supports_checkin(&json!({
             "provider": "qoder",
             "edition": "intl",
+        })));
+        assert!(supports_checkin(&json!({
+            "provider": "qoder",
+            "edition": "cn",
         })));
         assert!(!supports_checkin(&json!({
             "provider": "accio",

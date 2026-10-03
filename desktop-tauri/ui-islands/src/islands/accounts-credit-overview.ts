@@ -31,10 +31,15 @@ export type CreditOverviewRow = CreditSample & {
   duplicate: boolean
 }
 
+const CREDIT_PROVIDERS = new Set(['workbuddy', 'qoder'])
+export function supportsCreditOverview(account: AccountRecord | null | undefined): boolean {
+  return CREDIT_PROVIDERS.has(providerOf(account))
+}
+
 const emptyBuckets = (): Record<CreditBucket, number> => ({ day: 0, week: 0, month: 0, later: 0, never: 0, unknown: 0, timezone: 0 })
 
 export function creditScopeAccounts(accounts: AccountRecord[], scope: CreditScope, visible: ReadonlySet<string>, selected: ReadonlySet<string>): AccountRecord[] {
-  return accounts.filter(account => providerOf(account) === 'workbuddy' &&
+  return accounts.filter(account => supportsCreditOverview(account) &&
     (scope === 'all' || (scope === 'filtered' ? visible : selected).has(account.id)))
 }
 
@@ -72,11 +77,12 @@ function overviewRow(sample: CreditSample): CreditOverviewRow {
 }
 
 export function summarizeCreditOverview(samples: CreditSample[]) {
-  const rows = samples.filter(sample => providerOf(sample.account) === 'workbuddy').map(overviewRow)
+  const rows = samples.filter(sample => supportsCreditOverview(sample.account)).map(overviewRow)
   const identities = new Map<string, CreditOverviewRow>()
   for (const row of rows) {
-    const uid = typeof row.account.uid === 'string' && row.account.uid ? row.account.uid : null
-    const key = JSON.stringify([accountEdition(row.account), uid ? 'uid' : 'id', uid || row.account.id])
+    const provider = providerOf(row.account)
+    const uid = [row.account.uid, row.account.userId].find(value => typeof value === 'string' && value) as string | undefined
+    const key = JSON.stringify([provider, accountEdition(row.account), uid ? 'uid' : 'id', uid || row.account.id])
     const previous = identities.get(key)
     if (!previous) { identities.set(key, row); continue }
     const newer = (row.details?.fetchedAt ?? 0) - (previous.details?.fetchedAt ?? 0)
@@ -85,14 +91,25 @@ export function summarizeCreditOverview(samples: CreditSample[]) {
       identities.set(key, row)
     } else row.duplicate = true
   }
-  return (['cn', 'intl'] as const).map(edition => {
-    const groupRows = rows.filter(row => accountEdition(row.account) === edition)
+  const groups = new Map<string, CreditOverviewRow[]>()
+  for (const row of rows) {
+    const key = `${providerOf(row.account)}:${accountEdition(row.account)}`
+    const group = groups.get(key)
+    if (group) group.push(row)
+    else groups.set(key, [row])
+  }
+  return [...groups.entries()].sort(([a], [b]) => {
+    const [providerA, editionA] = a.split(':')
+    const [providerB, editionB] = b.split(':')
+    return (providerA === providerB ? 0 : providerA === 'workbuddy' ? -1 : 1) || (editionA === editionB ? 0 : editionA === 'cn' ? -1 : 1)
+  }).map(([key, groupRows]) => {
+    const [provider, edition] = key.split(':') as ['workbuddy' | 'qoder', 'cn' | 'intl']
     const included = groupRows.filter(row => !row.duplicate && row.amount !== null)
     const buckets = emptyBuckets()
     for (const row of included) for (const { id } of CREDIT_BUCKETS) buckets[id] += row.buckets[id]
     const amount = included.reduce((total, row) => total + row.amount!, 0)
     return {
-      edition, rows: groupRows, buckets,
+      provider, edition, rows: groupRows, buckets,
       amount: included.length && Number.isFinite(amount) ? amount : null,
       included: included.length,
       stale: included.filter(row => !row.fresh || row.failed || row.expired > 0).length,

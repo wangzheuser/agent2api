@@ -142,6 +142,20 @@ pub fn build_plan(
     body: &Value,
     model_name: &str,
 ) -> Result<ChatPlan, GatewayError> {
+    build_plan_with_base(
+        credentials,
+        body,
+        model_name,
+        credentials.region.inference_base(&credentials.access_token),
+    )
+}
+
+pub fn build_plan_with_base(
+    credentials: &Credentials,
+    body: &Value,
+    model_name: &str,
+    inference_base: &str,
+) -> Result<ChatPlan, GatewayError> {
     let model = super::models::resolve(model_name, credentials.region).ok_or_else(|| {
         GatewayError::bad_request(format!(
             "模型不存在: {model_name}。Qoder 可用模型见 GET /v1/models"
@@ -229,8 +243,7 @@ pub fn build_plan(
     let url = format!(
         "{}algo/api/v2/service/pro/sse/agent_chat_generation\
          ?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1",
-        // 对话链路按令牌前缀选主机（作业令牌 jt- 走 api2，见 `inference_base`）
-        credentials.region.inference_base(&credentials.access_token)
+        inference_base
     );
     let identity = CosyIdentity {
         user_id: &credentials.user_id,
@@ -311,6 +324,18 @@ pub async fn send(
             format!("Qoder 等待响应超时({}秒，出口 {via})", budget.as_secs()),
         )),
     }
+}
+
+/// 只有传输失败或上游明确返回 5xx 时才允许换国际版网关。
+/// 401/403/429 以及带 4xx 业务码的 502 不走这条路径，避免把账号问题伪装成网关故障。
+pub fn retryable_gateway_error(error: &GatewayError) -> bool {
+    if !(500..600).contains(&error.status_code) {
+        return false;
+    }
+    error
+        .upstream_code
+        .map(|code| (500_i64..600_i64).contains(&code))
+        .unwrap_or(true)
 }
 
 /// 把**失败**的上游响应转成「排队态或定论错误」。

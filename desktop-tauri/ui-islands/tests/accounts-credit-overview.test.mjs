@@ -20,6 +20,18 @@ test('domestic and international totals remain separate even for the same UID', 
   const groups = summarizeCreditOverview([cn, intl])
   assert.deepEqual(groups.map(g => [g.edition, g.amount, g.duplicates]), [['cn', 10, 0], ['intl', 25, 0]])
 })
+test('Qoder totals stay separate from WorkBuddy and use userId for deduplication', () => {
+  const workbuddy = sample('WB')
+  const qoder = sample('Q1', [segment('qoder-pack', 7)])
+  qoder.account.provider = 'qoder'; delete qoder.account.uid; qoder.account.userId = 'same-user'
+  const duplicate = sample('Q2', [segment('qoder-pack', 9)])
+  duplicate.account.provider = 'qoder'; delete duplicate.account.uid; duplicate.account.userId = 'same-user'
+  duplicate.details.fetchedAt++
+  const groups = summarizeCreditOverview([workbuddy, qoder, duplicate])
+  assert.deepEqual(groups.map(g => [g.provider, g.edition, g.amount, g.duplicates]), [
+    ['workbuddy', 'cn', 10, 0], ['qoder', 'cn', 9, 1],
+  ])
+})
 test('buckets are disjoint at exact 24h, 7d and 30d boundaries and preserve fractions', () => {
   const result = first([sample('A', [segment('a', .1), segment('b', .2, day + 1), segment('c', .3, 7 * day), segment('d', .4, 7 * day + 1), segment('e', .5, 30 * day), segment('f', .6, 30 * day + 1)])])
   assert.equal(result.buckets.day, .1); assert.equal(result.buckets.week, .5)

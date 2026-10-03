@@ -52,6 +52,11 @@ export * from './accounts-store'
  * 退回红色「查询失败」 */
 export const NOT_CONFIGURED_CODE = 'usage_not_configured'
 
+function supportsCreditDetails(account: AccountRecord | null | undefined): boolean {
+  const provider = domain.providerOf(account)
+  return provider === domain.DEFAULT_PROVIDER_ID || provider === 'qoder'
+}
+
 /**
  * 余额的结果缓存：**原地可变**的 Map，改完调 bump() 通知。
  * 高频小改动后调 bump；WorkBuddy 明细刷新保留旧值，通过 usageInflight 标注刷新中。
@@ -304,7 +309,7 @@ export function openSettingsDialog(id: string): void {
 
 export function openCreditsDialog(id: string, returnFocus?: HTMLElement | null): void {
   const account = findAccount(id)
-  if (!account || domain.providerOf(account) !== domain.DEFAULT_PROVIDER_ID) return
+  if (!supportsCreditDetails(account)) return
   ensureUsageIdentity(id)
   patch({ dialog: { kind: 'credits', id, returnFocus } })
   void refreshCreditDetails(id)
@@ -313,7 +318,7 @@ export function openCreditsDialog(id: string, returnFocus?: HTMLElement | null):
 /** 明细复用现有余额请求；手动刷新忽略 60 秒新鲜度，但仍合并在途请求。 */
 export async function refreshCreditDetails(id: string, force = false): Promise<void> {
   const account = findAccount(id)
-  if (!account || domain.providerOf(account) !== domain.DEFAULT_PROVIDER_ID) return
+  if (!supportsCreditDetails(account)) return
   ensureUsageIdentity(id)
   if (!force && creditDetailsFresh(id)) return
   try { await queryUsageFor(id) } catch { /* 查询层已经保存错误；弹窗展示错误与上次成功数据。 */ }
@@ -327,7 +332,7 @@ export function closeDialog(): void {
 export async function refreshCreditOverview(ids: string[], signal?: AbortSignal): Promise<void> {
   const targets = [...new Set(ids)].flatMap(id => {
     const account = findAccount(id)
-    return account && domain.providerOf(account) === domain.DEFAULT_PROVIDER_ID
+    return account && supportsCreditDetails(account)
       ? [{ id, identity: accountUsageIdentity(account) }] : []
   })
   let next = 0
@@ -471,12 +476,12 @@ export function applyBalances(
     if (!account || !identity || (identities && identities.get(id) !== identity)) continue
     if (requestVersions && requestVersions.get(id) !== (usageRequestVersions.get(id) || 0)) continue
     const entry = cacheEntryOf(row)
-    const workbuddy = domain.providerOf(account) === domain.DEFAULT_PROVIDER_ID
-    const queriedAt = workbuddy ? rowQueriedAt(row) : 0
+    const creditProvider = supportsCreditDetails(account)
+    const queriedAt = creditProvider ? rowQueriedAt(row) : 0
     const snapshotAt = serverTimestamp(balances?.at)
     const serverNow = serverTimestamp(balances?.serverNow)
     const at = queriedAt || creditFetchedAt(entry) || snapshotAt
-    if (workbuddy) {
+    if (creditProvider) {
       // 每账号 queriedAt 排序，旧格式成功回退 fetchedAt，不用整批时间替代行完成时间。
       const appliedAt = usageAppliedAt.get(id) || 0
       if (usageSnapshotBlocked.has(id) || usageRequests.has(id) || (appliedAt > 0 && at <= appliedAt)) continue
@@ -561,8 +566,8 @@ export async function queryUsageFor(id?: string | null): Promise<BalancesResult>
         returned.add(rowId)
         const entry = cacheEntryOf(row)
         // 本请求身份与代次已校验；浏览器时钟不参与服务端 fetchedAt 的排序。
-        const workbuddy = domain.providerOf(findAccount(rowId)) === domain.DEFAULT_PROVIDER_ID
-        const at = (workbuddy ? rowQueriedAt(row) : 0) || creditFetchedAt(entry) || usageAppliedAt.get(rowId) || 0
+        const creditProvider = supportsCreditDetails(findAccount(rowId))
+        const at = (creditProvider ? rowQueriedAt(row) : 0) || creditFetchedAt(entry) || usageAppliedAt.get(rowId) || 0
         writeUsage(rowId, entry, at)
         if (creditDetailsOf(entry)) usageSnapshotBlocked.delete(rowId)
       }
@@ -595,8 +600,8 @@ export async function queryUsageFor(id?: string | null): Promise<BalancesResult>
     requests.set(account.id, request)
     usageRequests.set(account.id, request)
     usageRequestVersions.set(account.id, request.sequence)
-    // WorkBuddy 刷新保留旧值；其他提供商沿用「查询中」中间态。
-    if (domain.providerOf(account) !== domain.DEFAULT_PROVIDER_ID) usageMap.set(account.id, null)
+    // 积分明细刷新保留旧值；其他提供商沿用「查询中」中间态。
+    if (!supportsCreditDetails(account)) usageMap.set(account.id, null)
   }
   if (!id) usageBatch = promise
   patch({ usageInflight: new Set([...getStore().usageInflight, ...requests.keys()]) })
