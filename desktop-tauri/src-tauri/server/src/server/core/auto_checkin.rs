@@ -53,10 +53,8 @@ pub const DEFAULT_TIME: &str = "00:01";
 ///     （`providers::autoclaw::checkin`）。两个地区**都支持** —— 任务接口在
 ///     两地是同一套路径、同一套任务 id，只是站点不同（已实测），因此两家
 ///     都列进来；地区由 `billing::checkin` 从账号的 provider 反查。
-///   - **Qoder 中国版**：活动（campaign）领取链路（`providers::qoder::checkin`）。
-///     只有中国版有每日签到 —— 国际版这个地区没有签到计划（legacy 路径 404、
-///     活动列表里只有促销），由 `billing::checkin::supports_checkin` 按 provider
-///     与 edition 联合判断排除；WorkBuddy 国际版是唯一的活跃任务例外。
+///   - **Qoder 国内版 / 国际版**：两地统一走活动（campaign）领取链路
+///     （`providers::qoder::checkin`），是否有可领取活动由上游实时返回。
 ///
 /// 这是「有签到或每日活跃任务」的清单，不是「有积分概念」的清单：CatPaw 有积分查询
 /// 但没有签到，因此不在此列 —— 它的账号在批量签到里被算作 `skipped`。
@@ -85,13 +83,12 @@ pub fn default_providers() -> Vec<String> {
 /// AutoClaw 两地的签到链路都存在且同形 —— 它的展示名已经带「国内版 / 国际版」
 /// 后缀（注册表里就是），因此不需要在这里再补。
 ///
-/// **Qoder 要补**（与 WorkBuddy 同理，但方向相反）：注册表里的名字是通用的
-/// 「Qoder」，而签到只在中国版成立（国际版没有签到计划），所以这里覆盖成
-/// 「Qoder 中国版」——用户勾上它时就知道自家国际版账号不会参与。
+/// **Qoder 要补**（与 WorkBuddy 同理）：注册表里的名字是通用的「Qoder」，
+/// 这里明确标出国内版与国际版都会参与，避免用户误以为国际版被排除。
 fn provider_label(id: &str) -> &str {
     match id {
         "workbuddy" => "WorkBuddy（含国际版活跃）",
-        "qoder" => "Qoder 中国版",
+        "qoder" => "Qoder（国内版/国际版）",
         other => crate::server::core::providers::PROVIDERS
             .iter()
             .find(|meta| meta.id == other)
@@ -811,7 +808,10 @@ fn activity_keepalive_succeeded(item: &Value) -> bool {
 mod tests {
     use serde_json::json;
 
-    use super::{activity_keepalive_succeeded, is_benign_completion_message};
+    use super::{
+        activity_keepalive_succeeded, default_providers, is_benign_completion_message,
+        provider_label,
+    };
 
     #[test]
     fn completed_checkin_errors_do_not_trigger_retries() {
@@ -834,6 +834,12 @@ mod tests {
         assert!(!activity_keepalive_succeeded(&json!({
             "activity": { "pokeSucceeded": false }
         })));
+    }
+
+    #[test]
+    fn qoder_is_default_and_labeled_for_both_regions() {
+        assert!(default_providers().iter().any(|id| id == "qoder"));
+        assert_eq!(provider_label("qoder"), "Qoder（国内版/国际版）");
     }
 }
 
