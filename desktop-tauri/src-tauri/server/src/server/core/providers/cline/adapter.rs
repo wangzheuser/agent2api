@@ -41,7 +41,7 @@
 //!     限额冷却会让账号被无意义地冷却一整个窗口。**403 一律不重试**是这里
 //!     刻意的判断，理由见 `classify_error`；
 //!   - 404 `{"error":"model not found"}` → `Fatal`（模型名不对，换账号无用）；
-//!   - 429 → `QuotaLimited`（上游未给结构化恢复时间，`reset_at` 为 None）。
+//!   - 429 → `QuotaLimited`（优先使用上游的 `resets_at` / `retry_after`）。
 //!
 //! ── 500 `empty response content` 不是错误分类问题 ────────────
 //! 实测：`max_tokens` 给小了（如 10）而模型要先输出一大段 reasoning 时，
@@ -216,8 +216,7 @@ impl ProviderAdapter for ClineAdapter {
         }
         if status == 429 {
             return UpstreamErrorClass::QuotaLimited {
-                // 上游不给结构化的恢复时间（实测错误体里没有任何时间字段）
-                reset_at: None,
+                reset_at: cline_reset_at(error_body),
                 message,
                 upstream_code: None,
                 status,
@@ -446,6 +445,72 @@ fn upstream_message(error_body: &Value) -> String {
         return text.to_string();
     }
     "上游错误".to_string()
+}
+
+/// Cline 的限流恢复时间在不同网关版本里出现过四种形态：绝对秒 / 毫秒时间戳、
+/// RFC3339 文本，以及相对秒数 `retry_after`。只读归一化字段，不把未知字段猜成
+/// 时间；解析失败交给存储层原有的 10 分钟兜底。
+fn cline_reset_at(error_body: &Value) -> Option<i64> {
+    for key in ["resets_at", "reset_at", "resetAt"] {
+        if let Some(value) = error_body.get(key).and_then(absolute_timestamp) {
+            return Some(value);
+        }
+    }
+    error_body
+        .get("retry_after")
+        .and_then(relative_seconds)
+        .map(|seconds| crate::server::logging::now_ms().saturating_add(seconds.saturating_mul(1000)))
+}
+
+fn absolute_timestamp(value: &Value) -> Option<i64> {
+    if let Some(number) = value.as_i64() {
+        return timestamp_from_number(number);
+    }
+    let text = value.as_str()?.trim();
+    if let Ok(number) = text.parse::<i64>() {
+        return timestamp_from_number(number);
+    }
+    chrono::DateTime::parse_from_rfc3339(text)
+        .ok()
+        .map(|date| date.timestamp_millis())
+        .filter(|value| *value > crate::server::logging::now_ms())
+}
+
+fn timestamp_from_number(number: i64) -> Option<i64> {
+    let millis = if number < 100_000_000_000 {
+        number.saturating_mul(1000)
+    } else {
+        number
+    };
+    (millis > crate::server::logging::now_ms()).then_some(millis)
+}
+
+fn relative_seconds(value: &Value) -> Option<i64> {
+    let seconds = value.as_i64().or_else(|| value.as_str()?.trim().parse().ok())?;
+    (seconds > 0).then_some(seconds)
+}
+
+#[cfg(test)]
+mod reset_tests {
+    use super::*;
+
+    #[test]
+    fn parses_absolute_seconds_milliseconds_and_iso() {
+        let future_seconds = crate::server::logging::now_ms() / 1000 + 3600;
+        let seconds = cline_reset_at(&serde_json::json!({"resets_at": future_seconds})).expect("seconds");
+        assert!((seconds - future_seconds * 1000).abs() < 1000);
+        let future_ms = crate::server::logging::now_ms() + 7_200_000;
+        assert_eq!(Some(future_ms), cline_reset_at(&serde_json::json!({"resetAt": future_ms})));
+        assert!(cline_reset_at(&serde_json::json!({"reset_at": "2099-01-01T00:00:00Z"})).is_some());
+    }
+
+    #[test]
+    fn parses_relative_retry_after_and_ignores_expired_values() {
+        let before = crate::server::logging::now_ms();
+        let reset = cline_reset_at(&serde_json::json!({"retry_after": 90})).expect("retry_after");
+        assert!(reset >= before + 89_000);
+        assert_eq!(None, cline_reset_at(&serde_json::json!({"resets_at": 1})));
+    }
 }
 
 /// 对本池清单补种默认映射（刷新落地后调用）。

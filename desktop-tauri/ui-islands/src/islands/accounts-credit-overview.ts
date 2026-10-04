@@ -1,6 +1,6 @@
 import type { AccountRecord } from './accounts-shared'
-import type { WorkBuddyCreditDetails } from './accounts-credit-details'
-import { accountEdition, byPriorityOrder, providerOf } from './accounts-domain'
+import type { GenericBalanceDetails, WorkBuddyCreditDetails } from './accounts-credit-details'
+import { accountEdition, byPriorityOrder, providerOf, supportsUsage } from './accounts-domain'
 
 const DAY = 86400000
 export const CREDIT_BUCKETS = [
@@ -17,6 +17,7 @@ export type CreditScope = 'all' | 'filtered' | 'selected'
 export type CreditSample = {
   account: AccountRecord
   details: WorkBuddyCreditDetails | null
+  generic: GenericBalanceDetails | null
   fresh: boolean
   failed: boolean
   /** 同源服务端时钟；旧快照缺少时间锚点时为 null。 */
@@ -29,11 +30,12 @@ export type CreditOverviewRow = CreditSample & {
   expired: number
   partial: boolean
   duplicate: boolean
+  mode: 'precise' | 'generic'
+  unit: string | null
 }
 
-const CREDIT_PROVIDERS = new Set(['workbuddy', 'qoder'])
 export function supportsCreditOverview(account: AccountRecord | null | undefined): boolean {
-  return CREDIT_PROVIDERS.has(providerOf(account))
+  return supportsUsage(account)
 }
 
 const emptyBuckets = (): Record<CreditBucket, number> => ({ day: 0, week: 0, month: 0, later: 0, never: 0, unknown: 0, timezone: 0 })
@@ -44,7 +46,21 @@ export function creditScopeAccounts(accounts: AccountRecord[], scope: CreditScop
 }
 
 function overviewRow(sample: CreditSample): CreditOverviewRow {
-  const row: CreditOverviewRow = { ...sample, buckets: emptyBuckets(), amount: null, nearest: null, expired: 0, partial: false, duplicate: false }
+  const row: CreditOverviewRow = {
+    ...sample, buckets: emptyBuckets(), amount: null, nearest: null, expired: 0,
+    partial: false, duplicate: false, mode: sample.generic || !sample.details ? 'generic' : 'precise',
+    unit: sample.generic?.unit || null,
+  }
+  if (sample.generic) {
+    row.amount = sample.generic.available
+    row.partial = !sample.generic.complete
+    row.nearest = [sample.generic.subscription?.expireAt, sample.generic.subscription?.resetAt,
+      ...sample.generic.wallets.map(wallet => wallet.expiresAt)]
+      .filter((value): value is number => typeof value === 'number' && Number.isFinite(value) && value > 0)
+      .reduce((nearest, value) => Math.min(nearest, value), Infinity)
+    if (!Number.isFinite(row.nearest)) row.nearest = null
+    return row
+  }
   const details = sample.details
   // 企业可能共用额度池；只逐账号展示，不加入个人积分总数或到期分布。
   if (!details || details.kind === 'enterprise' || details.unlimited) return row
@@ -85,7 +101,8 @@ export function summarizeCreditOverview(samples: CreditSample[]) {
     const key = JSON.stringify([provider, accountEdition(row.account), uid ? 'uid' : 'id', uid || row.account.id])
     const previous = identities.get(key)
     if (!previous) { identities.set(key, row); continue }
-    const newer = (row.details?.fetchedAt ?? 0) - (previous.details?.fetchedAt ?? 0)
+    const newer = (row.details?.fetchedAt ?? row.generic?.fetchedAt ?? 0) -
+      (previous.details?.fetchedAt ?? previous.generic?.fetchedAt ?? 0)
     if (newer > 0 || (newer === 0 && row.fresh && !previous.fresh)) {
       previous.duplicate = true
       identities.set(key, row)
@@ -93,7 +110,7 @@ export function summarizeCreditOverview(samples: CreditSample[]) {
   }
   const groups = new Map<string, CreditOverviewRow[]>()
   for (const row of rows) {
-    const key = `${providerOf(row.account)}:${accountEdition(row.account)}`
+    const key = `${providerOf(row.account)}:${accountEdition(row.account)}:${row.mode}:${row.unit || ''}`
     const group = groups.get(key)
     if (group) group.push(row)
     else groups.set(key, [row])
@@ -103,17 +120,17 @@ export function summarizeCreditOverview(samples: CreditSample[]) {
     const [providerB, editionB] = b.split(':')
     return (providerA === providerB ? 0 : providerA === 'workbuddy' ? -1 : 1) || (editionA === editionB ? 0 : editionA === 'cn' ? -1 : 1)
   }).map(([key, groupRows]) => {
-    const [provider, edition] = key.split(':') as ['workbuddy' | 'qoder', 'cn' | 'intl']
+    const [provider, edition, mode, unit] = key.split(':') as [string, 'cn' | 'intl', 'precise' | 'generic', string]
     const included = groupRows.filter(row => !row.duplicate && row.amount !== null)
     const buckets = emptyBuckets()
     for (const row of included) for (const { id } of CREDIT_BUCKETS) buckets[id] += row.buckets[id]
     const amount = included.reduce((total, row) => total + row.amount!, 0)
     return {
-      provider, edition, rows: groupRows, buckets,
+      provider, edition, mode, unit: unit || null, rows: groupRows, buckets,
       amount: included.length && Number.isFinite(amount) ? amount : null,
       included: included.length,
       stale: included.filter(row => !row.fresh || row.failed || row.expired > 0).length,
-      missing: groupRows.filter(row => !row.details && !row.duplicate).length,
+      missing: groupRows.filter(row => !row.details && !row.generic && !row.duplicate).length,
       partial: groupRows.filter(row => row.partial && !row.duplicate).length,
       duplicates: groupRows.filter(row => row.duplicate).length,
       enterprise: groupRows.filter(row => row.details?.kind === 'enterprise' && !row.duplicate).length,

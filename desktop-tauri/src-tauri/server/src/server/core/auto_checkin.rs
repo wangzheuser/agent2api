@@ -55,12 +55,13 @@ pub const DEFAULT_TIME: &str = "00:01";
 ///     都列进来；地区由 `billing::checkin` 从账号的 provider 反查。
 ///   - **Qoder 国内版 / 国际版**：两地统一走活动（campaign）领取链路
 ///     （`providers::qoder::checkin`），是否有可领取活动由上游实时返回。
+///   - **Trae**：国内 SOLO 账号走每日积分签到（`providers::trae::checkin`）。
 ///
 /// 这是「有签到或每日活跃任务」的清单，不是「有积分概念」的清单：CatPaw 有积分查询
 /// 但没有签到，因此不在此列 —— 它的账号在批量签到里被算作 `skipped`。
 /// 加一家之前先确认它的签到链路真的存在（一个点了必然报错的复选框比没有更糟）。
-pub const CHECKIN_PROVIDERS: [&str; 5] =
-    ["workbuddy", "raccoon", "autoclaw", "autoclaw-intl", "qoder"];
+pub const CHECKIN_PROVIDERS: [&str; 6] =
+    ["workbuddy", "raccoon", "autoclaw", "autoclaw-intl", "qoder", "trae"];
 
 /// 缺省的签到提供商集合（全选）
 pub fn default_providers() -> Vec<String> {

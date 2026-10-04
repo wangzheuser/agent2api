@@ -369,6 +369,7 @@ const BRIDGE_JS: &str = r#"
     // 最近一次「定时查询积分」的结果快照（形状同上，多一个 at 时间戳）。
     // 账号页轮询它，于是用户不点按钮也能看到最新余额。
     getBalancesSnapshot: () => call('GET', '/api/accounts/usage/snapshot'),
+    getAutoClawTasks: id => call('GET', '/api/accounts/autoclaw/tasks?id=' + encodeURIComponent(String(id || ''))),
     getWorkBuddyGrowth: id => call('GET', '/api/accounts/workbuddy/growth?id=' + encodeURIComponent(id)),
     workBuddyGrowthAction: input => call('POST', '/api/accounts/workbuddy/growth/action', input),
     getWorkBuddyPolicy: id => call('GET', '/api/accounts/workbuddy/policy?id=' + encodeURIComponent(id)),

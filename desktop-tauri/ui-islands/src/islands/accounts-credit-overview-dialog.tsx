@@ -23,6 +23,10 @@ const timestamp = (value: number): string => dateFormat.format(value)
 
 function rowStatus(row: CreditOverviewRow): string {
   if (row.duplicate) return '同一身份，未重复计入'
+  if (row.generic) {
+    if (row.generic.issues.length) return '余额已读取，但部分附加信息失败'
+    return '通用余额，未计入积分包分段合计'
+  }
   if (!row.details) return row.failed ? '查询失败，未计入' : '尚无明细，未计入'
   if (row.details.kind === 'enterprise') return '企业周期额度，单独展示'
   if (row.details.unlimited) return '不限量，不计入积分合计'
@@ -74,19 +78,21 @@ export function AccountsCreditOverviewDialog({ onClose, returnFocus }: { onClose
     const name = displayNameOf(row.account)
     const shownName = store.namesHidden ? maskName(name) : name
     const details = row.details
-    const amount = row.amount ?? details?.remaining ?? null
+    const generic = row.generic
+    const amount = row.amount ?? details?.remaining ?? generic?.available ?? null
     return <button key={row.account.id} type='button' className='credits-row overview-account' data-account-id={row.account.id}
       onClick={event => setDetail({ account: { ...row.account }, trigger: event.currentTarget })}>
       <span className='credits-package'><span className='credits-name'>{shownName}{row.account.enabled === false ? ' · 已禁用' : ''}</span>
         <span className='credits-note'>{rowStatus(row)}</span>
         {details && <span className='credits-note'>查询于 {timestamp(details.fetchedAt)}{row.failed ? ' · 最近刷新失败' : ''}</span>}
       </span>
-      <span className='credits-amount'><strong>{details?.unlimited ? '∞ 不限量' : formatCreditAmount(amount)}</strong>
-        <span className='credits-note'>{row.partial || row.duplicate ? '查询读数' : details?.kind === 'enterprise' ? '周期剩余额度' : '已知有效积分'}</span>
+        <span className='credits-amount'><strong>{details?.unlimited ? '∞ 不限量' : formatCreditAmount(amount)}</strong>
+        <span className='credits-note'>{generic ? `${generic.unit} · 通用余额` : row.partial || row.duplicate ? '查询读数' : details?.kind === 'enterprise' ? '周期剩余额度' : '已知有效积分'}</span>
       </span>
       <span className='credits-expiry'>
-        {details?.kind === 'enterprise' ? <span>重置时间见逐账号明细</span> : <span>{row.nearest !== null ? `最近到期 ${timestamp(row.nearest)}` : '暂无可确认的到期时间'}</span>}
+        {details?.kind === 'enterprise' ? <span>重置时间见逐账号明细</span> : <span>{row.nearest !== null ? `最近到期／重置 ${timestamp(row.nearest)}` : '暂无可确认的到期时间'}</span>}
         {details && !details.unlimited && row.amount !== null && <span className='credits-note'>24 小时内 {formatCreditAmount(row.buckets.day)} · 7 天内 {formatCreditAmount(row.buckets.day + row.buckets.week)}</span>}
+        {generic && <span className='credits-note'>订阅到期：{generic.subscription?.expireAt ? timestamp(generic.subscription.expireAt) : '未知'}</span>}
         {!!details?.unattributedRemaining && <span className='credits-note'>其中未归属 {formatCreditAmount(details.unattributedRemaining)}（已包含在未知周期段）</span>}
         {details && row.asOf === null && <span className='credits-note'>快照时钟未确认，请刷新后查看到期分布</span>}
       </span>
@@ -98,7 +104,7 @@ export function AccountsCreditOverviewDialog({ onClose, returnFocus }: { onClose
       finalFocus={() => returnFocus.isConnected ? returnFocus : false}>
       <DialogHeader><DialogTitle>积分总览</DialogTitle></DialogHeader>
       <DialogBody className='credits-body'>
-        <DialogDescription className='credits-description'>WorkBuddy 与 Qoder 按国内／国际分别汇总个人积分，企业额度逐账号展示。点击账号查看积分包明细。</DialogDescription>
+        <DialogDescription className='credits-description'>所有已接入余额的提供商按账号展示；WorkBuddy 与 Qoder 汇总精确积分包，其它提供商展示通用余额和到期信息。点击账号查看明细。</DialogDescription>
         <SegmentedControl aria-label='总览内容' value={tab} options={[{ value: 'credits', label: '积分到期' }, { value: 'growth', label: '福利待办' }]} onValueChange={setTab} />
         <div className='overview-controls'>
           <SegmentedControl aria-label='积分汇总范围' value={scope} disabled={refreshing} options={[
@@ -113,8 +119,28 @@ export function AccountsCreditOverviewDialog({ onClose, returnFocus }: { onClose
         {tab === 'growth' ? <AccountsGrowthOverview key={growthAccounts.map(growthAccountKey).join('|')} accounts={growthAccounts} namesHidden={store.namesHidden}
           onDetail={(account, trigger) => setDetail({ account: { ...account }, trigger, tab: 'growth' })} /> : <>
         <p className='credits-note'>当前范围 {accounts.length} 个账号（含禁用账号）。排序仅影响此弹窗；7 天内包含 24 小时内，分布条各段互不重叠。</p>
-        {!accounts.length && <p role='status' className='credits-empty-bar'>当前范围没有 WorkBuddy 或 Qoder 账号。</p>}
-        {groups.map(group => {
+        {!accounts.length && <p role='status' className='credits-empty-bar'>当前范围没有可查询余额的账号。</p>}
+          {groups.map(group => {
+            if (group.mode === 'generic') {
+            const providerLabel = ({
+              workbuddy: 'WorkBuddy', qoder: 'Qoder', raccoon: '小浣熊', catpaw: '小浣熊', autoclaw: 'AutoClaw', 'autoclaw-intl': 'AutoClaw 国际版',
+              trae: 'Trae', 'cline-free': 'Cline Free', 'cline-pass': 'Cline Pass', accio: 'Accio', 'accio-cn': 'Accio',
+              zcode: 'ZCode', 'zcode-intl': 'ZCode 国际版', codearts: 'CodeArts',
+              } as Record<string, string>)[group.provider] || group.provider
+            const rows = sortCreditOverviewRows(group.rows, sort === 'expiry')
+            const nearest = group.rows.reduce((value, row) => row.nearest === null ? value : Math.min(value, row.nearest), Infinity)
+            const editionLabel = group.edition === 'cn' ? '国内版' : '国际版'
+            return <section key={`${group.provider}:${group.edition}:generic:${group.unit || ''}`} className='overview-edition' aria-label={`${providerLabel} ${editionLabel}通用余额总览`}>
+              <h3 className='credits-section-title'>{providerLabel} {editionLabel}通用余额总览<span>{group.rows.length} 个账号 · 通用余额</span></h3>
+              <div className='credits-summary overview-summary'>
+                <div><span className='credits-label'>已知余额</span><strong data-overview-total>{formatCreditAmount(group.amount)}</strong><span className='credits-note'>单位：{group.unit || '余额'}</span></div>
+                <div><span className='credits-label'>最近到期／重置</span><strong>{Number.isFinite(nearest) ? timestamp(nearest) : '未知'}</strong></div>
+              </div>
+              <p className='credits-note overview-coverage'>通用余额不计入积分包分段合计 · 缓存待刷新 {group.stale} · 无明细 {group.missing} · 部分失败 {group.partial}</p>
+              <h4 className='credits-section-title'>账号明细<span>{rows.length} / {group.rows.length} 个 · 点击查看余额</span></h4>
+              <div className='credits-list'>{rows.map(renderRow)}</div>
+            </section>
+          }
           const activeBucket = filter?.provider === group.provider && filter.edition === group.edition ? filter.bucket : null
           const rows = sortCreditOverviewRows(group.rows.filter(row => !activeBucket || (!row.duplicate && row.amount !== null && row.buckets[activeBucket] > 0)), sort === 'expiry')
           const providerLabel = group.provider === 'qoder' ? 'Qoder' : 'WorkBuddy'

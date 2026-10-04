@@ -7,8 +7,12 @@ import {
   creditDetailsFresh, findAccount, getStore, lastSuccessfulUsage, maskName, refreshCreditDetails,
   subscribe, usageEntries, usageFailureOf,
 } from './accounts-data'
+import { shared } from './accounts-shared'
 import { displayNameOf, editionSuffix, providerOf } from './accounts-domain'
-import { creditDetailsOf, formatCreditAmount, type WorkBuddyCreditSegment } from './accounts-credit-details'
+import {
+  creditDetailsOf, formatCreditAmount, genericBalanceDetailsOf,
+  type GenericBalanceDetails, type WorkBuddyCreditSegment,
+} from './accounts-credit-details'
 import { growthAccountKey, supportsGrowth } from './accounts-growth-data'
 import { AccountsGrowthPanel, WorkBuddyPolicyPanel } from './accounts-growth-panel'
 
@@ -65,17 +69,24 @@ export function AccountsCreditDialog({ id, onClose, returnFocus, initialTab = 'c
   const failure = usageFailureOf(entry)
   const previous = lastSuccessfulUsage(id)
   const details = creditDetailsOf(entry) || ((failure || !entry) ? creditDetailsOf(previous) : null)
+  const generic = genericBalanceDetailsOf(entry, Date.now()) || ((failure || !entry) ? genericBalanceDetailsOf(previous, Date.now()) : null)
   const busy = store.usageInflight.has(id)
   const [now, setNow] = React.useState(Date.now)
   const [selected, setSelected] = React.useState<string | null>(null)
   const [tab, setTab] = React.useState(initialTab)
+  const [autoTasks, setAutoTasks] = React.useState<Array<Record<string, unknown>> | null>(null)
+  const [autoTasksError, setAutoTasksError] = React.useState('')
   const rows = React.useRef(new Map<string, HTMLButtonElement>())
   const originalFocus = React.useRef(returnFocus || (document.activeElement instanceof HTMLElement ? document.activeElement : null))
   const name = displayNameOf(account)
   const shownName = store.namesHidden ? maskName(name) : name
   const enterprise = details?.kind === 'enterprise'
   const growthEnabled = !!account && supportsGrowth(account) && !enterprise
-  const providerLabel = providerOf(account) === 'qoder' ? 'Qoder' : 'WorkBuddy'
+  const providerLabel = ({
+    qoder: 'Qoder', raccoon: '小浣熊', catpaw: '小浣熊', autoclaw: 'AutoClaw', 'autoclaw-intl': 'AutoClaw 国际版',
+    trae: 'Trae', 'cline-free': 'Cline Free', 'cline-pass': 'Cline Pass', accio: 'Accio', 'accio-cn': 'Accio', zcode: 'ZCode', 'zcode-intl': 'ZCode 国际版', codearts: 'CodeArts',
+  } as Record<string, string>)[providerOf(account)] || '余额'
+  const isAutoClaw = providerOf(account) === 'autoclaw' || providerOf(account) === 'autoclaw-intl'
 
   React.useEffect(() => { void refreshCreditDetails(id) }, [id])
   React.useEffect(() => {
@@ -83,6 +94,19 @@ export function AccountsCreditDialog({ id, onClose, returnFocus, initialTab = 'c
     return () => window.clearInterval(timer)
   }, [])
   React.useEffect(() => { if (!account) onClose() }, [account, onClose])
+  React.useEffect(() => {
+    if (!isAutoClaw) { setAutoTasks(null); setAutoTasksError(''); return }
+    let active = true
+    setAutoTasks(null)
+    setAutoTasksError('')
+    void shared().workbuddyDesktop?.getAutoClawTasks?.(id).then(value => {
+      if (!active) return
+      setAutoTasks(Array.isArray(value?.tasks) ? value.tasks : [])
+    }).catch(error => {
+      if (active) setAutoTasksError(error instanceof Error ? error.message : String(error))
+    })
+    return () => { active = false }
+  }, [id, isAutoClaw])
 
   const ordered = (details?.segments || []).slice().sort((a, b) => {
     const first = a.expiryStatus === 'known' && a.expiresAt !== null ? a.expiresAt : Infinity
@@ -149,18 +173,66 @@ export function AccountsCreditDialog({ id, onClose, returnFocus, initialTab = 'c
 
   const legacy = entry && typeof entry === 'object' && !failure ? entry :
     previous && typeof previous === 'object' ? previous : null
+  const genericNearest = generic ? [generic.subscription?.expireAt, generic.subscription?.resetAt,
+    ...generic.wallets.map(wallet => wallet.expiresAt)]
+    .filter((value): value is number => typeof value === 'number' && Number.isFinite(value) && value > now)
+    .reduce((first, value) => Math.min(first, value), Infinity) : Infinity
+  const genericExpiry = Number.isFinite(genericNearest) ? genericNearest : null
+  const renderGeneric = (value: GenericBalanceDetails) => <>
+    <div className='credits-summary'>
+      <div><span className='credits-label'>可用余额</span><strong className='credits-balance'>{value.available === null ? '未知' : formatCreditAmount(value.available)}</strong>
+        <span className='credits-note'>单位：{value.unit} · 查询于 {formatDate(value.fetchedAt)}</span></div>
+      <div><span className='credits-label'>最近到期／重置</span><strong className='credits-expiring'>{genericExpiry ? formatDate(genericExpiry) : '未知'}</strong>
+        <span className='credits-note'>通用余额不计入积分包分段合计</span></div>
+    </div>
+    {value.issues.length > 0 && <ul className='credits-issues'>{value.issues.map(issue => <li key={issue}>{issue}</li>)}</ul>}
+    {value.subscription && <p className='credits-note'>订阅：{value.subscription.planName || '未命名'} · {value.subscription.expireAt ? `到期 ${formatDate(value.subscription.expireAt)}` : '到期时间未知'}{value.subscription.status ? ` · ${value.subscription.status}` : ''}</p>}
+    <section aria-label='通用余额明细'>
+      <h3 className='credits-section-title'>钱包明细 <span>{value.wallets.length} 个余额项 · 通用余额</span></h3>
+      <div className='credits-list'>
+        {value.wallets.map(wallet => {
+          const ratio = wallet.total !== null && wallet.total > 0 && wallet.balance !== null
+            ? Math.max(0, Math.min(100, wallet.balance / wallet.total * 100)) : wallet.remainingPercent
+          return <div key={wallet.id} className='credits-row' data-tone={wallet.expiresAt && wallet.expiresAt <= now ? 'urgent' : 'normal'}>
+            <span className='credits-package'><span className='credits-name'>{store.namesHidden ? maskName(wallet.name) : wallet.name}</span>
+              {wallet.detail && <span className='credits-note'>{wallet.detail}</span>}</span>
+            <span className='credits-amount'><strong>{wallet.display || (wallet.balance === null ? '未知' : formatCreditAmount(wallet.balance))}</strong>
+              {wallet.total !== null && <span className='credits-note'> / {formatCreditAmount(wallet.total)}</span>}
+              {ratio !== null && <span className='credits-row-meter' aria-hidden='true'><span style={{ width: `${ratio}%` }} /></span>}</span>
+            <span className='credits-expiry'><span>{wallet.expiresAt ? (wallet.expiresAt <= now ? '已到期' : `到期 ${formatDate(wallet.expiresAt)}`) : '到期时间未知'}</span></span>
+          </div>
+        })}
+      </div>
+      {!value.wallets.length && <p className='credits-note'>上游没有返回钱包明细。</p>}
+    </section>
+    <p className='credits-timezone'>该提供商返回的是通用余额读数，未伪造积分包分段，也不参与 WorkBuddy／Qoder 的积分到期合计。</p>
+  </>
 
   return <Dialog open onOpenChange={open => { if (!open) onClose() }}>
     <DialogContent overlayForceRender className='w-[min(680px,calc(100vw-32px))] max-h-[calc(100dvh-32px)] credits-dialog'
       finalFocus={() => originalFocus.current?.isConnected ? originalFocus.current : false}>
       <DialogHeader><DialogTitle>{tab === 'growth' && growthEnabled ? '成长福利' : '积分包明细'}{account ? ` · ${shownName}` : ''}</DialogTitle></DialogHeader>
       <DialogBody className='credits-body' aria-busy={busy}>
-        <DialogDescription className='credits-description'>{providerLabel} {editionSuffix(account)} · {enterprise ? '企业周期额度' : '个人积分包'}</DialogDescription>
+        <DialogDescription className='credits-description'>{providerLabel} {editionSuffix(account)} · {details ? (enterprise ? '企业周期额度' : '个人积分包') : '通用余额'}</DialogDescription>
         {growthEnabled && <SegmentedControl aria-label='账号积分内容' value={tab} options={[{ value: 'credits', label: '积分包' }, { value: 'growth', label: '成长福利' }]} onValueChange={value => setTab(value as 'credits' | 'growth')} />}
         {tab === 'growth' && growthEnabled && account ? <AccountsGrowthPanel key={growthAccountKey(account)} account={account} namesHidden={store.namesHidden} /> : !account ? <p role='status'>账号已不存在。</p> : <>
           {failure && <div className='credits-alert' role='alert'>刷新失败：{store.namesHidden ? '当前账号余额查询失败，请重试。' : failure.message}
             {details && <span>以下为上次成功查询的数据。</span>}</div>}
-          {busy && <p className='credits-note' role='status'>{details ? '正在刷新当前账号，保留上次成功查询的数据…' : '正在查询当前账号积分明细…'}</p>}
+          {isAutoClaw && <section aria-label='AutoClaw任务列表' className='credits-task-list'>
+            <h3 className='credits-section-title'>AutoClaw 任务列表 <span>只读状态</span></h3>
+            {autoTasksError && <p className='credits-note'>任务列表读取失败：{autoTasksError}</p>}
+            {!autoTasks && !autoTasksError && <p className='credits-note'>正在读取任务状态…</p>}
+            {autoTasks && !autoTasks.length && <p className='credits-note'>上游没有返回任务。</p>}
+            {autoTasks?.map((task, index) => {
+              const taskId = String(task.taskId || task.task_id || `task-${index + 1}`)
+              const done = task.completed === true || ['completed', 'claimed', 'done'].includes(String(task.status || '').toLowerCase())
+              return <div className='credits-task-row' key={taskId}>
+                <span>{String(task.title || task.name || taskId)}</span>
+                <span className='credits-note'>{done ? '已完成' : task.status ? String(task.status) : '待完成'}</span>
+              </div>
+            })}
+          </section>}
+          {busy && <p className='credits-note' role='status'>{details || generic ? '正在刷新当前账号，保留上次成功查询的数据…' : '正在查询当前账号余额…'}</p>}
           {details ? <>
             <div className='credits-summary'>
               <div><span className='credits-label'>{unresolved ? '已读取积分（明细不完整）' : stale ? '上次查询余额' : enterprise ? '本周期剩余额度' : '可用积分'}</span>
@@ -202,7 +274,7 @@ export function AccountsCreditDialog({ id, onClose, returnFocus, initialTab = 'c
               {historical.length > 0 && <details className='credits-history'><summary>已耗尽／已到期／未生效（{historical.length} 个积分段）</summary><div className='credits-list'>{historical.map(renderRow)}</div></details>}
             </section>
             <p className='credits-timezone'>显示时区：{displayTimezone}（浏览器本地时区）。时区待确认的上游文本不参与倒计时和 24 小时到期统计。{enterprise ? '日期表示当前额度重置时间。' : '日期表示当前积分截止时间，长期权益另列。'}</p>
-          </> : !busy && <div className='credits-unavailable'>
+          </> : generic ? renderGeneric(generic) : !busy && <div className='credits-unavailable'>
             <h3>积分包明细暂不可用</h3>
             {legacy && <p>原余额摘要：{legacy.unlimited ? '不限量' : typeof legacy.totalLeft === 'number' ? formatCreditAmount(legacy.totalLeft) : '未知'}{failure ? '（上次成功查询）' : ''}</p>}
             <p>{failure ? '请重试当前账号。' : '当前服务器或缓存未返回新版积分明细，可刷新当前账号后重试。'}</p>
@@ -211,7 +283,7 @@ export function AccountsCreditDialog({ id, onClose, returnFocus, initialTab = 'c
         </>}
       </DialogBody>
       <DialogFooter className='credits-footer'>
-        <span className='credits-note mr-auto' aria-live='polite'>{tab === 'growth' && growthEnabled ? '关闭后已发出的操作仍会完成。' : busy ? '刷新中' : failure ? '刷新失败' : stale ? '上次成功查询' : details ? '当前查询结果' : '暂无明细'}</span>
+        <span className='credits-note mr-auto' aria-live='polite'>{tab === 'growth' && growthEnabled ? '关闭后已发出的操作仍会完成。' : busy ? '刷新中' : failure ? '刷新失败' : stale ? '上次成功查询' : details || generic ? '当前查询结果' : '暂无明细'}</span>
         {!(tab === 'growth' && growthEnabled) && <Button variant='outline' disabled={busy || !account} onClick={() => { void refreshCreditDetails(id, true) }}>{failure ? '重试当前账号' : '刷新当前账号'}</Button>}
         <Button variant='outline' onClick={onClose}>关闭</Button>
       </DialogFooter>

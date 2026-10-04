@@ -20,6 +20,7 @@
 //! 客户端上的 connect/read 超时也一并复用（见 egress 头部的旋钮映射）。
 
 use std::time::Duration;
+use serde_json::Map;
 
 use serde_json::{json, Value};
 
@@ -80,16 +81,23 @@ pub struct TransportRequest {
 pub struct UpstreamErrorDetail {
     pub code: Option<i64>,
     pub message: String,
+    /// Provider 需要的少量结构化恢复字段。只保留白名单，避免把上游错误体的
+    /// 凭据/调试字段继续向适配器传播。
+    pub fields: Map<String, Value>,
 }
 
 impl UpstreamErrorDetail {
     /// 适配器入参形态：`{code, message}`（键名与上游 JSON 一致，
     /// 于是适配器可以直接用 `error_body.get("code")` 读，不需要中间结构体）
     pub fn to_value(&self) -> Value {
-        json!({
+        let mut value = json!({
             "code": self.code.map(Value::from).unwrap_or(Value::Null),
             "message": self.message,
-        })
+        });
+        if let Some(object) = value.as_object_mut() {
+            object.extend(self.fields.clone());
+        }
+        value
     }
 }
 
@@ -110,9 +118,14 @@ pub async fn read_upstream_error(
         capture.push(text.as_bytes());
     }
     let mut code = None;
+    let mut fields = Map::new();
     let mut message: String = text.chars().take(500).collect();
     if let Ok(payload) = serde_json::from_str::<Value>(&text) {
         code = payload.get("code").and_then(Value::as_i64);
+        copy_reset_fields(&payload, &mut fields);
+        if let Some(error) = payload.get("error") {
+            copy_reset_fields(error, &mut fields);
+        }
         // Node: `payload?.message || payload?.msg || payload?.error?.message || message`
         let candidate = payload
             .get("message")
@@ -135,7 +148,18 @@ pub async fn read_upstream_error(
             message = candidate.to_string();
         }
     }
-    UpstreamErrorDetail { code, message }
+    UpstreamErrorDetail { code, message, fields }
+}
+
+const RESET_FIELDS: [&str; 4] = ["resets_at", "reset_at", "resetAt", "retry_after"];
+
+fn copy_reset_fields(source: &Value, target: &mut Map<String, Value>) {
+    let Some(object) = source.as_object() else { return };
+    for key in RESET_FIELDS {
+        if let Some(value) = object.get(key) {
+            target.insert(key.to_string(), value.clone());
+        }
+    }
 }
 
 /// 发一次上游请求（不读 body，保留原始响应给流式转发与错误解析）。

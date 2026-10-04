@@ -108,12 +108,26 @@ test('a legacy snapshot without a server clock cannot manufacture an expiry fore
   const result = first([sample('A', undefined, { asOf: null, fresh: false })])
   assert.equal(result.amount, 10); assert.equal(result.buckets.unknown, 10); assert.equal(result.buckets.day, 0)
 })
-test('scope filters include selected hidden and disabled accounts but no other providers', () => {
+test('scope filters include every provider with a balance capability', () => {
   const accounts = [{ id: 'A' }, { id: 'B', enabled: false }, { id: 'C', provider: 'catpaw' }]
   const visible = new Set(['A']), selected = new Set(['B', 'C'])
-  assert.deepEqual(creditScopeAccounts(accounts, 'all', visible, selected).map(a => a.id), ['A', 'B'])
+  assert.deepEqual(creditScopeAccounts(accounts, 'all', visible, selected).map(a => a.id), ['A', 'B', 'C'])
   assert.deepEqual(creditScopeAccounts(accounts, 'filtered', visible, selected).map(a => a.id), ['A'])
-  assert.deepEqual(creditScopeAccounts(accounts, 'selected', visible, selected).map(a => a.id), ['B'])
+  assert.deepEqual(creditScopeAccounts(accounts, 'selected', visible, selected).map(a => a.id), ['B', 'C'])
+})
+
+test('generic overview shows unit and keeps expiry as a timestamp', () => {
+  const result = summarizeCreditOverview([{
+    account: { id: 'generic', provider: 'catpaw' }, fresh: true, failed: false, asOf: now,
+    details: null,
+    generic: { kind: 'generic', fetchedAt: now, complete: true, available: 12.5, unit: '积分', issues: [],
+      wallets: [{ id: 'main', name: '主余额', balance: 12.5, total: 20, remainingPercent: 62.5, expiresAt: now + day, detail: null, display: null }],
+      subscription: null },
+  }])
+  assert.equal(result[0].mode, 'generic')
+  assert.equal(result[0].amount, 12.5)
+  assert.equal(result[0].unit, '积分')
+  assert.equal(result[0].rows[0].nearest, now + day)
 })
 test('display sorting does not mutate the source order or account priority', () => {
   const a = sample('A', [segment('a', 10, 3 * day)]), b = sample('B')

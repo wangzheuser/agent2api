@@ -2011,6 +2011,7 @@ async fn send_with_retry(
                 Err(_elapsed) => super::request::UpstreamErrorDetail {
                     code: None,
                     message: format!("非流式响应超时({}秒)", budget.as_secs()),
+                    fields: serde_json::Map::new(),
                 },
             }
         };

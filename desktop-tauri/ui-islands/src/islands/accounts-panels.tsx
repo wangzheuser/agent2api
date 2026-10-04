@@ -429,38 +429,32 @@ export function UsageCell({ account }: { account: AccountRecord }) {
   }
   const entry = usageEntries().get(account.id)
   const summary = usageSummary(entry)
-  if (providerOf(account) === 'workbuddy' || providerOf(account) === 'qoder') {
-    return (
-      <button type='button' className={`usage-sum credit-balance-trigger ${summary.kind}`}
-        title={`${summary.title}；双击查看积分包明细（Enter / Space 打开）`}
-        aria-label={`${summary.text}，查看积分包明细`} aria-haspopup='dialog'
-        onDoubleClick={event => {
-          event.stopPropagation()
-          openCreditsDialog(account.id, event.currentTarget)
-        }}
-        onClick={event => {
-          event.stopPropagation()
-          // 原生按钮键盘激活的 detail 为 0；触屏使用单击，避免双击缩放。
-          if (event.detail === 0 || window.matchMedia('(pointer: coarse)').matches) {
-            openCreditsDialog(account.id, event.currentTarget)
-          }
-        }}>{summary.text}</button>
-    )
-  }
-  // 失败 / 未配置那些档不画进度条：读数本身就不是「还剩多少」，
-  // 给它配个进度条会把一句错误装饰成一条可信的读数
+  // 所有已接入余额的 provider 都可双击打开统一余额弹窗；有结构化钱包时，
+  // 余额列继续保留原来的主额度进度条作为快速读数。
   const pool = summary.kind === 'ok' || summary.kind === 'warn' ? usagePool(entry) : null
-  if (!pool) {
-    return <span className={`usage-sum ${summary.kind}`} title={summary.title}>{summary.text}</span>
-  }
   return (
-    <span className='usage-pool' title={summary.title}>
-      {pool.planName ? <span className='usage-pool-name'>{pool.planName}</span> : null}
-      <span className='usage-pool-line'>
-        {pool.percent !== null ? <Progress value={pool.percent} className='usage-pool-bar' /> : null}
-        <span className={`usage-pool-view ${summary.kind}`}>{pool.text}</span>
-      </span>
-    </span>
+    <button type='button' className={`usage-sum credit-balance-trigger ${summary.kind}`}
+      title={`${summary.title}；双击查看余额明细（Enter / Space 打开）`}
+      aria-label={`${summary.text}，查看余额明细`} aria-haspopup='dialog'
+      onDoubleClick={event => {
+        event.stopPropagation()
+        openCreditsDialog(account.id, event.currentTarget)
+      }}
+      onClick={event => {
+        event.stopPropagation()
+        // 原生按钮键盘激活的 detail 为 0；触屏使用单击，避免双击缩放。
+        if (event.detail === 0 || window.matchMedia('(pointer: coarse)').matches) {
+          openCreditsDialog(account.id, event.currentTarget)
+        }
+      }}>
+      {pool ? <span className='usage-pool'>
+        {pool.planName ? <span className='usage-pool-name'>{pool.planName}</span> : null}
+        <span className='usage-pool-line'>
+          {pool.percent !== null ? <Progress value={pool.percent} className='usage-pool-bar' /> : null}
+          <span className={`usage-pool-view ${summary.kind}`}>{pool.text}</span>
+        </span>
+      </span> : summary.text}
+    </button>
   )
 }
 

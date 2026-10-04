@@ -9,7 +9,7 @@ const source = fs.readFileSync(path.join(root, 'desktop-tauri/ui-islands/src/isl
 const compiled = ts.transpileModule(source, {compilerOptions: {module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022}}).outputText;
 const context = {exports: {}};
 vm.runInNewContext(compiled, context);
-const {creditDetailsOf, formatCreditAmount} = context.exports;
+const {creditDetailsOf, genericBalanceDetailsOf, formatCreditAmount} = context.exports;
 const now = 1791000000000;
 const segment = {id: 'resource-a:cycle-a', resourceId: 'resource-a', packageCode: 'monthly', name: '月度额度',
   remaining: 0.75, total: 500, expiresAt: now + 3600000, expiresAtText: null, expiryStatus: 'known', entitlementEndsAt: now + 31536000000, state: 'active'};
@@ -19,6 +19,10 @@ const wrap = value => ({creditDetails: value});
 let count = 0;
 function check(name, test) {test(); count += 1; console.log(`PASS ${name}`);}
 check('legacy usage has no credit details', () => assert.equal(creditDetailsOf({totalLeft: 1}), null));
+check('generic wallet keeps balance, unit and subscription expiry', () => {
+  const result = genericBalanceDetailsOf({available: '12.5', unit: 'credit', wallets: [{type: 'main', balance: 12.5, total: 20}], subscription: {expireAt: '2026-10-10T00:00:00Z'}}, now)
+  assert.equal(result.available, 12.5); assert.equal(result.unit, 'credit'); assert.equal(result.wallets[0].total, 20); assert.equal(result.subscription.expireAt, Date.parse('2026-10-10T00:00:00Z'))
+});
 check('failure does not pass as successful details', () => assert.equal(creditDetailsOf({...wrap(details), error: 'failed'}), null));
 check('precise fractions and independent resources preserved', () => {const result = creditDetailsOf(wrap(details)); assert.equal(result.remaining, 1.5); assert.equal(result.segments.length, 2); assert.notEqual(result.segments[0].resourceId, result.segments[1].resourceId);});
 check('valid zero is preserved', () => assert.equal(creditDetailsOf(wrap({...details, remaining: 0, segments: [{...segment, remaining: 0, state: 'exhausted'}]})).remaining, 0));

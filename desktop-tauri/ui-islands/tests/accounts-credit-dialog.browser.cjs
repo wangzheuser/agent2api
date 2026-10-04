@@ -45,7 +45,7 @@ async function run() {
   assert.equal(await page.locator('.credits-row').nth(2).getAttribute('aria-pressed'),'true');
   assert.equal(await page.locator('.credits-row').nth(2).evaluate(el=>el===document.activeElement),true);checks.push('segment click selects and focuses matching row');
   for(let i=0;i<12;i++) await page.keyboard.press('Tab');
-  assert.equal(await page.evaluate(()=>!!document.activeElement.closest('[role=dialog]')),true); checks.push('dialog traps keyboard focus');
+  assert.equal(await page.evaluate(()=>!!document.activeElement?.closest('[role=dialog]')),true); checks.push('dialog traps keyboard focus');
   await page.getByRole('button',{name:'刷新当前账号',exact:true}).click();
   assert.equal(await page.locator('.credits-balance').innerText(),'580.50');
   assert.equal(await page.getByRole('button',{name:'刷新当前账号',exact:true}).isDisabled(),true);
@@ -77,7 +77,7 @@ async function run() {
   await apply(page,details(),'B');
   await page.locator('.credit-balance-trigger').nth(1).press('Enter');
   assert.match(await page.locator('.credits-description').innerText(),/国际/);checks.push('international account routes through same dialog');
-  assert.equal(await page.locator('.credit-balance-trigger').count(),2);checks.push('other providers retain existing balance cell');
+  assert.equal(await page.locator('.credit-balance-trigger').count(),3);checks.push('all balance-capable providers expose the same dialog trigger');
   await page.close();
   const touch=await browser.newPage({viewport:{width:1100,height:960},hasTouch:true,locale:'zh-CN'});
   touch.on('pageerror',e=>errors.push(e.message));await touch.goto(pathToFileURL(path.join(evidence,'browser-fixture.html')).href);

@@ -120,6 +120,7 @@ export type AccountsBridge = {
   } | null | undefined>
   getAllBalances(id?: string): Promise<{ results?: Array<Record<string, unknown>> } | null | undefined>
   getBalancesSnapshot(): Promise<{ at?: number; results?: Array<Record<string, unknown>> } | null | undefined>
+  getAutoClawTasks?(id: string): Promise<{ accountId?: string; region?: string; tasks?: Array<Record<string, unknown>> } | null | undefined>
   checkinAllAccounts(id?: string | null): Promise<{
     results?: Array<Record<string, unknown>>
     succeeded?: number

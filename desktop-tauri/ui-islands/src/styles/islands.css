@@ -39,6 +39,10 @@
 .growth-policy summary:focus-visible, .growth-panel select:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
 .growth-overview-row > div { min-width: 0; flex: 1 1 160px; }
 .growth-panel button { max-width: 100%; height: auto; white-space: normal; }
+.credits-task-list { display: flex; flex-direction: column; gap: 6px; padding: 10px 0 2px; }
+.credits-task-row { display: flex; min-width: 0; align-items: baseline; justify-content: space-between; gap: 12px; padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface-2); font-size: 11px; }
+.credits-task-row > span:first-child { min-width: 0; overflow-wrap: anywhere; }
+.credits-task-row > .credits-note { flex: 0 0 auto; }
 .overview-controls { display: flex; flex-wrap: wrap; gap: 12px; justify-content: space-between; }
 .overview-edition { padding: 14px 0; border-top: 1px solid var(--border); }
 .credit-overview .overview-summary { grid-template-columns: 1.2fr 1fr 1fr; gap: 12px; }

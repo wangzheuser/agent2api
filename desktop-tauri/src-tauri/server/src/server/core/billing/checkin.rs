@@ -99,15 +99,13 @@ pub fn supports_checkin(account: &Value) -> bool {
     if account.get("edition").and_then(Value::as_str) == Some("intl") {
         return false;
     }
-    // CodeArts 与 Trae 两家都没有「签到」链路，必须先排除：
-    // `checkin_for` 的分派 match 把「不在范围里的家」报成「未接入」，而这两家
+    // CodeArts 没有「签到」链路，必须先排除：
+    // `checkin_for` 的分派 match 把「不在范围里的家」报成「未接入」，而这家
     // 的按钮在界面上由能力位 `checkin: false` 收起 —— 这一层是批量路径
     // （`resolve_checkin_targets` 的 filter）与 API 直调的兜底，双保险。
     // 注意 CodeArts 的每日福利**不是**签到（那是 ops 福利领取，独立的「领福利」
     // 按钮，见 `providers::codearts::welfare`），与这条链无交集。
-    if provider == crate::server::core::account_store::codearts_accounts::CODEARTS_PROVIDER_ID
-        || provider == crate::server::core::account_store::TRAE_PROVIDER_ID
-    {
+    if provider == crate::server::core::account_store::codearts_accounts::CODEARTS_PROVIDER_ID {
         return false;
     }
     !crate::server::core::account_store::is_accio_family(provider)
@@ -209,7 +207,8 @@ pub fn resolve_checkin_targets(
 ///   - **AutoClaw**：通用任务接口的 `daily_signin` 任务
 ///     （`providers::autoclaw::checkin::claim_daily_signin`）；
 ///   - **Qoder**：活动（campaign）领取链路，两个地区共用
-///     （`providers::qoder::checkin::claim_daily_checkin`）。
+///     （`providers::qoder::checkin::claim_daily_checkin`）；
+///   - **Trae**：国内 SOLO 每日积分签到（`providers::trae::checkin::claim_daily`）。
 ///
 /// 拿一家的 token 去打另一家的签到接口只会稳定报错，所以这条分派是必需的而不是
 /// 优化。各分支的收尾（claim → 结果行 + 日志）完全一致，共用 [`claim_result`]；
@@ -253,6 +252,12 @@ pub async fn checkin_for(store: &AccountStore, billing: &BillingService, account
                 crate::server::core::providers::qoder::checkin::claim_daily_checkin(store, &id)
                     .await
                     .map_err(|error| error.message);
+            claim_result(id, name, &display, true, claim)
+        }
+        "trae" => {
+            let claim = crate::server::core::providers::trae::checkin::claim_daily(store, &id)
+                .await
+                .map_err(|error| error.message);
             claim_result(id, name, &display, true, claim)
         }
         // WorkBuddy 国内版与国际版共用 provider id，按 edition 选择任务形态。
@@ -375,6 +380,12 @@ fn claim_result(
 /// （批次撞上上游风控），所以判据必须收紧到「上游说签过了」。
 fn checkin_completed_today(claim: &Value) -> bool {
     if claim.get("success").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    if matches!(
+        claim.get("status").and_then(Value::as_str),
+        Some("claimed" | "already_claimed" | "balance_refreshed")
+    ) {
         return true;
     }
     if claim.get("alreadyCompleted").and_then(Value::as_bool) == Some(true) {

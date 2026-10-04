@@ -37,7 +37,7 @@ import {
 } from './accounts-domain'
 import * as domain from './accounts-domain'
 import { clampPriority, priorityOf } from './accounts-columns'
-import { creditDetailsOf } from './accounts-credit-details'
+import { creditDetailsOf, genericBalanceDetailsOf, type GenericBalanceDetails } from './accounts-credit-details'
 import type { CreditSample } from './accounts-credit-overview'
 import {
   allAccounts, bump, findAccount, getStore, isPicked, openPanelsFor, panelOpen, patch,
@@ -55,6 +55,10 @@ export const NOT_CONFIGURED_CODE = 'usage_not_configured'
 function supportsCreditDetails(account: AccountRecord | null | undefined): boolean {
   const provider = domain.providerOf(account)
   return provider === domain.DEFAULT_PROVIDER_ID || provider === 'qoder'
+}
+
+function supportsBalanceDialog(account: AccountRecord | null | undefined): boolean {
+  return supportsUsage(account)
 }
 
 /**
@@ -91,16 +95,35 @@ export function creditDetailsFresh(id: string, now = Date.now()): boolean {
   return Boolean(details?.complete && receivedAt !== undefined && now >= receivedAt && now - receivedAt < 60_000)
 }
 
+/** 所有余额提供商共用同一份 60 秒成功快照；精确积分仍由 creditDetailsFresh 保持原契约。 */
+function usageEntryFresh(id: string, now = Date.now()): boolean {
+  ensureUsageIdentity(id)
+  const entry = usageMap.get(id)
+  if (!entry || usageFailureOf(entry)) return false
+  const receivedAt = usageReceivedAt.get(id)
+  if (receivedAt === undefined || now < receivedAt || now - receivedAt >= 60_000) return false
+  const details = creditDetailsOf(entry)
+  if (details) return details.complete
+  return Boolean(genericBalanceDetailsOf(entry, receivedAt)?.complete)
+}
+
 /** 总览读取同一份缓存；用服务端采样时间推进到期判断，避免浏览器时钟偏移。 */
 export function creditOverviewSample(account: AccountRecord, now = Date.now()): CreditSample {
   ensureUsageIdentity(account.id)
   const entry = usageMap.get(account.id)
   const failed = Boolean(usageFailureOf(entry))
-  const details = creditDetailsOf(entry) || ((failed || !entry) ? creditDetailsOf(successfulUsage.get(account.id)) : null)
+  // 查询失败或请求在途时沿用上一次成功快照；失败状态仍单独保留给 UI 标注。
+  const source = entry && !failed ? entry : successfulUsage.get(account.id)
+  const details = creditDetailsOf(source)
+  const generic = genericBalanceDetailsOf(source, usageReceivedAt.get(account.id) || now)
   const receivedAt = usageReceivedAt.get(account.id)
-  return { account, details, failed, fresh: creditDetailsFresh(account.id, now),
-    asOf: details && receivedAt !== undefined && Number.isFinite(receivedAt) && now >= receivedAt
-      ? details.fetchedAt + now - receivedAt : null }
+  const fetchedAt = details?.fetchedAt ?? generic?.fetchedAt ?? null
+  const fresh = generic
+    ? receivedAt !== undefined && now >= receivedAt && now - receivedAt < 60_000
+    : creditDetailsFresh(account.id, now)
+  return { account, details, generic, failed, fresh,
+    asOf: fetchedAt !== null && receivedAt !== undefined && Number.isFinite(receivedAt) && now >= receivedAt
+      ? fetchedAt + now - receivedAt : null }
 }
 
 function accountUsageIdentity(account: AccountRecord): string {
@@ -309,7 +332,7 @@ export function openSettingsDialog(id: string): void {
 
 export function openCreditsDialog(id: string, returnFocus?: HTMLElement | null): void {
   const account = findAccount(id)
-  if (!supportsCreditDetails(account)) return
+  if (!supportsBalanceDialog(account)) return
   ensureUsageIdentity(id)
   patch({ dialog: { kind: 'credits', id, returnFocus } })
   void refreshCreditDetails(id)
@@ -318,9 +341,9 @@ export function openCreditsDialog(id: string, returnFocus?: HTMLElement | null):
 /** 明细复用现有余额请求；手动刷新忽略 60 秒新鲜度，但仍合并在途请求。 */
 export async function refreshCreditDetails(id: string, force = false): Promise<void> {
   const account = findAccount(id)
-  if (!supportsCreditDetails(account)) return
+  if (!supportsBalanceDialog(account)) return
   ensureUsageIdentity(id)
-  if (!force && creditDetailsFresh(id)) return
+  if (!force && usageEntryFresh(id)) return
   try { await queryUsageFor(id) } catch { /* 查询层已经保存错误；弹窗展示错误与上次成功数据。 */ }
 }
 
@@ -332,7 +355,7 @@ export function closeDialog(): void {
 export async function refreshCreditOverview(ids: string[], signal?: AbortSignal): Promise<void> {
   const targets = [...new Set(ids)].flatMap(id => {
     const account = findAccount(id)
-    return account && supportsCreditDetails(account)
+    return account && supportsUsage(account)
       ? [{ id, identity: accountUsageIdentity(account) }] : []
   })
   let next = 0
@@ -677,7 +700,11 @@ function checkinOutcomeOf(row: Record<string, unknown> | undefined): CheckinOutc
   const claim = row.claim as Record<string, unknown> | null | undefined
   if (!claim) return { kind: 'failed', reason: '签到响应为空' }
   if (claim.success === true) return { kind: 'ok', reason: '' }
-  if (claim.alreadyCompleted === true) return { kind: 'already', reason: '' }
+  if (claim.alreadyCompleted === true || claim.status === 'already_claimed') return { kind: 'already', reason: '' }
+  if (claim.status === 'auth_expired') return { kind: 'failed', reason: String(claim.msg || '登录态已过期') }
+  if (claim.status === 'task_not_found') return { kind: 'failed', reason: String(claim.msg || '签到任务不存在') }
+  if (claim.status === 'unsupported') return { kind: 'failed', reason: String(claim.msg || '签到任务暂不可用') }
+  if (claim.status === 'backoff') return { kind: 'failed', reason: String(claim.msg || '签到触发限流，请稍后重试') }
   const activity = row.activity as Record<string, unknown> | null | undefined
   if (activity?.pokeSucceeded === true) return { kind: 'active', reason: '' }
   return { kind: 'failed', reason: String(claim.msg || '未领取') }

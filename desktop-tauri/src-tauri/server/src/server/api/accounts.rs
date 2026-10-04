@@ -60,7 +60,7 @@ use crate::server::core::providers::adapter::adapter_for;
 use crate::server::core::providers::zcode;
 use crate::server::core::providers::ProviderKind;
 use crate::server::errors::management_error;
-use crate::server::http::{ok_json, parse_body};
+use crate::server::http::{ok_json, parse_body, query_param};
 use crate::server::logging;
 use crate::server::ServerState;
 
@@ -244,6 +244,21 @@ pub async fn dispatch(
         // 定时查询那一轮的结果快照（形状同 usage，多一个 `at`）
         ("GET", "usage/snapshot") => {
             return super::accounts_usage::accounts_usage_snapshot().await
+        }
+        // AutoClaw 只读任务列表；`?id=` 必须指定一个账号，避免无意间并发请求所有账号。
+        ("GET", "autoclaw/tasks") => {
+            let Some(id) = query_param(query, "id").filter(|value| !value.is_empty()) else {
+                return management_error(400, "缺少账号 id");
+            };
+            return match crate::server::core::providers::autoclaw::checkin::task_list(
+                state.store(),
+                &id,
+            )
+            .await
+            {
+                Ok(value) => ok_json(value),
+                Err(error) => management_error(error.status_code, error.message),
+            };
         }
         // 账号级活跃连接数（账号页「连接数」列；见 `core::upstream::connections`）
         ("GET", "connections") => return account_connections(&state),

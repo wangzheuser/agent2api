@@ -42,7 +42,7 @@
 //! 是「今天已签到」而不是「接口坏了」。因此只在需要解释失败时才拉它，
 //! 正常路径不多花一次往返。
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use crate::server::core::account_store::AccountStore;
 use crate::server::errors::GatewayError;
@@ -99,10 +99,12 @@ pub async fn claim_daily_signin(
     // （与积分查询同一组 AUTH_EXPIRED_CODES，见 balance.rs）。
     if let Some(code) = payload.get("code").and_then(Value::as_i64) {
         if super::balance::is_auth_expired_code(code) {
-            return Err(GatewayError::with_status(
-                401,
-                "登录态已过期，无法签到",
-            ));
+            return Ok(json!({
+                "success": false,
+                "status": "auth_expired",
+                "msg": "登录态已过期，无法签到",
+                "code": code,
+            }));
         }
         if code != 0 {
             let message = payload
@@ -110,7 +112,12 @@ pub async fn claim_daily_signin(
                 .and_then(Value::as_str)
                 .filter(|text| !text.is_empty())
                 .unwrap_or("签到失败");
-            return Ok(json!({ "success": false, "msg": message, "code": code }));
+            return Ok(json!({
+                "success": false,
+                "status": if code == 404 { "task_not_found" } else { "unsupported" },
+                "msg": message,
+                "code": code,
+            }));
         }
     }
 
@@ -129,6 +136,8 @@ pub async fn claim_daily_signin(
     if claimed {
         return Ok(json!({
             "success": true,
+            "status": "claimed",
+            "balanceRefreshed": false,
             "msg": if reward_points > 0 {
                 format!("签到成功，获得 {reward_points} 积分")
             } else {
@@ -140,45 +149,133 @@ pub async fn claim_daily_signin(
     }
 
     // 未领到：区分「今天已领过」与「上游异常」，前者是正常的幂等结果
+    let task_state = if already_completed { None } else { describe_task_state(&credentials).await };
     let msg = if already_completed {
         "今天已签到".to_string()
     } else {
-        let task_hint = describe_task_state(&credentials).await;
-        match task_hint {
-            Some(hint) => format!("签到未领取（{hint}）"),
+        match task_state {
+            Some(TaskState::Completed) => "今天已签到".to_string(),
+            Some(TaskState::Missing) => "签到任务不存在".to_string(),
+            Some(TaskState::Pending) => "签到任务暂不可用".to_string(),
             None => "签到未领取".to_string(),
+        }
+    };
+    let status = if already_completed {
+        "already_claimed"
+    } else {
+        match task_state {
+            Some(TaskState::Completed) => "already_claimed",
+            Some(TaskState::Missing) => "task_not_found",
+            Some(TaskState::Pending) => "unsupported",
+            None => "unsupported",
         }
     };
     Ok(json!({
         "success": false,
+        "status": status,
         "msg": msg,
         "rewardPoints": reward_points,
         "alreadyCompleted": already_completed,
     }))
 }
 
+/// 只读查询指定 AutoClaw 账号的任务列表，供账号详情页展示。
+///
+/// 两个地区共用任务协议，但凭证和 userapi 域必须按账号所属地区选择；返回值只
+/// 保留任务状态字段，不把上游调试响应直接透传到管理界面。
+pub async fn task_list(store: &AccountStore, account_id: &str) -> Result<Value, GatewayError> {
+    let Some((region, record)) = Region::ALL.into_iter().find_map(|region| {
+        store
+            .autoclaw_account_record(region, account_id)
+            .map(|record| (region, record))
+    }) else {
+        return Err(GatewayError::with_status(404, "AutoClaw 账号不存在"));
+    };
+    let credentials = credentials::snapshot_for(Some(&record), region)?;
+    if credentials.token.trim().is_empty() {
+        return Err(GatewayError::with_status(401, "该账号没有可用凭证，无法查询任务"));
+    }
+    let payload = userapi_get(&credentials, TASK_LIST_PATH, "任务列表查询").await?;
+    if let Some(code) = payload.get("code").and_then(Value::as_i64) {
+        if super::balance::is_auth_expired_code(code) {
+            return Err(GatewayError::with_status(401, "登录态已过期，无法查询任务"));
+        }
+        if code != 0 {
+            return Err(GatewayError::with_status(
+                502,
+                payload
+                    .get("msg")
+                    .and_then(Value::as_str)
+                    .unwrap_or("任务列表查询失败"),
+            ));
+        }
+    }
+    let data = payload.get("data").cloned().unwrap_or(Value::Null);
+    let source = data
+        .as_array()
+        .cloned()
+        .or_else(|| data.get("tasks").and_then(Value::as_array).cloned())
+        .unwrap_or_default();
+    let tasks = source
+        .into_iter()
+        .filter_map(|task| {
+            let object = task.as_object()?;
+            let id = object
+                .get("task_id")
+                .or_else(|| object.get("taskId"))
+                .and_then(Value::as_str)?;
+            let mut item = Map::new();
+            item.insert("taskId".to_string(), Value::String(id.to_string()));
+            for (target, source_key) in [
+                ("name", "name"),
+                ("title", "title"),
+                ("description", "description"),
+                ("status", "status"),
+                ("completed", "completed"),
+                ("rewardPoints", "reward_points"),
+                ("reward", "reward"),
+            ] {
+                if let Some(value) = object.get(source_key).or_else(|| object.get(target)) {
+                    item.insert(target.to_string(), value.clone());
+                }
+            }
+            Some(Value::Object(item))
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({ "accountId": account_id, "region": region.label(), "tasks": tasks }))
+}
+
 /// 签到未领取时，拉一次任务列表给出归因（**只读**，且失败不升级为错误）。
 ///
 /// 返回 None 表示「列表里没有可用信息」——调用方据此退回通用文案，
 /// 不把一次辅助查询的失败拼接进用户看到的消息里。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TaskState {
+    Completed,
+    Pending,
+    Missing,
+}
+
 async fn describe_task_state(
     credentials: &credentials::AutoClawCredentials,
-) -> Option<String> {
+) -> Option<TaskState> {
     let payload = userapi_get(credentials, TASK_LIST_PATH, "任务列表查询").await.ok()?;
     if payload.get("code").and_then(Value::as_i64).unwrap_or(0) != 0 {
         return None;
     }
     let tasks = payload.get("data").and_then(Value::as_array)?;
-    let task = tasks
+    let Some(task) = tasks
         .iter()
-        .find(|item| item.get("task_id").and_then(Value::as_str) == Some(DAILY_SIGNIN_TASK_ID))?;
+        .find(|item| item.get("task_id").and_then(Value::as_str) == Some(DAILY_SIGNIN_TASK_ID)) else {
+        return Some(TaskState::Missing);
+    };
     let completed = task
         .get("completed")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     if completed {
-        Some("任务列表显示今天已完成".to_string())
+        Some(TaskState::Completed)
     } else {
-        None
+        Some(TaskState::Pending)
     }
 }

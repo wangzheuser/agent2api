@@ -761,6 +761,9 @@ pub fn shim_js() -> &'static str {
       return call('GET', '/api/accounts/usage' + (id ? '?id=' + encodeURIComponent(id) : ''));
     },
     getBalancesSnapshot: function () { return call('GET', '/api/accounts/usage/snapshot'); },
+    getAutoClawTasks: function (id) {
+      return call('GET', '/api/accounts/autoclaw/tasks?id=' + encodeURIComponent(String(id || '')));
+    },
     getWorkBuddyGrowth: function (id) { return call('GET', '/api/accounts/workbuddy/growth?id=' + encodeURIComponent(id)); },
     workBuddyGrowthAction: function (input) { return call('POST', '/api/accounts/workbuddy/growth/action', input); },
     getWorkBuddyPolicy: function (id) { return call('GET', '/api/accounts/workbuddy/policy?id=' + encodeURIComponent(id)); },

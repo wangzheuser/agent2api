@@ -46,6 +46,22 @@ test('overview expiry clock follows the server sample despite browser clock skew
   } finally { Date.now = originalNow }
 })
 
+test('generic balance reuses a fresh cache and failed refresh keeps the last value', async () => {
+  const f = await fixture([{ id: 'A', provider: 'catpaw' }])
+  const generic = { available: 12.5, unit: '积分', wallets: [{ type: 'main', balance: 12.5 }] }
+  f.api.applyBalances(f.result('A', generic))
+  await f.api.refreshCreditDetails('A')
+  assert.deepEqual(f.calls, [])
+  const forced = f.api.refreshCreditDetails('A', true)
+  await f.tick()
+  assert.deepEqual(f.calls, ['A'])
+  f.pending[0].reject(new Error('temporary failure'))
+  await forced
+  const sample = f.api.creditOverviewSample(f.state.accounts.accounts[0])
+  assert.equal(sample.failed, true)
+  assert.equal(sample.generic.available, 12.5)
+})
+
 test('overview snapshot clock includes snapshot age and leaves legacy clocks unknown', async () => {
   const f = await fixture(), server = Date.now() + 4 * 3600000
   f.api.applyBalances({ at: server, serverNow: server, ...f.result('A', f.usage(10, server - 120_000)) })
@@ -56,7 +72,7 @@ test('overview snapshot clock includes snapshot age and leaves legacy clocks unk
   assert.equal(f.api.creditOverviewSample(f.state.accounts.accounts[0]).asOf, null)
 })
 
-test('overview refresh caps concurrency at three, includes disabled, and excludes other providers', async () => {
+test('overview refresh caps concurrency at three and includes every balance provider', async () => {
   const accounts = ['A', 'B', 'C', 'D', 'E'].map(id => ({ id, uid: id, enabled: id !== 'D' }))
   accounts.push({ id: 'other', provider: 'catpaw' })
   const f = await fixture(accounts)
@@ -67,6 +83,9 @@ test('overview refresh caps concurrency at three, includes disabled, and exclude
   f.pending[1].reject(new Error('one account failed')); await f.tick()
   assert.deepEqual(f.calls, ['A', 'B', 'C', 'D', 'E'])
   for (let i = 2; i < 5; i++) f.pending[i].resolve(f.result(f.calls[i], f.usage(1)))
+  await f.tick()
+  assert.deepEqual(f.calls, ['A', 'B', 'C', 'D', 'E', 'other'])
+  f.pending[5].resolve(f.result('other', { available: 1, unit: 'credits', wallets: [] }))
   await running
   assert.equal(f.api.getStore().usageInflight.size, 0)
   assert.ok(f.api.creditOverviewSample(accounts[1]).failed)
