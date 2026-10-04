@@ -16,6 +16,7 @@
 //!   "apiKey": "sk-…",                  // 唯一凭证来源（可空：部分上游不需要）
 //!   "baseUrl": "https://…",            // 可选覆盖项；不存在则用提供商的 baseUrl
 //!   "tokenTail": "…abcd",              // 界面上展示的尾号（apiKey 派生）
+//!   "rewardCredential": "…",            // 签到凭证（独立于 apiKey，可选）
 //!   "source": "manual",
 //!   "priority": 5,                     // 全局一条队列（与各家共用号段）
 //!   "enabled": true,
@@ -106,6 +107,23 @@ impl AccountStore {
         if api_key.chars().count() > MAX_API_KEY_LENGTH {
             return Err(AccountStoreError::bad_request("apiKey 过长"));
         }
+        // 签到凭证是独立于 apiKey 的可选 patch：字段缺省时保留旧值，
+        // 显式空串时清除，非空值 trim 后写入。它允许自定义账号创建/更新
+        // 表单一次提交模型凭证与签到凭证，也与独立 configure API 共用同一限制。
+        let reward_credential_patch = object
+            .get("rewardCredential")
+            .map(|value| {
+                let credential = value
+                    .as_str()
+                    .ok_or_else(|| AccountStoreError::bad_request("rewardCredential 必须是字符串"))?
+                    .trim()
+                    .to_string();
+                if credential.chars().count() > super::MAX_TOKEN_LENGTH {
+                    return Err(AccountStoreError::bad_request("rewardCredential 过长"));
+                }
+                Ok::<String, AccountStoreError>(credential)
+            })
+            .transpose()?;
         // baseUrl 覆盖项：给了就必须合法（与提供商侧同判据）；**没给不写键** ——
         // 「没有覆盖项」与「覆盖项指到空串」在转发阶段是两种语义，形状上要能区分
         let base_url_override = match object
@@ -122,8 +140,7 @@ impl AccountStore {
         };
 
         let _guard = self.guard();
-        let id = account_id_for(&api_key)
-            .map_err(|error| AccountStoreError::new(error, 500))?;
+        let id = account_id_for(&api_key).map_err(|error| AccountStoreError::new(error, 500))?;
         // 撞 id 保护（与 cline 同一考虑）：hash 空间巧合或手改数据都会撞上
         // 别家的记录，覆写会把那条记录的凭证一起弄丢
         let existing = self.record_by_id(&_guard, &id);
@@ -201,6 +218,16 @@ impl AccountStore {
                 }
             }
         }
+        if let Some(reward_credential) = reward_credential_patch {
+            if reward_credential.is_empty() {
+                fields.remove("rewardCredential");
+            } else {
+                fields.insert(
+                    "rewardCredential".to_string(),
+                    Value::String(reward_credential),
+                );
+            }
+        }
         fields.insert(
             "tokenTail".to_string(),
             Value::String(token_tail_of(&api_key)),
@@ -218,7 +245,12 @@ impl AccountStore {
         fields.insert("priority".to_string(), Value::from(priority));
         fields.insert(
             "enabled".to_string(),
-            Value::Bool(existing.as_ref().map(StoredAccount::enabled).unwrap_or(true)),
+            Value::Bool(
+                existing
+                    .as_ref()
+                    .map(StoredAccount::enabled)
+                    .unwrap_or(true),
+            ),
         );
         fields.insert(
             "addedAt".to_string(),
@@ -241,10 +273,13 @@ impl AccountStore {
             &format!(
                 "{} 自定义账号{}: {}（{}）",
                 if existing.is_some() { "🔄" } else { "✅" },
-                if existing.is_some() { "已更新" } else { "已添加" },
+                if existing.is_some() {
+                    "已更新"
+                } else {
+                    "已添加"
+                },
                 record_name,
-                custom_providers::label_of(provider_id)
-                    .unwrap_or_else(|| provider_id.to_string()),
+                custom_providers::label_of(provider_id).unwrap_or_else(|| provider_id.to_string()),
             ),
         );
         Ok(self.public_account(&saved))
@@ -285,6 +320,89 @@ impl AccountStore {
         provider
             .starts_with(custom_providers::ID_PREFIX)
             .then_some(provider)
+    }
+
+    /// 写入自定义账号的独立签到凭证。
+    ///
+    /// `apiKey` 只负责模型转发，`rewardCredential` 只负责签到，两者不能互相
+    /// 覆盖。凭证为空（或只含空白）时删除存储字段，作为明确的清除入口；非空
+    /// 值按字符数限制并 trim 后落盘。返回值走账号公开形态，绝不包含凭证明文。
+    /// 该方法只接受自定义提供商账号，避免误把内置账号的未知字段当成签到凭证。
+    pub fn set_custom_reward_credential(
+        &self,
+        account_id: &str,
+        credential: &str,
+    ) -> Result<Value, AccountStoreError> {
+        let account_id = account_id.trim();
+        if account_id.is_empty() {
+            return Err(AccountStoreError::bad_request("缺少账号 id"));
+        }
+        let credential = credential.trim();
+        if credential.chars().count() > super::MAX_TOKEN_LENGTH {
+            return Err(AccountStoreError::bad_request("rewardCredential 过长"));
+        }
+        let _guard = self.guard();
+        let Some(existing) = self.record_by_id(&_guard, account_id) else {
+            return Err(AccountStoreError::not_found(format!(
+                "账号不存在: {account_id}"
+            )));
+        };
+        let provider_id = existing.provider();
+        if !provider_id.starts_with(custom_providers::ID_PREFIX) {
+            return Err(AccountStoreError::bad_request(
+                "签到凭证只支持自定义提供商账号",
+            ));
+        }
+        if custom_providers::reward_profile_of_provider(&provider_id).is_none() {
+            return Err(AccountStoreError::bad_request(
+                "该自定义提供商未配置受支持的 rewardProfile",
+            ));
+        }
+        let mut fields = existing.fields().clone();
+        if credential.is_empty() {
+            fields.remove("rewardCredential");
+        } else {
+            fields.insert(
+                "rewardCredential".to_string(),
+                Value::String(credential.to_string()),
+            );
+        }
+        fields.insert("updatedAt".to_string(), Value::from(logging::now_ms()));
+        let saved = StoredAccount::from_map(fields);
+        self.with_conn(&_guard, |conn| sql::put(conn, &saved))?;
+        Ok(self.public_account(&saved))
+    }
+
+    /// 读取签到链路使用的自定义账号凭证快照。
+    ///
+    /// 只有提供商仍存在且配置了受支持的 `rewardProfile`、账号记录属于该
+    /// 自定义提供商并且凭证非空时才返回 Some；返回结构含明文凭证，仅供 core
+    /// 签到逻辑在进程内使用，不得直接序列化为 HTTP 响应。
+    pub fn custom_reward_credential_by_id(
+        &self,
+        account_id: &str,
+    ) -> Option<CustomRewardCredential> {
+        let _guard = self.guard();
+        let record = self.record_by_id(&_guard, account_id.trim())?;
+        let provider_id = record.provider();
+        if !provider_id.starts_with(custom_providers::ID_PREFIX) {
+            return None;
+        }
+        let profile_id = custom_providers::reward_profile_of_provider(&provider_id)?;
+        let credential = record
+            .fields()
+            .get("rewardCredential")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?
+            .to_string();
+        Some(CustomRewardCredential {
+            account_id: record.id().to_string(),
+            account_name: record.name(),
+            provider_id,
+            profile_id,
+            credential,
+        })
     }
 
     // ─── 读：内部凭证快照（转发 / 拉取模型清单用）────────────────
@@ -341,6 +459,18 @@ pub struct CustomCredential {
     pub proxy: Option<ResolvedProxy>,
 }
 
+/// 自定义账号签到凭证的内部快照。
+///
+/// `credential` 是明文，只能在签到 core 内部使用；公开账号形态仅提供
+/// `rewardCredentialConfigured` 与 `rewardCredentialTail`。
+pub struct CustomRewardCredential {
+    pub account_id: String,
+    pub account_name: String,
+    pub provider_id: String,
+    pub profile_id: String,
+    pub credential: String,
+}
+
 /// 一条记录 → 凭证快照（两个入口共用一份取数口径，不会各漂一份）
 fn credential_of_record(record: &StoredAccount) -> CustomCredential {
     let fields = record.fields();
@@ -386,4 +516,93 @@ fn account_id_for(api_key: &str) -> Result<String, String> {
         .map_err(|_| "无法生成安全的随机账号 id（系统随机源不可用），请重试".to_string())?;
     let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
     Ok(format!("{CUSTOM_ACCOUNT_ID_PREFIX}{hex}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store(label: &str) -> (AccountStore, crate::server::db::test_temp::TempDb) {
+        let (db, guard) =
+            crate::server::db::test_temp::TempDb::open(&format!("custom-reward-{label}"));
+        (AccountStore::with_db(Some(db)), guard)
+    }
+
+    #[test]
+    fn reward_credential_is_independent_and_never_public() {
+        let (store, _db) = store("independent");
+        let account = store
+            .add_custom_account(
+                "custom-provider-test",
+                &serde_json::json!({
+                    "apiKey": "model-api-key",
+                    "rewardCredential": "  reward-cookie-secret  "
+                }),
+                Some("奖励账号"),
+            )
+            .expect("自定义账号应能创建");
+        let id = account["id"].as_str().expect("返回账号 id");
+        let public_text = serde_json::to_string(&account).expect("公开形态可序列化");
+        assert!(!public_text.contains("reward-cookie-secret"));
+        assert_eq!(Some(true), account["rewardCredentialConfigured"].as_bool());
+        assert_eq!(Some("cret"), account["rewardCredentialTail"].as_str());
+
+        let internal = store
+            .custom_credential_by_id(id)
+            .expect("模型 apiKey 仍可读取");
+        assert_eq!("model-api-key", internal.api_key);
+
+        let cleared = store
+            .add_custom_account(
+                "custom-provider-test",
+                &serde_json::json!({
+                    "apiKey": "model-api-key",
+                    "rewardCredential": ""
+                }),
+                None,
+            )
+            .expect("空串应清除签到凭证");
+        assert_eq!(Some(false), cleared["rewardCredentialConfigured"].as_bool());
+        assert_eq!(Some(""), cleared["rewardCredentialTail"].as_str());
+        assert!(store.custom_reward_credential_by_id(id).is_none());
+    }
+
+    #[test]
+    fn reward_credential_patch_keeps_existing_value_when_omitted() {
+        let (store, _db) = store("patch");
+        let first = store
+            .add_custom_account(
+                "custom-provider-test",
+                &serde_json::json!({
+                    "apiKey": "model-api-key-2",
+                    "rewardCredential": "reward-cookie"
+                }),
+                None,
+            )
+            .expect("首次创建应成功");
+        let id = first["id"].as_str().expect("返回账号 id");
+        let second = store
+            .add_custom_account(
+                "custom-provider-test",
+                &serde_json::json!({ "apiKey": "model-api-key-2" }),
+                Some("改名"),
+            )
+            .expect("同 key 更新应成功");
+        assert_eq!(first["id"], second["id"]);
+        assert_eq!(Some(true), second["rewardCredentialConfigured"].as_bool());
+        assert_eq!(Some("okie"), second["rewardCredentialTail"].as_str());
+
+        let cleared = store
+            .add_custom_account(
+                "custom-provider-test",
+                &serde_json::json!({
+                    "apiKey": "model-api-key-2",
+                    "rewardCredential": ""
+                }),
+                None,
+            )
+            .expect("显式空串清除应成功");
+        assert_eq!(Some(false), cleared["rewardCredentialConfigured"].as_bool());
+        assert!(store.custom_reward_credential_by_id(id).is_none());
+    }
 }

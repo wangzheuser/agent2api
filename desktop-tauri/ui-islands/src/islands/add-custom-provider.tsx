@@ -65,8 +65,10 @@ const PROTOCOL_ID = 'custom-protocol-select'
 const NAME_ID = 'custom-name-input'
 const BASEURL_ID = 'custom-baseurl-input'
 const APIKEY_ID = 'custom-apikey-input'
+const REWARD_CREDENTIAL_ID = 'custom-reward-credential-input'
 const EXISTING_SELECT_ID = 'custom-existing-select'
 const EXISTING_APIKEY_ID = 'custom-existing-apikey-input'
+const EXISTING_REWARD_CREDENTIAL_ID = 'custom-existing-reward-credential-input'
 const EXISTING_NAME_ID = 'custom-existing-name-input'
 
 export const CREATE_BUTTON_ID = 'custom-create-button'
@@ -137,6 +139,7 @@ export function CustomProviderBlock({
   const wanted = providerHint && list.some(item => item.id === providerHint) ? providerHint : ''
   const current = wanted || (list.some(item => item.id === picked) ? picked : (list[0]?.id || ''))
   const pickedName = list.find(item => item.id === current)?.name || '该提供商'
+  const pickedRewardProfile = list.find(item => item.id === current)?.rewardProfile || ''
 
   // 提交动作在底部操作条那个组件里，它按 id 现读「当前选中的是哪一家」——
   // 下拉是组件库的按钮触发器（不是原生 select），值只能落到草稿里给它读
@@ -237,6 +240,17 @@ export function CustomProviderBlock({
             />
             <span className='hint'>留空表示无鉴权上游</span>
           </div>
+          <div className='add-field'>
+            <Label htmlFor={REWARD_CREDENTIAL_ID}>奖励凭证</Label>
+            <Input
+              id={REWARD_CREDENTIAL_ID}
+              type='password'
+              autoComplete='new-password'
+              placeholder='Cookie 或 Access Token（可选）'
+              {...draftProps(REWARD_CREDENTIAL_ID)}
+            />
+            <span className='hint'>仅用于每日/活动领取；不会替代 API Key</span>
+          </div>
         </div>
       </DialogSection>
 
@@ -274,6 +288,18 @@ export function CustomProviderBlock({
               {...draftProps(EXISTING_APIKEY_ID)}
             />
             <span className='hint'>留空表示无鉴权上游</span>
+          </div>
+          <div className='add-field'>
+            <Label htmlFor={EXISTING_REWARD_CREDENTIAL_ID}>奖励凭证</Label>
+            <Input
+              id={EXISTING_REWARD_CREDENTIAL_ID}
+              type='password'
+              autoComplete='new-password'
+              placeholder={pickedRewardProfile ? 'Cookie 或 Access Token（可选）' : '该提供商未配置奖励适配器'}
+              disabled={!pickedRewardProfile}
+              {...draftProps(EXISTING_REWARD_CREDENTIAL_ID)}
+            />
+            <span className='hint'>{pickedRewardProfile ? '仅用于每日/活动领取；不会替代 API Key' : '先为提供商选择 rewardProfile'}</span>
           </div>
           <div className='add-field'>
             <Label htmlFor={EXISTING_NAME_ID}>备注名</Label>
@@ -314,6 +340,7 @@ async function submitCreate(context: FootContext): Promise<void> {
   const protocol = readField(PROTOCOL_ID) || protocolOptions()[0].value
   const baseUrl = readField(BASEURL_ID)
   const apiKey = readField(APIKEY_ID)
+  const rewardCredential = readField(REWARD_CREDENTIAL_ID)
   // 必填拦截在本地先做一次（弹窗不是 <form>，原生 required 不生效）
   if (!name) { toast('请填写名称', 'err'); return }
   if (!baseUrl) { toast('请填写 Base URL', 'err'); return }
@@ -327,13 +354,15 @@ async function submitCreate(context: FootContext): Promise<void> {
     if (quirks.urlSuffix) payload.urlSuffix = quirks.urlSuffix
     if (quirks.headers && Object.keys(quirks.headers).length) payload.headers = { ...quirks.headers }
     if (quirks.anthropicToolType) payload.anthropicToolType = quirks.anthropicToolType
+    if (preset?.rewardProfile) payload.rewardProfile = preset.rewardProfile
     if (apiKey) payload.apiKey = apiKey // 留空 = 无鉴权上游，不进请求体
+    if (rewardCredential) payload.rewardCredential = rewardCredential
     context.setHint('')
     try {
       const data = (await shared().wbProviders?.customRequest?.(
         'POST', '/api/custom-providers', payload,
       )) as { provider?: { name?: string } } | null
-      clearFields([NAME_ID, BASEURL_ID, APIKEY_ID])
+      clearFields([NAME_ID, BASEURL_ID, APIKEY_ID, REWARD_CREDENTIAL_ID])
       const created = data?.provider?.name || name
       await afterCustomAdd(`✅ 已创建自定义提供商「${created}」并添加账号`)
     } catch (error) {
@@ -347,17 +376,19 @@ async function submitExisting(context: FootContext): Promise<void> {
   const providerId = readField(EXISTING_SELECT_ID)
   if (!providerId) { toast('请先选择一个自定义提供商', 'err'); return }
   const apiKey = readField(EXISTING_APIKEY_ID)
+  const rewardCredential = readField(EXISTING_REWARD_CREDENTIAL_ID)
   const name = readField(EXISTING_NAME_ID)
   await runSubmit(context.setBusy, async () => {
     const payload: Record<string, unknown> = { provider: providerId }
     if (apiKey) payload.apiKey = apiKey
+    if (rewardCredential) payload.rewardCredential = rewardCredential
     if (name) payload.name = name
     context.setHint('')
     try {
       const data = (await shared().wbProviders?.customRequest?.(
         'POST', '/api/accounts', payload,
       )) as { account?: { name?: string } } | null
-      clearFields([EXISTING_APIKEY_ID, EXISTING_NAME_ID])
+      clearFields([EXISTING_APIKEY_ID, EXISTING_REWARD_CREDENTIAL_ID, EXISTING_NAME_ID])
       const label = data?.account?.name
         || customList().find(item => item.id === providerId)?.name
         || ''

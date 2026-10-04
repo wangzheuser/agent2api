@@ -69,6 +69,7 @@ pub mod models;
 pub mod prompt;
 pub mod protocol;
 pub mod providers;
+pub mod reward_profiles;
 pub mod proxy_pool;
 pub mod proxies;
 pub mod routing;
