@@ -8,6 +8,8 @@ use super::task_state::{self, Claim, ManualBackoff};
 use crate::server::{config, logging};
 use serde_json::{json, Value};
 
+const RISK_BLOCK_RETRY_MS: i64 = 6 * 60 * 60_000;
+
 /// 从账号记录里取出领取链路要的三样东西。
 ///
 /// `jwt` 与 `deviceMid` **不走投影列**（它们是本家独有的字段，账号存储的
@@ -124,6 +126,17 @@ struct Report {
     skipped: usize,
     failed: usize,
     error: Option<String>,
+}
+
+/// 将上游业务码和短消息带进自动任务日志，避免所有未识别响应都只显示“未知失败”。
+fn failure_detail(failure: ClaimFailure, code: i64, message: &str) -> String {
+    let message = message.trim().replace('\r', " ").replace('\n', " ");
+    let message: String = message.chars().take(200).collect();
+    if message.is_empty() {
+        format!("{}（上游码 {code}）", failure.label())
+    } else {
+        format!("{}（上游码 {code}：{message}）", failure.label())
+    }
 }
 
 impl Report {
@@ -260,10 +273,13 @@ async fn scan_account(
             }
             ClaimOutcome::Failed {
                 failure,
+                code,
+                message,
                 failure_ends_at,
                 ..
             } => {
                 report.failed += 1;
+                let detail = failure_detail(failure, code, &message);
                 logging::log(
                     "[Claim]",
                     &format!(
@@ -271,7 +287,7 @@ async fn scan_account(
                         target.region.label(),
                         target.name,
                         plan.plan_id,
-                        failure.label()
+                        detail
                     ),
                 );
                 match failure {
@@ -282,9 +298,15 @@ async fn scan_account(
                             .unwrap_or_else(|| logging::now_ms() + 60 * 60_000);
                         retry.insert(plan.plan_id, json!(at));
                     }
+                    ClaimFailure::RiskBlocked => {
+                        retry.insert(
+                            plan.plan_id,
+                            json!(logging::now_ms().saturating_add(RISK_BLOCK_RETRY_MS)),
+                        );
+                    }
                     ClaimFailure::NotFound | ClaimFailure::Unavailable => {}
                     _ => {
-                        report.error = Some(failure.label().into());
+                        report.error = Some(detail);
                         break;
                     }
                 }
@@ -349,7 +371,11 @@ pub async fn run_auto(store: &AccountStore, manual: bool) -> Result<String, Stri
         total.failed += report.failed;
     }
     let summary = total.summary();
-    logging::log("[Claim]", &format!("ZCode 自动检查完成：{summary}"));
+    logging::log_with_level(
+        "[Claim]",
+        &format!("ZCode 自动检查完成：{summary}"),
+        if total.failed > 0 { "error" } else { "info" },
+    );
     Ok(summary)
 }
 
@@ -408,5 +434,18 @@ mod tests {
             assert!(already_recorded(&record, "plan-two"));
         }
         assert!(complete(&store, "missing", "plan").is_err());
+    }
+
+    #[test]
+    fn failure_detail_keeps_code_and_normalizes_line_breaks() {
+        let detail = failure_detail(
+            ClaimFailure::RiskBlocked,
+            3012,
+            "request has been blocked\n due to unusual activity",
+        );
+        assert_eq!(
+            detail,
+            "上游风控拦截（异常活动）（上游码 3012：request has been blocked  due to unusual activity）"
+        );
     }
 }

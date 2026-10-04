@@ -295,6 +295,8 @@ pub enum ClaimFailure {
     InvalidRequest,
     /// 验证码校验失败（3007）
     Captcha,
+    /// 上游风控拦截（3012）
+    RiskBlocked,
     /// 未登录 / JWT 失效（401）
     LoginRequired,
     /// 其它 HTTP 错误
@@ -314,6 +316,7 @@ impl ClaimFailure {
             Self::QuotaExhausted => "当日领取额度已用尽",
             Self::InvalidRequest => "参数错误（常见成因：缺少设备标识）",
             Self::Captcha => "验证码校验未通过",
+            Self::RiskBlocked => "上游风控拦截（异常活动）",
             Self::LoginRequired => "登录态已失效，请重新登录",
             Self::HttpError => "上游 HTTP 错误",
             Self::Unknown => "未知失败",
@@ -330,6 +333,7 @@ impl ClaimFailure {
             1005 => Self::QuotaExhausted,
             3001 => Self::InvalidRequest,
             3007 => Self::Captcha,
+            3012 => Self::RiskBlocked,
             401 => Self::LoginRequired,
             _ => Self::Unknown,
         }
@@ -398,7 +402,7 @@ pub fn outcome_hold(outcome: &ClaimOutcome) -> NextAttempt {
                 Some(at) => NextAttempt::WaitWindow(*at),
                 None => NextAttempt::Cooldown,
             },
-            // 活动没开始 / 不符合资格 / 参数错误 / 验证码 / 网络：都按冷却重试。
+            // 活动没开始 / 不符合资格 / 参数错误 / 验证码 / 风控 / 网络：都按冷却重试。
             // 其中 `Unavailable`（活动未开始）**不能**长退避 —— 它恰恰是开抢前
             // 最常见的一档，退避太久会错过上新。
             _ => NextAttempt::Cooldown,
@@ -458,7 +462,7 @@ pub async fn preview(
     let payload = response
         .payload
         .ok_or_else(|| GatewayError::with_status(502, "套餐探测：上游响应不是 JSON"))?;
-    let code = payload.get("code").and_then(Value::as_i64).unwrap_or(0);
+    let code = business_code(&payload).unwrap_or(0);
     let data = payload.get("data");
     if !(200..300).contains(&response.status) || code != 0 || data.is_none() {
         let message = error_message(&payload, response.status);
@@ -547,7 +551,7 @@ pub async fn claim(
     })?;
 
     let payload = response.payload.unwrap_or(Value::Null);
-    let biz_code = payload.get("code").and_then(Value::as_i64);
+    let biz_code = business_code(&payload);
     let data = payload.get("data");
     let plan = data.and_then(|value| value.get("plan"));
 
@@ -580,6 +584,25 @@ pub async fn claim(
         code: biz_code.unwrap_or(i64::from(response.status)),
         message: error_message(&payload, response.status),
         failure_ends_at,
+    })
+}
+
+/// 从上游响应中归一化业务码。
+///
+/// 正常响应使用顶层数字 `code`，但风控网关的部分响应会返回字符串，
+/// 某些错误包装还会把 code 放进 `data`。统一读取能避免这些响应被误报为未知失败。
+fn business_code(payload: &Value) -> Option<i64> {
+    fn parse(value: &Value) -> Option<i64> {
+        value
+            .as_i64()
+            .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
+    }
+
+    payload.get("code").and_then(parse).or_else(|| {
+        payload
+            .get("data")
+            .and_then(|data| data.get("code"))
+            .and_then(parse)
     })
 }
 
@@ -699,4 +722,26 @@ pub(super) fn urlencode(value: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_risk_block_and_preserves_unknown_codes() {
+        assert_eq!(ClaimFailure::from_code(3012), ClaimFailure::RiskBlocked);
+        assert_eq!(ClaimFailure::from_code(3999), ClaimFailure::Unknown);
+    }
+
+    #[test]
+    fn normalizes_numeric_business_codes() {
+        assert_eq!(business_code(&json!({"code": 3012})), Some(3012));
+        assert_eq!(business_code(&json!({"code": "3012"})), Some(3012));
+        assert_eq!(
+            business_code(&json!({"data": {"code": "1004"}})),
+            Some(1004)
+        );
+        assert_eq!(business_code(&json!({"code": "not-a-code"})), None);
+    }
 }

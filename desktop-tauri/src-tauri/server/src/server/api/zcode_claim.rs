@@ -329,6 +329,7 @@ fn failure_key(failure: ClaimFailure) -> &'static str {
         ClaimFailure::QuotaExhausted => "quota_exhausted",
         ClaimFailure::InvalidRequest => "invalid_request",
         ClaimFailure::Captcha => "captcha",
+        ClaimFailure::RiskBlocked => "risk_blocked",
         ClaimFailure::LoginRequired => "login_required",
         ClaimFailure::HttpError => "http_error",
         ClaimFailure::Unknown => "unknown",
