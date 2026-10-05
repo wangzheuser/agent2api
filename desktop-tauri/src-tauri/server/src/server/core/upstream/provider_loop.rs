@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! 候选家 = 清单里有这个模型名的 provider（router::route_for_forward）
-//! 账号循环：在候选家的全部账号里按**全局优先级**选一个
+//! 账号循环：在候选家的全部账号里按**当前选路策略**选一个
 //!   └ 一次发送（该账号所属 provider 的适配器；含退避重试 + 401 刷新后重试一次）
 //!        └ 429 → 标记该账号对该模型冷却，回到账号循环选下一个（可能换了一家）
 //! ```
@@ -275,7 +275,7 @@ fn retry_log_line(reason: &str, delay_ms: u64, used: usize, total: usize) -> Str
     format!("⚠️ {reason}；{} 秒后重试（第 {used}/{total} 次）", delay_ms / 1000)
 }
 
-/// 转发入口：在候选家的全部账号里按全局优先级逐个尝试。
+/// 转发入口：在候选家的全部账号里按当前选路策略逐个尝试。
 ///
 /// `slot` 是在途槽位凭证（`&mut` 是因为它只在**成功转为流式**时才被取走，
 /// 失败重试时仍由本函数持有；见 `InFlightGuard` 的说明）。
@@ -333,7 +333,7 @@ pub(super) async fn forward_with_providers(
     logging::verbose(
         "[Upstream]",
         &format!(
-            "候选提供商 {}（按账号全局优先级选路{}）",
+            "候选提供商 {}（按账号选路策略选路{}）",
             provider_ids.join(" / "),
             if with_mapping { "，含映射" } else { "" },
         ),
@@ -397,7 +397,7 @@ fn filter_by_key_scope(
     .with_code("model_not_found"))
 }
 
-/// 账号循环：每一轮从候选池里按全局优先级选一个账号，用它所属家的适配器发一次。
+/// 账号循环：每一轮从候选池里按当前选路策略选一个账号，用它所属家的适配器发一次。
 ///
 /// 按 `is_stateful` 分流（架构文档 §4.2.1）：
 ///   - 无状态（workbuddy / 小浣熊 / AutoClaw）→ 下面这段「构造请求 → 发送 →

@@ -247,6 +247,12 @@ pub fn panel_router(state: ServerState) -> Router {
             "/api/queue",
             get(api::queue_api::get_queue).put(api::queue_api::put_queue),
         )
+        // 账号选路策略：默认负载均衡，保存后对下一个请求立即生效。
+        .route(
+            "/api/account-selection",
+            get(api::account_selection_api::get_account_selection)
+                .put(api::account_selection_api::put_account_selection),
+        )
         // ── 调试模式（设置页「通用 → 调试模式」）──
         // GET/PUT 开关；traffic 是按 id 取原始报文的详情端点（列表接口不返回
         // 报文，见 debug_api 的模块头）。挂 protected：报文含上游 URL 与请求体。

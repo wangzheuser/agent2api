@@ -13,6 +13,7 @@
 //!                 GET/PUT /api/retention
 //!   retry_api.rs  GET/PUT /api/retry（请求重试设置，转发层退避的次数 / 间隔）
 //!   queue_api.rs  GET/PUT /api/queue（排队等待：次数与单次时长）
+//!   account_selection_api.rs  GET/PUT /api/account-selection（账号选路策略）
 //!   accounts.rs   /api/accounts*（对照 workbuddy-account-routes.mjs）
 //!   proxies.rs    /api/proxies*（Clash 读取 + 出口测试）
 //!   billing.rs    积分 / 签到 / 运营活动（对照 workbuddy-billing.mjs + server.mjs 871-911 行）
@@ -35,6 +36,7 @@
 //! 并保持与 Node 版一致的分组（需鉴权的一律挂 `protected`）。
 
 pub mod accounts;
+pub mod account_selection_api;
 // `/api/accounts/usage` 的查询与结果组装（从 accounts.rs 拆出：余额能力从
 // 「只服务 workbuddy」扩到四家混查时新增，见该文件模块头）
 pub mod accounts_usage;

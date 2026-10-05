@@ -33,6 +33,7 @@
 import * as React from 'react'
 import {
   CATEGORIES,
+  ACCOUNT_SELECTION_OPTIONS,
   NO_RETRY_CODES_KEY,
   PROMPT_MODES,
   QUEUE_FIELDS,
@@ -50,6 +51,7 @@ import {
   shared,
   toast,
   type AppSettings,
+  type AccountSelection,
   type GatewayBlocks,
   type NumberField,
   type PromptPatch,
@@ -71,6 +73,7 @@ export type BusyScope =
   | 'codes'
   | 'timeouts'
   | 'queue'
+  | 'accountSelection'
   | 'debug'
   | 'sanitize'
   | 'prompt'
@@ -190,6 +193,7 @@ export type SettingsSnapshot = {
   retryCodes: number[] | null
   timeouts: NumericState
   queue: NumericState
+  accountSelection: { status: LoadStatus; value: AccountSelection }
   debug: DebugState
   sanitize: SanitizeState
   prompt: PromptState
@@ -220,6 +224,7 @@ const INITIAL: SettingsSnapshot = {
   retryCodes: null,
   timeouts: { status: 'loading', values: null },
   queue: { status: 'loading', values: null },
+  accountSelection: { status: 'loading', value: 'balanced' },
   debug: { status: 'loading', on: false, count: null, limit: null },
   sanitize: { status: 'loading', on: false },
   prompt: {
@@ -696,6 +701,57 @@ export async function loadQueue(): Promise<void> {
 
 export async function saveQueueField(field: NumberField, raw: string): Promise<void> {
   await saveNumericField(queuePanel, field, raw)
+}
+
+/* ─── 账号选路策略 ─────────────────────────── */
+
+function normalizeAccountSelection(data: unknown): AccountSelection | null {
+  if (!data || typeof data !== 'object') return null
+  const raw = (data as Record<string, unknown>).accountSelection
+  return ACCOUNT_SELECTION_OPTIONS.some(option => option.value === raw)
+    ? raw as AccountSelection
+    : null
+}
+
+export function renderAccountSelection(data?: unknown): void {
+  if (data === undefined) return
+  const value = normalizeAccountSelection(data)
+  publish({
+    accountSelection: value === null
+      ? { status: 'unavailable', value: snapshot.accountSelection.value }
+      : { status: 'ready', value },
+  })
+}
+
+export async function loadAccountSelection(): Promise<void> {
+  try {
+    renderAccountSelection(await shared().workbuddyDesktop?.getAccountSelection())
+  } catch (error) {
+    console.warn('读取账号选路策略失败:', errorMessage(error))
+    renderAccountSelection(null)
+  }
+}
+
+export async function saveAccountSelection(value: AccountSelection): Promise<void> {
+  if (busyScope || snapshot.accountSelection.status !== 'ready' || value === snapshot.accountSelection.value) {
+    repaint()
+    return
+  }
+  const previous = snapshot.accountSelection
+  beginBusy('accountSelection')
+  publish({ accountSelection: { status: 'ready', value } })
+  try {
+    const saved = await shared().workbuddyDesktop?.saveAccountSelection({ accountSelection: value })
+    renderAccountSelection(saved)
+    const applied = snapshot.accountSelection.value
+    const label = ACCOUNT_SELECTION_OPTIONS.find(option => option.value === applied)?.label ?? applied
+    toast(`✅ 已保存账号选路策略：${label}`)
+  } catch (error) {
+    publish({ accountSelection: previous })
+    toast(`保存失败：${errorMessage(error)}`, 'err')
+  } finally {
+    endBusy()
+  }
 }
 
 /* ─── 请求重试 ─────────────────────────────── */
@@ -1413,6 +1469,7 @@ export async function load(): Promise<void> {
     loadRetry(),
     loadTimeouts(),
     loadQueue(),
+    loadAccountSelection(),
     loadDebug(),
     loadSanitize(),
     loadPrompt(),
@@ -1443,6 +1500,11 @@ export async function refreshTimeouts(): Promise<void> {
 export async function refreshQueue(): Promise<void> {
   await loadQueue()
   toast('排队等待设置已刷新')
+}
+
+export async function refreshAccountSelection(): Promise<void> {
+  await loadAccountSelection()
+  toast('账号选路策略已刷新')
 }
 
 export async function refreshDebug(): Promise<void> {

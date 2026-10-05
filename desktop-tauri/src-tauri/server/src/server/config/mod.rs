@@ -110,6 +110,8 @@ pub struct RuntimeConfig {
     /// 与 timeouts 同一理由：走排队制的适配器**每次遇到排队**都要取它
     /// （改完设置下一个请求就用新值，不重启进程），解析一次存下来最省事。
     queue: QueueSettings,
+    /// 账号选路策略（转发层每次选择账号时读取；保存后立即影响下一个请求）。
+    account_selection: AccountSelectionStrategy,
     /// 事件日志的保存目录（原始配置值；None = 未设置，用配置目录）。
     /// 低频字段（启动 + 设置页读写），不值得为它发明解析层，存原始值即可。
     log_dir: Option<String>,
@@ -381,6 +383,7 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
     let retry = retry_from(&raw);
     let timeouts = timeouts_from(&raw);
     let queue = queue_from(&raw);
+    let account_selection = account_selection_from(&raw);
     RuntimeConfig {
         // 文件里有就用文件的，否则环境变量兜底（对应 `if (config.apiKey && !opts.apiKey)`）
         api_key: string_field(&raw, "apiKey").or_else(env_api_key),
@@ -394,6 +397,7 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
         retry,
         timeouts,
         queue,
+        account_selection,
         log_dir: string_field(&raw, KEY_LOG_DIR),
         request_stats_dir: string_field(&raw, KEY_REQUEST_STATS_DIR),
         debug_dir: string_field(&raw, KEY_DEBUG_DIR),
@@ -1147,6 +1151,16 @@ pub fn queue_settings() -> QueueSettings {
     QueueSettings::default()
 }
 
+/// 只取账号选路策略的轻量读取。未初始化或配置损坏时使用默认负载均衡。
+pub fn account_selection() -> AccountSelectionStrategy {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.account_selection;
+        }
+    }
+    AccountSelectionStrategy::default()
+}
+
 /// 更新排队等待（`None` = 该项不动），返回是否写盘成功。
 ///
 /// 调用方（`queue_api::put_queue`）**必须先校验范围**：本函数按「已合法」处理，
@@ -1168,6 +1182,17 @@ pub fn set_queue(patch: QueuePatch) -> bool {
             next.wait_seconds = seconds;
         }
         config.queue = next;
+    })
+}
+
+/// 更新账号选路策略，内存快照与配置库同时更新；写盘失败时本次运行仍立即生效。
+pub fn set_account_selection(strategy: AccountSelectionStrategy) -> bool {
+    update(|config| {
+        config.raw.insert(
+            KEY_ACCOUNT_SELECTION.to_string(),
+            Value::String(strategy.as_str().to_string()),
+        );
+        config.account_selection = strategy;
     })
 }
 

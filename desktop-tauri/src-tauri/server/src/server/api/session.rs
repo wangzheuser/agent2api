@@ -90,7 +90,7 @@ pub async fn get_session(State(state): State<ServerState>) -> Response {
         // 最近一次实际请求用的模型：账号页的「模型」筛选默认选它
         "lastRequestModel": snapshot.last_request_model(),
         // 按 lastRequestModel 派生的「下一个请求会先用谁」（账号页 ★ / 「首选」）。
-        // 判据与转发层同一套（候选 = 提供该模型的那些家的账号，再按全局优先级取
+        // 判据与转发层同一套（候选 = 提供该模型的那些家的账号，再按当前选路策略取
         // 第一个「启用 + 有凭证 + 对该模型未限流」的）；模型未知或该模型下没有
         // 可用账号时为 null，界面回落到上面的 currentAccountId。
         "routedAccountId": routed,

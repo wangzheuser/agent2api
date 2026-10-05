@@ -1,8 +1,9 @@
-//! 账号选路 —— 严格优先级排队（对照 Node 版 src/workbuddy-routing.mjs 全量移植）。
+//! 账号选路 —— 过滤公共可用性后按可配置策略选择账号。
 //!
-//! 优先级是「主备序号」：优先级必须唯一（Agent2API 改造后作用域收窄为
-//! **同 provider 内**，由 account-store 在写入侧保证，见其模块头），
-//! 不允许多个账号并列 —— 并列会让「同级」语义失效。本模块只做**纯判定**，
+//! `balanced` 是默认策略：按实时在途负载与有效容量选择最空闲账号，负载相同
+//! 轮换平局；`priority` 保留优先级主备顺序；`roundRobin` 在可用账号中轮询。
+//! 优先级仍是账号页的稳定排序基准，但不再强制所有请求只落到队首。本模块只做
+//! **低开销判定**，
 //! 数据来源是账号存储的公开形态（`store.list_accounts()` 的 `accounts` 数组），
 //! 字段就是 UI 上看到的那几个：`id` / `name` / `priority` / `addedAt` /
 //! `enabled` / `rateLimits`。
@@ -13,9 +14,9 @@
 //! 语义，避免为了「类型好看」把手工编辑出的脏数据在解析期整条丢掉 ——
 //! 那会让选路结果与 Node 版分叉（例如某个账号因为 `priority: "abc"` 而消失）。
 //!
-//! ── 规则（照抄 Node 版头部注释）──────────────────────────────
+//! ── 公共过滤规则（照抄 Node 版头部注释）──────────────────────
 //!   1. 候选 = 启用中（`enabled !== false`）且未对「该模型」处于限额冷却期的账号；
-//!   2. 取候选里优先级数值最小的那个（数值小的先用）；
+//!   2. 按所选策略从候选里取一个；
 //!   3. 本次已尝试过的账号（429 降级）从候选中排除，避免回环；
 //!   4. 全部候选都不可用时，由调用方决定是降级重试还是透传错误。
 //!
@@ -32,12 +33,17 @@
 //! 降级到下一个候选 —— 那是按模型的一次性决策，不改写「当前账号」。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use serde_json::{json, Value};
 
 use crate::server::core::account_store::priority::{by_priority_order, normalize_priority};
 use crate::server::core::account_store::store_util::js_truthy;
+
+/// 只用于处理负载相同的账号平局。它不参与并发计数，也不跨进程持久化；
+/// 保存策略或重启服务都会自然从当前候选池重新开始。
+static ROUTE_CURSOR: AtomicUsize = AtomicUsize::new(0);
 
 /// 「请求名 → 各家上游真名」的解析缓存：限额冷却键的解析器。
 ///
@@ -214,7 +220,7 @@ pub fn max_concurrent_of(account: &Value) -> u64 {
         .unwrap_or(0)
 }
 
-/// 按优先级挑选本次请求使用的账号。
+/// 按当前策略挑选本次请求使用的账号。
 ///
 /// `accounts` 为 store.listAccounts().accounts 的公开形态；
 /// `exclude_ids` 是本次请求已尝试过的账号 id（429 降级用）。
@@ -233,14 +239,57 @@ pub fn max_concurrent_of(account: &Value) -> u64 {
 /// 短暂超载（请求结束计数立刻回落），而选路必须是「读一次快照、立刻决策」
 /// 的廉价操作。把这个口径写明：**允许短暂超 1-2 个，不做强一致**。
 ///
-/// 排序取首位即为唯一答案（优先级唯一由写入侧保证）；并列属手工编辑出来的
-/// 异常数据，按加入时间兜底，结果依旧稳定。
+/// `balanced` 先比较「在途数 / 有效并发容量」的负载，负载相同再轮换账号；
+/// `priority` 保持历史主备顺序；`roundRobin` 忽略负载差异，只在并发上限允许
+/// 的候选中轮询。策略只影响候选排序，不改变禁用、额度冷却和并发上限过滤。
 pub fn pick_account_by_priority(
     accounts: &[Value],
     keys: &CooldownKeys<'_>,
     counts: &HashMap<String, usize>,
     exclude_ids: &[String],
     now: i64,
+) -> Option<Value> {
+    pick_account_with_strategy(
+        accounts,
+        keys,
+        counts,
+        exclude_ids,
+        now,
+        crate::server::config::account_selection(),
+        true,
+    )
+}
+
+/// 选路的只读版本，供账号预览与「下一个账号」探测使用。
+///
+/// 预览不能推进轮询游标，否则打开管理页就会改变真实转发顺序；失败后的
+/// 预览也不能让下一轮实际选择跳过刚展示的账号。
+pub fn pick_account_peek(
+    accounts: &[Value],
+    keys: &CooldownKeys<'_>,
+    counts: &HashMap<String, usize>,
+    exclude_ids: &[String],
+    now: i64,
+) -> Option<Value> {
+    pick_account_with_strategy(
+        accounts,
+        keys,
+        counts,
+        exclude_ids,
+        now,
+        crate::server::config::account_selection(),
+        false,
+    )
+}
+
+fn pick_account_with_strategy(
+    accounts: &[Value],
+    keys: &CooldownKeys<'_>,
+    counts: &HashMap<String, usize>,
+    exclude_ids: &[String],
+    now: i64,
+    strategy: crate::server::config::AccountSelectionStrategy,
+    advance_cursor: bool,
 ) -> Option<Value> {
     let policy = super::workbuddy_policy::RoutePolicy::load();
     let mut candidates: Vec<Value> = accounts
@@ -262,8 +311,66 @@ pub fn pick_account_by_priority(
     if candidates.is_empty() {
         return None;
     }
-    candidates.sort_by(compare_by_priority);
-    policy.reorder(&mut candidates, &keys.for_provider("workbuddy"), now);
+
+    match strategy {
+        crate::server::config::AccountSelectionStrategy::Priority => {
+            candidates.sort_by(compare_by_priority);
+            policy.reorder(&mut candidates, &keys.for_provider("workbuddy"), now);
+            candidates.into_iter().next()
+        }
+        crate::server::config::AccountSelectionStrategy::RoundRobin => {
+            // 保留账号页的主备排序作为轮询的稳定基准；WorkBuddy 的福利策略
+            // 仍作为同一候选池的次级顺序，不会绕过余额保底过滤。
+            candidates.sort_by(compare_by_priority);
+            policy.reorder(&mut candidates, &keys.for_provider("workbuddy"), now);
+            let len = candidates.len();
+            choose_by_cursor(candidates, advance_cursor, len)
+        }
+        crate::server::config::AccountSelectionStrategy::Balanced => {
+            // 福利/到期/成本策略先形成稳定的次级顺序，再由负载作为主排序键；
+            // `sort_by` 是稳定排序，负载相同时仍保留该次级顺序，最后由游标
+            // 轮换同负载账号，避免空闲时永远命中同一优先级账号。
+            candidates.sort_by(compare_by_priority);
+            policy.reorder(&mut candidates, &keys.for_provider("workbuddy"), now);
+            candidates.sort_by(|left, right| {
+                load_score(left, counts)
+                    .partial_cmp(&load_score(right, counts))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let best = load_score(&candidates[0], counts);
+            let tie_len = candidates
+                .iter()
+                .take_while(|account| {
+                    (load_score(account, counts) - best).abs() < f64::EPSILON
+                })
+                .count();
+            choose_by_cursor(candidates, advance_cursor, tie_len)
+        }
+    }
+}
+
+/// 以「有效并发容量」归一化在途负载：有限上限使用 `count / limit`，不限上限
+/// 使用原始在途数作为保守负载。这样既不会让一个已占用的不限账号长期压住
+/// 空闲有限账号，也不会把所有不限账号误判为永远同一分数。
+fn load_score(account: &Value, counts: &HashMap<String, usize>) -> f64 {
+    let count = account_id(account)
+        .and_then(|id| counts.get(id).copied())
+        .unwrap_or(0) as f64;
+    let limit = max_concurrent_of(account);
+    if limit > 0 { count / limit as f64 } else { count }
+}
+
+fn choose_by_cursor(mut candidates: Vec<Value>, advance_cursor: bool, span: usize) -> Option<Value> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let span = span.max(1).min(candidates.len());
+    let index = ROUTE_CURSOR.load(Ordering::Relaxed) % span;
+    if advance_cursor {
+        ROUTE_CURSOR.fetch_add(1, Ordering::Relaxed);
+    }
+    // 只在同一负载的前缀里轮换；后面的更高负载候选保持原顺序。
+    candidates.swap(0, index);
     candidates.into_iter().next()
 }
 
@@ -277,7 +384,7 @@ fn at_concurrency_limit(account: &Value, id: &str, counts: &HashMap<String, usiz
 }
 
 /// 按**指定模型**派生队首：候选先收窄到「清单里有这个模型的家」，再走
-/// [`pick_account_by_priority`] 的常规判据（启用 + 该模型未限流 + 优先级序）。
+/// [`pick_account_by_priority`] 的常规判据（启用 + 该模型未限流 + 当前选路策略）。
 ///
 /// ── 为什么要单独有这个函数（`pick_current` 不够用）──────────────
 /// 账号库里的「当前账号」是**不限模型**的队首（只判启用 + 凭证），转发层却还要
@@ -320,7 +427,7 @@ pub fn pick_for_model(
         .cloned()
         .collect();
     let keys = CooldownKeys::new(model);
-    pick_account_by_priority(&candidates, &keys, counts, &[], now)
+    pick_account_peek(&candidates, &keys, counts, &[], now)
 }
 
 /// 账号记录上的 provider id（缺失按默认 provider 兜底，与 store 的
@@ -373,7 +480,7 @@ pub fn describe_route_decision(
     }
     // 排障快照，拿不到运行时的在途计数（它住在 UpstreamService 里），
     // 传空表 = 并发过滤不生效 —— 这里只回答「按启用/限流该选谁」。
-    let picked = pick_account_by_priority(accounts, &keys, &HashMap::new(), exclude_ids, now);
+    let picked = pick_account_peek(accounts, &keys, &HashMap::new(), exclude_ids, now);
     let priority = picked
         .as_ref()
         .map(|account| normalize_priority_value_of(account))
@@ -458,5 +565,124 @@ fn js_number(value: &Value) -> Option<f64> {
         Value::Bool(flag) => Some(if *flag { 1.0 } else { 0.0 }),
         Value::Null => Some(0.0),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use serde_json::json;
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn account(id: &str, priority: i64, max_concurrent: u64) -> Value {
+        json!({
+            "id": id,
+            "provider": "raccoon",
+            "priority": priority,
+            "addedAt": priority,
+            "enabled": true,
+            "maxConcurrent": max_concurrent,
+        })
+    }
+
+    #[test]
+    fn balanced_prefers_lower_normalized_load() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        ROUTE_CURSOR.store(0, Ordering::Relaxed);
+        let accounts = vec![account("busy", 1, 4), account("idle", 2, 2)];
+        let counts = HashMap::from([(String::from("busy"), 2usize)]);
+        let keys = CooldownKeys::new("fixture-model");
+        let picked = pick_account_peek(&accounts, &keys, &counts, &[], 0).expect("应有可用账号");
+        assert_eq!(picked["id"], "idle");
+    }
+
+    #[test]
+    fn balanced_rotates_equal_load_accounts() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        ROUTE_CURSOR.store(0, Ordering::Relaxed);
+        let accounts = vec![account("first", 1, 2), account("second", 2, 2)];
+        let keys = CooldownKeys::new("fixture-model");
+        let first = pick_account_by_priority(&accounts, &keys, &HashMap::new(), &[], 0)
+            .expect("第一次应有可用账号");
+        let second = pick_account_by_priority(&accounts, &keys, &HashMap::new(), &[], 0)
+            .expect("第二次应有可用账号");
+        assert_ne!(first["id"], second["id"]);
+    }
+
+    #[test]
+    fn priority_keeps_stable_primary_account() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let accounts = vec![account("first", 1, 2), account("second", 2, 2)];
+        let keys = CooldownKeys::new("fixture-model");
+        let picked = pick_account_with_strategy(
+            &accounts,
+            &keys,
+            &HashMap::new(),
+            &[],
+            0,
+            crate::server::config::AccountSelectionStrategy::Priority,
+            true,
+        )
+        .expect("应有可用账号");
+        assert_eq!(picked["id"], "first");
+    }
+
+    #[test]
+    fn round_robin_rotates_available_accounts() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        ROUTE_CURSOR.store(0, Ordering::Relaxed);
+        let accounts = vec![account("first", 1, 2), account("second", 2, 2)];
+        let keys = CooldownKeys::new("fixture-model");
+        let first = pick_account_with_strategy(
+            &accounts,
+            &keys,
+            &HashMap::new(),
+            &[],
+            0,
+            crate::server::config::AccountSelectionStrategy::RoundRobin,
+            true,
+        )
+        .expect("第一次应有可用账号");
+        let second = pick_account_with_strategy(
+            &accounts,
+            &keys,
+            &HashMap::new(),
+            &[],
+            0,
+            crate::server::config::AccountSelectionStrategy::RoundRobin,
+            true,
+        )
+        .expect("第二次应有可用账号");
+        assert_ne!(first["id"], second["id"]);
+    }
+
+    #[test]
+    fn peek_does_not_advance_round_robin_cursor() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        ROUTE_CURSOR.store(0, Ordering::Relaxed);
+        let accounts = vec![account("first", 1, 2), account("second", 2, 2)];
+        let keys = CooldownKeys::new("fixture-model");
+        let first = pick_account_with_strategy(
+            &accounts,
+            &keys,
+            &HashMap::new(),
+            &[],
+            0,
+            crate::server::config::AccountSelectionStrategy::RoundRobin,
+            false,
+        )
+        .expect("预览应有可用账号");
+        let second = pick_account_with_strategy(
+            &accounts,
+            &keys,
+            &HashMap::new(),
+            &[],
+            0,
+            crate::server::config::AccountSelectionStrategy::RoundRobin,
+            false,
+        )
+        .expect("第二次预览应有可用账号");
+        assert_eq!(first["id"], second["id"]);
     }
 }

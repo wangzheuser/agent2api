@@ -74,7 +74,7 @@
 //!     egress.rs    出网点（按出口缓存 reqwest Client）+ 出口连通性测试
 //!     billing/     积分 / 签到（checkin.rs） / 运营活动
 //!     models/      模型目录（workbuddy 单家：内置清单 + /v3/config 远程刷新）
-//!     routing.rs   账号选路（严格优先级 + 限额冷却判定）
+//!     routing.rs   账号选路（可配置策略 + 限额冷却判定）
 //!     auto_checkin.rs 定时签到调度（30 秒轮询 + 当天去重 + 启动补签）
 //!     credential_maintenance.rs 凭证自动维护（遍历账号 → 刷新临期凭证；
 //!                     调度由 `scheduled_tasks` 按配置的开关与间隔驱动）

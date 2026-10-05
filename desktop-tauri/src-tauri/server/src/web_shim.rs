@@ -905,6 +905,9 @@ pub fn shim_js() -> &'static str {
     // ── 排队等待（次数 / 单次秒数）──
     getQueue: function () { return call('GET', '/api/queue'); },
     saveQueue: function (patch) { return call('PUT', '/api/queue', patch); },
+    // ── 账号选路策略 ──
+    getAccountSelection: function () { return call('GET', '/api/account-selection'); },
+    saveAccountSelection: function (patch) { return call('PUT', '/api/account-selection', patch); },
 
     // ── 调试模式 ──
     getDebug: function () { return call('GET', '/api/debug'); },

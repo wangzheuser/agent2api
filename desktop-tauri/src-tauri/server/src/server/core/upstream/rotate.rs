@@ -1,7 +1,7 @@
 //! 账号选路与 429 轮换（从 mod.rs 拆出，单文件行数约定）。
 //!
 //! 对应 Node 版 workbuddy-upstream-client.mjs 的这几段：
-//!   selectTargetAccount   三级选路（优先级挑 → 全限额/全忙时恢复最早或按余量挤占 → 全禁用报 503）
+//!   selectTargetAccount   三级选路（按策略挑选 → 全限额/全忙时恢复最早或按余量挤占 → 全禁用报 503）
 //!   withProxyNotice       代理解析失败时记日志并回退直连
 //!   requireSession        无可用登录态时报 401
 //!   markAccountLimited    限额标记落盘 + 恢复时间文案
@@ -18,7 +18,7 @@
 //! ── 全局一条队列：候选集合 = 「能提供该模型的那些 provider」的全部账号 ──
 //! 选路入口收一个 `providers` 集合（`router::route_for_forward` 给出的、清单里
 //! 有这个模型名的家），候选账号先按 `account.provider ∈ providers` 过滤，再按
-//! **全局**优先级挑 —— 四家账号混在同一条队里，谁的号小谁先用。
+//! **全局**策略挑选 —— 四家账号混在同一条队里，默认按实时负载均衡。
 //! 「workbuddy 的请求不会借到 raccoon 的账号」这条仍然成立：raccoon 若不提供
 //! 这个模型名，它就不在 `providers` 里。限额冷却键仍是账号记录内的
 //! `rateLimits[model]`，账号唯一确定 provider，无需改结构。
@@ -93,7 +93,7 @@ pub(super) async fn session_for(
 
 /// 本次请求使用的账号（对照 Node 的 selectTargetAccount，三级顺序）。
 ///
-///   1. 按**全局**优先级选（跳过禁用、限额冷却中与已达并发上限的账号），
+///   1. 按**全局**账号选路策略选（跳过禁用、限额冷却中与已达并发上限的账号），
 ///      逐个向前找——跳过没有可用凭证的记录（避免选到空账号）；
 ///   2. 剩下的启用账号都在限额冷却期 / 已达并发上限 → 先在「未达并发上限」
 ///      的账号里挑恢复最早的一个试一次；一个都没有（全部达到并发上限）→
@@ -424,7 +424,7 @@ pub(super) fn connection_counts(service: &UpstreamService) -> HashMap<String, us
 /// 下一个可用账号（全局队列，限定在 `providers` 各家的账号里，跳过已尝试的）。
 ///
 /// `keys` 见 [`select_target_account`]：冷却按各家真名判定。
-/// 走与第一级选路同一个 `pick_account_by_priority`，并发上限的过滤
+/// 走与第一级选路同一个 `pick_account_by_priority`，因此沿用当前策略和并发上限过滤
 /// （与软上限口径）由此自动获得 —— 换号顺延不会把请求塞回一个已达上限的账号。
 pub(super) fn pick_next_account(
     service: &UpstreamService,
@@ -434,7 +434,7 @@ pub(super) fn pick_next_account(
 ) -> Option<Value> {
     let accounts = accounts_in_providers(service, providers);
     let counts = connection_counts(service);
-    routing::pick_account_by_priority(&accounts, keys, &counts, tried_ids, logging::now_ms())
+    routing::pick_account_peek(&accounts, keys, &counts, tried_ids, logging::now_ms())
 }
 
 #[cfg(test)]

@@ -23,6 +23,7 @@ import {
   Switch,
 } from '@ui'
 import {
+  ACCOUNT_SELECTION_OPTIONS,
   CATEGORIES,
   LANGUAGES,
   NOTES,
@@ -43,6 +44,7 @@ import {
   readThemeMode,
   readZoomPercent,
   shared,
+  type AccountSelection,
   type GatewayBlocks,
   type NumberField,
   type ThemeMode,
@@ -57,6 +59,7 @@ import {
   importAccounts,
   load,
   panelLogout,
+  refreshAccountSelection,
   refreshDebug,
   refreshPrompt,
   refreshQueue,
@@ -67,6 +70,7 @@ import {
   refreshTimeouts,
   removeProviderPrompt,
   removeRetryCode,
+  renderAccountSelection,
   renderDebug,
   renderPrompt,
   renderRetention,
@@ -76,6 +80,7 @@ import {
   renderStorage,
   resolveRetentionConfirm,
   restoreCategory,
+  saveAccountSelection,
   saveCaptcha,
   saveDebug,
   savePromptFile,
@@ -1045,9 +1050,61 @@ function RetryPane({ snap }: { snap: SettingsSnapshot }) {
 
 /* ─── 网关分类 ─────────────────────────────── */
 
+function AccountSelectionPanel({ snap }: { snap: SettingsSnapshot }) {
+  const state = snap.accountSelection
+  const option = ACCOUNT_SELECTION_OPTIONS.find(item => item.value === state.value)
+  const locked = state.status !== 'ready' || snap.busy === 'accountSelection'
+  return (
+    <section className='panel'>
+      <PanelHead
+        title='账号选路'
+        tip={TIPS.accountSelection}
+        badge={state.status === 'ready'
+          ? <StatusBadge tone='ok'>已生效</StatusBadge>
+          : state.status === 'unavailable'
+            ? <StatusBadge tone='bad'>不可用</StatusBadge>
+            : <StatusBadge tone='idle'>检测中…</StatusBadge>}
+        actions={<RefreshButton id='btn-account-selection-refresh' onClick={() => void refreshAccountSelection()} />}
+      />
+      <div className='panel-body'>
+        <div className='retention-list'>
+          <div className='retention-row'>
+            <label htmlFor='settings-account-selection'>选择策略</label>
+            <span className='prompt-input'>
+              <Select
+                value={state.value}
+                onValueChange={next => {
+                  const value = String(next ?? '') as AccountSelection
+                  if (ACCOUNT_SELECTION_OPTIONS.some(item => item.value === value)) void saveAccountSelection(value)
+                }}
+              >
+                <SelectTrigger
+                  id='settings-account-selection'
+                  className='w-[240px]'
+                  disabled={locked}
+                  aria-label='账号选路策略'
+                >
+                  <SelectValue>{option?.label ?? state.value}</SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  {ACCOUNT_SELECTION_OPTIONS.map(item => (
+                    <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </span>
+            <div className='hint'>{NOTES.accountSelection}</div>
+          </div>
+        </div>
+      </div>
+    </section>
+  )
+}
+
 function GatewayPane({ snap }: { snap: SettingsSnapshot }) {
   return (
     <>
+      <AccountSelectionPanel snap={snap} />
       <section className='panel'>
         <PanelHead
           title='排队等待'
@@ -1553,6 +1610,7 @@ declare global {
       render(data?: unknown): void
       renderRetention(data?: unknown): void
       renderRetry(data?: unknown): void
+      renderAccountSelection(data?: unknown): void
       renderDebug(data?: unknown): void
       renderSanitize(data?: unknown): void
       renderPrompt(data?: unknown): void
@@ -1567,6 +1625,7 @@ window.wbSettingsPanel = {
   render: renderSettings,
   renderRetention,
   renderRetry,
+  renderAccountSelection,
   renderDebug,
   renderSanitize,
   renderPrompt,

@@ -401,4 +401,9 @@ pub(super) fn queue_from(map: &Map<String, Value>) -> QueueSettings {
     }
 }
 
+/// 读取账号选路策略。未知值按负载均衡回落，保证手工编辑配置不会让转发失效。
+pub(super) fn account_selection_from(map: &Map<String, Value>) -> AccountSelectionStrategy {
+    AccountSelectionStrategy::parse(map.get(KEY_ACCOUNT_SELECTION))
+}
+
 // ─── 历史路由优先级（providerRoute，只读，供账号迁移）───────────

@@ -236,12 +236,18 @@ impl AccountStore {
         // （`routing::at_concurrency_limit`），这才是参考实现里
         // `candidateSessionAvailable` 承担的那一步。
         // 与准入闸读的是同一个数（`session::SessionGate::limit_for`：0/缺省 → 默认 3），
-        // 两处不会一个显示 3、一个按别的数判。
+        // 两处不会一个显示 3、一个按别的数判；显式值同时按闸的 64 上限收口。
+        let configured_limit = max_concurrent_public(record.get("maxConcurrent"));
+        let effective_limit = if configured_limit == 0 {
+            crate::server::core::providers::codearts::session::DEFAULT_SESSION_LIMIT as u64
+        } else {
+            configured_limit.min(
+                crate::server::core::providers::codearts::session::MAX_SESSION_LIMIT as u64,
+            )
+        };
         public.insert(
             "maxConcurrent".to_string(),
-            Value::from(max_concurrent_public(record.get("maxConcurrent")).max(
-                crate::server::core::providers::codearts::session::DEFAULT_SESSION_LIMIT as u64,
-            )),
+            Value::from(effective_limit),
         );
         // 每日福利领取的台账原样透出：界面要显示「今天已试过几次 / 是否已到账」，
         // 而这三项之外没有别的可推。里面**只有活动 id、幂等键与布尔状态**，
@@ -443,6 +449,10 @@ mod tests {
         assert_eq!(Some(3), published(&store), "没配过上限也要报 3，选路据此在满员时跳过本账号");
         store.update_account(&id, &json!({ "maxConcurrent": 5 })).unwrap();
         assert_eq!(Some(5), published(&store), "配了就按配的数");
+        store.update_account(&id, &json!({ "maxConcurrent": 2 })).unwrap();
+        assert_eq!(Some(2), published(&store), "显式较小上限必须与准入闸一致");
+        store.update_account(&id, &json!({ "maxConcurrent": 999 })).unwrap();
+        assert_eq!(Some(64), published(&store), "公开上限必须与准入闸的 64 对齐");
         store.update_account(&id, &json!({ "maxConcurrent": 0 })).unwrap();
         assert_eq!(Some(3), published(&store), "0 在本家不是「不限」，回到默认值");
     }

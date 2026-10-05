@@ -24,6 +24,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use serde_json::Value;
+
 /// 默认模型：客户端未指定模型时使用（对应 Node 版 `--default-model` 默认值）
 pub const DEFAULT_MODEL: &str = "auto";
 /// 计费接口默认语言（对应 Node 版 `--locale` 默认值）
@@ -285,6 +287,42 @@ pub const DEFAULT_DAILY_RETENTION_DAYS: i64 = 365;
 /// 用来把旧版「按家分队」的号码按旧的实际顺序合并成全局队列；不再有写侧，
 /// 文件里残留的值也不会被抹掉（未知字段全量保留）。
 pub const KEY_PROVIDER_ROUTE: &str = "providerRoute";
+
+/// 账号选路策略（`balanced` 为默认负载均衡，`priority` 保留旧版主备顺序，
+/// `roundRobin` 按账号轮询）。
+pub const KEY_ACCOUNT_SELECTION: &str = "accountSelection";
+pub const DEFAULT_ACCOUNT_SELECTION: &str = "balanced";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccountSelectionStrategy {
+    Balanced,
+    Priority,
+    RoundRobin,
+}
+
+impl AccountSelectionStrategy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Balanced => "balanced",
+            Self::Priority => "priority",
+            Self::RoundRobin => "roundRobin",
+        }
+    }
+
+    pub fn parse(value: Option<&Value>) -> Self {
+        match value.and_then(Value::as_str) {
+            Some("priority") => Self::Priority,
+            Some("roundRobin") | Some("round_robin") => Self::RoundRobin,
+            _ => Self::Balanced,
+        }
+    }
+}
+
+impl Default for AccountSelectionStrategy {
+    fn default() -> Self {
+        Self::Balanced
+    }
+}
 
 /// 天数的合法范围：下限 1 天（保留 0 天等于什么都不存，不是有效配置），
 /// 上限 10 年（防手改 config.json 写个天文数字让裁剪逻辑空转）。
