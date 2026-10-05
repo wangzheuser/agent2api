@@ -37,7 +37,9 @@ fn manifest_for(kind: ProviderKind) -> Vec<Value> {
     for item in model_rules::custom_models_for(kind_id(kind)) {
         let id = model_id(&item);
         if !id.is_empty()
-            && !models.iter().any(|existing| model_id(existing).eq_ignore_ascii_case(&id))
+            && !models
+                .iter()
+                .any(|existing| model_id(existing).eq_ignore_ascii_case(&id))
         {
             models.push(item);
         }
@@ -119,11 +121,16 @@ pub(crate) fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
             super::trae::models::remote_refreshed(),
             super::trae::models::last_refreshed_at(),
         ),
+        // MiniMax Code / LobsterAI 当前使用静态目录；协议保留远程刷新扩展点。
+        ProviderKind::MiniMaxCode | ProviderKind::LobsterAI => (false, 0),
     }
 }
 
 fn all_kinds() -> Vec<ProviderKind> {
-    PROVIDERS.iter().filter_map(|meta| kind_from_id(meta.id)).collect()
+    PROVIDERS
+        .iter()
+        .filter_map(|meta| kind_from_id(meta.id))
+        .collect()
 }
 
 pub fn provider_available(store: &AccountStore, kind: ProviderKind) -> bool {
@@ -150,6 +157,12 @@ fn aggregate_source(active: &[(ProviderKind, Vec<Value>)]) -> (&'static str, i64
             (if remote { "remote" } else { "builtin" }, refreshed_at)
         }
         [] => ("none", 0),
-        _ => ("aggregate", active.first().map(|(kind, _)| refresh_meta(*kind).1).unwrap_or(0)),
+        _ => (
+            "aggregate",
+            active
+                .first()
+                .map(|(kind, _)| refresh_meta(*kind).1)
+                .unwrap_or(0),
+        ),
     }
 }

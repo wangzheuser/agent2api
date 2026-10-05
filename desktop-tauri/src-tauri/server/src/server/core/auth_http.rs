@@ -166,6 +166,45 @@ pub async fn send_raw(
     Ok(ApiResponse { status, ok, payload })
 }
 
+/// 发出 `application/x-www-form-urlencoded` 请求并返回原始响应。
+///
+/// OAuth token 端点使用表单编码；复用与 JSON 请求相同的出口、超时和响应解析，
+/// 但不把表单中的授权码或 refresh token 写入日志。
+pub async fn send_form(
+    method: &str,
+    url: &str,
+    form: &[(String, String)],
+    headers: &[(String, String)],
+    proxy: Option<&ResolvedProxy>,
+    timeout_ms: Option<u64>,
+) -> Result<ApiResponse, reqwest::Error> {
+    let client = egress::client_for(proxy);
+    let mut builder = match method {
+        "POST" => client.post(url),
+        _ => client.get(url),
+    };
+    builder = builder.header("Accept", "application/json");
+    for (key, value) in headers {
+        builder = builder.header(key, value);
+    }
+    builder = builder
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .form(form);
+    if let Some(timeout) = timeout_ms {
+        builder = builder.timeout(Duration::from_millis(timeout));
+    }
+    let response = builder.send().await?;
+    let status = response.status().as_u16();
+    let ok = response.status().is_success();
+    let text = response.text().await?;
+    let payload = if text.trim().is_empty() {
+        None
+    } else {
+        serde_json::from_str::<Value>(&text).ok()
+    };
+    Ok(ApiResponse { status, ok, payload })
+}
+
 /// 把 reqwest 的传输错误翻译成可读中文（保留原因链，便于排障）
 fn describe_transport_error(error: &reqwest::Error) -> String {
     if error.is_timeout() {

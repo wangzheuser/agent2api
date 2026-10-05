@@ -124,7 +124,7 @@ export function AccountsCreditOverviewDialog({ onClose, returnFocus }: { onClose
             if (group.mode === 'generic') {
             const providerLabel = ({
               workbuddy: 'WorkBuddy', qoder: 'Qoder', raccoon: '小浣熊', catpaw: '小浣熊', autoclaw: 'AutoClaw', 'autoclaw-intl': 'AutoClaw 国际版',
-              trae: 'Trae', 'cline-free': 'Cline Free', 'cline-pass': 'Cline Pass', accio: 'Accio', 'accio-cn': 'Accio',
+              trae: 'Trae', 'minimax-code': 'MiniMax Code', lobsterai: 'LobsterAI', 'cline-free': 'Cline Free', 'cline-pass': 'Cline Pass', accio: 'Accio', 'accio-cn': 'Accio',
               zcode: 'ZCode', 'zcode-intl': 'ZCode 国际版', codearts: 'CodeArts',
               } as Record<string, string>)[group.provider] || group.provider
             const rows = sortCreditOverviewRows(group.rows, sort === 'expiry')

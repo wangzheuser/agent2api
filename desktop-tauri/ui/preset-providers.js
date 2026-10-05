@@ -122,35 +122,6 @@
       },
     },
     {
-      key: 'astudio', name: 'AStudio',
-      protocol: P.openai, baseUrl: 'https://maas-api.cn-huabei-1.xf-yun.com/v1',
-      rewardProfile: 'astudio',
-      hint: '讯飞星火 AStudio；签到奖励凭证在账号设置中单独填写 Cookie',
-    },
-    {
-      key: 'dumate', name: '百度搭子 DuMate',
-      protocol: P.openai, baseUrl: 'https://dumate-svc.baidu.com/gateway/apis/v1',
-      rewardProfile: 'dumate',
-      hint: '百度搭子免费体验版；每日奖励 Cookie 与模型 API Key 分开保存',
-    },
-    {
-      key: 'minimax-code', name: 'MiniMax Code', icon: 'minimax-cn.png',
-      protocol: P.anthropic, baseUrl: 'https://agent.minimax.cn/mavis/api/v1/llm',
-      rewardProfile: 'minimax-code',
-      hint: 'MiniMax Code；签到赠予积分仅限 Code，Anthropic 兼容端点不带额外 /v1',
-      quirks: {
-        urlSuffix: '?beta=true',
-        headers: { ...ANTHROPIC_BETA_HEADERS },
-        anthropicToolType: 'custom',
-      },
-    },
-    {
-      key: 'lobsterai', name: 'LobsterAI',
-      protocol: P.openai, baseUrl: 'https://lobsterai-server.youdao.com/api/proxy/v1',
-      rewardProfile: 'lobsterai',
-      hint: '网易有道 LobsterAI；活动未投放或账号无资格时状态接口会明确返回不可领取',
-    },
-    {
       key: 'siliconflow', name: 'SiliconFlow', icon: 'siliconflow.png',
       protocol: P.openai, baseUrl: 'https://api.siliconflow.com/v1',
       hint: '国内站为 https://api.siliconflow.cn/v1',
@@ -199,6 +170,18 @@
       key: 'ollama-local', name: 'Ollama（本地）', icon: 'ollama-local.png',
       protocol: P.openai, baseUrl: 'http://localhost:11434/v1',
       hint: '本机 Ollama 的 OpenAI 兼容端点，无需 API Key（鉴权留空即可）',
+    },
+    {
+      key: 'astudio', name: 'AStudio',
+      protocol: P.openai, baseUrl: 'https://maas-api.cn-huabei-1.xf-yun.com/v1',
+      rewardProfile: 'astudio',
+      hint: '讯飞星火 AStudio；签到奖励凭证在账号设置中单独填写 Cookie',
+    },
+    {
+      key: 'dumate', name: '百度搭子 DuMate',
+      protocol: P.openai, baseUrl: 'https://dumate-svc.baidu.com/gateway/apis/v1',
+      rewardProfile: 'dumate',
+      hint: '百度搭子免费体验版；每日奖励 Cookie 与模型 API Key 分开保存',
     },
   ];
 

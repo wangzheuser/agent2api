@@ -55,10 +55,10 @@ use serde_json::{json, Map, Value};
 use crate::server::core::account_store::AccountStoreError;
 use crate::server::core::auth::WorkBuddyAuthError;
 use crate::server::core::billing::checkin;
-use crate::server::core::proxies::ProxyConfigError;
 use crate::server::core::providers::adapter::adapter_for;
 use crate::server::core::providers::zcode;
 use crate::server::core::providers::ProviderKind;
+use crate::server::core::proxies::ProxyConfigError;
 use crate::server::errors::management_error;
 use crate::server::http::{ok_json, parse_body, query_param};
 use crate::server::logging;
@@ -125,16 +125,18 @@ fn decode_segment(value: &str) -> String {
 ///
 /// 用 `any(...)` 注册（接受任意方法），因为 Node 的判定里有「PATCH/DELETE 落到
 /// `<id>` 分支」这种跨方法的路径匹配 —— 交给 axum 的方法路由反而会把它拆错。
-pub async fn accounts_entry(State(state): State<ServerState>, request: axum::extract::Request) -> Response {
+pub async fn accounts_entry(
+    State(state): State<ServerState>,
+    request: axum::extract::Request,
+) -> Response {
     let method = request.method().clone();
     let full_path = request.uri().path().to_string();
     // 原始查询串（未解码的原文，由用到它的分支自行 `query_param` 解码）。
     // 目前只有 `GET /api/accounts/usage?id=<id>` 用它 —— 那一支是「用户手点某一行
     // 的积分按钮」，与批量的区别见 `core::usage_query::query_all` 的说明。
     let query = request.uri().query().unwrap_or("").to_string();
-    let body = match axum::body::to_bytes(request.into_body(), crate::server::http::MAX_BODY_SIZE)
-        .await
-    {
+    let body =
+        match axum::body::to_bytes(request.into_body(), crate::server::http::MAX_BODY_SIZE).await {
         Ok(bytes) => bytes,
         Err(error) => return management_error(413, format!("请求体读取失败或过大: {error}")),
     };
@@ -153,7 +155,10 @@ pub async fn accounts_entry(State(state): State<ServerState>, request: axum::ext
 /// `/pool/sync-clash`（「网络代理」页的代理池 CRUD + 测试 + Clash 同步，
 /// 见 `api::proxies` 的模块头）。池那几条的 id 走 body，不做路径段 ——
 /// 判定的写法因此还是一张 (方法, 剩余路径) 的表，与原来的两条完全同形。
-pub async fn proxies_entry(State(state): State<ServerState>, request: axum::extract::Request) -> Response {
+pub async fn proxies_entry(
+    State(state): State<ServerState>,
+    request: axum::extract::Request,
+) -> Response {
     let method = request.method().clone();
     let full_path = request.uri().path().to_string();
     let rest = full_path
@@ -161,9 +166,8 @@ pub async fn proxies_entry(State(state): State<ServerState>, request: axum::extr
         .unwrap_or("")
         .trim_start_matches('/')
         .to_string();
-    let body = match axum::body::to_bytes(request.into_body(), crate::server::http::MAX_BODY_SIZE)
-        .await
-    {
+    let body =
+        match axum::body::to_bytes(request.into_body(), crate::server::http::MAX_BODY_SIZE).await {
         Ok(bytes) => bytes,
         Err(error) => return management_error(413, format!("请求体读取失败或过大: {error}")),
     };
@@ -177,10 +181,7 @@ pub async fn proxies_entry(State(state): State<ServerState>, request: axum::extr
         ("POST", "pool/test") => super::proxies::pool_test(&state, &body).await,
         ("POST", "pool/sync-clash") => super::proxies::pool_sync_clash(&state).await,
         // 已注册路径上的其它方法：Node 的 tryHandleProxies 落到它自己的 404 信封
-        _ => management_error(
-            404,
-            format!("Not found: {} {full_path}", method.as_str()),
-        ),
+        _ => management_error(404, format!("Not found: {} {full_path}", method.as_str())),
     }
 }
 
@@ -227,9 +228,13 @@ pub async fn dispatch(
     // ② 固定子路径（Node 版把它们放在 `<id>` 通配之前的原因）
     match (method.as_str(), rest) {
         ("GET", "workbuddy/growth") => return super::accounts_growth::state(&state, query).await,
-        ("POST", "workbuddy/growth/action") => return super::accounts_growth::action(&state, body).await,
+        ("POST", "workbuddy/growth/action") => {
+            return super::accounts_growth::action(&state, body).await
+        }
         ("GET", "workbuddy/policy") => return super::accounts_growth::policy(&state, query),
-        ("PATCH", "workbuddy/policy") => return super::accounts_growth::patch_policy(&state, query, body),
+        ("PATCH", "workbuddy/policy") => {
+            return super::accounts_growth::patch_policy(&state, query, body)
+        }
         ("GET", "export") => return export_accounts(&state),
         ("POST", "import") => return import_accounts(&state, body).await,
         ("POST", "current") => return set_current(&state, body).await,
@@ -238,13 +243,9 @@ pub async fn dispatch(
         ("POST", "refresh-expiring") => return refresh_expiring_accounts(&state).await,
         // 余额 / 积分查询（四家混查）实现在 `api::accounts_usage`（拆分见那里的模块头）。
         // `?id=` 是「手点某一行积分按钮」的单查形态，语义见 accounts_usage 的说明。
-        ("GET", "usage") => {
-            return super::accounts_usage::accounts_usage(&state, query).await
-        }
+        ("GET", "usage") => return super::accounts_usage::accounts_usage(&state, query).await,
         // 定时查询那一轮的结果快照（形状同 usage，多一个 `at`）
-        ("GET", "usage/snapshot") => {
-            return super::accounts_usage::accounts_usage_snapshot().await
-        }
+        ("GET", "usage/snapshot") => return super::accounts_usage::accounts_usage_snapshot().await,
         // AutoClaw 只读任务列表；`?id=` 必须指定一个账号，避免无意间并发请求所有账号。
         ("GET", "autoclaw/tasks") => {
             let Some(id) = query_param(query, "id").filter(|value| !value.is_empty()) else {
@@ -424,8 +425,10 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
         // 域名发请求）。`importDesktop` 两地都给：桌面端那个 auth.json 没有地区
         // 标记、两个构建共用，**地区由用户选的那一项决定**（见
         // `import_autoclaw_desktop_account` 与 `region.rs` 的完整讨论）。
-        Some(kind @ (crate::server::core::providers::ProviderKind::AutoClaw
-            | crate::server::core::providers::ProviderKind::AutoClawIntl)) => {
+        Some(
+            kind @ (crate::server::core::providers::ProviderKind::AutoClaw
+            | crate::server::core::providers::ProviderKind::AutoClawIntl),
+        ) => {
             let region = crate::server::core::providers::autoclaw::Region::from_kind(kind)
                 .unwrap_or(crate::server::core::providers::autoclaw::Region::Cn);
             if import_desktop {
@@ -439,7 +442,9 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
         // 授权码；目录与连通性由刷新链路验。
         // 网页登录（要 DPoP + PKCE 回调）在 M5 后续切片，届时这里加一条分支。
         Some(crate::server::core::providers::ProviderKind::CodeArts) => {
-            match crate::server::core::providers::codearts::credentials::Credential::from_payload(&payload) {
+            match crate::server::core::providers::codearts::credentials::Credential::from_payload(
+                &payload,
+            ) {
                 Ok(credential) => store.add_codearts_account(&credential, import_name, "manual"),
                 Err(reason) => Err(AccountStoreError::new(reason, 400)),
             }
@@ -458,8 +463,10 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
         // `importDesktop` 不提供：Accio 桌面端的登录态落在 Electron 会话与 OS
         // 加密区里（没有 auth.json 那种稳定可读的文件形态），给了入口只会稳定
         // 失败 —— 与 AutoClaw「一读一解密」不同，不要照抄那边。
-        Some(kind @ (crate::server::core::providers::ProviderKind::Accio
-            | crate::server::core::providers::ProviderKind::AccioCn)) => {
+        Some(
+            kind @ (crate::server::core::providers::ProviderKind::Accio
+            | crate::server::core::providers::ProviderKind::AccioCn),
+        ) => {
             let region = crate::server::core::providers::accio::endpoints::Region::from_kind(kind)
                 .unwrap_or(crate::server::core::providers::accio::endpoints::Region::Global);
             if import_desktop {
@@ -483,8 +490,10 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
         // 展示名）都在 `add_cline_account` 里，与设备授权登录共用同一入口。
         // **两个池各是一个 provider**（`cline-free` / `cline-pass`），添加时
         // 由 body 的 `provider` 决定进哪一家 —— 不需要额外的池参数。
-        Some(kind @ (crate::server::core::providers::ProviderKind::ClineFree
-            | crate::server::core::providers::ProviderKind::ClinePass)) => {
+        Some(
+            kind @ (crate::server::core::providers::ProviderKind::ClineFree
+            | crate::server::core::providers::ProviderKind::ClinePass),
+        ) => {
             let provider_id = crate::server::core::providers::kind_id(kind);
             if import_desktop {
                 store.import_cline_desktop_account(provider_id, import_name)
@@ -507,8 +516,10 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
         // `importDesktop` 不提供：ZCode 客户端的凭证在它自己的加密存储里，
         // 没有 auth.json 那种稳定可读的形态 —— 给了入口只会稳定失败
         // （与 Accio 同一处境、同一处置，不要照抄 AutoClaw 那边）。
-        Some(kind @ (crate::server::core::providers::ProviderKind::Zcode
-            | crate::server::core::providers::ProviderKind::ZcodeIntl)) => {
+        Some(
+            kind @ (crate::server::core::providers::ProviderKind::Zcode
+            | crate::server::core::providers::ProviderKind::ZcodeIntl),
+        ) => {
             let region = crate::server::core::providers::zcode::region::Region::from_kind(kind)
                 .unwrap_or(crate::server::core::providers::zcode::region::Region::Cn);
             if import_desktop {
@@ -536,14 +547,16 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
                     "请至少填写 accessToken（用于转发）或 jwt（用于领取套餐）",
                 );
             }
-            let credentials = crate::server::core::providers::zcode::credentials::ZcodeCredentials {
+            let credentials =
+                crate::server::core::providers::zcode::credentials::ZcodeCredentials {
                 region,
                 access_token,
                 jwt,
                 user_id: text_field("userId"),
                 // 设备标识是领取链路的活动期要求（见 `credentials.rs` 的模块头）：
                 // 用户没给就新生成一个，随凭证落盘后跨请求稳定
-                device_mid: crate::server::core::providers::zcode::credentials::new_device_mid()
+                    device_mid: crate::server::core::providers::zcode::credentials::new_device_mid(
+                    )
                     .unwrap_or_default(),
             };
             store.add_zcode_account(&credentials, import_name, "manual")
@@ -569,7 +582,9 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
                 );
             }
             let mut credential =
-                match crate::server::core::providers::trae::credentials::Credential::from_payload(&payload) {
+                match crate::server::core::providers::trae::credentials::Credential::from_payload(
+                    &payload,
+                ) {
                     Ok(credential) => credential,
                     Err(reason) => return management_error(400, reason),
                 };
@@ -579,7 +594,8 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
             // 昵称而判失败」是本家明确要避免的那种行为。
             if credential.uid.is_empty() {
                 if let Ok(identity) =
-                    crate::server::core::providers::trae::profile::get_user_info(&credential, None).await
+                    crate::server::core::providers::trae::profile::get_user_info(&credential, None)
+                        .await
                 {
                     credential.uid = identity.uid;
                     credential.nickname = identity.nickname;
@@ -587,6 +603,32 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
                 }
             }
             store.add_trae_account(&credential, import_name, "manual")
+        }
+        Some(crate::server::core::providers::ProviderKind::LobsterAI) => {
+            if import_desktop {
+                return management_error(
+                    400,
+                    "LobsterAI 不支持导入桌面端登录态，请用「网页登录」或粘贴凭证添加账号",
+                );
+            }
+            let credentials = match crate::server::core::providers::lobsterai::credentials::Credentials::from_payload(&payload) {
+                Ok(credentials) => credentials,
+                Err(error) => return management_error(error.status_code, error.message),
+            };
+            store.add_lobsterai_account(&credentials, import_name, "manual")
+        }
+        Some(crate::server::core::providers::ProviderKind::MiniMaxCode) => {
+            if import_desktop {
+                return management_error(
+                    400,
+                    "MiniMax Code 不支持导入桌面端登录态，请用「网页登录」或粘贴凭证添加账号",
+                );
+            }
+            let credentials = match crate::server::core::providers::minimax_code::credentials::Credentials::from_payload(&payload) {
+                Ok(credentials) => credentials,
+                Err(error) => return management_error(error.status_code, error.message),
+            };
+            store.add_minimax_code_account(&credentials, import_name, "manual")
         }
         Some(crate::server::core::providers::ProviderKind::WorkBuddy) | None => {
             store.add_account(&payload, None)
@@ -699,14 +741,18 @@ pub async fn batch_accounts(state: &ServerState, body: &Bytes) -> Response {
         "remove" => state.store().batch_remove(&ids),
         "enable" | "disable" => {
             let enabled = action == "enable";
-            state.store().batch_update(&ids, &json!({ "enabled": enabled }))
+            state
+                .store()
+                .batch_update(&ids, &json!({ "enabled": enabled }))
         }
         "proxy" => {
             // 允许 proxy=null（批量改为直连）；缺字段是显式报错
             let Some(target) = payload.get("proxy") else {
                 return management_error(400, "批量修改代理时缺少 proxy 字段");
             };
-            state.store().batch_update(&ids, &json!({ "proxy": target }))
+            state
+                .store()
+                .batch_update(&ids, &json!({ "proxy": target }))
         }
         other => {
             return management_error(
@@ -779,6 +825,12 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
     if state.store().qoder_account_record(&id).is_some() {
         return refresh_provider_account(state, &id, ProviderKind::Qoder).await;
     }
+    if state.store().minimax_code_account_record(&id).is_some() {
+        return refresh_provider_account(state, &id, ProviderKind::MiniMaxCode).await;
+    }
+    if state.store().lobsterai_account_record(&id).is_some() {
+        return refresh_provider_account(state, &id, ProviderKind::LobsterAI).await;
+    }
     // CodeArts：一次性 refresh token + 写回，必须走适配器。
     // **这条不能省**：漏了就会落到下面的 workbuddy 兜底链路，用户得到一条与
     // 本家毫无关系的错误（沙箱端到端实测抓到的原文是
@@ -837,7 +889,11 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
         crate::server::core::providers::autoclaw::Region::Intl,
     ] {
         if let Some(record) = state.store().autoclaw_account_record(region, &id) {
-            if record.get("desktop").and_then(Value::as_bool).unwrap_or(false) {
+            if record
+                .get("desktop")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
                 return management_error(
                     400,
                     "AutoClaw 桌面端登录态由桌面客户端维护，网关不主动刷新：\
@@ -910,7 +966,6 @@ pub async fn refresh_expiring_accounts(state: &ServerState) -> Response {
 ///   （定时签到与手动签到必须共用同一段逻辑）。
 /// 本文件只剩 `accounts_checkin` 一个转发壳。
 
-
 /// POST /api/accounts/checkin
 ///
 /// 串行签到：避免多账号同时打上游触发 11128 风控。
@@ -936,7 +991,12 @@ pub async fn accounts_checkin(state: &ServerState, body: &Bytes) -> Response {
     // 批量路径的提供商范围取自动签到的同一份配置（两处入口一个口径）；
     // 指定 id 的单签不受范围限制（见 resolve_checkin_targets 的说明）
     let providers = state.auto_checkin().configured_providers();
-    match checkin::run_checkin(state.store(), state.billing(), providers.as_slice(), id.as_deref())
+    match checkin::run_checkin(
+        state.store(),
+        state.billing(),
+        providers.as_slice(),
+        id.as_deref(),
+    )
         .await
     {
         Ok(result) => ok_json(result),
@@ -1119,7 +1179,9 @@ pub fn clear_rate_limits(state: &ServerState, id: &str, body: &Bytes) -> Respons
             "[Accounts]",
             &format!(
                 "🧹 已清除账号 {id} 的限流标记（{}）",
-                model.map(|value| value.to_string()).unwrap_or_else(|| format!("{cleared} 个模型"))
+                model
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| format!("{cleared} 个模型"))
             ),
         );
     }

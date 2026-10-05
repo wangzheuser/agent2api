@@ -485,6 +485,55 @@ const TRAE: ProviderConfig = {
   ],
 }
 
+/**
+ * MiniMax Code 原生 Provider：网页登录优先，手填 access/refresh token 作为备用。
+ * 账号 API 与奖励签到均由原生 provider 处理，不能再作为预置 API custom 账号添加。
+ */
+const MINIMAX_CODE: ProviderConfig = {
+  provider: 'minimax-code',
+  label: 'MiniMax Code',
+  desktop: false,
+  webLogin: {
+    noteHtml: '在<strong>网页登录</strong>中完成 MiniMax Code 授权，成功后自动加入账号列表。',
+    button: '打开 MiniMax Code 登录',
+    busyText: '等待 MiniMax Code 登录完成…',
+    modes: [
+      { value: 'embedded', label: '内嵌窗口（推荐）', hint: '内嵌窗口打开；完成后自动加入列表，关窗即取消等待' },
+      { value: 'external', label: '系统浏览器', hint: '系统浏览器打开（复用已有登录态）；完成后自动加入列表' },
+    ],
+  },
+  manualTitle: '手动填写 accessToken / refreshToken',
+  manualNoteHtml: '网页登录不可用时，可从 MiniMax Code 客户端复制 <code>accessToken</code> 与 <code>refreshToken</code>。',
+  fields: [
+    { key: 'accessToken', label: 'accessToken', rows: 3, placeholder: '粘贴 accessToken' },
+    { key: 'refreshToken', label: 'refreshToken', rows: 2, optional: true, placeholder: '可选；填入后支持自动续期' },
+    { key: 'name', label: '备注名', optional: true, placeholder: '可选，留空自动取账号名称' },
+  ],
+}
+
+/** LobsterAI 原生 Provider：动态活动奖励由原生模块处理。 */
+const LOBSTERAI: ProviderConfig = {
+  provider: 'lobsterai',
+  label: 'LobsterAI',
+  desktop: false,
+  webLogin: {
+    noteHtml: '在<strong>网页登录</strong>中完成 LobsterAI 授权，成功后自动加入账号列表。',
+    button: '打开 LobsterAI 登录',
+    busyText: '等待 LobsterAI 登录完成…',
+    modes: [
+      { value: 'embedded', label: '内嵌窗口（推荐）', hint: '内嵌窗口打开；完成后自动加入列表，关窗即取消等待' },
+      { value: 'external', label: '系统浏览器', hint: '系统浏览器打开（复用已有登录态）；完成后自动加入列表' },
+    ],
+  },
+  manualTitle: '手动填写 accessToken / refreshToken',
+  manualNoteHtml: '网页登录不可用时，可从 LobsterAI 客户端复制 <code>accessToken</code> 与 <code>refreshToken</code>。',
+  fields: [
+    { key: 'accessToken', label: 'accessToken', rows: 3, placeholder: '粘贴 accessToken' },
+    { key: 'refreshToken', label: 'refreshToken', rows: 2, optional: true, placeholder: '可选；填入后支持自动续期' },
+    { key: 'name', label: '备注名', optional: true, placeholder: '可选，留空自动取账号名称' },
+  ],
+}
+
 /** 内置家的表单块，顺序与旧 ADD_FORMS 一致（只影响 DOM 里的块顺序，不影响界面） */
 export const BUILTIN_CONFIGS: ProviderConfig[] = [
   RACCOON,
@@ -506,6 +555,8 @@ export const BUILTIN_CONFIGS: ProviderConfig[] = [
   CODEARTS,
   // Trae 只有 SOLO 那一家（没有地区分叉，理由见 TRAE 上方那段）
   TRAE,
+  MINIMAX_CODE,
+  LOBSTERAI,
 ]
 
 /** WorkBuddy 的块 id（结构特殊，单独一个组件） */

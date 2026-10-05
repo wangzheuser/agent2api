@@ -62,7 +62,9 @@ use shape::{js_truthy, value_text};
 // 取这些名字，保持与拆分前同一条导入路径。
 // `shape_value_text` 是 `shape::value_text` 的别名导出：聚合目录要按 `name`
 // 匹配模型（对齐 `ModelCatalog::get` 的第二段），需要与这里同一套 JS 文本化。
-pub use shape::{list_item, list_response_from, model_id, suggest_from, value_text as shape_value_text};
+pub use shape::{
+    list_item, list_response_from, model_id, suggest_from, value_text as shape_value_text,
+};
 
 /// 下游可见模型白名单：/v1/models 与路由解析只暴露这些模型。
 ///
@@ -216,8 +218,16 @@ fn initial_state() -> CatalogState {
         };
     }
     let allowed = apply_filters(builtin_models());
-    let models = if allowed.is_empty() { allowlist_fallback() } else { allowed };
-    CatalogState { models, last_refreshed_at: 0, remote_refreshed: false }
+    let models = if allowed.is_empty() {
+        allowlist_fallback()
+    } else {
+        allowed
+    };
+    CatalogState {
+        models,
+        last_refreshed_at: 0,
+        remote_refreshed: false,
+    }
 }
 
 /// 模型目录句柄：内部一把 `RwLock`，克隆共享同一份状态。
@@ -235,7 +245,9 @@ impl Default for ModelCatalog {
 impl ModelCatalog {
     /// 构造目录（不刷新；刷新由启动流程与 /v1/models 触发）
     pub fn new() -> Self {
-        Self { inner: Arc::new(RwLock::new(initial_state())) }
+        Self {
+            inner: Arc::new(RwLock::new(initial_state())),
+        }
     }
 
     /// 读取状态快照；锁中毒（持锁 panic）时接管内部数据继续用，
@@ -365,7 +377,11 @@ impl ModelCatalog {
             .collect();
         list_response_from(
             data,
-            if state.remote_refreshed { "remote" } else { "builtin" },
+            if state.remote_refreshed {
+                "remote"
+            } else {
+                "builtin"
+            },
             state.last_refreshed_at,
         )
     }
@@ -415,10 +431,7 @@ impl ModelCatalog {
                         let allowed = apply_filters(raw.clone());
                         if !allowed.is_empty() {
                             self.apply_remote(allowed, "auto", false);
-                            return RefreshOutcome::refreshed(
-                                self.count(),
-                                "v3/config",
-                            );
+                            return RefreshOutcome::refreshed(self.count(), "v3/config");
                         }
                         logging::verbose(
                             "[Models]",
@@ -495,13 +508,20 @@ impl ModelCatalog {
                 };
                 object.insert("isDefault".to_string(), Value::Bool(is_auto));
                 let model_type = if enterprise {
-                    if raw_id.starts_with(custom_prefix) { "enterprise" } else { "built-in" }
+                    if raw_id.starts_with(custom_prefix) {
+                        "enterprise"
+                    } else {
+                        "built-in"
+                    }
                 } else if is_auto {
                     "auto"
                 } else {
                     "built-in"
                 };
-                object.insert("modelType".to_string(), Value::String(model_type.to_string()));
+                object.insert(
+                    "modelType".to_string(),
+                    Value::String(model_type.to_string()),
+                );
                 Value::Object(object)
             })
             .collect();
@@ -564,7 +584,10 @@ impl ModelCatalog {
                 None => match auth.get_current_session().await {
                     Ok(session) => (session, None),
                     Err(error) => {
-                        logging::verbose("[Models]", &format!("模型目录刷新失败: {}", error.message));
+                        logging::verbose(
+                            "[Models]",
+                            &format!("模型目录刷新失败: {}", error.message),
+                        );
                         return RefreshOutcome::not_refreshed(error.message);
                     }
                 },
@@ -616,7 +639,10 @@ impl ModelCatalog {
         if outcome.refreshed {
             logging::log(
                 "[Models]",
-                &format!("✅ 模型目录已更新（{} 个，来源 {}）", outcome.count, outcome.source),
+                &format!(
+                    "✅ 模型目录已更新（{} 个，来源 {}）",
+                    outcome.count, outcome.source
+                ),
             );
         } else {
             logging::verbose("[Models]", &format!("模型目录未更新: {}", outcome.reason));
@@ -669,7 +695,8 @@ fn encode_uri_component(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.as_bytes() {
         let ch = *byte as char;
-        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '!' | '~' | '*' | '\'' | '(' | ')')
+        if ch.is_ascii_alphanumeric()
+            || matches!(ch, '-' | '_' | '.' | '!' | '~' | '*' | '\'' | '(' | ')')
         {
             out.push(ch);
         } else {

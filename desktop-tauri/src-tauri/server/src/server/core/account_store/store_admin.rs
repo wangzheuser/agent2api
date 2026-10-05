@@ -51,6 +51,8 @@ use crate::server::core::account_store::store_util::{token_tail_of, truncate_cha
 use crate::server::core::providers::{provider_index, DEFAULT_PROVIDER_ID};
 use crate::server::logging;
 
+use super::{AccountStoreError, CredentialWrite};
+
 impl AccountStore {
     // ─── 凭证回写与限额标记 ──────────────────────────────────
 
@@ -86,6 +88,47 @@ impl AccountStore {
         // 原地更新：凭证回写不改账号在列表里的位置（与旧实现「在下标上改字段」一致）
         self.with_conn(&_guard, |conn| sql::update_in_place(conn, &record))
             .is_ok()
+    }
+
+    /// 仅当账号仍持有刷新前的 access/refresh token 时回写刷新结果。
+    ///
+    /// 比较和写入在同一把账号锁内完成，避免 refresh token 轮换时较慢的并发
+    /// 请求把较早的结果覆盖回去。空的新字段不会覆盖已有凭证。
+    pub fn update_account_tokens_if_current(
+        &self,
+        id: &str,
+        expected_access_token: &str,
+        expected_refresh_token: &str,
+        access_token: Option<&str>,
+        refresh_token: Option<&str>,
+        expires_at: Option<f64>,
+        refresh_expires_at: Option<f64>,
+    ) -> Result<CredentialWrite, AccountStoreError> {
+        let guard = self.guard();
+        let Some(mut record) = self.record_by_id(&guard, id) else {
+            return Ok(CredentialWrite::Stale);
+        };
+        if record.access_token() != expected_access_token
+            || record.refresh_token() != expected_refresh_token
+        {
+            return Ok(CredentialWrite::Stale);
+        }
+        if let Some(token) = access_token.filter(|value| !value.is_empty()) {
+            record.set("accessToken", Value::String(token.to_string()));
+            record.set("tokenTail", Value::String(token_tail_of(token)));
+        }
+        if let Some(token) = refresh_token.filter(|value| !value.is_empty()) {
+            record.set("refreshToken", Value::String(token.to_string()));
+        }
+        if let Some(value) = expires_at.filter(|value| value.is_finite() && *value > 0.0) {
+            record.set("expiresAt", json_number(value));
+        }
+        if let Some(value) = refresh_expires_at.filter(|value| value.is_finite() && *value > 0.0) {
+            record.set("refreshExpiresAt", json_number(value));
+        }
+        record.set_updated_at(logging::now_ms());
+        self.with_conn(&guard, |conn| sql::update_in_place(conn, &record))?;
+        Ok(CredentialWrite::Written)
     }
 
     /// 记录账号对某模型的限额状态（上游 429 / code 6004）。
