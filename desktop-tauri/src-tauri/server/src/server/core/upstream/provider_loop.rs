@@ -942,7 +942,7 @@ async fn attempt_queue(
                         return Err(cancellation::cancelled_error());
                     }
                     // ── 指定错误码直接换号 ──────────────────────────────
-                    // 用户点名的状态码（默认 402）不做「同一账号再看一眼」：
+                    // 用户点名的状态码（默认 402、405）不做「同一账号再看一眼」：
                     // 原地重发已在 `send_with_retry` 的第二道闸挡住，这里的
                     // 标记再把同账号的补救动作（动作 0 换提示词、动作 2 刷新
                     // 凭证）一并跳过 —— 点名的码没有任何例外。明细仍走下面
@@ -2031,7 +2031,7 @@ async fn send_with_retry(
         // 重试（11-128 的「拦截窗口会持续一小段时间」是实测结论），再不行才换账号。
         //
         // ── 「指定错误码直接换号」为什么是第二道闸 ────────────────────
-        // 用户点名的状态码（默认 402）连「再看一眼」都不值得：重发同一份 body
+        // 用户点名的状态码（默认 402、405）连「再看一眼」都不值得：重发同一份 body
         // 结论不变。这里返回 None 会让下面的终端错误路径立即收尾，不再消耗
         // 原地重发预算 —— 换号那条路由编排层接管：命中名单的失败不留在本账号
         // 上，直接换下一个账号继续试（见 `direct_switch_status` 与动作 3），
@@ -2192,6 +2192,59 @@ mod single_use_tests {
             }
             server.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn http_405_switches_accounts_without_same_account_retry() {
+        use axum::http::StatusCode;
+
+        let seen = Arc::new(Mutex::new(0usize));
+        let app = Router::new()
+            .route(
+                "/",
+                post(|State(seen): State<Arc<Mutex<usize>>>| async move {
+                    *seen.lock().unwrap() += 1;
+                    (
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        Json(serde_json::json!({
+                            "message": "request has been blocked due to unusual activity"
+                        })),
+                    )
+                }),
+            )
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let transport = TransportRequest {
+            url: format!("http://{address}/"),
+            headers: Vec::new(),
+            payload: "{}".to_string(),
+            proxy: None,
+        };
+        let adapter = &crate::server::core::providers::zcode::adapter::ZCODE_ADAPTER;
+        let telemetry = crate::server::core::upstream::usage::RequestTelemetry::new();
+        let mut budget = RetryBudget::new(3);
+
+        let failure = match send_with_retry(
+            adapter,
+            &transport,
+            &mut budget,
+            None,
+            &telemetry,
+            false,
+            false,
+        )
+        .await
+        {
+            Ok(_) => panic!("HTTP 405 should finish this account attempt"),
+            Err(failure) => failure,
+        };
+
+        assert_eq!(failure.error.status_code, 405);
+        assert_eq!(*seen.lock().unwrap(), 1, "HTTP 405 must not be retried in place");
+        assert_eq!(budget.remaining, 3, "direct account switch must preserve resend budget");
+        server.abort();
     }
 
     #[tokio::test]

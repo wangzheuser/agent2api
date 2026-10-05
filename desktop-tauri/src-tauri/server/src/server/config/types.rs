@@ -580,9 +580,9 @@ pub const DEFAULT_RETRY_INTERVAL_SECONDS: i64 = 5;
 /// 同账号补救（内容拦截换提示词 / 401 刷新）都不做，按队列换下一个账号
 /// 继续试，换满仍失败才把错误给客户端。
 pub const KEY_RETRY_NO_RETRY_CODES: &str = "noRetryStatusCodes";
-/// 默认名单：402（WorkBuddy 积分不足）。余额问题重发结论不变，
-/// 客户端拿到 402 才能如实体感「这个账号没钱了」。
-pub const DEFAULT_NO_RETRY_CODES: &[u16] = &[402];
+/// 默认名单：402（WorkBuddy 积分不足）与 405（上游拒绝请求）。这两类错误
+/// 重发同一账号的请求通常不会改变结论，应直接尝试下一个账号。
+pub const DEFAULT_NO_RETRY_CODES: &[u16] = &[402, 405];
 /// 名单里状态码的合法范围：HTTP 状态码本身就定义在 100–599
 pub const RETRY_CODE_MIN: u16 = 100;
 pub const RETRY_CODE_MAX: u16 = 599;
