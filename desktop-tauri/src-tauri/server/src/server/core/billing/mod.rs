@@ -448,8 +448,8 @@ impl BillingService {
                     ..Default::default()
                 },
             )
-            .await?;
-        Ok(normalize_daily_claim(result))
+            .await;
+        normalize_daily_checkin_result(result)
     }
 
     /// WorkBuddy 国际版每日活跃任务。
@@ -782,6 +782,24 @@ fn normalize_activity_status(result: &BillingCall) -> Value {
     })
 }
 
+/// 国内签到明确返回「今天已签到」的 HTTP 400 也是完成状态；其它错误保持原样。
+fn normalize_daily_checkin_result(result: Result<BillingCall, BillingError>) -> Result<Value, BillingError> {
+    match result {
+        Ok(result) => Ok(normalize_daily_claim(result)),
+        Err(error) if error.status_code == 400
+            && ["今天已签到", "今日已签到"].iter().any(|marker| error.message.contains(marker)) =>
+        {
+            Ok(json!({
+                "success": false,
+                "alreadyCompleted": true,
+                "code": error.upstream_code.unwrap_or(-1),
+                "msg": error.message,
+            }))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// 将每日领取接口的原始返回转换成统一 claim 形状。
 fn normalize_daily_claim(result: BillingCall) -> Value {
     if result.code == Some(RESPONSE_CODE_OK) && !result.data.is_null() {
@@ -821,6 +839,22 @@ fn assert_checkin_supported(session: &Value) -> Result<(), BillingError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_explicit_completed_checkin_400_is_a_completion() {
+        for message in ["今天已签到，请明天再来", "今日已签到"] {
+            let claim = normalize_daily_checkin_result(Err(BillingError::with_code(message, 400, Some(1001)))).unwrap();
+            assert_eq!(claim["success"], false);
+            assert_eq!(claim["alreadyCompleted"], true);
+            assert_eq!(claim["code"], 1001);
+            for status in [401, 403, 500] {
+                assert!(normalize_daily_checkin_result(Err(BillingError::new(message, status))).is_err());
+            }
+        }
+        for message in ["风控拦截", "今天未签到", "没有可领取的签到活动"] {
+            assert!(normalize_daily_checkin_result(Err(BillingError::new(message, 400))).is_err());
+        }
+    }
 
     #[test]
     fn failed_status_cannot_authorize_a_claim_or_mark_checkin_complete() {

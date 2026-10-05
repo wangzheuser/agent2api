@@ -675,14 +675,15 @@ async fn require_api_key(mut request: Request, next: Next) -> Response {
         .is_some();
         let seen_header = request.headers().contains_key("x-panel-token")
             || request.headers().contains_key(axum::http::header::AUTHORIZATION);
-        logging::log(
+        logging::log_with_level(
             "[Security]",
             &format!(
-                "❌ 面板会话无效: {} {path}（cookie={} 凭证头={}）",
+                "面板会话无效: {} {path}（cookie={} 凭证头={}）",
                 request.method(),
                 if seen_cookie { "有" } else { "无" },
                 if seen_header { "有" } else { "无" },
             ),
+            if seen_cookie || seen_header { "warn" } else { "info" },
         );
         return errors::panel_login_required_response();
     }
