@@ -79,13 +79,30 @@ pub(crate) fn load_target(
     })
 }
 
-/// 取该账号配置的出口代理（理由见模块头：领取**要**挂代理）
-pub(crate) fn account_proxy(
+/// 领取链路可按地区独立直连；验证码配置、生产者与领取共用此选择。
+/// 推理与余额仍使用账号出口。默认沿用账号代理，部署可显式设置
+/// ZCODE_CLAIM_DIRECT=1 / ZCODE_INTL_CLAIM_DIRECT=1。
+pub(crate) fn claim_proxy(
     store: &AccountStore,
     account_id: &str,
 ) -> Option<crate::server::core::proxies::ResolvedProxy> {
+    let record = store.zcode_account_record(account_id)?;
+    let region = record.get("provider").and_then(Value::as_str)
+        .and_then(Region::from_provider_id)?;
+    let direct = std::env::var(format!("{}CLAIM_DIRECT", region.env_prefix())).ok();
     let session = store.get_session_by_id(account_id)?.session;
-    crate::server::core::proxies::session_proxy(&session)
+    select_claim_proxy(&session, direct.as_deref())
+}
+
+fn select_claim_proxy(
+    session: &Value,
+    direct: Option<&str>,
+) -> Option<crate::server::core::proxies::ResolvedProxy> {
+    if direct.is_some_and(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true")) {
+        None
+    } else {
+        crate::server::core::proxies::session_proxy(session)
+    }
 }
 
 /// 台账只认套餐 ID，不用自然日过滤；昨天领过的同一份套餐也不重复提交。
@@ -155,7 +172,7 @@ async fn request_claim(
     plan_id: &str,
     manual: bool,
 ) -> Result<Option<ClaimOutcome>, String> {
-    let proxy = account_proxy(store, id);
+    let proxy = claim_proxy(store, id);
     let config = claim::captcha_config(target.region, proxy.as_ref())
         .await
         .map_err(|error| format!("获取验证码配置失败（HTTP {}）", error.status_code))?;
@@ -192,7 +209,7 @@ async fn scan_account(
     retry: &mut serde_json::Map<String, Value>,
 ) -> Result<Report, String> {
     let target = load_target(store, id).map_err(|(_, message)| message)?;
-    let proxy = account_proxy(store, id);
+    let proxy = claim_proxy(store, id);
     let mut plans = match claim::preview(
         target.region,
         &target.jwt,
@@ -382,6 +399,22 @@ pub async fn run_auto(store: &AccountStore, manual: bool) -> Result<String, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_claim_direct_preserves_the_inference_proxy() {
+        let session = json!({"proxy":{"source":"custom","protocol":"http",
+            "host":"proxy.example","port":7890,"username":"account","password":"fixture"}});
+        for direct in [None, Some(""), Some("0"), Some("false")] {
+            let proxy = select_claim_proxy(&session, direct).unwrap();
+            assert_eq!(proxy.host, "proxy.example");
+            assert_eq!(proxy.username, "account");
+        }
+        for direct in [Some("1"), Some("true"), Some(" TRUE ")] {
+            assert!(select_claim_proxy(&session, direct).is_none());
+        }
+        assert!(crate::server::core::proxies::session_proxy(&session).is_some());
+        assert!(select_claim_proxy(&json!({}), None).is_none());
+    }
 
     #[test]
     fn both_regions_require_enabled_claimable_accounts() {

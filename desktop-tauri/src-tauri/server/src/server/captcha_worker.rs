@@ -25,7 +25,7 @@ pub(crate) async fn proof_for_claim(
             .ok_or_else(|| "等待领取验证码超时，请保持桌面或管理页面运行".to_string());
     };
     let mut settings = json!({"prefix":config.prefix,"sceneId":config.scene_id,"region":config.region});
-    if let Some(proxy) = crate::server::core::zcode_claim::account_proxy(store, account_id) {
+    if let Some(proxy) = crate::server::core::zcode_claim::claim_proxy(store, account_id) {
         settings["proxy"] = json!({
             "server": format!("{}://{}:{}",proxy.protocol,proxy.host,proxy.port.unwrap_or(80)),
             "username":proxy.username,"password":proxy.password,

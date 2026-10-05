@@ -31,11 +31,9 @@
 //! 手动领取由前端提供验证码；定时领取由 core::zcode_claim 调用已有生产者，
 //! 共用协议、账号上下文和领取台账。
 //!
-//! ── 出口要不要挂账号代理：**要**（与「余额查询直连」相反）────────
-//! 小浣熊的余额查询刻意直连（照抄源实现的裸 fetch），本家**不照抄那个决定**：
-//! 领取打的是 `zcode.z.ai`，而国内用户访问它通常需要代理；账号记录上的
-//! 出口正是用户为这个账号配的（他配代理就是为了让这个账号能上网）。
-//! 直连会让「配了代理的账号领不了套餐」，且报错是超时这种看不出原因的形状。
+//! ── 领取出口 ──────────────────────────────────────────────
+//! 默认沿用账号代理，国内网络可能需要它；经对照验证后可按地区独立直连。
+//! 探测、风控配置与领取通过 core::zcode_claim::claim_proxy 统一选择出口。
 //!
 //! ── 硬约束 ──────────────────────────────────────────────────
 //! release 是 `panic=abort`：本文件零 unwrap/expect/panic。
@@ -51,7 +49,7 @@ use crate::server::errors::management_error;
 use crate::server::http::{ok_json, parse_body};
 use crate::server::ServerState;
 
-use crate::server::core::zcode_claim::{load_target, account_proxy};
+use crate::server::core::zcode_claim::{load_target, claim_proxy};
 
 /// `POST /api/accounts/{id}/zcode-claim/preview`：探测当前可领的套餐。
 ///
@@ -69,7 +67,7 @@ pub async fn preview(state: &ServerState, account_id: &str) -> axum::response::R
         Ok(target) => target,
         Err((status, message)) => return management_error(status, message),
     };
-    let proxy = account_proxy(state.store(), account_id);
+    let proxy = claim_proxy(state.store(), account_id);
     let outcome = claim::preview(
         target.region,
         &target.jwt,
@@ -113,7 +111,7 @@ pub async fn captcha_config(state: &ServerState, account_id: &str) -> axum::resp
         Some(region) => region,
         None => return management_error(400, "该账号不是 ZCode 账号"),
     };
-    let proxy = account_proxy(state.store(), account_id);
+    let proxy = claim_proxy(state.store(), account_id);
     match claim::captcha_config(region, proxy.as_ref()).await {
         // `enabled: false` 或配置不全 → 前端不弹滑块（见 claim::captcha_config 的说明）
         Ok(None) => ok_json(json!({ "enabled": false })),
@@ -170,7 +168,7 @@ pub async fn claim_plan(
         (!value.is_empty()).then_some(value)
     };
 
-    let proxy = account_proxy(state.store(), account_id);
+    let proxy = claim_proxy(state.store(), account_id);
     let requested_plan_id = field("planId");
     let plan_id = if requested_plan_id.is_empty() {
         // 没点名就探测一次，取优先级最高的那个

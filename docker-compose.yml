@@ -33,6 +33,9 @@ services:
       AGENT2API_PANEL_PORT: ${AGENT2API_PANEL_PORT:-}
       # 登录页人机验证组件环境变量，默认为1开启，0为关闭
       AGENT2API_CAPTCHA_ENABLED: ${AGENT2API_CAPTCHA_ENABLED:-1}
+      # 套餐领取可独立直连，配置/验证码/领取统一出口；推理保留账号代理。
+      ZCODE_CLAIM_DIRECT: ${ZCODE_CLAIM_DIRECT:-0}
+      ZCODE_INTL_CLAIM_DIRECT: ${ZCODE_INTL_CLAIM_DIRECT:-0}
       # 可选：AGENT2API_VERBOSE / AGENT2API_ALLOW_NO_KEY / AGENT2API_PROXY_PORT
     volumes:
       # 全部状态（SQLite 库、配置、日志）都在这一个卷里
