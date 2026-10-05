@@ -73,6 +73,23 @@ async function run() {
     assert.match(await dialog.locator('.growth-result').innerText(), /失败.*示例业务拒绝/s)
     assert.equal(await dialog.getByRole('checkbox', { name: '我已阅读并同意官方领养协议' }).isChecked(), false)
     checks.push('lazy growth query preserves zero/unknown; claim failure stays failed; adoption and real execution remain separate')
+    for (const [status, action, confirmed, expected] of [
+      ['not_applicable', 'travel_cycle', false, '未执行，无需确认'],
+      ['completed', 'claim_available', false, '未执行，无需确认'],
+      ['uncertain', 'travel_cycle', false, '回执待确认 · 状态待核实'],
+      ['claimed', 'travel_cycle', true, '回执已确认 · 状态已读回'],
+    ]) {
+      await page.evaluate(({ status, action, confirmed }) => {
+        fixture.base.lastRun = { id: 'A0', action, at: Date.now(), status, message: '示例操作结果', rewards: { credits: null }, receiptConfirmed: confirmed, stateConfirmed: confirmed, items: [], balanceBefore: 100, balanceAfter: 100, balanceDelta: 0 }
+      }, { status, action, confirmed })
+      await dialog.getByRole('button', { name: '刷新福利状态', exact: true }).click()
+      await dialog.locator(`.growth-result[data-status="${status}"]`).waitFor()
+      const text = await dialog.locator('.growth-result').innerText()
+      assert.ok(text.includes(expected), text)
+      if (expected === '未执行，无需确认') assert.doesNotMatch(text, /回执待确认|状态待核实|积分 未知/)
+    }
+    await page.evaluate(() => { fixture.base.lastRun = null })
+    checks.push('skipped travel and empty claims require no receipt; uncertain and confirmed actions keep their receipt status')
     await dialog.locator('summary', { hasText: '抽奖与其他活动' }).click()
     assert.equal(await dialog.getByRole('button', { name: '消耗 1 次机会抽奖', exact: true }).isEnabled(), true)
     assert.equal(await dialog.getByRole('button', { name: '检查并尝试领取', exact: true }).isEnabled(), true)

@@ -15,10 +15,11 @@ function officialLink(value: string | null | undefined): string | undefined {
 }
 
 export function GrowthResultView({ result, namesHidden = false }: { result: GrowthResult; namesHidden?: boolean }) {
+  const skipped = result.status === 'not_applicable' || (result.status === 'completed' && ['claim_available', 'run_supported'].includes(result.action) && !result.items?.length)
   return <section className='growth-result' data-status={result.status} aria-label='最近福利操作结果'>
     <strong>{resultLabels[result.status] || '状态待确认'}</strong>
     <span>{namesHidden ? '' : result.message}</span>
-    <span className='credits-note'>本次回执：{rewardsText(result.rewards)} · 回执{result.receiptConfirmed ? '已确认' : '待确认'} · 状态{result.stateConfirmed ? '已读回' : '待核实'}</span>
+    <span className='credits-note'>{skipped ? '未执行，无需确认' : <>本次回执：{rewardsText(result.rewards)} · 回执{result.receiptConfirmed ? '已确认' : '待确认'} · 状态{result.stateConfirmed ? '已读回' : '待核实'}</>}</span>
     <span className='credits-note'>余额 {amountText(result.balanceBefore)} → {amountText(result.balanceAfter)} · 净变化 {typeof result.balanceDelta === 'number' && Number.isFinite(result.balanceDelta) ? `${result.balanceDelta > 0 ? '+' : ''}${result.balanceDelta.toLocaleString('zh-CN')}` : '未知'}（净变化不等同发奖金额）</span>
     {!!result.items?.length && <ul>{result.items.map((item, index) => <li key={index}>{resultLabels[item.status] || item.status} · {namesHidden ? item.action : item.message} · {rewardsText(item.rewards)}</li>)}</ul>}
   </section>

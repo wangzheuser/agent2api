@@ -375,8 +375,10 @@ async fn run_backend(
             (summary, true)
         }
         TASK_WORKBUDDY_GROWTH => {
-            let summary = crate::server::core::workbuddy_growth::scheduled_run(store).await?;
-            (summary, true)
+            match crate::server::core::workbuddy_growth::scheduled_run(store).await {
+                Ok(summary) => (summary, true),
+                Err(summary) => (summary, false),
+            }
         }
         TASK_USAGE_QUERY => {
             match crate::server::core::usage_query::query_all(store, None).await {
