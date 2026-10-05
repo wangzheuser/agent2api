@@ -457,10 +457,10 @@ impl AutoCheckin {
         {
             Ok(result) => Some(self.record_success(&result, &today, reason)),
             Err(error) => {
-                // 失败也写 lastResult（failed 里放错误文案），并清除本日完成标记，
-                // 让下一次轮询仍可重试。
+                // 失败也写 lastResult（failed 里放错误文案），并结束本日调度窗口。
+                // 失败账号仍可通过面板手动重试，避免单个账号让整批任务每 30 秒重跑。
                 write_state(json!({
-                    "lastFiredDate": Value::Null,
+                    "lastFiredDate": Value::String(today.to_string()),
                     "lastResult": {
                         "at": logging::now_ms(),
                         "date": today,
@@ -560,15 +560,7 @@ impl AutoCheckin {
             "failed": failures.iter().take(5).cloned().collect::<Vec<_>>(),
             "failedCount": failures.len(),
         });
-        let has_failures = !failures.is_empty();
-        write_state(json!({
-            "lastFiredDate": if has_failures {
-                Value::Null
-            } else {
-                Value::String(today.to_string())
-            },
-            "lastResult": summary
-        }));
+        write_state(daily_state_patch(today, summary.clone()));
         logging::log(
             "[Checkin]",
             &format!(
@@ -817,13 +809,22 @@ fn activity_keepalive_succeeded(item: &Value) -> bool {
         == Some(true)
 }
 
+/// 一次批处理即消耗当天的自动签到窗口；失败详情保留在 `lastResult`，
+/// 手动入口仍可单独重试失败账号，避免整批任务在 30 秒轮询中重复运行。
+fn daily_state_patch(today: &str, summary: Value) -> Value {
+    json!({
+        "lastFiredDate": Value::String(today.to_string()),
+        "lastResult": summary,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::{
-        activity_keepalive_succeeded, default_providers, is_benign_completion_message,
-        provider_label,
+        activity_keepalive_succeeded, daily_state_patch, default_providers,
+        is_benign_completion_message, provider_label,
     };
 
     #[test]
@@ -847,6 +848,16 @@ mod tests {
         assert!(!activity_keepalive_succeeded(&json!({
             "activity": { "pokeSucceeded": false }
         })));
+    }
+
+    #[test]
+    fn partial_failure_closes_daily_window_and_keeps_failure_details() {
+        let patch = daily_state_patch(
+            "2026-10-05",
+            json!({"failed": ["Trae（设备限流）"], "failedCount": 1}),
+        );
+        assert_eq!(patch["lastFiredDate"], "2026-10-05");
+        assert_eq!(patch["lastResult"]["failedCount"], 1);
     }
 
     #[test]
