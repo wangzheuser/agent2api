@@ -50,9 +50,9 @@ fn positive_number_of(value: Option<&Value>) -> Option<Value> {
             (parsed.is_finite() && parsed > 0.0).then(|| value.cloned().unwrap_or(Value::Null))
         }
         Some(Value::String(text)) => match text.trim().parse::<f64>() {
-            Ok(parsed) if parsed.is_finite() && parsed > 0.0 => {
-                Some(crate::server::core::account_store::state::json_number(parsed))
-            }
+            Ok(parsed) if parsed.is_finite() && parsed > 0.0 => Some(
+                crate::server::core::account_store::state::json_number(parsed),
+            ),
             _ => None,
         },
         _ => None,
@@ -118,7 +118,10 @@ pub(super) fn normalize_imported(
         }
     };
     if !access_token.is_empty() {
-        record.insert("accessToken".to_string(), Value::String(access_token.clone()));
+        record.insert(
+            "accessToken".to_string(),
+            Value::String(access_token.clone()),
+        );
     }
     if !refresh_token.is_empty() {
         record.insert("refreshToken".to_string(), Value::String(refresh_token));
@@ -183,7 +186,7 @@ pub(super) fn normalize_imported(
         }
     }
 
-    // 自定义提供商账号：apiKey / baseUrl / tokenTail 是本家 schema，
+    // 自定义提供商账号：apiKey / baseUrl / tokenTail / rewardCredential 是本家 schema，
     // 通用保留兜不住校验（超长、非法 URL），走专属归一
     if provider.starts_with(crate::server::core::custom_providers::ID_PREFIX) {
         normalize_custom_known_fields(&mut record, item, before)?;
@@ -193,10 +196,10 @@ pub(super) fn normalize_imported(
     Ok(record)
 }
 
-/// 自定义提供商账号的专属字段：apiKey（凭证）、baseUrl（账号级覆盖项）、
-/// tokenTail（界面尾号）。
+/// 自定义提供商账号的专属字段：apiKey（模型转发凭证）、baseUrl（账号级覆盖项）、
+/// tokenTail（界面尾号）、rewardCredential（签到凭证）。
 ///
-/// 三者都是 `custom_accounts::add_custom_account` 落盘的形状，导入沿用同一套
+/// 这些字段都是 `custom_accounts::add_custom_account` 落盘的形状，导入沿用同一套
 /// 规则：apiKey trim 后落盘（超长该条失败）、导入值为空时保留本机旧凭证
 /// （与 accessToken / refreshToken 的合并纪律一致）；baseUrl 带键才动 ——
 /// 空值清除覆盖项（回落提供商默认基址），非空值过 `normalize_base_url` 门禁；
@@ -256,6 +259,27 @@ fn normalize_custom_known_fields(
             record.insert("baseUrl".to_string(), Value::String(base_url));
         }
     }
+
+    // 签到凭证与 apiKey 独立：缺键保留本机值，显式空串清除，非空值 trim 后
+    // 写入。导入时也执行长度门禁，避免把整段文档误当成凭证落盘。
+    if let Some(value) = item.get("rewardCredential") {
+        if value.is_null() {
+            // null 按通用导入口径视为未提供，保留本机凭证。
+        } else {
+            let reward_credential = text_of(Some(value));
+            if reward_credential.chars().count() > MAX_TOKEN_LENGTH {
+                return Err("rewardCredential 过长".to_string());
+            }
+            if reward_credential.is_empty() {
+                record.remove("rewardCredential");
+            } else {
+                record.insert(
+                    "rewardCredential".to_string(),
+                    Value::String(reward_credential),
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -305,33 +329,46 @@ fn normalize_workbuddy_known_fields(
         ),
     );
 
-    let before_text = |getter: fn(&StoredAccount) -> String| -> String {
-        before.map(getter).unwrap_or_default()
-    };
+    let before_text =
+        |getter: fn(&StoredAccount) -> String| -> String { before.map(getter).unwrap_or_default() };
     for (key, fallback) in [
         ("nickname", before_text(StoredAccount::nickname)),
         ("enterpriseId", before_text(StoredAccount::enterprise_id)),
-        ("enterpriseName", before_text(StoredAccount::enterprise_name)),
+        (
+            "enterpriseName",
+            before_text(StoredAccount::enterprise_name),
+        ),
         ("domain", before_text(StoredAccount::domain)),
     ] {
         let incoming = text_of(item.get(key));
         record.insert(
             key.to_string(),
-            Value::String(if incoming.is_empty() { fallback } else { incoming }),
+            Value::String(if incoming.is_empty() {
+                fallback
+            } else {
+                incoming
+            }),
         );
     }
     let account_type = {
         let incoming = text_of(item.get("type"));
         if incoming.is_empty() {
             let fallback = before_text(StoredAccount::account_type);
-            if fallback.is_empty() { "personal".to_string() } else { fallback }
+            if fallback.is_empty() {
+                "personal".to_string()
+            } else {
+                fallback
+            }
         } else {
             incoming
         }
     };
     record.insert("type".to_string(), Value::String(account_type));
     for (key, getter) in [
-        ("expiresAt", StoredAccount::expires_at as fn(&StoredAccount) -> Option<f64>),
+        (
+            "expiresAt",
+            StoredAccount::expires_at as fn(&StoredAccount) -> Option<f64>,
+        ),
         ("refreshExpiresAt", StoredAccount::refresh_expires_at),
     ] {
         let fallback = before

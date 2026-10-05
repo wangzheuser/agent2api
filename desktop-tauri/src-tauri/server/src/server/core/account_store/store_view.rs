@@ -20,9 +20,13 @@ use serde_json::{json, Map, Value};
 
 use crate::server::core::account_store::state::{AccountState, StoredAccount};
 use crate::server::core::account_store::store::{forwards_requests, AccountStore};
-use crate::server::core::account_store::store_util::{js_truthy, max_concurrent_public, value_or, value_or_nullish};
+use crate::server::core::account_store::store_util::token_tail_of;
+use crate::server::core::account_store::store_util::{
+    js_truthy, max_concurrent_public, value_or, value_or_nullish,
+};
 use crate::server::core::endpoints::{resolve_edition, EditionInfo};
 use crate::server::core::proxies::describe_account_proxy;
+use crate::server::core::custom_providers;
 
 impl AccountStore {
     // ─── 公开形态 ────────────────────────────────────────────
@@ -39,10 +43,7 @@ impl AccountStore {
         public.insert("id".to_string(), Value::String(record.id().to_string()));
         // 所属提供商（Agent2API 改造新增字段）：缺失时按 workbuddy 兜底，
         // 保证界面拿到的每条账号都能直接分组，不必自己判断「没有 provider = 老数据」
-        public.insert(
-            "provider".to_string(),
-            Value::String(record.provider()),
-        );
+        public.insert("provider".to_string(), Value::String(record.provider()));
         // name 无兜底：原样透出（含非字符串的脏值），缺失时不出现该键
         if let Some(value) = fields.get("name") {
             public.insert("name".to_string(), value.clone());
@@ -77,12 +78,7 @@ impl AccountStore {
         );
         public.insert(
             "hasRefreshToken".to_string(),
-            Value::Bool(
-                fields
-                    .get("refreshToken")
-                    .map(js_truthy)
-                    .unwrap_or(false),
-            ),
+            Value::Bool(fields.get("refreshToken").map(js_truthy).unwrap_or(false)),
         );
         public.insert(
             "prefixPath".to_string(),
@@ -294,10 +290,8 @@ impl AccountStore {
     /// 计数在已读出的账号列表上跑（不再次访问数据库、不再取锁）——
     /// `snapshot` 的调用方已经持锁，且已经把那份列表读在手上了。
     fn provider_summary(&self, state: &AccountState) -> Value {
-        let counts: Vec<(String, usize)> = state
-            .accounts
-            .iter()
-            .fold(Vec::new(), |mut acc, record| {
+        let counts: Vec<(String, usize)> =
+            state.accounts.iter().fold(Vec::new(), |mut acc, record| {
                 let provider = record.provider();
                 match acc.iter_mut().find(|(id, _)| *id == provider) {
                     Some((_, count)) => *count += 1,
@@ -372,6 +366,36 @@ impl AccountStore {
             "tokenTail".to_string(),
             value_or(fields.get("tokenTail"), Value::String(String::new())),
         );
+        // 奖励签到凭证与 apiKey 完全独立。公开形态只返回是否配置和末四字符，
+        // 永远不把 rewardCredential 明文带到管理 API / 账号快照。
+        let reward_credential = fields
+            .get("rewardCredential")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        // 凭证独立存储，关闭提供商的 rewardProfile 时保留它以便日后重新启用，
+        // 但公开状态不能继续显示为“已配置”。未知的历史 provider 没有配置
+        // 记录，沿用旧行为，避免把仅凭账号数据存在的状态误判成已关闭。
+        let reward_profile_active = custom_providers::get(&record.provider())
+            .map(|provider| {
+                provider
+                    .get("rewardProfile")
+                    .and_then(Value::as_str)
+                    .is_some_and(|profile| !profile.trim().is_empty())
+            })
+            .unwrap_or(true);
+        public.insert(
+            "rewardCredentialConfigured".to_string(),
+            Value::Bool(reward_profile_active && !reward_credential.is_empty()),
+        );
+        public.insert(
+            "rewardCredentialTail".to_string(),
+            Value::String(if reward_profile_active {
+                token_tail_of(reward_credential)
+            } else {
+                String::new()
+            }),
+        );
         // 覆盖项：记录里**写了键**才透出（缺键 = 未覆盖，语义见函数头）
         if let Some(base_url) = fields.get("baseUrl") {
             public.insert("baseUrl".to_string(), base_url.clone());
@@ -381,7 +405,10 @@ impl AccountStore {
         public.insert("enabled".to_string(), Value::Bool(record.enabled()));
         public.insert("addedAt".to_string(), Value::from(record.added_at()));
         public.insert("updatedAt".to_string(), Value::from(record.updated_at()));
-        public.insert("proxy".to_string(), describe_account_proxy(Some(&record.proxy())));
+        public.insert(
+            "proxy".to_string(),
+            describe_account_proxy(Some(&record.proxy())),
+        );
         public.insert("available".to_string(), Value::Bool(true));
         // 单账号并发上限（与 to_public_account 同口径，兜底共用
         // `max_concurrent_public`）：0 = 不限，缺键同样输出 0

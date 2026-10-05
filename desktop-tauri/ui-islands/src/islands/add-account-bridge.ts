@@ -28,6 +28,7 @@ export type CustomProviderRecord = {
   name?: string
   protocol?: string
   baseUrl?: string
+  rewardProfile?: string
   accountCount?: number
   quirks?: {
     urlSuffix?: string
@@ -42,6 +43,7 @@ export type PresetRecord = {
   protocol?: string
   baseUrl?: string
   hint?: string
+  rewardProfile?: string
   quirks?: CustomProviderRecord['quirks']
 }
 

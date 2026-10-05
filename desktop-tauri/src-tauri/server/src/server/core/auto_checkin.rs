@@ -60,8 +60,18 @@ pub const DEFAULT_TIME: &str = "00:01";
 /// 这是「有签到或每日活跃任务」的清单，不是「有积分概念」的清单：CatPaw 有积分查询
 /// 但没有签到，因此不在此列 —— 它的账号在批量签到里被算作 `skipped`。
 /// 加一家之前先确认它的签到链路真的存在（一个点了必然报错的复选框比没有更糟）。
-pub const CHECKIN_PROVIDERS: [&str; 6] =
-    ["workbuddy", "raccoon", "autoclaw", "autoclaw-intl", "qoder", "trae"];
+pub const CHECKIN_PROVIDERS: [&str; 7] = [
+    "workbuddy",
+    "raccoon",
+    "autoclaw",
+    "autoclaw-intl",
+    "qoder",
+    "trae",
+    // Custom providers opt into the reward profile adapters.  The virtual id
+    // keeps the persisted scheduler setting independent from generated
+    // `custom-*` provider ids.
+    "reward-custom",
+];
 
 /// 缺省的签到提供商集合（全选）
 pub fn default_providers() -> Vec<String> {
@@ -90,6 +100,7 @@ fn provider_label(id: &str) -> &str {
     match id {
         "workbuddy" => "WorkBuddy（含国际版活跃）",
         "qoder" => "Qoder（国内版/国际版）",
+        "reward-custom" => "自定义提供商奖励",
         other => crate::server::core::providers::PROVIDERS
             .iter()
             .find(|meta| meta.id == other)
@@ -787,6 +798,7 @@ impl AutoCheckin {
 fn is_benign_completion_message(message: &str) -> bool {
     [
         "当前没有可领取的签到活动",
+        "当前没有可领取的奖励",
         "无每日签到活动",
         "今天已签到",
         "今日已签到",
@@ -841,6 +853,8 @@ mod tests {
     fn qoder_is_default_and_labeled_for_both_regions() {
         assert!(default_providers().iter().any(|id| id == "qoder"));
         assert_eq!(provider_label("qoder"), "Qoder（国内版/国际版）");
+        assert!(default_providers().iter().any(|id| id == "reward-custom"));
+        assert_eq!(provider_label("reward-custom"), "自定义提供商奖励");
     }
 }
 

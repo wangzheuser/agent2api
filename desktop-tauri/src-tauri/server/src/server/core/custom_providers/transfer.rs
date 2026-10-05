@@ -29,7 +29,9 @@ use std::collections::HashSet;
 use serde_json::{Map, Value};
 
 // 父模块的私有函数与常量：子模块可见（Rust 隐私规则），但名字仍要显式引入
-use super::{item_of, normalize_base_url, read_items, write_items, ID_PREFIX};
+use super::{
+    item_of, normalize_base_url, read_items, validate_reward_profile, write_items, ID_PREFIX,
+};
 use crate::server::logging;
 
 /// 一条定义的处理结果（结构化警告：账号导入端直接并进 `errors` 数组）
@@ -51,7 +53,11 @@ pub(crate) struct MergeReport {
 /// 整体失败（写盘不成功）返回 Err，调用方必须当成整批导入失败。
 pub(crate) fn merge_imported(items: &[Value]) -> Result<MergeReport, String> {
     let mut current = read_items();
-    let mut report = MergeReport { added: 0, updated: 0, warnings: Vec::new() };
+    let mut report = MergeReport {
+        added: 0,
+        updated: 0,
+        warnings: Vec::new(),
+    };
     let mut seen: HashSet<String> = HashSet::new();
 
     for item in items {
@@ -117,7 +123,9 @@ pub(crate) fn merge_imported(items: &[Value]) -> Result<MergeReport, String> {
     }
 
     if !write_items(&current) {
-        return Err("保存失败：自定义提供商定义写入未成功（请检查磁盘空间与配置目录权限）".to_string());
+        return Err(
+            "保存失败：自定义提供商定义写入未成功（请检查磁盘空间与配置目录权限）".to_string(),
+        );
     }
     Ok(report)
 }
@@ -129,6 +137,9 @@ pub(crate) fn merge_imported(items: &[Value]) -> Result<MergeReport, String> {
 /// 报错拦的是手改数据 —— 空基址的定义转发必然失败，收进来只是埋雷）。
 /// 展示名缺失不报错：`item_of` 会回落成 id，与读取路径同一取向。
 fn normalize_item(object: &Map<String, Value>) -> Result<Value, String> {
+    // 对导入文件里的 profile 仍执行写侧校验：读侧归一只负责容忍旧数据，
+    // 新导入不能把未知 profile 静默变成空串后报告“成功”。
+    validate_reward_profile(object.get("rewardProfile"))?;
     let mut item = item_of(object);
     let base_url = item
         .get("baseUrl")

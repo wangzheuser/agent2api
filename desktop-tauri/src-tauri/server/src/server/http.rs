@@ -300,6 +300,19 @@ pub fn panel_router(state: ServerState) -> Router {
             "/api/checkin/claim-and-report",
             post(api::billing::claim_and_report),
         )
+        // Custom provider rewards use a separate credential from model
+        // forwarding. Keep these management endpoints in the protected
+        // group alongside the existing account/check-in APIs.
+        .route(
+            "/api/reward-providers",
+            get(api::rewards::list_reward_providers),
+        )
+        .route(
+            "/api/rewards/configure",
+            post(api::rewards::configure_reward),
+        )
+        .route("/api/rewards/status", get(api::rewards::reward_status))
+        .route("/api/rewards/claim", post(api::rewards::claim_reward))
         .route("/api/activity/banner", get(api::billing::activity_banner))
         .route(
             "/api/activity/ambassador",

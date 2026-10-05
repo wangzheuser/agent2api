@@ -33,6 +33,7 @@
    *   baseUrl  预填基址（按本网关的拼接语义，见文件头）
    *   hint     表单 Base URL 栏下的备注：该家另一端协议的地址 / 站点差异说明
    *   quirks   该家的上游特判（随创建写进提供商记录，转发时生效，见下）
+   *   rewardProfile  可选的活动/签到奖励适配器 id；凭证由账号单独配置
    *
    * ── quirks 的取值（抄自 9Router 各家适配器，后端 customProviders 记录的字段）──
    *   urlSuffix          原样追加到出站 URL 的查询串（GLM / MiniMax 的
@@ -119,6 +120,35 @@
         headers: { ...ANTHROPIC_BETA_HEADERS },
         anthropicToolType: 'custom',
       },
+    },
+    {
+      key: 'astudio', name: 'AStudio',
+      protocol: P.openai, baseUrl: 'https://maas-api.cn-huabei-1.xf-yun.com/v1',
+      rewardProfile: 'astudio',
+      hint: '讯飞星火 AStudio；签到奖励凭证在账号设置中单独填写 Cookie',
+    },
+    {
+      key: 'dumate', name: '百度搭子 DuMate',
+      protocol: P.openai, baseUrl: 'https://dumate-svc.baidu.com/gateway/apis/v1',
+      rewardProfile: 'dumate',
+      hint: '百度搭子免费体验版；每日奖励 Cookie 与模型 API Key 分开保存',
+    },
+    {
+      key: 'minimax-code', name: 'MiniMax Code', icon: 'minimax-cn.png',
+      protocol: P.anthropic, baseUrl: 'https://agent.minimax.cn/mavis/api/v1/llm',
+      rewardProfile: 'minimax-code',
+      hint: 'MiniMax Code；签到赠予积分仅限 Code，Anthropic 兼容端点不带额外 /v1',
+      quirks: {
+        urlSuffix: '?beta=true',
+        headers: { ...ANTHROPIC_BETA_HEADERS },
+        anthropicToolType: 'custom',
+      },
+    },
+    {
+      key: 'lobsterai', name: 'LobsterAI',
+      protocol: P.openai, baseUrl: 'https://lobsterai-server.youdao.com/api/proxy/v1',
+      rewardProfile: 'lobsterai',
+      hint: '网易有道 LobsterAI；活动未投放或账号无资格时状态接口会明确返回不可领取',
     },
     {
       key: 'siliconflow', name: 'SiliconFlow', icon: 'siliconflow.png',
