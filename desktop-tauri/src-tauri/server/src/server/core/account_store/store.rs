@@ -512,6 +512,9 @@ impl AccountStore {
         // 空值不写：会话里出现空串会让「有没有这条通道的凭证」的判定变成
         // 「键在不在」，那是两个不同的问法。
         let mut session = json!({
+            // Provider 是内部会话元数据；原生适配器按账号 id 取会话时用它防止
+            // 把另一家账号的凭证误交给本家协议。
+            "provider": record.provider(),
             "endpoint": record.endpoint().unwrap_or_else(|| edition.endpoint.to_string()),
             "prefixPath": record
                 .prefix_path()
@@ -552,6 +555,32 @@ impl AccountStore {
                 ] {
                     if !value.trim().is_empty() {
                         object.insert(key.to_string(), Value::String(value));
+                    }
+                }
+            }
+        }
+        if record.provider() == crate::server::core::providers::lobsterai::PROVIDER_ID {
+            if let Some(object) = session.as_object_mut() {
+                if let Some(auth) = object.get_mut("auth").and_then(Value::as_object_mut) {
+                    for key in ["uuid", "firstKeyfrom", "latestKeyfrom"] {
+                        if let Some(value) = record.fields().get(key).and_then(Value::as_str) {
+                            if !value.trim().is_empty() {
+                                auth.insert(key.to_string(), Value::String(value.to_string()));
+                            }
+                        }
+                    }
+                }
+                if let Some(account) = object
+                    .get_mut("account")
+                    .and_then(Value::as_object_mut)
+                {
+                    if let Some(value) = record.fields().get("userId").and_then(Value::as_str) {
+                        if !value.trim().is_empty() {
+                            account.insert(
+                                "userId".to_string(),
+                                Value::String(value.to_string()),
+                            );
+                        }
                     }
                 }
             }

@@ -77,9 +77,9 @@ impl ProviderAdapter for LobsterAIAdapter {
 
     fn classify_error(&self, status: u16, error_body: &Value) -> UpstreamErrorClass {
         let raw = error_message(error_body);
-        let code = error_body.get("code").and_then(Value::as_i64);
+        let code = error_code(error_body);
         let message = format!("上游返回 {status}: {raw}");
-        if status == 401 {
+        if status == 401 || code == Some(401) {
             return UpstreamErrorClass::TokenExpired { message };
         }
         if status == 429
@@ -105,29 +105,35 @@ impl ProviderAdapter for LobsterAIAdapter {
         let has_error_event =
             text.lines().any(|line| line.trim() == "event: error") || text.contains("event:error");
         let Some(value) = first_json_value(body) else {
-            if has_error_event || body.len() >= SUCCESS_HEAD_LIMIT {
+            if has_error_event {
+                return SuccessHead::Failure(UpstreamErrorClass::Fatal {
+                    status: 502,
+                    message: "上游返回 200: 上游业务错误".to_string(),
+                    upstream_code: None,
+                });
+            }
+            if body.len() >= SUCCESS_HEAD_LIMIT {
                 return SuccessHead::Ready;
             }
             return SuccessHead::Pending;
         };
         let Some(error) = value.get("error") else {
             if has_error_event {
-                let message = format!("上游返回 200: {}", error_message(&value));
-                return SuccessHead::Failure(UpstreamErrorClass::Fatal {
-                    status: 502,
-                    message,
-                    upstream_code: value.get("code").and_then(Value::as_i64),
-                });
+                return SuccessHead::Failure(self.classify_error(200, &value));
             }
             return SuccessHead::Ready;
         };
         if !error.is_object() {
+            if has_error_event {
+                return SuccessHead::Failure(UpstreamErrorClass::Fatal {
+                    status: 502,
+                    message: format!("上游返回 200: {}", error_message(&value)),
+                    upstream_code: value.get("code").and_then(Value::as_i64),
+                });
+            }
             return SuccessHead::Ready;
         }
-        let code = error
-            .get("code")
-            .and_then(Value::as_i64)
-            .or_else(|| value.get("code").and_then(Value::as_i64));
+        let code = error_code(&value).or_else(|| error_code(error));
         let raw = error_message_optional(error).unwrap_or_default();
         if raw.is_empty() && !has_error_event {
             return SuccessHead::Ready;
@@ -262,6 +268,20 @@ fn error_message_optional(value: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+fn error_code(value: &Value) -> Option<i64> {
+    [
+        value.get("code"),
+        value.get("error").and_then(|error| error.get("code")),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_str()?.trim().parse::<i64>().ok())
+    })
+}
+
 fn is_quota_error(code: Option<i64>, message: &str) -> bool {
     matches!(code, Some(40201 | 40202 | 42901 | 42902)) || is_quota_text(message)
 }
@@ -331,5 +351,35 @@ mod tests {
             first_json_value(b"data: [DONE]\n\ndata: {\"ok\":true}\n").expect("json")["ok"],
             true
         );
+    }
+
+    #[test]
+    fn malformed_http_200_sse_error_is_not_marked_ready() {
+        let adapter = LobsterAIAdapter;
+        let head = b"event: error\ndata: malformed\n\n";
+        assert!(matches!(
+            adapter.inspect_success_head(head),
+            SuccessHead::Failure(UpstreamErrorClass::Fatal { .. })
+        ));
+    }
+
+    #[test]
+    fn top_level_http_200_sse_token_error_triggers_refresh_classification() {
+        let adapter = LobsterAIAdapter;
+        let head = b"event: error\ndata: {\"code\":401,\"message\":\"expired\"}\n\n";
+        assert!(matches!(
+            adapter.inspect_success_head(head),
+            SuccessHead::Failure(UpstreamErrorClass::TokenExpired { .. })
+        ));
+    }
+
+    #[test]
+    fn nested_and_string_sse_error_codes_trigger_refresh_classification() {
+        let adapter = LobsterAIAdapter;
+        let head = b"event: error\ndata: {\"error\":{\"code\":\"401\",\"message\":\"expired\"}}\n\n";
+        assert!(matches!(
+            adapter.inspect_success_head(head),
+            SuccessHead::Failure(UpstreamErrorClass::TokenExpired { .. })
+        ));
     }
 }

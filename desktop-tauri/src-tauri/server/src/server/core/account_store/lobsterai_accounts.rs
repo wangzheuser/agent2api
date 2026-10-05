@@ -118,10 +118,14 @@ impl AccountStore {
             "accessToken".to_string(),
             Value::String(credentials.access_token.clone()),
         );
-        fields.insert(
-            "refreshToken".to_string(),
-            Value::String(credentials.refresh_token.clone()),
-        );
+        // 手动补填 accessToken 时经常没有 refreshToken；空值不能洗掉既有
+        // refresh 链，否则下一次临期刷新会把这条账号变成不可续期。
+        if !credentials.refresh_token.trim().is_empty() || existing.is_none() {
+            fields.insert(
+                "refreshToken".to_string(),
+                Value::String(credentials.refresh_token.clone()),
+            );
+        }
         fields.insert(
             "tokenTail".to_string(),
             Value::String(token_tail_of(&credentials.access_token)),
@@ -203,5 +207,72 @@ impl AccountStore {
             Value::from(max_concurrent_public(record.get("maxConcurrent"))),
         );
         Value::Object(public)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn store(label: &str) -> (AccountStore, crate::server::db::test_temp::TempDb) {
+        let (db, guard) = crate::server::db::test_temp::TempDb::open(&format!(
+            "lobsterai-accounts-{label}"
+        ));
+        (AccountStore::with_db(Some(db)), guard)
+    }
+
+    fn credentials(access_token: &str, refresh_token: &str) -> Credentials {
+        Credentials::from_payload(&json!({
+            "accessToken": access_token,
+            "refreshToken": refresh_token,
+            "userId": "u-1"
+        }))
+        .expect("credentials")
+    }
+
+    #[test]
+    fn partial_access_token_update_keeps_existing_refresh_token() {
+        let (store, _db) = store("partial");
+        store
+            .add_lobsterai_account(&credentials("A1", "R1"), None, "web")
+            .expect("initial account");
+        let account = store
+            .add_lobsterai_account(&credentials("A2", ""), None, "manual")
+            .expect("partial update");
+        let id = account["id"].as_str().expect("id");
+        let record = store.lobsterai_account_record(id).expect("record");
+        assert_eq!(record["accessToken"], "A2");
+        assert_eq!(record["refreshToken"], "R1");
+    }
+
+    #[test]
+    fn session_restores_refresh_identity_fields() {
+        let (store, _db) = store("session-identity");
+        let credentials = Credentials::from_payload(&json!({
+            "auth": {
+                "accessToken": "A1",
+                "refreshToken": "R1",
+                "uuid": "uuid-1",
+                "firstKeyfrom": "desktop",
+                "latestKeyfrom": "latest-1"
+            },
+            "account": {"userId": "u-1", "uid": "uid-1"}
+        }))
+        .expect("credentials");
+        let account = store
+            .add_lobsterai_account(&credentials, None, "web")
+            .expect("account");
+        let id = account["id"].as_str().expect("id");
+        let session = store.get_session_by_id(id).expect("session").session;
+        assert_eq!(session["auth"]["uuid"], "uuid-1");
+        assert_eq!(session["auth"]["firstKeyfrom"], "desktop");
+        assert_eq!(session["auth"]["latestKeyfrom"], "latest-1");
+        assert_eq!(session["account"]["userId"], "u-1");
+        let restored = Credentials::from_payload(&session).expect("restored credentials");
+        let refresh = restored.refresh_payload();
+        assert_eq!(refresh["uuid"], "uuid-1");
+        assert_eq!(refresh["firstKeyfrom"], "desktop");
+        assert_eq!(refresh["userId"], "u-1");
     }
 }

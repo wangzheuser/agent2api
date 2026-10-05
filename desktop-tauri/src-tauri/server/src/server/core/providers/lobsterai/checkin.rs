@@ -163,6 +163,9 @@ pub async fn daily_checkin(
     if explicitly_inactive(&context) {
         return neutral("当前活动未启用", false);
     }
+    if context_requires_login(&context) {
+        return neutral("当前账号未登录 LobsterAI 活动", false);
+    }
     let claimed_today = bool_at(&context, &["/state/claimedToday", "/claimedToday"]);
     let completed = bool_at(&context, &["/state/completed", "/completed"]);
     if claimed_today || completed {
@@ -300,22 +303,53 @@ fn explicitly_inactive(value: &Value) -> bool {
     [
         "/active",
         "/isActive",
+        "/lifecycleState",
         "/activity/active",
         "/activity/isActive",
+        "/activity/lifecycleState",
         "/state/active",
         "/state/isActive",
+        "/state/lifecycleState",
     ]
     .iter()
-    .filter_map(|path| value.pointer(path))
-    .any(|flag| {
-        flag.as_bool() == Some(false)
-            || flag.as_str().is_some_and(|text| {
-                matches!(
-                    text.trim().to_ascii_lowercase().as_str(),
-                    "false" | "0" | "inactive" | "ended" | "closed"
-                )
-            })
+    .any(|path| {
+        let Some(flag) = value.pointer(path) else {
+            return false;
+        };
+        if flag.as_bool() == Some(false) {
+            return true;
+        }
+        let Some(text) = flag.as_str() else {
+            return false;
+        };
+        let normalized = text.trim().to_ascii_lowercase();
+        if path.ends_with("lifecycleState") {
+            normalized != "active"
+        } else {
+            matches!(normalized.as_str(), "false" | "0" | "inactive" | "ended" | "closed")
+        }
     })
+}
+
+fn context_requires_login(context: &Value) -> bool {
+    ["/authenticated", "/state/authenticated"]
+        .iter()
+        .filter_map(|path| context.pointer(path))
+        .any(|value| {
+            value.as_bool() == Some(false)
+                || value
+                    .as_str()
+                    .is_some_and(|text| text.trim().eq_ignore_ascii_case("false"))
+        })
+        || ["/loginRequired", "/state/loginRequired"]
+            .iter()
+            .filter_map(|path| context.pointer(path))
+            .any(|value| {
+                value.as_bool() == Some(true)
+                    || value
+                        .as_str()
+                        .is_some_and(|text| text.trim().eq_ignore_ascii_case("true"))
+            })
 }
 
 fn has_checkin_action(context: &Value) -> bool {
@@ -451,6 +485,20 @@ mod tests {
             &json!({"state":{"isEligible":false}})
         ));
         assert!(slot_is_available(&json!({"active":true})));
+    }
+
+    #[test]
+    fn lifecycle_state_must_be_active() {
+        assert!(explicitly_inactive(&json!({"lifecycleState":"ended"})));
+        assert!(explicitly_inactive(&json!({"state":{"lifecycleState":"paused"}})));
+        assert!(!explicitly_inactive(&json!({"lifecycleState":"active"})));
+    }
+
+    #[test]
+    fn unauthenticated_context_is_neutral() {
+        assert!(context_requires_login(&json!({"authenticated":false})));
+        assert!(context_requires_login(&json!({"state":{"loginRequired":true}})));
+        assert!(!context_requires_login(&json!({"authenticated":true,"loginRequired":false})));
     }
 
     #[test]

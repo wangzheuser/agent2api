@@ -263,7 +263,8 @@ fn allowed_hosts(provider: &str) -> Option<&'static [&'static str]> {
         // 那张表**既没有** `trae.cn`（授权页）**也没有** `127.0.0.1`（回调），
         // 症状正是本文件上面警告的那种 —— 窗口一片空白，日志什么也看不出。
         "catpaw" | "qoder" | "cline-free" | "cline-pass" | "autoclaw" | "autoclaw-intl"
-        | "accio" | "accio-cn" | "zcode" | "zcode-intl" | "codearts" | "trae" => None,
+        | "accio" | "accio-cn" | "zcode" | "zcode-intl" | "codearts" | "trae"
+        | "minimax-code" | "lobsterai" => None,
         _ => Some(WORKBUDDY_ALLOWED_HOSTS),
     }
 }
@@ -434,6 +435,10 @@ fn normalize_provider(provider: &str) -> Result<&'static str, String> {
         // 上游把这个地址按正则逐字校验），所以窗口**必须允许**导航到本机端口，
         // 否则用户点完授权、回调请求根本发不出去（见下面 allowed_hosts 的同一条）。
         "trae" => Ok("trae"),
+        // MiniMax Code / LobsterAI 的授权地址和 loopback 回调由原生 Provider 生成，
+        // 壳侧只负责打开页面并等待后端任务完成。
+        "minimax-code" => Ok("minimax-code"),
+        "lobsterai" => Ok("lobsterai"),
         other => Err(format!("不支持网页登录的提供商：{other}")),
     }
 }
@@ -725,6 +730,8 @@ pub async fn start(
         // Trae 只有一家（国内 SOLO 通道；国际版是另一套协议、另立 provider id），
         // 品牌名里不需要地区
         "trae" => "Trae",
+        "minimax-code" => "MiniMax Code",
+        "lobsterai" => "LobsterAI",
         _ => "WorkBuddy",
     };
     // 窗口标题：Cline 两家的池、ZCode 两家的地区、CodeArts / Trae 的单一家
@@ -733,6 +740,7 @@ pub async fn start(
     let title = if matches!(
         provider,
         "cline-free" | "cline-pass" | "zcode" | "zcode-intl" | "codearts" | "trae"
+            | "minimax-code" | "lobsterai"
     ) {
         format!("登录 {provider_label} 账号")
     } else {

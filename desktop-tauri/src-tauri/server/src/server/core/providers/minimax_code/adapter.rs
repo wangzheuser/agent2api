@@ -97,12 +97,7 @@ impl ProviderAdapter for MiniMaxCodeAdapter {
 
     fn classify_error(&self, status: u16, error_body: &Value) -> UpstreamErrorClass {
         let raw = error_message(error_body);
-        let code = error_body.get("code").and_then(Value::as_i64).or_else(|| {
-            error_body
-                .get("base_resp")
-                .and_then(|v| v.get("status_code"))
-                .and_then(Value::as_i64)
-        });
+        let code = error_code(error_body);
         let message = format!("上游返回 {status}: {raw}");
         if status == 401 || code == Some(401) {
             return UpstreamErrorClass::TokenExpired { message };
@@ -122,22 +117,7 @@ impl ProviderAdapter for MiniMaxCodeAdapter {
         let text = String::from_utf8_lossy(body);
         if text.lines().any(|line| line.trim() == "event: error") || text.contains("event:error") {
             let value = first_json_value(body).unwrap_or_else(|| serde_json::json!({}));
-            let raw = error_message(&value);
-            let message = format!("上游返回 200: {raw}");
-            return SuccessHead::Failure(if is_quota_text(&raw) {
-                UpstreamErrorClass::QuotaLimited {
-                    reset_at: None,
-                    message,
-                    upstream_code: value.get("code").and_then(Value::as_i64),
-                    status: 429,
-                }
-            } else {
-                UpstreamErrorClass::Fatal {
-                    status: 502,
-                    message,
-                    upstream_code: value.get("code").and_then(Value::as_i64),
-                }
-            });
+            return SuccessHead::Failure(self.classify_error(200, &value));
         }
         if first_json_value(body).is_some() || body.len() >= 8192 {
             SuccessHead::Ready
@@ -254,6 +234,27 @@ fn error_message(value: &Value) -> String {
         .to_string()
 }
 
+fn error_code(value: &Value) -> Option<i64> {
+    [
+        value.get("code"),
+        value.get("error").and_then(|error| error.get("code")),
+        value
+            .get("base_resp")
+            .and_then(|response| response.get("status_code")),
+        value
+            .get("error")
+            .and_then(|error| error.get("base_resp"))
+            .and_then(|response| response.get("status_code")),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_str()?.trim().parse::<i64>().ok())
+    })
+}
+
 fn is_quota_text(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     [
@@ -300,5 +301,35 @@ mod tests {
         assert_eq!(plan.response, UpstreamResponse::Anthropic);
         assert_eq!(plan.body["tools"][0]["type"], "custom");
         assert!(plan.url.contains("beta=true"));
+    }
+
+    #[test]
+    fn http_200_sse_error_event_is_not_marked_ready() {
+        let adapter = MiniMaxCodeAdapter;
+        let head = b"event: error\ndata: malformed\n\n";
+        assert!(matches!(
+            adapter.inspect_success_head(head),
+            SuccessHead::Failure(UpstreamErrorClass::Fatal { .. })
+        ));
+    }
+
+    #[test]
+    fn http_200_sse_token_error_triggers_refresh_classification() {
+        let adapter = MiniMaxCodeAdapter;
+        let head = b"event: error\ndata: {\"code\":401,\"message\":\"expired\"}\n\n";
+        assert!(matches!(
+            adapter.inspect_success_head(head),
+            SuccessHead::Failure(UpstreamErrorClass::TokenExpired { .. })
+        ));
+    }
+
+    #[test]
+    fn nested_and_string_sse_error_codes_trigger_refresh_classification() {
+        let adapter = MiniMaxCodeAdapter;
+        let head = b"event: error\ndata: {\"error\":{\"code\":\"401\",\"message\":\"expired\"}}\n\n";
+        assert!(matches!(
+            adapter.inspect_success_head(head),
+            SuccessHead::Failure(UpstreamErrorClass::TokenExpired { .. })
+        ));
     }
 }
