@@ -95,8 +95,8 @@
 //!                stream / chat / balance
 //! 本文件仍然只做「身份与元数据」这一件事，不认识磁盘也不认识账号。
 
-pub mod adapter;
 pub mod accio;
+pub mod adapter;
 pub mod autoclaw;
 pub mod catalog;
 /// 远程模型清单的**持久化缓存**（各家的清单在进程重启后由它读回，见模块头）。
@@ -116,6 +116,10 @@ pub mod content_block;
 /// 形态调用它 —— 挂在这里与其它子模块并列，便于对照「内置家走适配器、
 /// 自定义家走独立通道」的两条路径。
 pub mod custom;
+/// LobsterAI 原生 Provider：OpenAI Chat Completions、OAuth、额度与活动奖励。
+pub mod lobsterai;
+/// MiniMax Code（mcode）原生 Provider：Anthropic Messages 反代、OAuth 续期、额度与签到。
+pub mod minimax_code;
 pub mod qoder;
 pub mod raccoon;
 pub mod refresh_flight;
@@ -283,6 +287,10 @@ pub enum ProviderKind {
     /// `core::auto_checkin` 的提供商清单不含本家。每日签到存在，但要单独授权
     /// 才会接（见 cpa-deploy/notes/agent2api-trae-port-plan.md 的 §8 决策 3）。
     Trae,
+    /// MiniMax Code（mcode）。原生 Anthropic Messages 上游与 Code 专属额度池。
+    MiniMaxCode,
+    /// LobsterAI。原生 OpenAI Chat Completions、活动奖励与额度查询。
+    LobsterAI,
 }
 
 /// 一个提供商的静态元数据。
@@ -307,29 +315,79 @@ pub struct ProviderMeta {
 /// 注册表顺序只用于**展示**（providers 摘要、模型目录合并时同名模型的去重顺序）
 /// 与旧数据迁移（把按家分队的优先级合并成全局队列时，作为旧默认路由顺序的依据）。
 pub const PROVIDERS: &[ProviderMeta] = &[
-    ProviderMeta { id: "workbuddy", label: "WorkBuddy" },
-    ProviderMeta { id: "raccoon", label: "小浣熊" },
-    ProviderMeta { id: "catpaw", label: "CatPaw" },
+    ProviderMeta {
+        id: "workbuddy",
+        label: "WorkBuddy",
+    },
+    ProviderMeta {
+        id: "raccoon",
+        label: "小浣熊",
+    },
+    ProviderMeta {
+        id: "catpaw",
+        label: "CatPaw",
+    },
     // AutoClaw 两个地区**相邻**排列（本次改动的要求）：界面上它们是同一条产品线的
     // 两个版本，中间隔着别的家会让「找国际版」变成一次扫描。顺序也决定模型目录
     // 合并时同名模型先归谁家 —— 国内版在前，与存量账号的归属一致。
-    ProviderMeta { id: "autoclaw", label: "AutoClaw 国内版" },
-    ProviderMeta { id: "autoclaw-intl", label: "AutoClaw 国际版" },
-    ProviderMeta { id: "qoder", label: "Qoder" },
-    ProviderMeta { id: "cline-free", label: "Cline Free" },
-    ProviderMeta { id: "cline-pass", label: "Cline Pass" },
+    ProviderMeta {
+        id: "autoclaw",
+        label: "AutoClaw 国内版",
+    },
+    ProviderMeta {
+        id: "autoclaw-intl",
+        label: "AutoClaw 国际版",
+    },
+    ProviderMeta {
+        id: "qoder",
+        label: "Qoder",
+    },
+    ProviderMeta {
+        id: "cline-free",
+        label: "Cline Free",
+    },
+    ProviderMeta {
+        id: "cline-pass",
+        label: "Cline Pass",
+    },
     // Accio 两个地区**相邻**排列（与 AutoClaw 同一理由：同一条产品线的两个
     // 版本，中间隔着别家会让「找国际版」变成一次扫描）。顺序也决定模型目录
     // 合并时同名模型先归谁家 —— 国际版在前（用户装的、默认用的是它）。
-    ProviderMeta { id: "accio", label: "Accio" },
-    ProviderMeta { id: "accio-cn", label: "Accio 国内版" },
+    ProviderMeta {
+        id: "accio",
+        label: "Accio",
+    },
+    ProviderMeta {
+        id: "accio-cn",
+        label: "Accio 国内版",
+    },
     // ZCode 两个地区**相邻**排列（与 AutoClaw / Accio 同一理由：同一条产品线的
     // 两个版本，中间隔着别家会让「找国际版」变成一次扫描）。顺序也决定模型目录
     // 合并时同名模型先归谁家 —— 国内版在前（国内网络环境下更常被添加的那个）。
-    ProviderMeta { id: "zcode", label: "ZCode 国内版" },
-    ProviderMeta { id: "zcode-intl", label: "ZCode 国际版" },
-    ProviderMeta { id: "codearts", label: "CodeArts" },
-    ProviderMeta { id: "trae", label: "Trae" },
+    ProviderMeta {
+        id: "zcode",
+        label: "ZCode 国内版",
+    },
+    ProviderMeta {
+        id: "zcode-intl",
+        label: "ZCode 国际版",
+    },
+    ProviderMeta {
+        id: "codearts",
+        label: "CodeArts",
+    },
+    ProviderMeta {
+        id: "trae",
+        label: "Trae",
+    },
+    ProviderMeta {
+        id: "minimax-code",
+        label: "MiniMax Code",
+    },
+    ProviderMeta {
+        id: "lobsterai",
+        label: "LobsterAI",
+    },
 ];
 
 /// provider id 在注册表里的下标（未知 id → None）。
@@ -404,6 +462,8 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
         "zcode-intl" => Some(ProviderKind::ZcodeIntl),
         "codearts" => Some(ProviderKind::CodeArts),
         "trae" => Some(ProviderKind::Trae),
+        "minimax-code" => Some(ProviderKind::MiniMaxCode),
+        "lobsterai" => Some(ProviderKind::LobsterAI),
         // 走到这里 = 上面的注册表判定已放行、这个 match 却没有对应分支：
         // 只可能是有人给 `PROVIDERS` 加了条目忘了加这里。开发期喊出来；
         // release 返回 None（见上：宁可为「未知」，不可误认成别家）。
@@ -436,6 +496,8 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
         ProviderKind::ZcodeIntl => "zcode-intl",
         ProviderKind::CodeArts => "codearts",
         ProviderKind::Trae => "trae",
+        ProviderKind::MiniMaxCode => "minimax-code",
+        ProviderKind::LobsterAI => "lobsterai",
     }
 }
 

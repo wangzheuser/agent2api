@@ -56,17 +56,22 @@ pub const DEFAULT_TIME: &str = "00:01";
 ///   - **Qoder 国内版 / 国际版**：两地统一走活动（campaign）领取链路
 ///     （`providers::qoder::checkin`），是否有可领取活动由上游实时返回。
 ///   - **Trae**：国内 SOLO 账号走每日积分签到（`providers::trae::checkin`）。
+///   - **MiniMax Code**：原生 Provider 的每日签到。
+///   - **LobsterAI**：原生 Provider 的活动奖励领取。
+///   - **预置 API 奖励**：AStudio / DuMate 通过 `reward-custom` 虚拟选项聚合。
 ///
 /// 这是「有签到或每日活跃任务」的清单，不是「有积分概念」的清单：CatPaw 有积分查询
 /// 但没有签到，因此不在此列 —— 它的账号在批量签到里被算作 `skipped`。
 /// 加一家之前先确认它的签到链路真的存在（一个点了必然报错的复选框比没有更糟）。
-pub const CHECKIN_PROVIDERS: [&str; 7] = [
+pub const CHECKIN_PROVIDERS: [&str; 9] = [
     "workbuddy",
     "raccoon",
     "autoclaw",
     "autoclaw-intl",
     "qoder",
     "trae",
+    "minimax-code",
+    "lobsterai",
     // Custom providers opt into the reward profile adapters.  The virtual id
     // keeps the persisted scheduler setting independent from generated
     // `custom-*` provider ids.
@@ -100,7 +105,9 @@ fn provider_label(id: &str) -> &str {
     match id {
         "workbuddy" => "WorkBuddy（含国际版活跃）",
         "qoder" => "Qoder（国内版/国际版）",
-        "reward-custom" => "自定义提供商奖励",
+        "minimax-code" => "MiniMax Code（每日签到）",
+        "lobsterai" => "LobsterAI（活动奖励）",
+        "reward-custom" => "预置 API 奖励（AStudio / DuMate）",
         other => crate::server::core::providers::PROVIDERS
             .iter()
             .find(|meta| meta.id == other)
@@ -864,8 +871,15 @@ mod tests {
     fn qoder_is_default_and_labeled_for_both_regions() {
         assert!(default_providers().iter().any(|id| id == "qoder"));
         assert_eq!(provider_label("qoder"), "Qoder（国内版/国际版）");
+        assert!(default_providers().iter().any(|id| id == "minimax-code"));
+        assert_eq!(provider_label("minimax-code"), "MiniMax Code（每日签到）");
+        assert!(default_providers().iter().any(|id| id == "lobsterai"));
+        assert_eq!(provider_label("lobsterai"), "LobsterAI（活动奖励）");
         assert!(default_providers().iter().any(|id| id == "reward-custom"));
-        assert_eq!(provider_label("reward-custom"), "自定义提供商奖励");
+        assert_eq!(
+            provider_label("reward-custom"),
+            "预置 API 奖励（AStudio / DuMate）"
+        );
     }
 }
 

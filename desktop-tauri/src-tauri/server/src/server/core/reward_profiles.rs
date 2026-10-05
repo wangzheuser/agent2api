@@ -5,8 +5,7 @@
 //! 奖励与钱包字段，不回显 Cookie、Bearer token 或上游原始响应。
 
 use reqwest::header::{
-    HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, COOKIE, ORIGIN, REFERER,
-    USER_AGENT,
+    HeaderMap, HeaderValue, ACCEPT, CONTENT_TYPE, COOKIE, ORIGIN, REFERER, USER_AGENT,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -16,38 +15,23 @@ use std::time::Duration;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 const ASTUDIO_BASE: &str = "https://agent.xfyun.cn/xingchen-studio";
 const DUMATE_BASE: &str = "https://www.dumate.cn";
-const MINIMAX_BASE: &str = "https://agent.minimax.cn";
-const LOBSTER_BASE: &str = "https://lobsterai-server.youdao.com";
-const LOBSTER_CLIENT_VERSION: &str = "2026.9.4";
-const MINIMAX_TIMEZONE: &str = "Asia/Shanghai";
 
-/// 四家奖励 profile 的稳定 ID。这个 ID 会写入 custom provider 配置，不能随意改名。
+/// 预置 API 奖励 profile 的稳定 ID。这个 ID 会写入 custom provider 配置，不能随意改名。
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum RewardProfileId {
     #[serde(rename = "astudio")]
     AStudio,
     #[serde(rename = "dumate")]
     DuMate,
-    #[serde(rename = "minimax-code")]
-    MiniMaxCode,
-    #[serde(rename = "lobsterai")]
-    LobsterAI,
 }
 
 impl RewardProfileId {
-    pub const ALL: [Self; 4] = [
-        Self::AStudio,
-        Self::DuMate,
-        Self::MiniMaxCode,
-        Self::LobsterAI,
-    ];
+    pub const ALL: [Self; 2] = [Self::AStudio, Self::DuMate];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::AStudio => "astudio",
             Self::DuMate => "dumate",
-            Self::MiniMaxCode => "minimax-code",
-            Self::LobsterAI => "lobsterai",
         }
     }
 
@@ -55,15 +39,12 @@ impl RewardProfileId {
         match self {
             Self::AStudio => "AStudio",
             Self::DuMate => "DuMate",
-            Self::MiniMaxCode => "MiniMax Code",
-            Self::LobsterAI => "LobsterAI",
         }
     }
 
     pub const fn credential_type(self) -> &'static str {
         match self {
             Self::AStudio | Self::DuMate => "cookie",
-            Self::MiniMaxCode | Self::LobsterAI => "access-token",
         }
     }
 }
@@ -164,8 +145,6 @@ pub fn parse_profile(value: &str) -> Result<RewardProfileId, RewardError> {
     match value.trim().to_ascii_lowercase().as_str() {
         "astudio" | "a-studio" => Ok(RewardProfileId::AStudio),
         "dumate" | "du-mate" => Ok(RewardProfileId::DuMate),
-        "minimax-code" | "minimax" | "minimaxcode" => Ok(RewardProfileId::MiniMaxCode),
-        "lobsterai" | "lobster-ai" => Ok(RewardProfileId::LobsterAI),
         _ => Err(RewardError::invalid("未知奖励提供商")),
     }
 }
@@ -180,7 +159,7 @@ pub fn is_known_profile(value: &str) -> bool {
     parse_profile(value).is_ok()
 }
 
-/// 返回四家预置 profile，不读取任何账号凭证。
+/// 返回预置 API 奖励 profile，不读取任何账号凭证。
 pub fn list_profiles() -> Vec<RewardProfileInfo> {
     RewardProfileId::ALL
         .into_iter()
@@ -193,20 +172,10 @@ pub fn list_profiles() -> Vec<RewardProfileInfo> {
                 RewardProfileId::DuMate => {
                     format!("{DUMATE_BASE}/api/dumate/points/loginBonusInfo")
                 }
-                RewardProfileId::MiniMaxCode => {
-                    format!("{MINIMAX_BASE}/minimax-cloud/api/v1/signin/status")
-                }
-                RewardProfileId::LobsterAI => format!("{LOBSTER_BASE}/api/client-activities/slot"),
             },
             claim_endpoint: match profile {
                 RewardProfileId::AStudio => format!("{ASTUDIO_BASE}/tenant-app/init-web"),
                 RewardProfileId::DuMate => format!("{DUMATE_BASE}/api/dumate/points/loginBonus"),
-                RewardProfileId::MiniMaxCode => {
-                    format!("{MINIMAX_BASE}/minimax-cloud/api/v1/signin/claim")
-                }
-                RewardProfileId::LobsterAI => format!(
-                    "{LOBSTER_BASE}/api/client-activities/{{activityCode}}/actions/check_in"
-                ),
             },
         })
         .collect()
@@ -555,245 +524,6 @@ fn parse_dumate_claim(status: &RewardStatus, value: &Value) -> RewardClaim {
     }
 }
 
-fn minimax_panel(value: &Value) -> Value {
-    let data = payload(value);
-    data.get("panel")
-        .or_else(|| data.get("signin_panel"))
-        .or_else(|| value.pointer("/data/panel"))
-        .cloned()
-        .unwrap_or(data)
-}
-
-fn minimax_today(value: &Value) -> (bool, bool, Option<f64>, Option<String>) {
-    let data = payload(value);
-    let panel = minimax_panel(value);
-    let days = panel.get("days").and_then(Value::as_array);
-    if let Some(days) = days {
-        for day in days {
-            if boolish(day.get("is_today").or_else(|| day.get("isToday"))) {
-                let status = day.get("status").and_then(number_i64).unwrap_or(0);
-                let points = first_number(day, &["points", "rewardPoints"]);
-                let expiry = first_string(day, &["expire_at", "expireAt", "expireAtMs"]);
-                return (status == 2, status == 3, points, expiry);
-            }
-        }
-    }
-    let already = boolish(
-        data.get("checkedInToday")
-            .or_else(|| data.get("checked_in_today"))
-            .or_else(|| data.get("alreadyCompleted")),
-    );
-    let claimable = boolish(
-        data.get("claimableToday")
-            .or_else(|| data.get("claimable_today")),
-    );
-    (
-        claimable,
-        already,
-        first_number(&data, &["todayPoints", "points", "rewardPoints"]),
-        first_string(&data, &["expireAt", "expire_at"]),
-    )
-}
-
-fn parse_minimax_status(value: &Value) -> RewardStatus {
-    let (claimable, already, points, expires_at) = minimax_today(value);
-    RewardStatus {
-        profile: RewardProfileId::MiniMaxCode.to_string(),
-        claimable,
-        already_completed: already,
-        reward: reward_object([("points", points)]),
-        wallet: wallet_whitelist(
-            &payload(value),
-            &["credits", "balance", "quota", "totalCreditsRemaining"],
-        ),
-        expires_at,
-        message: None,
-    }
-}
-
-fn parse_minimax_claim(status: &RewardStatus, value: &Value) -> RewardClaim {
-    let data = payload(value);
-    let result = data
-        .get("claim_result")
-        .or_else(|| data.get("claimResult"))
-        .and_then(number_i64);
-    let already = result == Some(2) || status.already_completed;
-    let success =
-        response_code(value).is_none_or(|code| code == 0) && (already || result == Some(1));
-    RewardClaim {
-        profile: RewardProfileId::MiniMaxCode.to_string(),
-        success,
-        already_completed: already,
-        claimable: !already,
-        reward: reward_object([("points", first_number(&data, &["points", "rewardPoints"]))])
-            .or_else(|| status.reward.clone()),
-        wallet: wallet_whitelist(
-            &data,
-            &["credits", "balance", "quota", "totalCreditsRemaining"],
-        ),
-        expires_at: first_string(&data, &["expireAt", "expire_at", "expire_at_ms"])
-            .or_else(|| status.expires_at.clone()),
-        message: if already {
-            Some("今天已签到".into())
-        } else if success {
-            Some("签到完成".into())
-        } else {
-            Some("签到未完成".into())
-        },
-    }
-}
-
-fn parse_lobster_wallet(value: &Value) -> Option<Value> {
-    let data = payload(value);
-    let mut map = Map::new();
-    for key in ["totalCreditsRemaining", "creditsRemaining", "totalCredits"] {
-        if let Some(item) = data.get(key).filter(|v| v.is_number()) {
-            map.insert(key.into(), item.clone());
-        }
-    }
-    if let Some(items) = data.get("creditItems").and_then(Value::as_array) {
-        let clean = items
-            .iter()
-            .filter_map(|item| {
-                let object = item.as_object()?;
-                let mut row = Map::new();
-                for key in ["type", "label", "creditsRemaining", "expiresAt"] {
-                    if let Some(value) = object.get(key).filter(|v| v.is_number() || v.is_string())
-                    {
-                        row.insert(key.into(), value.clone());
-                    }
-                }
-                (!row.is_empty()).then_some(Value::Object(row))
-            })
-            .collect::<Vec<_>>();
-        if !clean.is_empty() {
-            map.insert("creditItems".into(), Value::Array(clean));
-        }
-    }
-    (!map.is_empty()).then_some(Value::Object(map))
-}
-
-#[derive(Clone, Debug)]
-struct LobsterState {
-    status: RewardStatus,
-    code: String,
-    revision: i64,
-}
-
-fn path_segment(value: &str) -> String {
-    // `form_urlencoded` 使用 `+` 表示空格，这是 query/form 的规则，不是
-    // path segment 的规则。活动 code 来自上游，必须按 RFC 3986 的 unreserved
-    // 集合编码，避免 `+`、`/` 等字符改变实际路由。
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-            encoded.push(byte as char);
-        } else {
-            encoded.push('%');
-            encoded.push(
-                char::from_digit((byte >> 4) as u32, 16)
-                    .unwrap()
-                    .to_ascii_uppercase(),
-            );
-            encoded.push(
-                char::from_digit((byte & 0x0f) as u32, 16)
-                    .unwrap()
-                    .to_ascii_uppercase(),
-            );
-        }
-    }
-    encoded
-}
-
-fn parse_lobster_slot(value: &Value) -> Option<(String, i64)> {
-    let data = payload(value);
-    if data.get("slotState").and_then(Value::as_str) != Some("available") {
-        return None;
-    }
-    let activity = data.get("activity")?.as_object()?;
-    let code = activity
-        .get("activityCode")
-        .or_else(|| activity.get("activity_code"))?
-        .as_str()?
-        .trim();
-    if code.is_empty() {
-        return None;
-    }
-    let revision = activity
-        .get("configRevision")
-        .or_else(|| activity.get("config_revision"))
-        .and_then(number_i64)
-        .unwrap_or(0);
-    Some((code.to_string(), revision))
-}
-
-fn parse_lobster_context(slot: &Value, context: &Value, wallet: Option<Value>) -> LobsterState {
-    let (code, revision) = parse_lobster_slot(slot).unwrap_or_default();
-    let data = payload(context);
-    let claimed = boolish(
-        data.pointer("/state/claimedToday")
-            .or_else(|| data.get("claimedToday")),
-    );
-    let has_action = data
-        .get("actions")
-        .and_then(Value::as_array)
-        .is_some_and(|items| items.iter().any(|v| v.as_str() == Some("check_in")));
-    let points = first_number(
-        &data,
-        &["creditsGranted", "rewardCredits", "credits", "points"],
-    );
-    LobsterState {
-        status: RewardStatus {
-            profile: RewardProfileId::LobsterAI.to_string(),
-            claimable: !claimed && has_action && !code.is_empty(),
-            already_completed: claimed,
-            reward: reward_object([("credits", points)]),
-            wallet,
-            expires_at: first_string(&data, &["expireAt", "expiresAt", "expire_at"]),
-            message: None,
-        },
-        code,
-        revision,
-    }
-}
-
-fn parse_lobster_claim(status: &RewardStatus, value: &Value, wallet: Option<Value>) -> RewardClaim {
-    let data = payload(value);
-    let already = status.already_completed
-        || boolish(
-            data.get("already")
-                .or_else(|| data.get("claimedToday"))
-                .or_else(|| data.get("alreadyCompleted")),
-        );
-    let reward = reward_object([(
-        "credits",
-        first_number(
-            &data,
-            &["creditsGranted", "rewardCredits", "credits", "points"],
-        ),
-    )])
-    .or_else(|| status.reward.clone());
-    let success =
-        response_code(value).is_none_or(|code| code == 0) && (already || reward.is_some());
-    RewardClaim {
-        profile: RewardProfileId::LobsterAI.to_string(),
-        success,
-        already_completed: already,
-        claimable: !already,
-        reward,
-        wallet,
-        expires_at: first_string(&data, &["expireAt", "expiresAt", "expire_at"])
-            .or_else(|| status.expires_at.clone()),
-        message: if already {
-            Some("今日已领取".into())
-        } else if success {
-            Some("签到完成".into())
-        } else {
-            Some("签到未完成".into())
-        },
-    }
-}
-
 fn astudio_headers(credential: &str, json_body: bool) -> Result<HeaderMap, RewardError> {
     validate_credential(credential, "AStudio Cookie")?;
     let mut headers = HeaderMap::new();
@@ -830,27 +560,6 @@ fn dumate_headers(credential: &str, json_body: bool) -> Result<HeaderMap, Reward
     if json_body {
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     }
-    Ok(headers)
-}
-
-fn bearer_headers(credential: &str) -> Result<HeaderMap, RewardError> {
-    validate_credential(credential, "access token")?;
-    let mut headers = HeaderMap::new();
-    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    let mut auth = header_value(&format!("Bearer {}", credential.trim()))?;
-    auth.set_sensitive(true);
-    headers.insert(AUTHORIZATION, auth);
-    Ok(headers)
-}
-
-fn lobster_headers(credential: &str) -> Result<HeaderMap, RewardError> {
-    let mut headers = bearer_headers(credential)?;
-    headers.insert(USER_AGENT, HeaderValue::from_static("LobsterAI/2026.9.4"));
-    headers.insert(
-        "X-LobsterAI-Client-Version",
-        HeaderValue::from_static(LOBSTER_CLIENT_VERSION),
-    );
     Ok(headers)
 }
 
@@ -973,187 +682,6 @@ async fn dumate_claim(
     Ok(claim)
 }
 
-async fn minimax_status(
-    client: &reqwest::Client,
-    credential: &str,
-) -> Result<RewardStatus, RewardError> {
-    let url =
-        format!("{MINIMAX_BASE}/minimax-cloud/api/v1/signin/status?timezone_id={MINIMAX_TIMEZONE}");
-    let response = client
-        .get(url)
-        .headers(bearer_headers(credential)?)
-        .timeout(HTTP_TIMEOUT)
-        .send()
-        .await
-        .map_err(|_| RewardError::invalid("MiniMax Code 状态请求失败"))?;
-    Ok(parse_minimax_status(
-        &response_json(response, credential).await?,
-    ))
-}
-
-async fn minimax_claim(
-    client: &reqwest::Client,
-    credential: &str,
-) -> Result<RewardClaim, RewardError> {
-    let status = minimax_status(client, credential).await?;
-    if status.already_completed || !status.claimable {
-        return Ok(RewardClaim {
-            profile: RewardProfileId::MiniMaxCode.to_string(),
-            success: status.already_completed,
-            already_completed: status.already_completed,
-            claimable: status.claimable,
-            reward: status.reward,
-            wallet: status.wallet,
-            expires_at: status.expires_at,
-            message: Some(
-                if status.already_completed {
-                    "今天已签到"
-                } else {
-                    "今天暂不可领"
-                }
-                .into(),
-            ),
-        });
-    }
-    let url =
-        format!("{MINIMAX_BASE}/minimax-cloud/api/v1/signin/claim?timezone_id={MINIMAX_TIMEZONE}");
-    let response = client
-        .post(url)
-        .headers(bearer_headers(credential)?)
-        .json(&json!({}))
-        .timeout(HTTP_TIMEOUT)
-        .send()
-        .await
-        .map_err(|_| RewardError::invalid("MiniMax Code 签到请求失败"))?;
-    Ok(parse_minimax_claim(
-        &status,
-        &response_json(response, credential).await?,
-    ))
-}
-
-async fn lobster_state(
-    client: &reqwest::Client,
-    credential: &str,
-) -> Result<LobsterState, RewardError> {
-    let query =
-        "placement=desktop_sidebar&clientVersion=2026.9.4&containerApiVersion=2&platform=win32";
-    let slot_response = client
-        .get(format!("{LOBSTER_BASE}/api/client-activities/slot?{query}"))
-        .headers(lobster_headers(credential)?)
-        .timeout(HTTP_TIMEOUT)
-        .send()
-        .await
-        .map_err(|_| RewardError::invalid("LobsterAI 活动查询失败"))?;
-    let slot = response_json(slot_response, credential).await?;
-    let wallet = client
-        .get(format!("{LOBSTER_BASE}/api/user/profile-summary"))
-        .headers(lobster_headers(credential)?)
-        .timeout(HTTP_TIMEOUT)
-        .send()
-        .await
-        .map_err(|_| RewardError::invalid("LobsterAI 额度查询失败"))?;
-    let wallet = parse_lobster_wallet(&response_json(wallet, credential).await?);
-    let Some((code, revision)) = parse_lobster_slot(&slot) else {
-        return Ok(LobsterState {
-            status: RewardStatus {
-                profile: RewardProfileId::LobsterAI.to_string(),
-                claimable: false,
-                already_completed: false,
-                reward: None,
-                wallet,
-                expires_at: None,
-                message: Some("当前没有可用活动".into()),
-            },
-            code: String::new(),
-            revision: 0,
-        });
-    };
-    let context_url = format!(
-        "{LOBSTER_BASE}/api/client-activities/{}/context?configRevision={revision}",
-        path_segment(&code)
-    );
-    let context_response = client
-        .get(context_url)
-        .headers(lobster_headers(credential)?)
-        .timeout(HTTP_TIMEOUT)
-        .send()
-        .await
-        .map_err(|_| RewardError::invalid("LobsterAI 活动状态请求失败"))?;
-    let context = response_json(context_response, credential).await?;
-    Ok(parse_lobster_context(&slot, &context, wallet))
-}
-
-async fn lobster_status(
-    client: &reqwest::Client,
-    credential: &str,
-) -> Result<RewardStatus, RewardError> {
-    Ok(lobster_state(client, credential).await?.status)
-}
-
-fn random_idempotency_key() -> String {
-    let mut bytes = [0_u8; 16];
-    if getrandom::getrandom(&mut bytes).is_err() {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos() as u128);
-        bytes.copy_from_slice(&now.to_be_bytes());
-    }
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    format!("{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}", bytes[0],bytes[1],bytes[2],bytes[3],bytes[4],bytes[5],bytes[6],bytes[7],bytes[8],bytes[9],bytes[10],bytes[11],bytes[12],bytes[13],bytes[14],bytes[15])
-}
-
-async fn lobster_claim(
-    client: &reqwest::Client,
-    credential: &str,
-) -> Result<RewardClaim, RewardError> {
-    let state = lobster_state(client, credential).await?;
-    if state.status.already_completed || !state.status.claimable {
-        return Ok(RewardClaim {
-            profile: RewardProfileId::LobsterAI.to_string(),
-            success: state.status.already_completed,
-            already_completed: state.status.already_completed,
-            claimable: state.status.claimable,
-            reward: state.status.reward,
-            wallet: state.status.wallet,
-            expires_at: state.status.expires_at,
-            message: Some(
-                if state.status.already_completed {
-                    "今日已领取"
-                } else {
-                    "当前不可领取"
-                }
-                .into(),
-            ),
-        });
-    }
-    let url = format!(
-        "{LOBSTER_BASE}/api/client-activities/{}/actions/check_in",
-        path_segment(&state.code)
-    );
-    let response = client.post(url).headers(lobster_headers(credential)?).json(&json!({ "configRevision": state.revision, "idempotencyKey": random_idempotency_key(), "payload": {} })).timeout(HTTP_TIMEOUT).send().await.map_err(|_| RewardError::invalid("LobsterAI 签到请求失败"))?;
-    let result = response_json(response, credential).await?;
-    let wallet = match client
-        .get(format!("{LOBSTER_BASE}/api/user/profile-summary"))
-        .headers(lobster_headers(credential)?)
-        .timeout(HTTP_TIMEOUT)
-        .send()
-        .await
-    {
-        Ok(response) => response_json(response, credential)
-            .await
-            .ok()
-            .and_then(|v| parse_lobster_wallet(&v)),
-        Err(_) => None,
-    };
-    let fallback_wallet = state.status.wallet.clone();
-    Ok(parse_lobster_claim(
-        &state.status,
-        &result,
-        wallet.or(fallback_wallet),
-    ))
-}
-
 /// 查询奖励状态。传入 `None` 时内部创建默认 reqwest client。
 pub async fn status(
     profile: RewardProfileId,
@@ -1164,8 +692,6 @@ pub async fn status(
     match profile {
         RewardProfileId::AStudio => astudio_status(&owned, credential).await,
         RewardProfileId::DuMate => dumate_status(&owned, credential).await,
-        RewardProfileId::MiniMaxCode => minimax_status(&owned, credential).await,
-        RewardProfileId::LobsterAI => lobster_status(&owned, credential).await,
     }
 }
 
@@ -1179,8 +705,6 @@ pub async fn claim(
     match profile {
         RewardProfileId::AStudio => astudio_claim(&owned, credential).await,
         RewardProfileId::DuMate => dumate_claim(&owned, credential).await,
-        RewardProfileId::MiniMaxCode => minimax_claim(&owned, credential).await,
-        RewardProfileId::LobsterAI => lobster_claim(&owned, credential).await,
     }
 }
 
@@ -1189,13 +713,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn profile_catalog_has_four_redacted_entries() {
+    fn profile_catalog_contains_only_preset_api_rewards() {
         let list = list_profiles();
-        assert_eq!(list.len(), 4);
+        assert_eq!(list.len(), 2);
         let serialized = serde_json::to_string(&list).unwrap();
         assert!(!serialized.contains("Cookie"));
         assert!(!serialized.contains("Bearer"));
-        assert!(serialized.contains("minimax-code"));
+        assert!(serialized.contains("astudio"));
+        assert!(serialized.contains("dumate"));
+        assert!(!serialized.contains("minimax-code"));
+        assert!(!serialized.contains("lobsterai"));
     }
 
     #[test]
@@ -1219,35 +746,13 @@ mod tests {
     }
 
     #[test]
-    fn minimax_claim_panel_statuses_are_mapped() {
-        let available = parse_minimax_status(
-            &json!({"data":{"days":[{"is_today":true,"status":2,"points":300}]}}),
-        );
-        assert!(available.claimable);
-        assert_eq!(available.reward.unwrap()["points"], json!(300.0));
-        let claimed = parse_minimax_status(
-            &json!({"data":{"days":[{"is_today":true,"status":3,"points":300}]}}),
-        );
-        assert!(claimed.already_completed);
-        assert!(!claimed.claimable);
-    }
-
-    #[test]
-    fn lobster_dynamic_activity_code_and_claimed_state() {
-        let slot = json!({"data":{"slotState":"available","activity":{"activityCode":"campaign-2026","configRevision":7}}});
-        let context = json!({"data":{"state":{"claimedToday":false},"actions":["check_in"],"rewardCredits":100}});
-        let state =
-            parse_lobster_context(&slot, &context, Some(json!({"totalCreditsRemaining":1200})));
-        assert_eq!(state.code, "campaign-2026");
-        assert!(state.status.claimable);
-        assert_eq!(state.status.reward.unwrap()["credits"], json!(100.0));
-        let claimed = parse_lobster_context(
-            &slot,
-            &json!({"data":{"state":{"claimedToday":true},"actions":["check_in"]}}),
-            None,
-        );
-        assert!(claimed.status.already_completed);
-        assert!(!claimed.status.claimable);
+    fn native_provider_ids_are_not_custom_reward_profiles() {
+        assert!(parse_profile("astudio").is_ok());
+        assert!(parse_profile("dumate").is_ok());
+        assert!(parse_profile("minimax-code").is_err());
+        assert!(parse_profile("lobsterai").is_err());
+        assert!(!is_known_profile("minimax-code"));
+        assert!(!is_known_profile("lobsterai"));
     }
 
     #[test]
@@ -1271,21 +776,5 @@ mod tests {
             response_message(&json!({"data":{"msg":"登录失效"}}), ""),
             "登录失效"
         );
-    }
-
-    #[test]
-    fn path_segment_uses_percent_encoding_not_form_plus() {
-        assert_eq!(
-            path_segment("campaign 2026+/汉"),
-            "campaign%202026%2B%2F%E6%B1%89"
-        );
-    }
-
-    #[test]
-    fn random_idempotency_key_is_uuid_v4_shaped() {
-        let key = random_idempotency_key();
-        assert_eq!(key.len(), 36);
-        assert_eq!(&key[14..15], "4");
-        assert!(matches!(&key[19..20], "8" | "9" | "a" | "b"));
     }
 }

@@ -92,6 +92,12 @@ pub fn supports_checkin(account: &Value) -> bool {
     if provider == "qoder" {
         return true;
     }
+    // MiniMax Code / LobsterAI are native providers with their own reward
+    // protocol.  They are not custom providers and must bypass the generic
+    // edition filter below.
+    if matches!(provider, "minimax-code" | "lobsterai") {
+        return true;
+    }
     // AutoClaw 国际版也有独立的 daily_signin 任务链路，不能被通用 intl 判据挡掉。
     if provider == crate::server::core::account_store::AUTOCLAW_INTL_PROVIDER_ID {
         return true;
@@ -239,8 +245,10 @@ pub fn resolve_checkin_targets(
 ///   - **Qoder**：活动（campaign）领取链路，两个地区共用
 ///     （`providers::qoder::checkin::claim_daily_checkin`）；
 ///   - **Trae**：国内 SOLO 每日积分签到（`providers::trae::checkin::claim_daily`）。
-///   - **自定义奖励提供商**：按 `rewardProfile` 先查状态、再领取；奖励凭证
-///     与模型 API Key 分开存储。
+///   - **MiniMax Code**：原生 Provider 的每日签到；
+///   - **LobsterAI**：原生 Provider 的活动奖励；
+///   - **预置 API 奖励**：自定义 Provider 按 `rewardProfile` 先查状态、再领取；
+///     奖励凭证与模型 API Key 分开存储。
 ///
 /// 拿一家的 token 去打另一家的签到接口只会稳定报错，所以这条分派是必需的而不是
 /// 优化。各分支的收尾（claim → 结果行 + 日志）完全一致，共用 [`claim_result`]；
@@ -265,24 +273,24 @@ pub async fn checkin_for(store: &AccountStore, billing: &BillingService, account
         // account complete.
         provider if provider.starts_with(crate::server::core::custom_providers::ID_PREFIX) => {
             let Some(reward) = store.custom_reward_credential_by_id(&id) else {
-                return json!({
+                return with_reward_kind(
+                    json!({
                     "id": id,
                     "name": name,
                     "claim": Value::Null,
                     "error": "未配置奖励凭证",
-                });
+                    }),
+                    "preset_api_reward",
+                );
             };
             let result = async {
                 let profile =
                     crate::server::core::reward_profiles::parse_profile(&reward.profile_id)
                         .map_err(|error| redact_reward_error(&error.message, &reward.credential))?;
-                let status = crate::server::core::reward_profiles::status(
-                    profile.clone(),
-                    &reward.credential,
-                    None,
-                )
-                .await
-                .map_err(|error| redact_reward_error(&error.message, &reward.credential))?;
+                let status =
+                    crate::server::core::reward_profiles::status(profile, &reward.credential, None)
+                        .await
+                        .map_err(|error| redact_reward_error(&error.message, &reward.credential))?;
                 if status.already_completed || !status.claimable {
                     return Ok(reward_status_value(&status));
                 }
@@ -293,14 +301,42 @@ pub async fn checkin_for(store: &AccountStore, billing: &BillingService, account
                 Ok(reward_claim_value(&claim))
             }
             .await;
-            claim_result(id, name, &display, true, result)
+            with_reward_kind(
+                claim_result(id, name, &display, true, result),
+                "preset_api_reward",
+            )
+        }
+        "minimax-code" => {
+            let claim = crate::server::core::providers::minimax_code::checkin::claim_daily_checkin(
+                store, &id,
+            )
+            .await
+            .map_err(|error| error.to_string());
+            with_reward_kind(
+                claim_result(id, name, &display, true, claim),
+                "daily_checkin",
+            )
+        }
+        "lobsterai" => {
+            let claim = crate::server::core::providers::lobsterai::checkin::claim_activity_reward(
+                store, &id,
+            )
+            .await
+            .map_err(|error| error.to_string());
+            with_reward_kind(
+                claim_result(id, name, &display, true, claim),
+                "activity_reward",
+            )
         }
         "raccoon" => {
             let claim =
                 crate::server::core::providers::raccoon::balance::claim_daily_grant(store, &id)
                     .await
                     .map_err(|error| error.message);
-            claim_result(id, name, &display, true, claim)
+            with_reward_kind(
+                claim_result(id, name, &display, true, claim),
+                "daily_checkin",
+            )
         }
         "autoclaw" | "autoclaw-intl" => {
             let region =
@@ -311,7 +347,10 @@ pub async fn checkin_for(store: &AccountStore, billing: &BillingService, account
             )
             .await
             .map_err(|error| error.message);
-            claim_result(id, name, &display, true, claim)
+            with_reward_kind(
+                claim_result(id, name, &display, true, claim),
+                "daily_checkin",
+            )
         }
         "qoder" => {
             // 两个地区的每日权益都以活动（campaign）形式下发；有没有活动由
@@ -320,23 +359,32 @@ pub async fn checkin_for(store: &AccountStore, billing: &BillingService, account
                 crate::server::core::providers::qoder::checkin::claim_daily_checkin(store, &id)
                     .await
                     .map_err(|error| error.message);
-            claim_result(id, name, &display, true, claim)
+            with_reward_kind(
+                claim_result(id, name, &display, true, claim),
+                "activity_reward",
+            )
         }
         "trae" => {
             let claim = crate::server::core::providers::trae::checkin::claim_daily(store, &id)
                 .await
                 .map_err(|error| error.message);
-            claim_result(id, name, &display, true, claim)
+            with_reward_kind(
+                claim_result(id, name, &display, true, claim),
+                "daily_checkin",
+            )
         }
         // WorkBuddy 国内版与国际版共用 provider id，按 edition 选择任务形态。
         _ if provider_id == crate::server::core::providers::DEFAULT_PROVIDER_ID => {
             let Some(entry) = store.get_session_by_id(&id) else {
-                return json!({
-                    "id": id,
-                    "name": name,
-                    "claim": Value::Null,
-                    "error": "没有可用凭证",
-                });
+                return with_reward_kind(
+                    json!({
+                        "id": id,
+                        "name": name,
+                        "claim": Value::Null,
+                        "error": "没有可用凭证",
+                    }),
+                    "daily_checkin",
+                );
             };
             if account.get("edition").and_then(Value::as_str) == Some("intl") {
                 let activity = billing.workbuddy_daily_activity(&entry.session).await;
@@ -356,26 +404,35 @@ pub async fn checkin_for(store: &AccountStore, billing: &BillingService, account
                         &format!("账号 {display}: WorkBuddy 国际版 {message}"),
                     );
                 }
-                return json!({
+                return with_reward_kind(
+                    json!({
                     "id": id,
                     "name": name,
                     "claim": claim,
                     "activity": activity.get("activity").cloned().unwrap_or(Value::Null),
                     "error": Value::Null,
-                });
+                    }),
+                    "activity_reward",
+                );
             }
             let claim = billing
                 .claim_daily_checkin(Some(&entry.session))
                 .await
                 .map_err(|error| error.message);
-            claim_result(id, name, &display, false, claim)
+            with_reward_kind(
+                claim_result(id, name, &display, false, claim),
+                "daily_checkin",
+            )
         }
-        other => json!({
-            "id": id,
-            "name": name,
-            "claim": Value::Null,
-            "error": format!("{other} 的签到链路尚未接入"),
-        }),
+        other => with_reward_kind(
+            json!({
+                "id": id,
+                "name": name,
+                "claim": Value::Null,
+                "error": format!("{other} 的签到链路尚未接入"),
+            }),
+            "daily_checkin",
+        ),
     }
 }
 
@@ -422,6 +479,25 @@ fn redact_reward_error(message: &str, credential: &str) -> String {
         result = result.replace(key, "credential");
     }
     result
+}
+
+/// 给统一结果行标注奖励来源。保留既有 `{id,name,claim,error}` 外形，
+/// 在结果行顶层增加稳定的 `rewardKind`，前端可据此区分每日签到、活动奖励和
+/// 预置 API 奖励，不必通过文案猜测；claim 内的同名字段保留，兼容本轮早期客户端。
+fn with_reward_kind(mut row: Value, reward_kind: &str) -> Value {
+    if let Some(object) = row.as_object_mut() {
+        object.insert(
+            "rewardKind".to_string(),
+            Value::String(reward_kind.to_string()),
+        );
+    }
+    if let Some(claim) = row.get_mut("claim").and_then(Value::as_object_mut) {
+        claim.insert(
+            "rewardKind".to_string(),
+            Value::String(reward_kind.to_string()),
+        );
+    }
+    row
 }
 
 /// 把一次签到调用翻成统一的结果行（`{id, name, claim, error}`）。
@@ -623,6 +699,8 @@ mod tests {
             "provider": "autoclaw-intl",
             "edition": "intl",
         })));
+        assert!(supports_checkin(&json!({ "provider": "minimax-code" })));
+        assert!(supports_checkin(&json!({ "provider": "lobsterai" })));
     }
 
     #[test]
@@ -665,5 +743,19 @@ mod tests {
             "msg": "今日已领取",
         })));
         assert!(checkin_completed_today(&json!({ "success": true })));
+    }
+
+    #[test]
+    fn reward_kind_is_attached_to_claim_or_error_rows() {
+        let claimed = with_reward_kind(
+            json!({ "id": "a", "claim": { "success": true } }),
+            "activity_reward",
+        );
+        assert_eq!(claimed["claim"]["rewardKind"], "activity_reward");
+        let failed = with_reward_kind(
+            json!({ "id": "a", "claim": Value::Null, "error": "offline" }),
+            "daily_checkin",
+        );
+        assert_eq!(failed["rewardKind"], "daily_checkin");
     }
 }

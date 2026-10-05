@@ -20,7 +20,7 @@
 //!   "protocol": "chat_completions", // chat_completions / responses / anthropic
 //!   "baseUrl": "https://api.example.com/v1",
 //!   "enabled": true,
-//!   "rewardProfile": "astudio",   // 可选：astudio / dumate / minimax-code / lobsterai
+//!   "rewardProfile": "astudio",   // 可选：astudio / dumate（预置 API 奖励）
 //!   "createdAt": 1730000000000,
 //!   "models": [                     // 用户登记的模型清单（第二阶段起）
 //!     { "id": "gpt-x", "enabled": true, "reasoning": "",
@@ -1153,8 +1153,9 @@ fn validate_tool_type(value: Option<&Value>) -> Result<String, String> {
     Err("anthropicToolType 只支持 \"custom\"（留空表示不补 type）".to_string())
 }
 
-/// 奖励签到 profile：空串表示关闭该自定义提供商的签到适配；非空值必须是
-/// `core::reward_profiles` 注册的 profile id。写侧拒绝未知值，避免保存成功后
+/// 预置 API 奖励 profile：空串表示关闭该自定义提供商的签到适配；非空值必须是
+/// `core::reward_profiles` 注册的 AStudio / DuMate profile id。原生 Provider 的
+/// 奖励由各自 Provider 处理，不应配置在 custom provider 上。写侧拒绝未知值，避免保存成功后
 /// 定时签到才发现没有对应协议；读侧则由 [`reward_profile_of`] 对未来 profile
 /// 做容错回落。
 fn validate_reward_profile(value: Option<&Value>) -> Result<String, String> {

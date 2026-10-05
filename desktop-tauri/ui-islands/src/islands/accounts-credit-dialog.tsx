@@ -84,7 +84,7 @@ export function AccountsCreditDialog({ id, onClose, returnFocus, initialTab = 'c
   const growthEnabled = !!account && supportsGrowth(account) && !enterprise
   const providerLabel = ({
     qoder: 'Qoder', raccoon: '小浣熊', catpaw: '小浣熊', autoclaw: 'AutoClaw', 'autoclaw-intl': 'AutoClaw 国际版',
-    trae: 'Trae', 'cline-free': 'Cline Free', 'cline-pass': 'Cline Pass', accio: 'Accio', 'accio-cn': 'Accio', zcode: 'ZCode', 'zcode-intl': 'ZCode 国际版', codearts: 'CodeArts',
+    trae: 'Trae', 'minimax-code': 'MiniMax Code', lobsterai: 'LobsterAI', 'cline-free': 'Cline Free', 'cline-pass': 'Cline Pass', accio: 'Accio', 'accio-cn': 'Accio', zcode: 'ZCode', 'zcode-intl': 'ZCode 国际版', codearts: 'CodeArts',
   } as Record<string, string>)[providerOf(account)] || '余额'
   const isAutoClaw = providerOf(account) === 'autoclaw' || providerOf(account) === 'autoclaw-intl'
 

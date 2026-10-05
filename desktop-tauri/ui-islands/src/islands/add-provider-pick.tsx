@@ -17,7 +17,7 @@ import { accountCountOf, shared } from './add-account-bridge'
 import type { CustomProviderRecord } from './add-account-bridge'
 import { ADD_SEG_CLASS } from './add-provider-blocks'
 
-/** 第 1 步的账号类型：反代（内置八家）/ 预置 API / 自定义 / 导入 */
+/** 第 1 步的账号类型：反代（内置 Provider）/ 预置 API / 自定义 / 导入 */
 export type AccountType = 'proxy' | 'preset' | 'custom' | 'import'
 
 export const TYPE_PROXY: AccountType = 'proxy'
@@ -68,6 +68,7 @@ const PROVIDER_ICONS: Record<string, string> = {
   'zcode-intl': 'assets/providers/zcode.png',
   codearts: 'assets/providers/codearts.png',
   trae: 'assets/providers/trae.png',
+  'minimax-code': 'assets/providers/minimax-cn.png',
 }
 
 type CardItem = {

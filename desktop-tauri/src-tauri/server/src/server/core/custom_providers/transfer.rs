@@ -138,7 +138,8 @@ pub(crate) fn merge_imported(items: &[Value]) -> Result<MergeReport, String> {
 /// 展示名缺失不报错：`item_of` 会回落成 id，与读取路径同一取向。
 fn normalize_item(object: &Map<String, Value>) -> Result<Value, String> {
     // 对导入文件里的 profile 仍执行写侧校验：读侧归一只负责容忍旧数据，
-    // 新导入不能把未知 profile 静默变成空串后报告“成功”。
+    // 新导入不能把未知 profile（原生 Provider 的奖励也不属于 custom profile）
+    // 静默变成空串后报告“成功”。
     validate_reward_profile(object.get("rewardProfile"))?;
     let mut item = item_of(object);
     let base_url = item

@@ -129,6 +129,9 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   // 积分池 + ide_user_pay_status 的快请求与 SOLO 并发）。
   // 签到钱包与模型积分池是两笔账，签到结果只刷新余额，不并入模型积分池明细。
   trae: { usage: true, checkin: true, edition: false, identifier: 'uid', expiry: 'expiresAt' },
+  // MiniMax Code / LobsterAI：原生 Provider 自己维护额度与奖励活动，不使用 edition。
+  'minimax-code': { usage: true, checkin: true, edition: false, identifier: 'userId', expiry: 'expiresAt' },
+  lobsterai: { usage: true, checkin: true, edition: false, identifier: 'userId', expiry: 'expiresAt' },
 }
 
 /**
@@ -277,7 +280,8 @@ export function accountEdition(account: AccountRecord | null | undefined): 'cn' 
  *
  * WorkBuddy 国际版没有国内版的普通签到按钮，但参考客户端把它接到同一个
  * 调度入口：探测/领取日活奖励后，再用免费模型完成一次活跃保活；Qoder 两个
- * 地区都由 campaigns 实时判断活动状态。
+ * 地区都由 campaigns 实时判断活动状态；MiniMax Code / LobsterAI 是原生
+ * Provider，各自通过自己的奖励接口完成领取。
  *
  * 与后端同源同口径：`billing::checkin::supports_checkin` 也是这条判据，
  * 两处任一改动都要同时改（批量签到的目标集合由后端算，前端这处只决定按钮）。
@@ -285,7 +289,7 @@ export function accountEdition(account: AccountRecord | null | undefined): 'cn' 
 export function supportsCheckin(account: AccountRecord | null | undefined): boolean {
   const provider = providerOf(account)
   if (!providerFeatures(provider).checkin) return false
-  if (provider === DEFAULT_PROVIDER_ID || provider === 'qoder') return true
+  if (provider === DEFAULT_PROVIDER_ID || provider === 'qoder' || provider === 'minimax-code' || provider === 'lobsterai') return true
   return accountEdition(account) !== 'intl'
 }
 

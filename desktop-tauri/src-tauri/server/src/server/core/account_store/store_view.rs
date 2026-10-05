@@ -24,9 +24,9 @@ use crate::server::core::account_store::store_util::token_tail_of;
 use crate::server::core::account_store::store_util::{
     js_truthy, max_concurrent_public, value_or, value_or_nullish,
 };
+use crate::server::core::custom_providers;
 use crate::server::core::endpoints::{resolve_edition, EditionInfo};
 use crate::server::core::proxies::describe_account_proxy;
-use crate::server::core::custom_providers;
 
 impl AccountStore {
     // ─── 公开形态 ────────────────────────────────────────────
@@ -238,6 +238,10 @@ impl AccountStore {
             // 所以这里没有 `is_trae_family` —— 将来接国际版时另立 kind、
             // 另开一个分支，不要往本家的记录上挂 `region` 字段。
             self.to_trae_public_account(record)
+        } else if record.provider() == super::LOBSTERAI_PROVIDER_ID {
+            self.to_lobsterai_public_account(record)
+        } else if record.provider() == super::MINIMAX_CODE_PROVIDER_ID {
+            self.to_minimax_code_public_account(record)
         } else if record
             .provider()
             .starts_with(crate::server::core::custom_providers::ID_PREFIX)
@@ -373,8 +377,9 @@ impl AccountStore {
             .and_then(Value::as_str)
             .map(str::trim)
             .unwrap_or("");
-        // 凭证独立存储，关闭提供商的 rewardProfile 时保留它以便日后重新启用，
-        // 但公开状态不能继续显示为“已配置”。未知的历史 provider 没有配置
+        // 凭证独立存储，关闭预置 API 提供商的 rewardProfile 时保留它以便日后重新启用，
+        // 但公开状态不能继续显示为“已配置”。原生 Provider 的奖励凭证不走
+        // custom provider 视图；未知的历史 provider 没有配置
         // 记录，沿用旧行为，避免把仅凭账号数据存在的状态误判成已关闭。
         let reward_profile_active = custom_providers::get(&record.provider())
             .map(|provider| {
