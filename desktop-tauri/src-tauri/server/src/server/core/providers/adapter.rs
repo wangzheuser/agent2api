@@ -306,6 +306,11 @@ pub trait ProviderAdapter: Send + Sync {
     /// 本适配器对应的 provider
     fn kind(&self) -> ProviderKind;
 
+    /// 推理请求及其验证码生产者共用的直连选择；默认沿用账号出口。
+    fn chat_uses_direct_egress(&self, _account: &Value) -> bool {
+        false
+    }
+
     /// 该 provider 的模型清单（供聚合目录 / 路由判定）。
     ///
     /// 返回的是**上游原始形态**的记录数组（字段名与 `/v3/config` 或

@@ -59,6 +59,11 @@ pub static ZCODE_INTL_ADAPTER: ZcodeAdapter = ZcodeAdapter { region: Region::Int
 const REASONING_FIELD: &str = "reasoning_effort";
 const SUCCESS_HEAD_LIMIT: usize = 64 * 1024;
 
+fn start_plan_direct(account: &Value, configured: Option<&str>) -> bool {
+    super::plan_of(account) == super::PLAN_START
+        && configured.is_some_and(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"))
+}
+
 impl ZcodeAdapter {
     /// 本实例的地区（供 `adapter_for` 之外的调用点自查，例如领取任务的选路）
     pub fn region(&self) -> Region {
@@ -160,6 +165,10 @@ impl ProviderAdapter for ZcodeAdapter {
 
     fn request_is_single_use(&self, account: &Value) -> bool {
         super::plan_of(account) == super::PLAN_START
+    }
+
+    fn chat_uses_direct_egress(&self, account: &Value) -> bool {
+        start_plan_direct(account, self.region.env_override("START_PLAN_DIRECT").as_deref())
     }
 
     fn build_chat_request(

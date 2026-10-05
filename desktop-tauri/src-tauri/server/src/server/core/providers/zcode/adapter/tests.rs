@@ -3,6 +3,19 @@ use crate::server::core::protocol::{anthropic, responses};
 use crate::server::core::providers::adapter::ReasoningPatch;
 use serde_json::json;
 
+#[test]
+fn direct_egress_requires_start_plan_and_explicit_enable() {
+    let start = json!({"zcodePlan": "start-plan"});
+    let coding = json!({"zcodePlan": "coding-plan"});
+    for flag in [None, Some("0"), Some("false")] {
+        assert!(!start_plan_direct(&start, flag));
+    }
+    for flag in [Some("1"), Some("true"), Some(" TRUE ")] {
+        assert!(start_plan_direct(&start, flag));
+        assert!(!start_plan_direct(&coding, flag));
+        assert!(!start_plan_direct(&json!({}), flag));
+    }
+}
 fn ingress(protocol: &str, model: &str, effort: Option<&str>, stream: bool) -> Value {
     let mut body = json!({"model": model, "stream": stream,
         "messages": [{"role": "user", "content": "hello"}]});

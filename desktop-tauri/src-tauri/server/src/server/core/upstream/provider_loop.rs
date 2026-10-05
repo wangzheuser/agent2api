@@ -888,7 +888,11 @@ async fn attempt_queue(
                 url: plan.url,
                 headers: plan.headers,
                 payload,
-                proxy: target.proxy.clone(),
+                proxy: if adapter.chat_uses_direct_egress(&session) {
+                    None
+                } else {
+                    target.proxy.clone()
+                },
             };
             // ── 调试模式：抓一份即将发出去的原始报文 ──────────────────
             // 位置在 `build_chat_request` 之后（URL / 头 / body 都已定稿）。

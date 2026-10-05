@@ -161,7 +161,15 @@ async fn configuration(state: &ServerState, account_id: &str) -> Result<Value, &
     let proxy = state
         .store()
         .get_session_by_id(account_id)
-        .and_then(|item| proxies::session_proxy(&item.session));
+        .and_then(|item| {
+            if crate::server::core::providers::adapter::adapter_for(region.kind())
+                .chat_uses_direct_egress(&item.session)
+            {
+                None
+            } else {
+                proxies::session_proxy(&item.session)
+            }
+        });
     let config = claim::captcha_config(region, proxy.as_ref())
         .await
         .map_err(|_| "config_fetch_failed")?
