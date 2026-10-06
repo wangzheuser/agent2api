@@ -9,7 +9,10 @@
 //!
 //! ── 上游协议 ────────────────────────────────────────────────
 //! 推理走 **OpenAI 兼容**端点：`POST {openai_base}/chat/completions`，
-//! `Authorization: Bearer {token}`，发送前统一归一思考等级。
+//! `Authorization: Bearer {token}`。模型名不改写；思考等级是唯一被改写的
+//! 字段 —— 映射上绑定的默认档由 [`ProviderAdapter::reasoning_patch`] 注入，
+//! 随后 `reasoning::apply_to_chat` 把它归一成上游认的三档（见 `super::reasoning`
+//! 的模块头），客户端没点名等级时那条链什么也不做、保持上游默认。
 //! 因此 `is_stateful()` 保持默认 false（一次发送由通用编排层完成），
 //! 与 CatPaw / Qoder / Accio 那三家「适配器自己发」的情形不同。
 //!
@@ -29,7 +32,7 @@
 //! release 是 `panic=abort`：本文件零 unwrap/expect/panic。
 
 use axum::http::HeaderMap;
-use serde_json::Value;
+use serde_json::{json, Map, Value};
 
 use crate::server::core::account_store::AccountStore;
 use crate::server::errors::GatewayError;
@@ -95,10 +98,29 @@ impl ProviderAdapter for ZcodeAdapter {
     /// 两地共用的默认等级绑定；客户端显式字段优先，能力按上游模型判定。
     fn reasoning_patch(&self, level: &str, model: &str, body: &Value) -> ReasoningPatch {
         if body.get(REASONING_FIELD).is_some()
-            || body.pointer("/thinking/type").and_then(Value::as_str) == Some("disabled")
+            || body
+                .pointer("/thinking/type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("disabled"))
         {
             return ReasoningPatch::Skip {
-                reason: "客户端已指定思考参数，绑定不覆盖",
+                reason: "客户端请求体里已指定思考参数，绑定不覆盖",
+            };
+        }
+        if super::reasoning::is_glm53(model) {
+            if crate::server::core::model_rules::reasoning_rank(level).is_none() {
+                return ReasoningPatch::Skip {
+                    reason: "该等级不在通用档位表内（自定义等级不参与转发）",
+                };
+            }
+            return match super::reasoning::normalize(Some(level)) {
+                Some(effort) => ReasoningPatch::Set {
+                    field: super::reasoning::EFFORT_FIELD,
+                    value: Value::String(effort.as_str().to_string()),
+                },
+                None => ReasoningPatch::Skip {
+                    reason: "该等级没有可翻译的 ZCode 目标值",
+                },
             };
         }
         let Some(effort) = normalize_effort(model, level) else {
@@ -112,18 +134,38 @@ impl ProviderAdapter for ZcodeAdapter {
         }
     }
 
-    /// 日志与发送体使用同一归一规则。
+    /// 随请求上行的思考等级（请求日志「上游等级」列的采集口）。
     fn outbound_reasoning(&self, body: &Value) -> Option<String> {
-        let level = body.get(REASONING_FIELD)?.as_str()?;
         let model = body.get("model").and_then(Value::as_str).unwrap_or("");
-        Some(normalize_effort(model, level).unwrap_or(level).to_string())
+        if let Some(level) = body
+            .get(super::reasoning::EFFORT_FIELD)
+            .and_then(Value::as_str)
+            .filter(|_| super::reasoning::is_glm53(model))
+            .and_then(|level| super::reasoning::normalize(Some(level)))
+        {
+            return Some(level.as_str().to_string());
+        }
+        if let Some(level) = body
+            .get(REASONING_FIELD)
+            .and_then(Value::as_str)
+            .and_then(|level| normalize_effort(model, level))
+        {
+            return Some(level.to_string());
+        }
+        if let Some(level) = body.get(REASONING_FIELD).and_then(Value::as_str) {
+            return Some(level.to_string());
+        }
+        crate::server::core::model_rules::read_client_level(body)
+            .filter(|level| !crate::server::core::model_rules::reasoning_is_off(level))
     }
 
     /// 构造上游请求：按账号的「使用套餐」（`zcodePlan`）**二选一**。
     ///
     ///   - `coding-plan`（默认）：`POST {openai_base}/chat/completions`，
-    ///     `Authorization: Bearer {accessToken}`，body 使用 OpenAI 协议，发送前
-    ///     按该通道的模型能力归一 `reasoning_effort`；
+    ///     `Authorization: Bearer {accessToken}`，模型名不改写；思考等级由
+    ///     [`Self::reasoning_patch`] 注入映射绑定的默认档、再由
+    ///     `reasoning::apply_to_chat` 归一后发出（客户端没绑定也没点名等级时
+    ///     保持上游默认）；
     ///   - `start-plan`：`POST {zcode}/api/v1/zcode-plan/anthropic/v1/messages`，
     ///     `Authorization: Bearer {jwt}`，OpenAI 体翻成 Anthropic 并装配官方
     ///     系统提示词块 —— 细节全在 [`super::plan`]，本函数只做分派。
@@ -199,10 +241,24 @@ impl ProviderAdapter for ZcodeAdapter {
             ("Authorization".to_string(), format!("Bearer {token}")),
         ];
         headers.extend(identity_headers(None));
+        let mut outgoing = prepare_reasoning(body);
+        // 思考等级：这条通道没有「思考预算」这个概念，`reasoning_effort` 是唯一
+        // 的旋钮，注了才拦得住「小输出额度被思考吃光、正文空串」（见
+        // `super::reasoning` 的模块头与 `apply_to_chat` 的说明）。
+        let wire_model = outgoing
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        super::reasoning::apply_to_chat(&mut outgoing, &wire_model);
+        // 流式补 `stream_options.include_usage`：上游只在显式要求时才回用量帧，
+        // 不补的话这条通道的输入/输出/缓存三列恒为 0（面板看着像没计费）。
+        // 与 workbuddy 的 `normalize` 同一手法：**不覆盖**客户端已有的取值。
+        ensure_include_usage(&mut outgoing);
         Ok(ChatRequestPlan::chat(
             format!("{}/chat/completions", self.openai_base_url()),
             headers,
-            prepare_reasoning(body),
+            outgoing,
         ))
     }
 
@@ -511,3 +567,32 @@ fn prepare_reasoning(body: &Value) -> Value {
 
 #[cfg(test)]
 mod tests;
+
+/// 流式请求补 `stream_options.include_usage = true`。
+///
+/// ── 为什么要补 ──────────────────────────────────────────────
+/// OpenAI 协议的流式响应**默认不带用量帧**，上游只在客户端显式要求时才在流末
+/// 补一帧 `usage`。不补的后果是这条通道的请求日志三列（输入 / 输出 / 缓存）
+/// 恒为 0 —— 面板看着像「这条没计费」，也让「用量对不上上游账单」这类问题
+/// （issue #56）失去参照物。非流式响应本来就带 usage，因此这里只动流式。
+///
+/// ── 为什么不覆盖客户端的取值 ────────────────────────────────
+/// 客户端可能显式写了 `include_usage: false`（少数客户端拿它省一帧），
+/// 那是它的选择；网关补的是**缺省值**，不是替它做决定 —— 与 workbuddy
+/// `normalize` 的 `stream_options` 处理同一条口径。
+fn ensure_include_usage(body: &mut Value) {
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    if object.get("stream").and_then(Value::as_bool) != Some(true) {
+        return;
+    }
+    let options = object
+        .entry("stream_options".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if let Some(options) = options.as_object_mut() {
+        options
+            .entry("include_usage".to_string())
+            .or_insert_with(|| json!(true));
+    }
+}

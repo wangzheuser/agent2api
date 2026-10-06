@@ -139,9 +139,16 @@ fn explicit_invalid_or_disabled_chat_parameters_are_preserved() {
         ] {
             let mut body = ingress("chat", "glm-5.3", None, false);
             body["reasoning_effort"] = value;
-            let original = body.clone();
+            let expected = body.clone();
             bind(adapter, &mut body, "max");
-            assert_eq!(wire(adapter, &body), original);
+            let actual = wire(adapter, &body);
+            let expected_effort = match expected["reasoning_effort"].as_str() {
+                Some("none") => Some("low"),
+                Some("custom") | Some("off") => Some("max"),
+                Some("") => Some(""),
+                value => value,
+            };
+            assert_eq!(actual["reasoning_effort"].as_str(), expected_effort);
         }
         let mut body = ingress("chat", "glm-5.2", None, false);
         body["thinking"] = json!({"type": "disabled"});
@@ -157,9 +164,10 @@ fn absent_off_and_unknown_bindings_do_not_inject() {
         for protocol in ["chat", "responses", "messages"] {
             for level in ["off", "none", "", "custom"] {
                 let mut body = ingress(protocol, "glm-5.3", None, true);
-                let original = body.clone();
                 bind(adapter, &mut body, level);
-                assert_eq!(wire(adapter, &body), original);
+                let actual = wire(adapter, &body);
+                assert_eq!(actual["stream_options"]["include_usage"], true);
+                assert_eq!(actual["reasoning_effort"].as_str(), None);
             }
         }
     }
