@@ -1412,6 +1412,95 @@ pub fn set_prompt_provider(provider_id: &str, patch: Option<ProviderPromptPatch>
     })
 }
 
+/// WorkBuddy 拆家迁移（2026-10）的**一次性标记**（config 顶层键）。
+///
+/// ── 为什么这几条迁移需要一个标记（与 `migrate_cline_split` 的差别）────
+/// Cline 那次是**改名**：旧键改完就不存在了，天然只命中一次。WorkBuddy 拆家
+/// 涉及的三条都是**复制**（模型规则、网关 Key 白名单、按家提示词覆盖）：
+/// 「一边有、另一边没有就补一份」这种判据在拆家之后**一直成立** —— 用户之后
+/// 在国内版新做的一次启停、新建的一把限了 workbuddy 的 Key、新配的一段提示词，
+/// 都会在下次启动被镜像到国际版，反复覆盖用户的明确意图。
+///
+/// 因此三条迁移共用一个标记、由 `account_bootstrap` 统一编排（见那里的调用点）：
+/// 处理过一次就不再回头，与 `raccoonImported` / `autoclawImported` 那几个
+/// 一次性导入标记同一模式。
+///
+/// 它是**配置键**而不是 `db::schema::RESERVED_KV_KEYS` 里的保留键：那一张表
+/// 是「不归配置管的零散状态」，本键由配置 API 读写。
+const WORKBUDDY_SPLIT_FLAG: &str = "workbuddySplitMigrated";
+
+/// 本机是否已经处理过 WorkBuddy 拆家的存量迁移
+pub fn workbuddy_split_migrated() -> bool {
+    current()
+        .raw()
+        .get(WORKBUDDY_SPLIT_FLAG)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// 写下「拆家迁移已处理」的标记。
+///
+/// **无论有没有可迁移的内容都要写**（全新安装也一样）：没有可继承的东西不代表
+/// 没处理过 —— 不写的话，用户之后配置国内版时那三条复制型迁移会突然把那些
+/// 配置镜像过去（正是本标记要防的事）。
+///
+/// 唯一**不**写的场合是规则迁移没落盘（见 `account_bootstrap` 的调用点）：
+/// 那时下次启动重来一次比停在半迁移状态安全。
+pub fn mark_workbuddy_split_migrated() -> bool {
+    update_raw_field(WORKBUDDY_SPLIT_FLAG, Value::Bool(true))
+}
+
+/// WorkBuddy 拆家（2026-10）的提示词覆盖同步：把 `promptProviders.workbuddy`
+/// **原样复制**一份给 `workbuddy-intl`。
+///
+/// ── 为什么必须做（不做的后果是静默失效）──────────────────────
+/// 拆家前 `workbuddy` 这一个 id 覆盖两个站点，因此「给 WorkBuddy 单独配一段
+/// 提示词 / 切成替换或追加模式」的用户设置本来对两地都生效。拆家后国际版是
+/// 另一个 id：不复制的话，那些设置对国际版**静默回落到全局默认**
+/// （多半是 passthrough），而这条设置最常见的用途恰恰是绕开 system 指纹拦截
+/// —— 症状是「国内版不撞 11-128、国际版又撞了」，用户完全想不到要去设置页
+/// 给另一家再配一遍。
+///
+/// ── 为什么是复制而不是搬（与 `migrate_cline_split` 的差别）──────
+/// 旧 id `workbuddy` 仍然存在（它就是国内版），搬走会把国内版的配置清空。
+///
+/// ── 实现口径 ────────────────────────────────────────────────
+/// 值**逐字复制**（不解析再重建）：这一项的形状由 `api::prompt` 的写侧校验，
+/// 这里只搬字节，任何重建都可能丢掉将来新增的键。没有 `workbuddy` 条目时
+/// 不写（不凭空造一个空壳）。
+///
+/// **只跑一次**：调用点（`account_bootstrap`）把它与另外两条拆家迁移放在同一个
+/// 一次性标记之下 —— 复制类迁移不能每次启动都跑，那会把用户拆家之后给国内版
+/// 新配的提示词反复镜像给国际版（完整理由见 [`WORKBUDDY_SPLIT_FLAG`]）。
+pub fn migrate_workbuddy_split_prompt_providers() -> Option<String> {
+    let intl = crate::server::core::providers::workbuddy::Region::Intl.provider_id();
+    let mut summary: Option<String> = None;
+    update(|config| {
+        let table = config
+            .raw
+            .get(KEY_PROMPT_PROVIDERS)
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        if table.contains_key(intl) {
+            return;
+        }
+        let Some(inherited) = table.get("workbuddy").cloned() else {
+            return;
+        };
+        let mut next = table;
+        next.insert(intl.to_string(), inherited);
+        config
+            .raw
+            .insert(KEY_PROMPT_PROVIDERS.to_string(), Value::Object(next));
+        config.prompt = prompt_from(&config.raw);
+        summary = Some(format!(
+            "💬 已把 WorkBuddy 的提示词覆盖同步给国际版（拆家前它对两地都生效，设置口径保持不变）：{intl}"
+        ));
+    });
+    summary
+}
+
 /// 写**某一家**的网关自带提示词**正文覆盖**（`None` = 删键、回到官方原文）。
 ///
 /// 与 [`set_prompt_gateway`]（装不装）分开两张表：改文本与拨开关互不牵连 ——

@@ -47,9 +47,10 @@ use crate::server::core::auth::{
     urlencoding, with_expires_at, AuthService, WorkBuddyAuthError, SERVER_CODE_RETRY_FETCH_TOKEN,
 };
 use crate::server::core::endpoints::{resolve_edition, Context, DEFAULT_EDITION};
+use crate::server::core::providers::workbuddy::Region;
 use crate::server::core::providers::adapter::adapter_for;
 use crate::server::core::providers::raccoon::oauth;
-use crate::server::core::providers::{kind_from_id, kind_id, ProviderKind, DEFAULT_PROVIDER_ID};
+use crate::server::core::providers::{kind_from_id, kind_id, ProviderKind};
 use crate::server::errors::GatewayError;
 use crate::server::logging;
 
@@ -339,20 +340,22 @@ impl LoginService {
     ///
     /// 立刻返回任务句柄，登录流程在后台任务里跑 —— authUrl 与 state 由
     /// 回调写进句柄，调用方（`/api/session/login/start`）负责等它出现。
-    pub fn start(&self, edition: Option<&str>) -> LoginTaskHandle {
-        let info = resolve_edition(edition.or(Some(DEFAULT_EDITION)));
-        let handle = self.new_handle(info);
-        self.spawn_login(handle.clone(), info.id.to_string());
+    /// `region` 由**调用方按 provider id 反查**给出（国内版 / 国际版）。
+    ///
+    /// 拆家后不读 body 里的 `edition`：界面上两个地区是两个条目，点哪个就发
+    /// 哪个 provider id —— 那是权威。拿一个回显字段定地区，会出现「点了国际版
+    /// 却落了国内版账号」，而账号一旦落错家，转发会稳定打错域名
+    /// （与 `api::session` 里 ZCode 那段注释同一条理由）。
+    pub fn start(&self, region: Region) -> LoginTaskHandle {
+        let handle = self.new_handle_for_provider(region.edition(), region.provider_id());
+        self.spawn_login(handle.clone(), region);
         handle
     }
 
     /// 建一个任务句柄但不启动后台任务（`/auth/login` 的同步登录用它 ——
     /// 那条路径自己 await 登录流程，不能再起一个后台任务重复登录）
-    fn new_handle(
-        &self,
-        info: &'static crate::server::core::endpoints::EditionInfo,
-    ) -> LoginTaskHandle {
-        self.new_handle_for_provider(info, DEFAULT_PROVIDER_ID)
+    fn new_handle(&self, region: Region) -> LoginTaskHandle {
+        self.new_handle_for_provider(region.edition(), region.provider_id())
     }
 
     /// 同上，但显式指定 provider（网页登录的任务表要记住它，见 `LoginTaskState::provider`）。
@@ -557,15 +560,15 @@ impl LoginService {
     /// 命令行入口要的就是「等登录完成才响应」。任务句柄仍然建一个，
     /// 这样 authUrl 能被回调写进去（日志用它打印链接），登录结果也能
     /// 被 `/api/session/login/wait` 查到（与 Node 版共用 loginTasks 一致）。
-    pub async fn run_login(&self, edition: Option<&str>) -> Result<Value, WorkBuddyAuthError> {
-        let info = resolve_edition(edition.or(Some(DEFAULT_EDITION)));
+    pub async fn run_login(&self, region: Region) -> Result<Value, WorkBuddyAuthError> {
+        let info = region.edition();
         logging::log(
             "[Login]",
             &format!("发起{}登录（{}）…", info.label, info.endpoint),
         );
-        let handle = self.new_handle(info);
+        let handle = self.new_handle(region);
         let session = self
-            .login_interactive(Some(info.id), &handle, |url, _state| {
+            .login_interactive(region, &handle, |url, _state| {
                 logging::log("[Login]", "请在浏览器中打开以下链接并完成登录：");
                 logging::console_line("[Login]", &format!("  {url}"));
                 logging::log("[Login]", "登录完成后本网关将自动获取并保存 token…");
@@ -876,12 +879,12 @@ impl LoginService {
     }
 
     /// 后台起一个登录任务，并把「失败/完成」写回任务句柄。
-    fn spawn_login(&self, handle: LoginTaskHandle, edition: String) {
+    fn spawn_login(&self, handle: LoginTaskHandle, region: Region) {
         let this = self.clone();
         crate::spawn_task(async move {
             let handle_for_callback = handle.clone();
             let result = this
-                .login_interactive(Some(edition.as_str()), &handle, move |url, state| {
+                .login_interactive(region, &handle, move |url, state| {
                     // 回调发生在轮询任务内：把 authUrl/state 落进句柄，
                     // 让 /start 的等待与 /wait 的轮询都能看到
                     let state = state.map(str::to_string);
@@ -905,7 +908,10 @@ impl LoginService {
                     finish_task(&handle, &session);
                     logging::log(
                         "[Login]",
-                        &format!("✅ 登录任务完成（{edition}，账号 {account_uid}）"),
+                        &format!(
+                            "✅ 登录任务完成（{}，账号 {account_uid}）",
+                            crate::server::core::providers::label_of(region.provider_id())
+                        ),
                     );
                 }
                 Err(error) => {
@@ -927,11 +933,16 @@ impl LoginService {
     /// 每拍轮询前检查任务的 `canceled` 标记 —— 等价 Node 的 `signal.aborted`。
     async fn login_interactive(
         &self,
-        edition: Option<&str>,
+        region: Region,
         handle: &LoginTaskHandle,
         on_auth_url: impl Fn(&str, Option<&str>),
     ) -> Result<Value, WorkBuddyAuthError> {
-        let context: Context = context_for_edition(edition, None);
+        // 端点覆盖按本地区取（staging / 自建反向代理用户的落点，见
+        // `Region::env_endpoint_override`）
+        let context: Context = context_for_edition(
+            Some(region.id()),
+            region.env_endpoint_override().as_deref(),
+        );
         let headers = anonymous_headers();
         let url = context.auth_url(&format!(
             "/auth/state?platform={}",
@@ -1006,7 +1017,10 @@ impl LoginService {
                         "登录成功但获取账号信息失败（缺少 uid），请重试",
                     ));
                 }
-                let saved = self.store.add_account(&session, None).map_err(|error| {
+                let saved = self
+                    .store
+                    .add_account(&session, None, Some(region.provider_id()))
+                    .map_err(|error| {
                         WorkBuddyAuthError::with_status(error.status_code, error.message)
                     })?;
                 let name = saved

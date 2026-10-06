@@ -63,8 +63,11 @@ pub const KV_KEY: &str = "modelCatalogCache";
 // 粒度是**一个远程目录一条**：按地区分开的目录（Qoder / AutoClaw / Accio）
 // 各自一条，与各家内存状态的粒度一致。
 
-/// WorkBuddy（`/v3/config`）
+/// WorkBuddy 国内版（`/v3/config`）
 pub const SCOPE_WORKBUDDY: &str = "workbuddy";
+/// WorkBuddy 国际版（`/v3/config`；另一个站点、另一份清单，见
+/// `providers::workbuddy::region`）
+pub const SCOPE_WORKBUDDY_INTL: &str = "workbuddyIntl";
 /// 小浣熊（`/model_catalog`）
 pub const SCOPE_RACCOON: &str = "raccoon";
 /// Qoder 国际版
@@ -91,6 +94,7 @@ pub const SCOPE_TRAE: &str = "trae";
 /// 全部 scope（事实来源：`cached_scopes` 按它遍历；新增一家时加在这里）。
 pub const ALL_SCOPES: &[&str] = &[
     SCOPE_WORKBUDDY,
+    SCOPE_WORKBUDDY_INTL,
     SCOPE_RACCOON,
     SCOPE_QODER_GLOBAL,
     SCOPE_QODER_CN,

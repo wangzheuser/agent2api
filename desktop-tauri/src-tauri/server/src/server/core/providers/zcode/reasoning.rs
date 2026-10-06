@@ -29,16 +29,28 @@
 //! 留得住正文空间。本模块照此实现，并补一条自己的兜底规则（见 [`resolve`]
 //! 里「短输出」那一档）。
 //!
-//! ── 契约只对 5.3 家族生效 ───────────────────────────────────
+//! ── 预算契约只对 5.3 家族生效 ───────────────────────────────
 //! 下面的预算数字（8000 / 16000 / 32000）来自官方目录 `agent/configs` 的
 //! `builtinModels[].reasoning.levels`，**只有 GLM-5.3 与 GLM-5.3-Flash 有
-//! 目录与实测依据**。glm-5 / 5.1 / 5.2 / 4.x 的档位表我们没有证据
-//! （参考实现的模型匹配式也刻意把它们排除在外），因此那些模型原样走通用
-//! 路径，不猜数字 —— 猜错的代价是给上游发一个它不认的预算。
+//! 目录与实测依据**。glm-5 / 5.1 / 4.x 的档位表我们没有证据（参考实现的
+//! 模型匹配式也刻意把它们排除在外），因此那些模型原样走通用路径，不猜数字
+//! —— 猜错的代价是给上游发一个它不认的预算。
 //!
-//! 同一条界线也管**映射绑定**：模型管理里给某条映射绑的档位只在 5.3 家族上
-//! 生效（适配器的 `reasoning_patch` 对别的模型直接 `Skip`），所以「绑了不生效」
-//! 时详细日志里能读到原因，而不是一个静默的默认值。
+//! ── GLM-5.2：只归一、不做预算 ───────────────────────────────
+//! 5.2 的依据是智谱开放文档「深度思考」页（2026-10-05 核对）：`reasoning_effort`
+//! 对它接受 `none` / `minimal`（放弃思考）、`low` / `medium`（映射为 `high`）、
+//! `high`、`xhigh`（映射为 `max`）、`max`（默认）——
+//! <https://docs.bigmodel.cn/cn/guide/capabilities/thinking>。
+//! 上游既然自己就会折出这套目标值，这里就把它**提前到网关执行**
+//! （[`normalize_glm52`]）：发出去的字节与日志里的等级因此一致，形状也与
+//! 5.3 那条链相同。**但预算装配（[`apply_to_anthropic`]）不适用于它**：那是
+//! 给「关不掉思考、必然与正文抢 `max_tokens`」的 5.3 留正文空间的（见上），
+//! 5.2 可关思考、默认还是自适应（要不要想由模型自己判断），给它加预算没有
+//! 实测依据 —— 不猜。
+//!
+//! 同一条界线也管**映射绑定**：模型管理里给某条映射绑的档位只在 5.2 / 5.3
+//! 家族上生效（适配器的 `reasoning_patch` 对别的模型直接 `Skip`），所以
+//! 「绑了不生效」时详细日志里能读到原因，而不是一个静默的默认值。
 //!
 //! ── 硬约束 ──────────────────────────────────────────────────
 //! release 是 `panic=abort`：本文件零 unwrap/expect/panic。
@@ -97,16 +109,16 @@ const SHORT_OUTPUT_TOKENS: i64 = 1024;
 /// 的上游约束，又没有把额度浪费在思考上。
 const FLOOR_BUDGET: i64 = 1_024;
 
-/// 本模型是否属于 GLM-5.3 家族（`glm-5.3` / `glm-5.3-flash`，大小写不敏感）。
+/// 本模型是否属于某个 GLM 家族（`needle` 形如 `glm-5.3`，大小写不敏感）。
 ///
-/// 尾随数字要排除（`glm-5.30` 不算 5.3 家族）——参考实现用正则的负向前瞻
-/// 表达这件事，而 Rust 的 `regex` crate 不支持前瞻，所以这里手写扫描。
-pub(super) fn is_glm53(model: &str) -> bool {
-    const NEEDLE: &str = "glm-5.3";
+/// 尾随数字要排除（`glm-5.30` 不算 5.3 家族、`glm-5.25` 不算 5.2 家族）——
+/// 参考实现用正则的负向前瞻表达这件事，而 Rust 的 `regex` crate 不支持前瞻，
+/// 所以这里手写扫描。
+fn is_family(model: &str, needle: &str) -> bool {
     let lower = model.trim().to_ascii_lowercase();
     let mut from = 0;
-    while let Some(at) = lower.get(from..).and_then(|rest| rest.find(NEEDLE)) {
-        let end = from + at + NEEDLE.len();
+    while let Some(at) = lower.get(from..).and_then(|rest| rest.find(needle)) {
+        let end = from + at + needle.len();
         let next_is_digit = lower
             .get(end..)
             .and_then(|rest| rest.chars().next())
@@ -117,6 +129,18 @@ pub(super) fn is_glm53(model: &str) -> bool {
         from = end;
     }
     false
+}
+
+/// 本模型是否属于 GLM-5.3 家族（`glm-5.3` / `glm-5.3-flash`，大小写不敏感）。
+pub(super) fn is_glm53(model: &str) -> bool {
+    is_family(model, "glm-5.3")
+}
+
+/// 本模型是否属于 GLM-5.2 家族（`glm-5.2`，大小写不敏感）。
+///
+/// 依据见模块头「GLM-5.2：只归一、不做预算」一段。
+pub(super) fn is_glm52(model: &str) -> bool {
+    is_family(model, "glm-5.2")
 }
 
 /// 客户端给的等级字面量 → 三档。`None` = 客户端没点名（空串与缺省同义）。
@@ -134,6 +158,44 @@ pub(super) fn normalize(effort: Option<&str>) -> Option<Level> {
         "xhigh" | "max" | "ultra" => Level::Max,
         _ => Level::Max,
     })
+}
+
+/// GLM-5.2 的等级归一：把上游的兼容映射**提前到网关执行**（模块头那一段）。
+///
+/// 映射表照抄智谱开放文档（同模块头链接）：
+///   · `off` / `none` / `minimal` → `minimal`（放弃思考）—— 这是 5.2 与 5.3
+///     最大的差别：5.3 那条链把 `none` 归到 `low` 是因为上游根本不接受关思考，
+///     5.2 则**真的能关**，所以「关」的意图必须落到 `minimal` 而不是被抬档；
+///   · `light` / `low` / `medium` / `high` → `high`（`light` 按 `low` 类比，
+///     上游对 `low` / `medium` 的官方映射就是 `high`）；
+///   · `xhigh` / `max` / `ultra` → `max`（官方默认档）；
+///   · 认不出的取值给 `max` —— 与 [`normalize`] 同一口径（官方默认档）。
+pub(super) fn normalize_glm52(effort: Option<&str>) -> Option<&'static str> {
+    let raw = effort.map(str::trim).filter(|text| !text.is_empty())?;
+    Some(match raw.to_ascii_lowercase().as_str() {
+        "off" | "none" | "minimal" => "minimal",
+        "light" | "low" | "medium" | "high" => "high",
+        "xhigh" | "max" | "ultra" => "max",
+        _ => "max",
+    })
+}
+
+/// 某模型下，等级字面量 → 发上游的目标档位字面量。
+///
+/// 非受管家族返回 `None`（调用方保持原样）：5.1 / 5 / 4.x 与两档视觉模型的
+/// 档位表没有依据（见模块头）。受管的两族各走各的表 —— 5.3 三档
+/// （[`normalize`]）、5.2 三档（[`normalize_glm52`]）。
+///
+/// 三个消费方（适配器的 `reasoning_patch` / `outbound_reasoning` 与
+/// [`apply_to_chat`]）共用它，绑定注入与日志读取因此永远与发送口径一致。
+pub(super) fn target_effort(model: &str, effort: Option<&str>) -> Option<&'static str> {
+    if is_glm53(model) {
+        normalize(effort).map(Level::as_str)
+    } else if is_glm52(model) {
+        normalize_glm52(effort)
+    } else {
+        None
+    }
 }
 
 /// 定档：客户端点名优先，没点名时按输出额度推。
@@ -170,6 +232,10 @@ fn resolve(effort: Option<&str>, client_max_tokens: Option<i64>) -> (Level, i64)
 /// 通用层可能已经按它自己的档位表抬过一次，那份额度不能当客户端的意图用）。
 ///
 /// 非 5.3 家族直接返回（不做任何改动）—— 通用转换层的行为原样保留。
+/// **GLM-5.2 也走这条「原样」路径**：预算装配是给「关不掉思考」的 5.3 兜底的
+/// （模块头），5.2 可关思考、默认自适应，给它加预算没有实测依据；这条通道上
+/// 它继续按通用转换层的折算走（`anthropic_request_from_chat` 读
+/// `reasoning_effort` 折 thinking），本次不为它加特判。
 pub(super) fn apply_to_anthropic(
     payload: &mut Value,
     model: &str,
@@ -219,8 +285,16 @@ pub(super) fn apply_to_anthropic(
 /// 这里都已经是同一个 [`EFFORT_FIELD`] 键）；没点名又不像短输出则**不注入**
 /// （保持上游默认，实测约 100 个思考 token，属于正常量级）——与 Anthropic
 /// 那条通道不同，那边「不注入」会让上游按自己的默认想到把额度吃光，这边不会。
+///
+/// ── 5.2 与 5.3 的两点差别 ────────────────────────────────────
+///   · 归一表不同：5.2 走 [`normalize_glm52`]（可关思考，`none` / `minimal`
+///     落 `minimal`），5.3 走 [`normalize`]（`none` / `minimal` 只能落 `low`）；
+///   · **不做短输出注入**：短输出那条特判是给 5.3「关不掉思考」的形态兜底的，
+///     5.2 可关、默认又是自适应（要不要想由模型自己判断），替它注一个默认档
+///     等于替用户做决定 —— 没有实测依据的不做（模块头同一口径）。
 pub(super) fn apply_to_chat(body: &mut Value, model: &str) {
-    if !is_glm53(model) {
+    let is_53 = is_glm53(model);
+    if !is_53 && !is_glm52(model) {
         return;
     }
     let Some(object) = body.as_object_mut() else {
@@ -230,20 +304,24 @@ pub(super) fn apply_to_chat(body: &mut Value, model: &str) {
         .get(EFFORT_FIELD)
         .and_then(Value::as_str)
         .map(str::to_string);
-    let client_max = object
-        .get("max_tokens")
-        .or_else(|| object.get("max_completion_tokens"))
-        .and_then(Value::as_i64)
-        .filter(|value| *value > 0);
-    let level = match normalize(effort.as_deref()) {
-        Some(level) => Some(level),
-        None if client_max.is_some_and(|value| value < SHORT_OUTPUT_TOKENS) => Some(Level::Low),
-        None => None,
+    let target: Option<String> = if is_53 {
+        let client_max = object
+            .get("max_tokens")
+            .or_else(|| object.get("max_completion_tokens"))
+            .and_then(Value::as_i64)
+            .filter(|value| *value > 0);
+        match normalize(effort.as_deref()) {
+            Some(level) => Some(level.as_str().to_string()),
+            None if client_max.is_some_and(|value| value < SHORT_OUTPUT_TOKENS) => {
+                Some(Level::Low.as_str().to_string())
+            }
+            None => None,
+        }
+    } else {
+        // 没点名（读不到值）时保持上游默认，不注入
+        normalize_glm52(effort.as_deref()).map(str::to_string)
     };
-    if let Some(level) = level {
-        object.insert(
-            EFFORT_FIELD.to_string(),
-            Value::String(level.as_str().to_string()),
-        );
+    if let Some(level) = target {
+        object.insert(EFFORT_FIELD.to_string(), Value::String(level));
     }
 }

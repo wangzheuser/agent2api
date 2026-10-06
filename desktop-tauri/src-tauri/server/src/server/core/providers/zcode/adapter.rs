@@ -107,52 +107,37 @@ impl ProviderAdapter for ZcodeAdapter {
                 reason: "客户端请求体里已指定思考参数，绑定不覆盖",
             };
         }
-        if super::reasoning::is_glm53(model) {
-            if crate::server::core::model_rules::reasoning_rank(level).is_none() {
-                return ReasoningPatch::Skip {
-                    reason: "该等级不在通用档位表内（自定义等级不参与转发）",
-                };
-            }
-            return match super::reasoning::normalize(Some(level)) {
-                Some(effort) => ReasoningPatch::Set {
-                    field: super::reasoning::EFFORT_FIELD,
-                    value: Value::String(effort.as_str().to_string()),
-                },
-                None => ReasoningPatch::Skip {
-                    reason: "该等级没有可翻译的 ZCode 目标值",
-                },
+        if !super::reasoning::is_glm53(model) && !super::reasoning::is_glm52(model) {
+            return ReasoningPatch::Skip {
+                reason: "该模型没有已确认的 ZCode 思考档位（目前只有 GLM-5.2 / 5.3 家族）",
             };
         }
-        let Some(effort) = normalize_effort(model, level) else {
+        if crate::server::core::model_rules::reasoning_rank(level).is_none() {
             return ReasoningPatch::Skip {
-                reason: "模型或绑定等级没有已确认的 ZCode 思考等级映射",
+                reason: "该等级不在通用档位表内（自定义等级不参与转发）",
             };
-        };
-        ReasoningPatch::Set {
-            field: REASONING_FIELD,
-            value: Value::String(effort.to_string()),
+        }
+        match super::reasoning::target_effort(model, Some(level)) {
+            Some(value) => ReasoningPatch::Set {
+                field: super::reasoning::EFFORT_FIELD,
+                value: Value::String(value.to_string()),
+            },
+            None => ReasoningPatch::Skip {
+                reason: "该等级没有可翻译的 ZCode 目标值",
+            },
         }
     }
 
     /// 随请求上行的思考等级（请求日志「上游等级」列的采集口）。
     fn outbound_reasoning(&self, body: &Value) -> Option<String> {
         let model = body.get("model").and_then(Value::as_str).unwrap_or("");
-        if let Some(level) = body
+        let declared = body
             .get(super::reasoning::EFFORT_FIELD)
-            .and_then(Value::as_str)
-            .filter(|_| super::reasoning::is_glm53(model))
-            .and_then(|level| super::reasoning::normalize(Some(level)))
-        {
-            return Some(level.as_str().to_string());
-        }
-        if let Some(level) = body
-            .get(REASONING_FIELD)
-            .and_then(Value::as_str)
-            .and_then(|level| normalize_effort(model, level))
-        {
+            .and_then(Value::as_str);
+        if let Some(level) = super::reasoning::target_effort(model, declared) {
             return Some(level.to_string());
         }
-        if let Some(level) = body.get(REASONING_FIELD).and_then(Value::as_str) {
+        if let Some(level) = declared {
             return Some(level.to_string());
         }
         crate::server::core::model_rules::read_client_level(body)

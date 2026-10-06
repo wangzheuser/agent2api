@@ -582,6 +582,19 @@ export function ProviderBlock({
   )
 }
 
+/**
+ * 账号版本 → provider id。
+ *
+ * WorkBuddy 拆家（2026-10）后两个地区是**两家 provider**（`workbuddy` /
+ * `workbuddy-intl`，见 `providers::workbuddy::region`）。界面上仍然是同一个
+ * 「添加账号」块里的一个分段控件，因此这个映射只在这里写一份 —— 壳侧按它记录
+ * 「这次登录属于哪一家」、后端按它决定账号落进哪一组，写错任一处的症状都是
+ * 「用国际版登录、账号进了国内版组」（转发稳定 401）。
+ */
+function workbuddyProviderId(edition: Edition): string {
+  return edition === 'intl' ? 'workbuddy-intl' : 'workbuddy'
+}
+
 /* ─── WorkBuddy（账号版本 + 网页登录 + 第三方入口开关）───────
  *
  * 结构与其余各家不同：它有两处静态分段（账号版本 / 打开方式）与一个第三方入口
@@ -606,7 +619,13 @@ export function WorkBuddyBlock({ active }: { active: boolean }): React.ReactElem
     const engine = shared().wbWebLogin
     if (!engine) return
     controllerRef.current = engine.create({
-      provider: 'workbuddy',
+      // provider 随分段控件**动态解析**（getter）：引擎按
+      // `loginProvider === config.provider` 判断「等待中的是不是本家」，
+      // 写死一个 id 会让切到国际版之后按钮禁用态、取消与提示全部失联
+      // （壳侧记的是 workbuddy-intl）。
+      get provider() {
+        return workbuddyProviderId(editionRef.current)
+      },
       buttonId: 'web-login-button',
       cancelId: 'web-login-cancel',
       hintId: 'web-login-hint',
@@ -623,7 +642,9 @@ export function WorkBuddyBlock({ active }: { active: boolean }): React.ReactElem
       start: () => shared().workbuddyDesktop?.startLogin(
         editionRef.current,
         modeRef.current,
-        'workbuddy',
+        // 归属取当前分段：拆家后它是权威（后端按 provider id 反查地区，
+        // 不再从 `edition` 反推，见 api::session 的 login_start）
+        workbuddyProviderId(editionRef.current),
         socialRef.current,
       ),
       onSuccess: async () => {
@@ -674,7 +695,10 @@ export function WorkBuddyBlock({ active }: { active: boolean }): React.ReactElem
     <div className='add-provider-block' hidden={!active}>
       <DialogSection>
         <h3>账号版本</h3>
-        <p>两版账号可同时保存，按账号自动路由。</p>
+        <p>
+          两版账号可同时保存，各自一份模型清单（国内版与国际版是两家提供商，
+          可分别启用与映射）。
+        </p>
         <SegmentedControl
           aria-label='账号版本'
           className={ADD_SEG_CLASS}

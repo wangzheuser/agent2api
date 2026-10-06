@@ -34,6 +34,7 @@ use crate::server::core::account_store::AccountStore;
 use crate::server::core::upstream::ForwardOutcome;
 use crate::server::core::upstream::usage::RequestTelemetry;
 use crate::server::errors::GatewayError;
+use crate::server::logging;
 
 use super::adapter::{ChatRequestPlan, ProviderAdapter, UpstreamErrorClass};
 
@@ -121,7 +122,7 @@ impl ProviderAdapter for CodeArtsAdapter {
         _client_headers: &'a HeaderMap,
         proxy: Option<crate::server::core::proxies::ResolvedProxy>,
         stream: bool,
-        _telemetry: &'a std::sync::Arc<RequestTelemetry>,
+        telemetry: &'a std::sync::Arc<RequestTelemetry>,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<ForwardOutcome, GatewayError>> + Send + 'a>> {
         Box::pin(async move {
             // ① 凭据（含临期主动续期与写回）；代理沿用编排层为本账号解析出的那份
@@ -181,15 +182,43 @@ impl ProviderAdapter for CodeArtsAdapter {
                 chat_session_id: Some(session_id),
                 ..Default::default()
             };
-            let (url, headers, payload) =
-                match chat::build_upstream_request(models::DEFAULT_BASE_URL, &upstream_model, body.clone(), true, benefit, &profile, Some(&credential)) {
+            let (url, headers, payload) = {
+                // 客户端额度太小、而这个模型一定先思考时，抬到 +预留（实测形状与
+                // 三条边界见 `chat::reserve_for_thinking`）：不抬的话上游会把额度全
+                // 花在 reasoning 上，客户端收到一次"成功的空回答"。
+                let mut outbound = body.clone();
+                if let Some((from, to)) =
+                    chat::reserve_for_thinking(&mut outbound, model.max_output_tokens)
+                {
+                    logging::verbose(
+                        "[CodeArts]",
+                        &format!(
+                            "客户端 max_tokens {from} 撑不下这个模型的思考，抬到 {to}（该模型上限 {}）",
+                            if model.max_output_tokens > 0 {
+                                model.max_output_tokens.to_string()
+                            } else {
+                                "未声明".to_string()
+                            }
+                        ),
+                    );
+                }
+                match chat::build_upstream_request(
+                    models::DEFAULT_BASE_URL,
+                    &upstream_model,
+                    outbound,
+                    true,
+                    benefit,
+                    &profile,
+                    Some(&credential),
+                ) {
                     Ok(built) => built,
                     Err(error) => {
                         session.stop().await;
                         drop(permit);
                         return Err(error);
                     }
-                };
+                }
+            };
             let mut request = crate::server::core::egress::client_for(proxy.as_ref()).post(&url);
             for (name, value) in headers {
                 request = request.header(name.as_str(), value.as_str());
@@ -244,16 +273,25 @@ impl ProviderAdapter for CodeArtsAdapter {
                 if let Some(error) = read_error {
                     return Err(GatewayError::with_status(502, format!("CodeArts 上游流中断：{error}")));
                 }
-                return Ok(ForwardOutcome::Completion {
-                    body: chat::aggregate_sse(&all, &upstream_model)?,
-                });
+                let completion = chat::aggregate_sse(&all, &upstream_model)?;
+                // 用量旁路记账：聚合体里那份 usage 是上游给的，报一次进请求日志
+                // （流式那份由 `UsageSniffer` 负责，两条路都缺了就又是恒 0）
+                if let Some(usage) = completion.get("usage") {
+                    telemetry.report_usage(usage);
+                }
+                return Ok(ForwardOutcome::Completion { body: completion });
             }
 
             // ⑧ 流式：透传（上游已是 OpenAI chunk 形状），结束时释放会话与许可
             let (sender, receiver) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+            // usage 嗅探要活到这个任务里，而本函数是借用签名 —— 克隆一份 Arc
+            // （不是所有权转移：编排层那一份还要在收尾时读同一槽位）
+            let sniff_telemetry = telemetry.clone();
             crate::spawn_task(async move {
                 use futures::StreamExt;
+                let mut sniffer = chat::UsageSniffer::default();
                 if !prefetched.is_empty() {
+                    sniffer.feed(&prefetched, &sniff_telemetry);
                     if sender.send(Ok(bytes::Bytes::from(prefetched))).await.is_err() {
                         session.stop().await;
                         return;
@@ -261,10 +299,15 @@ impl ProviderAdapter for CodeArtsAdapter {
                 }
                 let mut rest = rest;
                 while let Some(item) = rest.next().await {
+                    // 只读地看一眼这一片里有没有 usage 帧，字节原样转发
+                    if let Ok(bytes) = item.as_ref() {
+                        sniffer.feed(bytes, &sniff_telemetry);
+                    }
                     if sender.send(item).await.is_err() {
                         break;
                     }
                 }
+                sniffer.finish(&sniff_telemetry);
                 // 客户端断开也会走到这里：idle 必须发，否则上游槽位悬着
                 session.stop().await;
                 drop(permit);
@@ -290,14 +333,17 @@ impl ProviderAdapter for CodeArtsAdapter {
             .unwrap_or("");
         let message = format!("上游返回 {status}{}", raw_part(raw));
         match status {
-            // 403：额度耗尽 —— 标记账号冷却并换下一账号
+            // 403：额度耗尽 —— 标记账号冷却并换下一账号。恢复时刻只在**认得出日池**
+            // 时给（下一个北京零点），其余仍走存储层的 10 分钟兜底，见
+            // [`daily_pool_reset_at`]。
             403 => UpstreamErrorClass::QuotaLimited {
-                reset_at: None,
+                reset_at: daily_pool_reset_at(logging::now_ms(), &message),
                 message,
                 upstream_code: None,
                 status,
             },
             429 => UpstreamErrorClass::QuotaLimited {
+                // 429 是分钟级限流，与日池无关：不给它零点，交给 10 分钟兜底
                 reset_at: None,
                 message,
                 upstream_code: None,
@@ -331,13 +377,18 @@ impl ProviderAdapter for CodeArtsAdapter {
             && error.message.to_lowercase().contains("insufficient quota");
         match error.status_code {
             429 => UpstreamErrorClass::QuotaLimited {
+                // 429 是分钟级限流，与「今天没额度」是两回事 —— 给它零点会把一个
+                // 只是暂时繁忙的账号打死一整天，所以交给存储层的 10 分钟兜底。
                 reset_at: None,
                 message: error.message.clone(),
                 upstream_code: error.upstream_code,
                 status: u16::try_from(error.status_code).unwrap_or(429),
             },
             403 if quota_403 => UpstreamErrorClass::QuotaLimited {
-                reset_at: None,
+                // 认得出额度 ⇒ 日池打满 ⇒ 冷却到下一个北京零点（同一判据见
+                // [`daily_pool_reset_at`]）；这里已经要求文案带 `insufficient quota`，
+                // 所以给的一定是零点而不是 10 分钟。
+                reset_at: daily_pool_reset_at(logging::now_ms(), &error.message),
                 message: error.message.clone(),
                 upstream_code: error.upstream_code,
                 status: 403,
@@ -600,6 +651,34 @@ fn raw_part(raw: &str) -> String {
     }
 }
 
+/// 认得出「福利日池打满」的文案 ⇒ 冷却到**北京时间下一个零点**；认不出 ⇒ None
+/// （由存储层落 10 分钟兜底）。
+///
+/// ── 为什么不是 10 分钟 ──────────────────────────────────────
+/// `InferHub.4291.200 / insufficient quota` 是本家**按日**的 token 池打满时那一帧
+/// （实测 2026-10-02：pri=2 的 `daily_tokens_used` 到 10,028,800 / 上限 10,000,000
+/// 的那一刻起，每条请求都只回这一帧）。上游不告诉我们什么时候重置，但它整套日口径
+/// 都是 UTC+8 零点（见 `welfare::today` 的说明），所以零点是有据可依的那个答案。
+/// 10 分钟兜底的实际后果也量过：池子当天不会再回来，于是直到次日零点之前，这个已耗尽
+/// 的账号大约每 10 分钟被白撞一次（一次往返 + 一条 403 痕迹 + 一次顺延噪声）。
+///
+/// 形状与 Trae 的计划限额同一套（`trae::forward::next_local_midnight_ms`），差别只在
+/// 本家用**固定 UTC+8** 而不是机器时区：NAS 容器跑在 UTC，跟机器时区走会早 8 小时
+/// 放开（那一小时上游还在扣当天的账），又会在北京时间的白天里挡掉本来能用的额度。
+///
+/// 只认这两串原文，不认状态码：429 是限流（分钟级，10 分钟兜底正是它要的），
+/// 认不出额度的 403 是内容闸门/权限/签名那一类（本来就不该罚账号，见
+/// [`CodeArtsAdapter::classify_conversation_error`]）。把非日池的失败冷却一整天，
+/// 爆炸半径是这一家的全部福利模型 —— 宁缺勿滥。
+fn daily_pool_reset_at(now_ms: i64, message: &str) -> Option<i64> {
+    let text = message.to_lowercase();
+    if text.contains("insufficient quota") || text.contains("4291.200") {
+        Some(welfare::next_day_boundary_ms(now_ms))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod store_hooks {
     //! 三个存储侧钩子的接线验收。
@@ -615,7 +694,7 @@ mod store_hooks {
     use crate::server::core::providers::codearts::credentials::{OAuthContext, PkcePair, Credential};
     use crate::server::db::Db;
 
-    use super::{benefit_cooldown_group, models};
+    use super::{benefit_cooldown_group, daily_pool_reset_at, models};
     use super::{CODEARTS_ADAPTER, CodeArtsAdapter, ProviderAdapter};
 
     static SEQ: AtomicUsize = AtomicUsize::new(0);
@@ -697,7 +776,8 @@ mod store_hooks {
         assert!(error.message.contains("refresh token"), "文案要点名缺什么：{}", error.message);
     }
 
-    /// 会话式分类：429 与「认得出额度」的 403 交回 QuotaLimited（都要落冷却）；
+    /// 会话式分类：429 与「认得出额度」的 403 交回 QuotaLimited（都要落冷却，
+    /// 但**冷却长度不同**：认得出日池的给下一个北京零点，429 留给存储层兜底）；
     /// 认不出额度的 403（内容闸门/权限/签名）与 401/502 一律 Fatal —— 特别是
     /// 401：会话式路径没有「刷凭证后同账号重试」的编排，交 TokenExpired 会把
     /// 错误吞进一条根本不存在的重试链里。
@@ -709,25 +789,28 @@ mod store_hooks {
             CODEARTS_ADAPTER
                 .classify_conversation_error(&GatewayError::with_status(status, message))
         };
-        // 流内折叠的额度信封：首包门按 insufficient quota 折的 403，消息必带原文
+        // 流内折叠的额度信封：首包门按 insufficient quota 折的 403，消息必带原文。
+        // 带上 `reset_at: Some(_)`：改前这里是 `None` ⇒ 存储层落 10 分钟兜底 ⇒
+        // 日池当天不会回来，于是直到次日零点前每 10 分钟白撞一次这个账号。
         assert!(matches!(
             class(403, "上游报告 InferHub.4291.200：insufficient quota"),
-            UpstreamErrorClass::QuotaLimited { status: 403, .. }
+            UpstreamErrorClass::QuotaLimited { status: 403, reset_at: Some(_), .. }
         ));
-        // HTTP 403、诊断体里带额度原文 → 也认
+        // HTTP 403、诊断体里带额度原文 → 也认（同一判据，文案里有 quota 原文）
         assert!(matches!(
             class(403, "CodeArts 上游返回 HTTP 403：{error_msg: insufficient quota}"),
-            UpstreamErrorClass::QuotaLimited { .. }
+            UpstreamErrorClass::QuotaLimited { reset_at: Some(_), .. }
         ));
         // 认不出额度的 403 → 透传，不罚账号
         assert!(matches!(
             class(403, "CodeArts 上游返回 HTTP 403：permission denied"),
             UpstreamErrorClass::Fatal { status: 403, .. }
         ));
-        // 429 无歧义（限流）→ 记账
+        // 429 无歧义（限流）→ 记账，但**不给零点**：它是分钟级的，罚一整天会把
+        // 一个只是暂时繁忙的账号打死
         assert!(matches!(
             class(429, "too many requests"),
-            UpstreamErrorClass::QuotaLimited { status: 429, .. }
+            UpstreamErrorClass::QuotaLimited { status: 429, reset_at: None, .. }
         ));
         assert!(matches!(class(401, "x"), UpstreamErrorClass::Fatal { status: 401, .. }));
         assert!(matches!(class(502, "x"), UpstreamErrorClass::Fatal { status: 502, .. }));
@@ -793,24 +876,77 @@ mod store_hooks {
         store.add_codearts_account(&credential("AK_BARE", "bare", 120, false), None, "manual").unwrap();
         let id = store.codearts_account_record("").expect("账号应当可读")["id"].as_str().unwrap().to_string();
 
-        // 与 provider_loop 会话式分支同一动作：按整组名单逐个记账
-        // （reset_at = None → store 落 10 分钟兜底冷却，与无状态路径同一兜底）。
+        // 与 provider_loop 会话式分支同一动作：按整组名单逐个记账，恢复时刻也走
+        // 同一判据（认得出日池 ⇒ 下一个北京零点，见 `daily_pool_reset_at`）。
         let group = benefit_cooldown_group(&catalog, "glm-5.3-flash");
+        let reset_at = daily_pool_reset_at(
+            crate::server::logging::now_ms(),
+            "上游报告 InferHub.4291.200：insufficient quota",
+        )
+        .expect("这条文案就该给出日池重置点");
         for name in &group {
-            store.mark_rate_limited(&id, name, 403, None, None, "上游报告 InferHub.4291.200：insufficient quota");
+            store.mark_rate_limited(
+                &id,
+                name,
+                403,
+                None,
+                Some(reset_at as f64),
+                "上游报告 InferHub.4291.200：insufficient quota",
+            );
         }
 
         let now = crate::server::logging::now_ms();
         let limits = store.codearts_account_record("").unwrap()["rateLimits"].clone();
         let limits = limits.as_object().expect("rateLimits 应当是对象");
-        // 别的福利模型名（本次没撞的那个）也必须有自己的冷却记录
+        // 别的福利模型名（本次没撞的那个）也必须有自己的冷却记录，且恢复时刻
+        // 是日池重置点而不是 10 分钟兜底
         for expected in ["deepseek-v4-flash-0731", "glm-5.3-flash", "deepseek-v4-pro-0813", "deepseek-v4.1-flash"] {
             let entry = limits.get(expected).unwrap_or_else(|| panic!("缺整组键 {expected}：{:?}", limits.keys().collect::<Vec<_>>()));
             let reset = entry["resetAt"].as_f64().unwrap_or(0.0);
-            assert!(reset > now as f64 && reset - now as f64 <= 11.0 * 60.0 * 1000.0,
-                    "{expected} 的 resetAt 应是 10 分钟兜底，实际 {reset}");
+            assert!(reset > now as f64, "{expected} 的 resetAt 应当在未来，实际 {reset}");
+            assert!(
+                (reset - reset_at as f64).abs() <= 2.0,
+                "{expected} 的 resetAt 应当是日池重置点 {reset_at}，实际 {reset}"
+            );
         }
         // 对照组：非福利模型键没有被整组波及 —— 冷却只盖福利池，不把整号打死
         assert!(!limits.contains_key("GLM-5.2"), "非福利模型不该被整组标记");
+    }
+
+    /// 冷却长度判据本身（纯函数，不吃时钟）：认得出日池的两串原文给下一个北京零点，
+    /// 其它文案（429 的 `too many requests`、内容闸门的 `permission denied`）给 None
+    /// 让存储层兜 10 分钟。
+    ///
+    /// 固定 `now` 才谈得上「零点」：拿 `logging::now_ms()` 进出的话，这条用例在
+    /// 北京零点前后各跑一次会给出不同的期望值，等于没钉住任何事。
+    #[test]
+    fn only_the_daily_pool_envelope_cools_until_midnight() {
+        // 2026-09-26T07:00Z = 北京 15:00，离下一个零点 9 小时
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 9, 26)
+            .expect("合法日期")
+            .and_hms_opt(7, 0, 0)
+            .expect("合法时刻")
+            .and_utc()
+            .timestamp_millis();
+        let want = now + 9 * 60 * 60 * 1000;
+        for text in [
+            "上游报告 InferHub.4291.200：insufficient quota",
+            "CodeArts 上游返回 HTTP 403：insufficient quota",
+            "INFERHUB.4291.200 only",
+        ] {
+            assert_eq!(
+                Some(want),
+                daily_pool_reset_at(now, text),
+                "认得出日池的文案要冷却到下一个北京零点：{text}"
+            );
+        }
+        for text in [
+            "too many requests",
+            "上游返回 403: permission denied",
+            "上游返回 403: content policy blocked",
+            "",
+        ] {
+            assert_eq!(None, daily_pool_reset_at(now, text), "认不出日池就不许冷却一整天：{text}");
+        }
     }
 }

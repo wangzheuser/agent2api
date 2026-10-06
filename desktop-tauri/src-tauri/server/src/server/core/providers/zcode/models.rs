@@ -88,15 +88,21 @@ struct Extra {
 /// 目录补充信息表。
 ///
 /// ── 为什么与 [`MODELS`] 分开放 ───────────────────────────────
-/// 这两项**只有 GLM-5.3 家族有依据**（目录 + 实测）。塞进 `Spec` 会让另外九行
-/// 各拖一串「没有」的占位值，反而看不出「谁真有数据」；分表之后，没有依据的
-/// 模型就是**不在表里**，出口也如实不出这些键（管理页显示「未声明」，见
-/// `ui-islands` 的 `model-capability.ts` 三态说明）。
+/// 这两项只有**有依据的家族**才在表里：5.3 是目录 + 实测，5.2 是智谱开放文档
+/// 给出的档位兼容映射（见下）。塞进 `Spec` 会让其它几行各拖一串「没有」的
+/// 占位值，反而看不出「谁真有数据」；分表之后，没有依据的模型就是**不在表里**，
+/// 出口也如实不出这些键（管理页显示「未声明」，见 `ui-islands` 的
+/// `model-capability.ts` 三态说明）。
 ///
 /// ── 档位值的来源 ────────────────────────────────────────────
-/// 目录给每个档位写的是「往 `output_config.effort` 塞什么值」，三个档位
-/// 各一条（`low` / `high` / `max`），`defaultLevel` 是 `max`。这与本家
-/// `reasoning.rs` 的实现逐字对应 —— 那三个值正是上游接受的合法取值。
+/// 写的是**上游语义上的目标档位**（与本家 `reasoning.rs` 归一后的发出口径
+/// 逐字对应）：
+///   · 5.3：目录给每个档位写「往 `output_config.effort` 塞什么值」，三个档位
+///     各一条（`low` / `high` / `max`），`defaultLevel` 是 `max`；
+///   · 5.2：智谱开放文档的兼容映射（`none` / `minimal` 放弃思考、`low` /
+///     `medium` → `high`、`xhigh` → `max`、默认 `max`）——「能落到哪一档」的
+///     集合是 `minimal` / `high` / `max`，与 `reasoning.rs` 的
+///     `normalize_glm52` 一致。
 const CATALOG_EXTRAS: &[Extra] = &[
     Extra {
         id: "glm-5.3",
@@ -108,6 +114,13 @@ const CATALOG_EXTRAS: &[Extra] = &[
         id: "glm-5.3-flash",
         video: Some(true),
         levels: &["low", "high", "max"],
+        default_level: "max",
+    },
+    // 5.2 的视频输入能力没有依据（目录里没有它的条目），如实不出 supportsVideo
+    Extra {
+        id: "glm-5.2",
+        video: None,
+        levels: &["minimal", "high", "max"],
         default_level: "max",
     },
 ];

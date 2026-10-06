@@ -448,7 +448,7 @@ mod policy_tests {
         let (db, _temp) = crate::server::db::test_temp::TempDb::open("workbuddy-policy-routing");
         task_state::install(Some(db.clone()));
         let store = AccountStore::with_db(Some(db));
-        let add = |uid: &str| store.add_account(&json!({"account":{"uid":uid},"auth":{"accessToken":"fixture-token"},"edition":"cn"}),Some(uid)).unwrap();
+        let add = |uid: &str| store.add_account(&json!({"account":{"uid":uid},"auth":{"accessToken":"fixture-token"},"edition":"cn"}),Some(uid),Some("workbuddy")).unwrap();
         let a = add("policy-route-a"); let b = add("policy-route-b");
         let a_id = a["id"].as_str().unwrap(); let b_id = b["id"].as_str().unwrap();
         let identity_a = workbuddy_policy::identity(&a).unwrap();

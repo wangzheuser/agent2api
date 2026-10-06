@@ -344,10 +344,17 @@ pub async fn login_start(State(state): State<ServerState>, body: Bytes) -> Respo
         };
         return management_error(400, message);
     }
-    if kind != crate::server::core::providers::ProviderKind::WorkBuddy {
+    // WorkBuddy 的两个地区（国内版 / 国际版）：**地区取 provider id，不读请求
+    // 里的 `edition`** —— 与下面 ZCode 那段同一条理由，而且这里更要紧：
+    // 账号一旦落错家（国际版凭证进了国内版组），转发会稳定打错域名，
+    // 而那种错在日志里只表现为一串 401。
+    //
+    // 不是 workbuddy 系的家（raccoon / CodeArts 等）继续走各自的网页登录分支
+    // —— 这一条不能少：少了它，那些家的登录会被这条 501 拦下。
+    let Some(region) = crate::server::core::providers::workbuddy::Region::from_kind(kind) else {
         return start_web_login(state, kind).await;
-    }
-    let handle = state.login().start(edition.as_deref());
+    };
+    let handle = state.login().start(region);
     match state
         .login()
         .wait_for_auth_url(&handle, Duration::from_millis(AUTH_URL_WAIT_MS))
@@ -357,6 +364,9 @@ pub async fn login_start(State(state): State<ServerState>, body: Bytes) -> Respo
             "state": task_state,
             "authUrl": auth_url,
             "edition": task_edition,
+            // 回显归属：前端按它把「这次登录的是哪一家」显示清楚（国际版的
+            // 登录页与国内版不同，用户需要确认自己点对了）
+            "provider": region.provider_id(),
         })),
         Err(error) => {
             logging::log("[Login]", &format!("❌ 发起登录失败: {error}"));
@@ -1207,17 +1217,30 @@ pub async fn auth_logout(State(state): State<ServerState>) -> Response {
 ///
 /// 桌面端不用这条（它走 /api/session/login/* 的异步三步），保留它是为了
 /// 与 Node 版的命令行/脚本入口保持契约一致。
+///
+/// ── 地区怎么定（2026-10 拆家）────────────────────────────────
+/// 优先读 `provider`（`workbuddy` / `workbuddy-intl`，与其它入口同一口径：
+/// 身份即归属），其次读 `edition`（Node 版既有入参，脚本用户在用），
+/// 都没有则国内版。两条路最终都归一到 [`Region`]。
 pub async fn auth_login(State(state): State<ServerState>, body: Bytes) -> Response {
-    let edition = parse_body(&body)
+    let region = parse_body(&body)
         .ok()
-        .and_then(|payload| {
-            payload
-                .get("edition")
+        .map(|payload| {
+            let explicit_provider = payload
+                .get("provider")
                 .and_then(Value::as_str)
-                .map(str::to_string)
+                .and_then(crate::server::core::providers::workbuddy::Region::from_provider_id);
+            explicit_provider.unwrap_or_else(|| {
+                crate::server::core::providers::workbuddy::Region::from_edition_id(
+                    payload
+                        .get("edition")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty()),
+                )
+            })
         })
-        .filter(|value| !value.is_empty());
-    match state.login().run_login(edition.as_deref()).await {
+        .unwrap_or_default();
+    match state.login().run_login(region).await {
         Ok(session) => crate::server::http::raw_json(session),
         Err(error) => {
             logging::log("[Login]", &format!("❌ {}", error.message));

@@ -994,6 +994,9 @@ pub fn usage_not_configured(provider_label: &str, field_hint: &str) -> GatewayEr
 pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
     match kind {
         ProviderKind::WorkBuddy => &super::workbuddy::WORKBUDDY_ADAPTER,
+        // WorkBuddy 的两个地区是两个 provider、两个实例（同一份实现的按地区
+        // 参数化，见 `workbuddy::region` 与 `workbuddy::adapter` 的模块头）
+        ProviderKind::WorkBuddyIntl => &super::workbuddy::WORKBUDDY_INTL_ADAPTER,
         ProviderKind::Raccoon => &super::raccoon::RACCOON_ADAPTER,
         ProviderKind::CatPaw => &super::catpaw::adapter::CATPAW_ADAPTER,
         ProviderKind::AutoClaw => &super::autoclaw::AUTOCLAW_ADAPTER,
@@ -1053,6 +1056,11 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
 pub fn implemented_kinds() -> Vec<ProviderKind> {
     vec![
         ProviderKind::WorkBuddy,
+        // WorkBuddy 国际版算一家：与国内版各自一份模型清单（`/v3/config` 打
+        // 各自的站点）、各自的缓存槽与刷新排期 —— 两家都必须在本列表里，
+        // 否则国际版的目录刷新永远不会被调度（症状是「国际版账号加了、
+        // 模型列表一直是内置兜底」）。
+        ProviderKind::WorkBuddyIntl,
         ProviderKind::Raccoon,
         ProviderKind::CatPaw,
         ProviderKind::AutoClaw,
@@ -1160,14 +1168,23 @@ fn seed_current_raccoon_defaults() {
 /// 与 `seed_current_raccoon_defaults` 同理：刷新可能因失败 / 无登录态而不落地
 /// 新清单 —— 那条路径上没有种子可挂，启动后手里的这份清单（内置或旧缓存）
 /// 也要有同样的默认值。幂等：种过的 id 不会再动。
+///
+/// **两个地区各跑一遍**（拆家后各有各的清单与 provider 键）：种子按
+/// `(provider, id)` 记账，只种国内版会让国际版的新模型停在全开状态，
+/// 而两家的模型名很可能同名。
 fn seed_current_workbuddy_defaults() {
-    let ids: Vec<String> = crate::server::core::models::global_catalog()
-        .list()
-        .iter()
-        .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_string))
-        .collect();
-    if let Some(summary) = crate::server::core::model_rules::seed_workbuddy_defaults(&ids) {
-        crate::server::logging::log("[Models]", &summary);
+    for region in super::workbuddy::Region::ALL {
+        let ids: Vec<String> = crate::server::core::models::global_catalog(region)
+            .list()
+            .iter()
+            .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        if let Some(summary) = crate::server::core::model_rules::seed_workbuddy_defaults(
+            region.provider_id(),
+            &ids,
+        ) {
+            crate::server::logging::log("[Models]", &summary);
+        }
     }
 }
 

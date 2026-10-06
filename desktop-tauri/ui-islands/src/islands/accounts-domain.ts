@@ -83,6 +83,12 @@ type ProviderFeatures = {
 const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   // 国内版领取签到奖励，国际版通过同一入口完成活跃保活并尝试领取日活奖励。
   workbuddy: { usage: true, checkin: true, edition: true, identifier: 'uid', expiry: 'expiresAt' },
+  // WorkBuddy 国际版（拆家后的第二家，见 providers::workbuddy::region）：
+  //   · 通过同一入口执行日活探测与免费模型保活，仍提供「活跃保活」动作；
+  //   · `edition: false` 是因为注册名「WorkBuddy 国际版」自带地区，再拼一次会
+  //     得到「WorkBuddy 国际版 国际版」（`editionSuffix` 虽有「名字已含就不拼」
+  //     的兜底，这里直接写 false 更清楚，与 `zcode-intl` 同款）。
+  'workbuddy-intl': { usage: true, checkin: true, edition: false, identifier: 'uid', expiry: 'expiresAt' },
   raccoon: { usage: true, checkin: true, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt' },
   catpaw: { usage: true, checkin: false, edition: false, identifier: 'uid', expiry: 'tokenExpiresAt' },
   // AutoClaw 两个地区能力完全一致，差别只在域名；两项都必须登记 —— 漏了哪一项，
@@ -183,7 +189,15 @@ export function providerSummaries(snapshot: AccountsSnapshot | null | undefined)
     if (known.has(id)) return
     known.set(id, { id, label: shared().wbProviders?.labelOf?.(id) || id, count })
   })
-  if (!known.size) known.set(DEFAULT_PROVIDER_ID, { id: DEFAULT_PROVIDER_ID, label: 'WorkBuddy', count: 0 })
+  // 摘要还没到时的兜底项：名字优先问注册表，问不到才用字面量 —— 与
+  // add-provider-pick 那张卡的兜底同一口径（拆家后注册名带「国内版」）
+  if (!known.size) {
+    known.set(DEFAULT_PROVIDER_ID, {
+      id: DEFAULT_PROVIDER_ID,
+      label: shared().wbProviders?.labelOf?.(DEFAULT_PROVIDER_ID) || 'WorkBuddy 国内版',
+      count: 0,
+    })
+  }
   return [...known.values()]
 }
 
@@ -301,13 +315,14 @@ export function accountEdition(account: AccountRecord | null | undefined): 'cn' 
 export function supportsCheckin(account: AccountRecord | null | undefined): boolean {
   const provider = providerOf(account)
   if (!providerFeatures(provider).checkin) return false
-  if (provider === DEFAULT_PROVIDER_ID || provider === 'qoder' || provider === 'minimax-code' || provider === 'lobsterai') return true
+  if (provider === DEFAULT_PROVIDER_ID || provider === 'workbuddy-intl' || provider === 'qoder' || provider === 'minimax-code' || provider === 'lobsterai') return true
   return accountEdition(account) !== 'intl'
 }
 
 /** WorkBuddy 国际版执行的是日活保活任务，仍复用签到请求入口。 */
 export function isWorkBuddyInternational(account: AccountRecord | null | undefined): boolean {
-  return providerOf(account) === DEFAULT_PROVIDER_ID && accountEdition(account) === 'intl'
+  const provider = providerOf(account)
+  return provider === 'workbuddy-intl' || (provider === DEFAULT_PROVIDER_ID && accountEdition(account) === 'intl')
 }
 
 /**

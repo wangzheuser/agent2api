@@ -17,7 +17,6 @@ use crate::server::core::account_store::state::StoredAccount;
 use crate::server::core::account_store::store_util::{token_tail_of, truncate_text};
 use crate::server::core::account_store::MAX_TOKEN_LENGTH;
 use crate::server::core::endpoints::resolve_edition;
-use crate::server::core::providers::{kind_id, ProviderKind};
 
 /// 导入值不允许覆盖的键（本机运营字段；语义见模块头）。
 const LOCAL_OWNED_KEYS: [&str; 6] = [
@@ -175,7 +174,10 @@ pub(super) fn normalize_imported(
         record.insert("proxy".to_string(), Value::Null);
     }
 
-    if provider == kind_id(ProviderKind::WorkBuddy) {
+    // 判据是「workbuddy 系」而不是单个 id：国内版与国际版共用同一套账号 schema
+    // （uid 身份 + edition/endpoint/prefixPath/platform），写成单 id 会让国际版
+    // 掉进 else 分支把那些字段**清掉** —— 导入后账号只剩默认端点，转发必然 401。
+    if crate::server::core::providers::workbuddy::is_workbuddy_family(&provider) {
         normalize_workbuddy_known_fields(&mut record, item, before);
     } else {
         // 非 WorkBuddy：edition / prefixPath / endpoint / platform 是 WorkBuddy 的
