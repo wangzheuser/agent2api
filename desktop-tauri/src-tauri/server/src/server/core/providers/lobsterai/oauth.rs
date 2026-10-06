@@ -153,6 +153,22 @@ pub fn parse_callback_code(
     Ok(code)
 }
 
+/// 官方客户端会在回调里附带 `return_to`，用于把浏览器带回 portal 成功页。
+/// 只允许 Youdao 域名和本机回环地址，避免把 OAuth 回调变成开放重定向。
+pub fn safe_return_to(value: &str) -> Option<String> {
+    let value = value.trim();
+    let url = url::Url::parse(value).ok()?;
+    if !matches!(url.scheme(), "http" | "https") || !url.username().is_empty() || url.password().is_some() {
+        return None;
+    }
+    let host = url.host_str()?.to_ascii_lowercase();
+    let allowed = host == "youdao.com"
+        || host.ends_with(".youdao.com")
+        || host == "127.0.0.1"
+        || host == "localhost";
+    allowed.then(|| value.to_string())
+}
+
 /// 用一次性授权码换取 LobsterAI 凭证。`state` 在这里再次消费，防止绕过路由层重复换码。
 pub async fn exchange_code(
     code: &str,
@@ -281,5 +297,23 @@ mod tests {
         )
         .expect_err("state mismatch");
         assert_eq!(error.status_code, 400);
+    }
+
+    #[test]
+    fn return_to_is_limited_to_youdao_or_loopback() {
+        assert!(safe_return_to("https://lobsterai.youdao.com/portal#/login").is_some());
+        assert!(safe_return_to("http://127.0.0.1:3065/auth/callback").is_some());
+        assert!(safe_return_to("https://example.invalid/steal").is_none());
+        assert!(safe_return_to("javascript:alert(1)").is_none());
+    }
+
+    #[test]
+    fn callback_parser_accepts_official_return_to_parameter() {
+        let code = parse_callback_code(
+            "http://127.0.0.1:3065/auth/callback?return_to=https%3A%2F%2Flobsterai.youdao.com%2Fportal%23%2Flogin&code=fixture-code&state=fixture-state",
+            "fixture-state",
+        )
+        .expect("official callback");
+        assert_eq!(code, "fixture-code");
     }
 }

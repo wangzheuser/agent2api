@@ -78,6 +78,8 @@ pub fn panel_router(state: ServerState) -> Router {
     // Key，不受影响；而 headless/公网形态下它暴露账号昵称、各家健康状态等
     // 部署信息，不该在无 Key 的世界里裸奔（网页端 bridge 首次 401 会引导输入）。
     let public = Router::new()
+        // LobsterAI portal 的 loopback GET 回调不携带面板 API Key。
+        .route("/auth/callback", get(api::session::login_lobsterai_callback))
         .route("/api/endpoints", get(api::endpoints::handle))
         // 面板登录：调用方此时没有任何凭证，必须挂 public —— 安全由
         // 失败锁定（同 IP 连续 5 次锁 5 分钟）与 bcrypt 校验成本承担

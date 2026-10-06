@@ -303,7 +303,6 @@ impl ServerState {
         crate::server::core::providers::codearts::oauth::set_loopback_port(port);
         // MiniMax Code 与 LobsterAI 的授权地址同样由无参适配器生成，回调
         // 必须指向当前网关的 loopback 端口。
-        crate::server::core::providers::minimax_code::oauth::set_loopback_port(port);
         crate::server::core::providers::lobsterai::oauth::set_loopback_port(port);
         let config_dir = config::config_dir();
         // 与 Node 版一致：verbose 由环境变量 AGENT2API_VERBOSE=1 打开

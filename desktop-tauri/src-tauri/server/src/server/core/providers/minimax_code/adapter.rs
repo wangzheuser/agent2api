@@ -16,7 +16,7 @@ use crate::server::core::providers::content_block;
 use crate::server::core::providers::ProviderKind;
 use crate::server::errors::GatewayError;
 
-use super::{auth, balance, credentials, models, oauth, refresh};
+use super::{auth, balance, credentials, models, refresh};
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
@@ -187,33 +187,7 @@ impl ProviderAdapter for MiniMaxCodeAdapter {
     }
 
     fn supports_web_login(&self) -> bool {
-        true
-    }
-
-    fn build_login_url(&self) -> Option<(String, String)> {
-        oauth::begin_login()
-    }
-
-    fn exchange_login_code<'a>(
-        &'a self,
-        store: &'a AccountStore,
-        code: &'a str,
-        state: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<String, GatewayError>> + Send + 'a>> {
-        Box::pin(async move {
-            let credentials = oauth::exchange_code(code, state).await?;
-            let account = store
-                .add_minimax_code_account(&credentials, None, "web")
-                .map_err(|error| GatewayError::with_status(error.status_code, error.message))?;
-            account
-                .get("id")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .filter(|id| !id.is_empty())
-                .ok_or_else(|| {
-                    GatewayError::with_status(500, "MiniMax Code 登录成功但账号未能写入")
-                })
-        })
+        false
     }
 }
 
