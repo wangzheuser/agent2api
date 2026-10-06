@@ -709,7 +709,8 @@ async function runAccountAction(action, id) {
       toast('✅ Token 已刷新');
     } else if (action === 'remove') {
       const account = state?.accounts?.accounts?.find(a => a.id === id);
-      const name = esc(account?.nickname || account?.name || id);
+      // 与岛内 displayNameOf 同一口径：nameCustom 恒赢，未打标维持旧口径（昵称优先）
+      const name = esc(account?.nameCustom && account?.name ? account.name : (account?.nickname || account?.name || id));
       // 原生 confirm 在 Tauri 的 WebView 里不弹窗、直接放行（等于没有确认），
       // 危险确认一律走自绘弹窗（wbConfirm，见 confirm-dialog.js）—— 下同
       const note = window.wbAccountsModel?.isDesktopAccount?.(account) ? '（不会影响客户端登录态）' : '';

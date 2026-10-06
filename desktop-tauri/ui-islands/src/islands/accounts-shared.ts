@@ -51,6 +51,8 @@ export type AccountRecord = {
   provider?: string
   name?: string
   nickname?: string
+  /** 用户显式设置过备注名（后端在 update_account 真正改到 name 时打的标，见 apply_patch） */
+  nameCustom?: boolean
   email?: string
   priority?: number
   enabled?: boolean

@@ -70,6 +70,8 @@ const PROVIDER_ICONS: Record<string, string> = {
   codearts: 'assets/providers/codearts.png',
   trae: 'assets/providers/trae.png',
   'minimax-code': 'assets/providers/minimax-cn.png',
+  // Loomy：取自安装包 `resources/app.asar` 的 Windows 图标集。
+  loomy: 'assets/providers/loomy.png',
 }
 
 type CardItem = {

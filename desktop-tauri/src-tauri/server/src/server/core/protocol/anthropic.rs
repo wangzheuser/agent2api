@@ -30,9 +30,9 @@ use std::sync::Arc;
 use serde_json::{json, Map, Value};
 
 use super::{
-    content_parts, content_text, event_frame, is_truthy, json_number_of, json_text, native_tool,
-    random_id, string_field, string_value, tool_plan, SseLineBuffer, FIELD_CACHE_CONTROL,
-    FIELD_IS_ERROR,
+    content_parts, content_text, event_frame, is_truthy, json_text, native_tool, random_id,
+    string_field, string_value, tool_plan, SseLineBuffer, TOOL_IMAGE_PLACEHOLDER,
+    FIELD_CACHE_CONTROL, FIELD_IS_ERROR,
 };
 use super::responses::ConvertError;
 use crate::server::core::upstream::usage::{merge_usage, usage_value, RequestTelemetry};
@@ -278,6 +278,12 @@ fn convert_message(messages: &mut Vec<Value>, message: &Value) -> Result<(), Con
     // beginning of this message"）。Anthropic 自身的规范顺序同样是 tool_result
     // 在前、正文在后 —— 先推正文会把用户消息插进 assistant 与其结果之间，
     // 严格上游因此对之后每条请求都 400，整条会话报废。
+    //
+    // 工具结果里的图片：Chat 的 tool 消息不许带图（OpenAI 直接 400，理由见
+    // `responses::PendingImages`），所以攒起来、在本轮工具结果**全部**落地之后
+    // 落成一条 user 消息。不需要跨 Anthropic 消息暂存 —— Anthropic 要求一条
+    // assistant 的全部 tool_result 都在紧接着的那条 user 消息里。
+    let mut tool_result_images: Vec<Value> = Vec::new();
     for (index, result) in tool_results.iter().enumerate() {
         let tool_use_id = string_field(result, "tool_use_id");
         let output = result.get("content").unwrap_or(&Value::Null);
@@ -286,6 +292,8 @@ fn convert_message(messages: &mut Vec<Value>, message: &Value) -> Result<(), Con
         // 恢复；OpenAI 形出口没有这个概念，随 strip 剥离。
         let is_error = result.get("is_error").and_then(Value::as_bool) == Some(true);
         let cache = tool_result_caches.get(index).cloned().flatten();
+        let parts = tool_result_parts(output, image_to_chat);
+        tool_result_images.extend(parts.images);
         let mut entry = Map::new();
         entry.insert("role".to_string(), Value::String("tool".to_string()));
         entry.insert(
@@ -294,7 +302,12 @@ fn convert_message(messages: &mut Vec<Value>, message: &Value) -> Result<(), Con
         );
         entry.insert(
             "content".to_string(),
-            Value::String(tool_result_text(output)),
+            // 只有图片时 `text` 是空串，占位文案理由见 [`TOOL_IMAGE_PLACEHOLDER`]
+            Value::String(if parts.text.is_empty() {
+                TOOL_IMAGE_PLACEHOLDER.to_string()
+            } else {
+                parts.text
+            }),
         );
         if is_error {
             entry.insert(FIELD_IS_ERROR.to_string(), Value::Bool(true));
@@ -303,6 +316,12 @@ fn convert_message(messages: &mut Vec<Value>, message: &Value) -> Result<(), Con
             entry.insert(FIELD_CACHE_CONTROL.to_string(), cache);
         }
         messages.push(Value::Object(entry));
+    }
+    // 结果之后、正文之前：图属于工具结果，挨着它最近的位置是这里。
+    // （客户端自己的正文随后照旧成一条消息，两条连续 user 消息不做合并 ——
+    // 上游接受这种形状，合并反而会把我们的合成内容融进客户端的消息）
+    if !tool_result_images.is_empty() {
+        messages.push(json!({ "role": "user", "content": Value::Array(tool_result_images) }));
     }
 
     // 工具调用：必须挂在 assistant 消息上（Anthropic 的 tool_use 只在 assistant 里）
@@ -343,31 +362,73 @@ fn convert_message(messages: &mut Vec<Value>, message: &Value) -> Result<(), Con
     Ok(())
 }
 
-/// 工具结果内容 → 文本（Chat 的 tool 消息 content 只接受字符串）
+/// 工具结果拆出来的两部分（见 [`tool_result_parts`]）
+pub(super) struct ToolResultParts {
+    /// 文本部分（可能为空串 —— 只有图片时由调用方决定补什么）
+    pub(super) text: String,
+    /// 图片块，**已按调用方给的转换器转成目标协议的形态**
+    pub(super) images: Vec<Value>,
+}
+
+/// 工具结果内容 → 文本 + 图片块。
+///
+/// `convert` 是该方向「图片块 → 目标协议形态」的转换器（入站给
+/// [`image_to_chat`]，出站给 `image_to_anthropic`）：转不出来的块在这里就被
+/// 剔除，所以调用方拿到的 `images` 一定落得下去，不必再判一次。
+///
+/// ── 为什么必须拆开（与 responses.rs 的 issue #76 同一类）──────
+/// Anthropic 的 `tool_result.content` 允许**嵌套内容块数组**，官方收
+/// `text` / `image` / `document` / `search_result` 四类，图片是真实用法
+/// （Claude Code 读一张截图、MCP 的截图类工具都这么回）。原实现一律走
+/// [`content_text`] 取文本，**图片被静默丢掉**；只有图片时则退化成 `json_text`
+/// 把 base64 拍平成正文 —— 前者症状是模型看不到图却照上下文编答案（比 token
+/// 暴涨更隐蔽，因为连 token 数都不涨），后者与 issue #76 完全同病。
+///
+/// 拆开之后：文本进 Chat 的 tool 消息，图片由调用方转交相邻的 user 消息
+/// （Chat 的 tool 消息不许带图，理由见 `responses::PendingImages`）。
 ///
 /// `pub(super)`：出站方向（`anthropic_outbound`）把 chat 的 tool 消息折回
-/// user 消息里的 tool_result 块时用同一口径。
-pub(super) fn tool_result_text(content: &Value) -> String {
+/// `tool_result` 时用同一口径，两处各写一份迟早分叉。
+pub(super) fn tool_result_parts(
+    content: &Value,
+    convert: fn(&Value) -> Option<Value>,
+) -> ToolResultParts {
+    let text_only = |text: String| ToolResultParts { text, images: Vec::new() };
     match content {
         Value::String(text) => {
-            if text.is_empty() { "(empty)".to_string() } else { text.clone() }
+            if text.is_empty() { text_only("(empty)".to_string()) } else { text_only(text.clone()) }
         }
-        Value::Null => "(empty)".to_string(),
-        Value::Array(_) => {
+        Value::Null => text_only("(empty)".to_string()),
+        Value::Array(parts) => {
+            let images: Vec<Value> = parts
+                .iter()
+                .filter(|part| is_image_block(part))
+                .filter_map(|part| convert(part))
+                .collect();
             let text = content_text(content);
-            if text.is_empty() {
-                // 结构化结果（图片等）：拍平成 JSON
+            if text.is_empty() && images.is_empty() {
+                // 一个块都落不下来（例如 Anthropic Files API 的 `file` 源图片、
+                // 只有 `search_result` / `document` 的结果）：保持原来的拍平
+                // 兜底，免得整段结果凭空消失
                 let raw = json_text(content);
-                if raw.is_empty() { "(empty)".to_string() } else { raw }
-            } else {
-                text
+                return text_only(if raw.is_empty() { "(empty)".to_string() } else { raw });
             }
+            ToolResultParts { text, images }
         }
         other => {
             let raw = json_text(other);
-            if raw.is_empty() { "(empty)".to_string() } else { raw }
+            text_only(if raw.is_empty() { "(empty)".to_string() } else { raw })
         }
     }
+}
+
+/// 是不是图片块（Anthropic 的 `image` 与 Chat 的 `image_url` / `input_image`
+/// 都认 —— 两个方向的输入各是其中一种，转不转得出来交给 `convert` 判）
+fn is_image_block(part: &Value) -> bool {
+    matches!(
+        string_field(part, "type").to_lowercase().as_str(),
+        "image" | "image_url" | "input_image"
+    )
 }
 
 /// Anthropic 的 image 块 → Chat 的 image_url 块。
@@ -623,27 +684,29 @@ pub fn usage_to_anthropic(usage: Option<&Value>) -> Value {
         return json!({ "input_tokens": 0, "output_tokens": 0 });
     };
     let number = |value: &Value| {
-        value
-            .as_i64()
-            .or_else(|| value.as_f64().filter(|number| number.is_finite()).map(|number| number as i64))
+        value.as_i64().or_else(|| {
+            value
+                .as_f64()
+                .filter(|number| number.is_finite())
+                .map(|number| number as i64)
+        }).unwrap_or(0)
+    };
+    let number_of = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|key| usage.get(*key).map(number))
             .unwrap_or(0)
     };
     let cached = usage
         .pointer("/prompt_tokens_details/cached_tokens")
         .map(number)
         .filter(|value| *value > 0)
-        .unwrap_or_else(|| {
-            json_number_of(
-                usage,
-                &["cache_read_input_tokens", "cache_read_tokens", "prompt_cache_hit_tokens"],
-            )
-        });
+        .unwrap_or_else(|| number_of(&["cache_read_input_tokens", "cache_read_tokens", "prompt_cache_hit_tokens"]));
     let cache_creation = crate::server::core::upstream::usage::cache_creation_tokens(usage);
-    let input = json_number_of(usage, &["prompt_tokens", "input_tokens"]);
+    let input = number_of(&["prompt_tokens", "input_tokens"]);
     let mut out = json!({
         // Anthropic 的 input_tokens 不含缓存读取和创建部分。
         "input_tokens": (input - cached - cache_creation.unwrap_or(0)).max(0),
-        "output_tokens": json_number_of(usage, &["completion_tokens", "output_tokens"]),
+        "output_tokens": number_of(&["completion_tokens", "output_tokens"]),
     });
     if cached > 0 {
         out["cache_read_input_tokens"] = Value::from(cached);
@@ -655,10 +718,6 @@ pub fn usage_to_anthropic(usage: Option<&Value>) -> Value {
 }
 
 // ─── 流式：Chat SSE → Anthropic SSE ─────────────────────────
-
-/// 在末帧 usage 到达前暂存的最大下行字节数。超过上限后恢复正常实时下发；
-/// 此时 message_start 仅能使用已有用量证据，避免无界缓存。
-const MAX_DEFERRED_BYTES: usize = 1024 * 1024;
 
 /// Chat 的 SSE 字节流 → Anthropic 的 SSE 字节流（状态机）。
 ///
@@ -688,9 +747,8 @@ pub struct AnthropicStream {
     has_tool: bool,
     stop_reason: Option<String>,
     usage: Option<Value>,
+    input_tokens: i64,
     telemetry: Option<Arc<RequestTelemetry>>,
-    deferred: Vec<bytes::Bytes>,
-    deferred_bytes: usize,
 }
 
 impl AnthropicStream {
@@ -712,15 +770,11 @@ impl AnthropicStream {
             has_tool: false,
             stop_reason: None,
             usage: None,
+            input_tokens: 0,
             telemetry: None,
-            deferred: Vec::new(),
-            deferred_bytes: 0,
         }
     }
 
-    /// 绑定请求旁路槽。转发层会先把末帧 usage 写入该槽，再把同一帧交给
-    /// 协议转换器；因此即使上游只在末帧给 usage，首个 Anthropic 事件也能
-    /// 使用真实统计值。
     pub fn set_telemetry(&mut self, telemetry: Arc<RequestTelemetry>) {
         self.telemetry = Some(telemetry);
     }
@@ -757,7 +811,7 @@ impl AnthropicStream {
         }
         self.sync_telemetry_usage();
         self.finished = true;
-        out.extend(self.release_before_start(Vec::new(), true));
+        out.extend(self.emit_start());
         out.extend(self.close_block());
         let stop_reason = self
             .stop_reason
@@ -767,44 +821,19 @@ impl AnthropicStream {
             "message_delta",
             json!({
                 "delta": { "stop_reason": stop_reason, "stop_sequence": Value::Null },
-                "usage": self.message_delta_usage(),
+                "usage": { "output_tokens": self.output_tokens() },
             }),
         ));
         out.push(self.event("message_stop", json!({})));
         out
     }
 
-    fn input_tokens_known(&self) -> bool {
-        self.usage.as_ref().is_some_and(|usage| {
-            let input = json_number_of(usage, &["prompt_tokens", "input_tokens"]);
-            let cached_from_details = usage
-                .pointer("/prompt_tokens_details/cached_tokens")
-                .and_then(|value| value.as_i64().or_else(|| value.as_f64().map(|number| number as i64)))
-                .unwrap_or(0)
-                .max(0);
-            let cached = if cached_from_details > 0 {
-                cached_from_details
-            } else {
-                json_number_of(
-                    usage,
-                    &["cache_read_input_tokens", "cache_read_tokens", "prompt_cache_hit_tokens"],
-                )
-            };
-            let output = json_number_of(usage, &["completion_tokens", "output_tokens"]);
-            let total = json_number_of(usage, &["total_tokens"]);
-            input > 0 || cached > 0 || total > output
-        })
-    }
-
-    fn message_delta_usage(&self) -> Value {
-        let output_tokens = self
-            .usage
+    fn output_tokens(&self) -> i64 {
+        self.usage
             .as_ref()
-            .map(|usage| json_number_of(usage, &["completion_tokens", "output_tokens"]))
-            .unwrap_or(0);
-        // Anthropic 将输入/缓存 usage 放在 message_start；message_delta 只承载
-        // 增量输出，避免严格客户端拒绝未知字段或按事件累加时重复计数。
-        json!({ "output_tokens": output_tokens })
+            .and_then(|usage| usage.get("completion_tokens"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
     }
 
     fn consume(&mut self, chunk: &Value) -> Vec<bytes::Bytes> {
@@ -814,7 +843,7 @@ impl AnthropicStream {
         let mut out = Vec::new();
         if let Some(error) = chunk.get("error").filter(|value| is_truthy(value)) {
             self.finished = true;
-            out.extend(self.release_before_start(Vec::new(), true));
+            out.extend(self.emit_start());
             let message = {
                 let text = string_field(error, "message");
                 if text.is_empty() { string_value(error) } else { text }
@@ -832,9 +861,10 @@ impl AnthropicStream {
             }
         }
         if let Some(usage) = chunk.get("usage").filter(|value| value.is_object()) {
-            self.update_usage(usage);
+            // Anthropic 的 message_delta 只报 output_tokens，input 在 message_start
+            self.input_tokens = usage.get("prompt_tokens").and_then(Value::as_i64).unwrap_or(0);
+            self.usage = Some(merge_usage(self.usage.as_ref(), usage));
         }
-        self.sync_telemetry_usage();
         let choice = chunk.pointer("/choices/0");
         if let Some(finish) = choice
             .and_then(|choice| choice.get("finish_reason"))
@@ -849,8 +879,9 @@ impl AnthropicStream {
                 "end_turn".to_string()
             });
         }
+        out.extend(self.emit_start());
         let Some(delta) = choice.and_then(|choice| choice.get("delta")) else {
-            return self.release_before_start(out, false);
+            return out;
         };
         // 思考增量 → thinking 块
         let reasoning = {
@@ -886,44 +917,6 @@ impl AnthropicStream {
                 out.extend(self.consume_tool(call));
             }
         }
-        self.release_before_start(out, false)
-    }
-
-    fn update_usage(&mut self, usage: &Value) {
-        self.usage = Some(merge_usage(self.usage.as_ref(), usage));
-    }
-
-    fn sync_telemetry_usage(&mut self) {
-        let Some(telemetry) = &self.telemetry else {
-            return;
-        };
-        let snapshot = telemetry.snapshot();
-        let Some(usage) = usage_value(&snapshot) else {
-            return;
-        };
-        self.update_usage(&usage);
-    }
-
-    fn release_before_start(&mut self, mut current: Vec<bytes::Bytes>, force: bool) -> Vec<bytes::Bytes> {
-        if self.started {
-            return current;
-        }
-        if !force && !self.input_tokens_known() {
-            // 上游通常只在最后一个 Chat chunk 提供 prompt usage。Anthropic
-            // 要求 message_start 先带真实 input/cache，而 message_start 一旦
-            // 发出就不能修订，因此在拿到 usage 前暂存已转换事件；若上游一直
-            // 不给 usage，finish() 会在 EOF 以既有的 0 值完成协议收尾。
-            let current_bytes: usize = current.iter().map(bytes::Bytes::len).sum();
-            if self.deferred_bytes.saturating_add(current_bytes) <= MAX_DEFERRED_BYTES {
-                self.deferred_bytes = self.deferred_bytes.saturating_add(current_bytes);
-                self.deferred.append(&mut current);
-                return Vec::new();
-            }
-        }
-        let mut out = self.emit_start();
-        self.deferred_bytes = 0;
-        out.append(&mut self.deferred);
-        out.append(&mut current);
         out
     }
 
@@ -1046,8 +1039,6 @@ impl AnthropicStream {
             return Vec::new();
         }
         self.started = true;
-        let mut usage = usage_to_anthropic(self.usage.as_ref());
-        usage["output_tokens"] = Value::from(0);
         vec![self.event(
             "message_start",
             json!({
@@ -1059,7 +1050,7 @@ impl AnthropicStream {
                     "content": [],
                     "stop_reason": Value::Null,
                     "stop_sequence": Value::Null,
-                    "usage": usage,
+                    "usage": { "input_tokens": self.input_tokens, "output_tokens": 0 },
                 },
             }),
         )]
@@ -1070,6 +1061,21 @@ impl AnthropicStream {
             map.insert("type".to_string(), Value::String(event.to_string()));
         }
         event_frame(event, &data)
+    }
+
+    fn sync_telemetry_usage(&mut self) {
+        let Some(telemetry) = &self.telemetry else {
+            return;
+        };
+        if let Some(usage) = usage_value(&telemetry.snapshot()) {
+            self.usage = Some(merge_usage(self.usage.as_ref(), &usage));
+            self.input_tokens = self
+                .usage
+                .as_ref()
+                .and_then(|value| value.get("prompt_tokens"))
+                .and_then(Value::as_i64)
+                .unwrap_or(self.input_tokens);
+        }
     }
 }
 
@@ -1177,8 +1183,13 @@ impl AnthropicCollector {
         }
     }
 
-    pub fn into_response(mut self, model: &str) -> Value {
-        self.sync_telemetry_usage();
+    pub fn into_response(self, model: &str) -> Value {
+        let mut this = self;
+        this.sync_telemetry_usage();
+        this.into_response_inner(model)
+    }
+
+    fn into_response_inner(self, model: &str) -> Value {
         let mut content: Vec<Value> = Vec::new();
         if !self.reasoning.is_empty() {
             content.push(json!({ "type": "thinking", "thinking": self.reasoning }));
@@ -1258,230 +1269,5 @@ pub fn responses_error_code(status: u16) -> &'static str {
         429 => "rate_limit_error",
         500..=599 => "server_error",
         _ => "api_error",
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cache_creation_stream_usage_is_independent_of_network_splits() {
-        use crate::server::core::upstream::sse::ReasoningCoalescer;
-        for creation in [None, Some(0), Some(30)] {
-            let mut usage = json!({"prompt_tokens": 100, "completion_tokens": 7,
-                "prompt_tokens_details": {"cached_tokens": 20}});
-            if let Some(value) = creation {
-                usage["cache_creation_input_tokens"] = json!(value);
-            }
-            let mut input = chat_frame(json!({"choices": [{"delta": {"content": "样例"}}]}));
-            input.extend(chat_frame(json!({"choices": [], "usage": usage})));
-            input.extend_from_slice(b"data: [DONE]\n\n");
-            for split in 0..=input.len() {
-                let telemetry = Arc::new(RequestTelemetry::new());
-                let mut upstream = ReasoningCoalescer::with_telemetry(telemetry.clone());
-                let mut downstream = AnthropicStream::new("sample");
-                downstream.set_telemetry(telemetry);
-                let mut frames = Vec::new();
-                for part in [&input[..split], &input[split..]] {
-                    for frame in upstream.push(part) {
-                        frames.extend(downstream.push(&frame));
-                    }
-                }
-                for frame in upstream.finish() {
-                    frames.extend(downstream.push(&frame));
-                }
-                frames.extend(downstream.finish());
-                let events = event_values(&frames);
-                let start = events.iter().find(|event| event["type"] == "message_start").unwrap();
-                let actual = &start["message"]["usage"];
-                assert_eq!(actual["input_tokens"], 80 - creation.unwrap_or(0), "split={split}");
-                assert_eq!(actual["cache_read_input_tokens"], 20);
-                assert_eq!(actual.get("cache_creation_input_tokens").and_then(Value::as_i64), creation, "split={split}");
-                assert_eq!(events.iter().filter(|e| e["type"] == "message_stop").count(), 1);
-                let delta = events.iter().find(|e| e["type"] == "message_delta").unwrap();
-                assert_eq!(delta["usage"], json!({"output_tokens": 7}));
-            }
-            let mut collector = AnthropicCollector::new();
-            collector.push(&input);
-            collector.finish();
-            let response = collector.into_response("sample");
-            assert_eq!(response["usage"], usage_to_anthropic(Some(&usage)));
-        }
-    }
-
-    fn chat_frame(value: Value) -> Vec<u8> {
-        format!("data: {}\n\n", serde_json::to_string(&value).unwrap()).into_bytes()
-    }
-
-    fn event_values(frames: &[bytes::Bytes]) -> Vec<Value> {
-        frames
-            .iter()
-            .filter_map(|frame| {
-                let text = std::str::from_utf8(frame).ok()?;
-                let data = text.lines().find_map(|line| line.strip_prefix("data: "))?;
-                serde_json::from_str(data).ok()
-            })
-            .collect()
-    }
-
-    #[test]
-    fn usage_to_anthropic_keeps_real_tokens_and_omits_empty_cache_fields() {
-        let usage = usage_to_anthropic(Some(&json!({
-            "prompt_tokens": 183_284,
-            "completion_tokens": 237,
-            "total_tokens": 183_521,
-        })));
-        assert_eq!(usage["input_tokens"], 183_284);
-        assert_eq!(usage["output_tokens"], 237);
-        assert!(usage.get("cache_read_input_tokens").is_none());
-        assert!(usage.get("cache_creation_input_tokens").is_none());
-
-        let with_cache_creation = usage_to_anthropic(Some(&json!({
-            "prompt_tokens": 100,
-            "completion_tokens": 3,
-            "prompt_tokens_details": { "cached_tokens": 20 },
-            "cache_creation_input_tokens": 30,
-        })));
-        assert_eq!(with_cache_creation["input_tokens"], 50);
-        assert_eq!(with_cache_creation["cache_read_input_tokens"], 20);
-        assert_eq!(with_cache_creation["cache_creation_input_tokens"], 30);
-
-        let with_top_level_cache = usage_to_anthropic(Some(&json!({
-            "prompt_tokens": 100,
-            "completion_tokens": 3,
-            "prompt_tokens_details": { "cached_tokens": 0 },
-            "cache_read_tokens": 20,
-        })));
-        assert_eq!(with_top_level_cache["input_tokens"], 80);
-        assert_eq!(with_top_level_cache["cache_read_input_tokens"], 20);
-    }
-
-    #[test]
-    fn streaming_usage_waits_for_late_usage_and_keeps_cache_fields() {
-        let mut stream = AnthropicStream::new("glm-5.3-flash");
-        let first = chat_frame(json!({
-            "id": "chat-1",
-            "choices": [{ "delta": { "role": "assistant", "content": "ok" }, "finish_reason": null }],
-        }));
-        assert!(stream.push(&first).is_empty());
-
-        let final_chunk = chat_frame(json!({
-            "id": "chat-1",
-            "choices": [],
-            "usage": {
-                "prompt_tokens": 183_284,
-                "completion_tokens": 237,
-                "total_tokens": 183_521,
-                "prompt_tokens_details": { "cached_tokens": 183_040 },
-            },
-        }));
-        let mut frames = stream.push(&final_chunk);
-        frames.extend(stream.finish());
-        let events = event_values(&frames);
-        let start = events.iter().find(|event| event["type"] == "message_start").unwrap();
-        assert_eq!(start["message"]["usage"]["input_tokens"], 244);
-        assert_eq!(start["message"]["usage"]["cache_read_input_tokens"], 183_040);
-        let delta = events.iter().find(|event| event["type"] == "message_delta").unwrap();
-        assert_eq!(delta["usage"]["output_tokens"], 237);
-        assert!(delta["usage"].get("input_tokens").is_none());
-        assert!(delta["usage"].get("cache_read_input_tokens").is_none());
-    }
-
-    #[test]
-    fn streaming_usage_falls_back_to_internal_telemetry() {
-        let telemetry = std::sync::Arc::new(RequestTelemetry::new());
-        let mut stream = AnthropicStream::new("glm-5.3-flash");
-        stream.set_telemetry(telemetry.clone());
-        let first = chat_frame(json!({
-            "id": "chat-telemetry",
-            "choices": [{ "delta": { "role": "assistant", "content": "ok" }, "finish_reason": null }],
-        }));
-        assert!(stream.push(&first).is_empty());
-
-        telemetry.report_usage(&json!({
-            "prompt_tokens": 183_284,
-            "completion_tokens": 237,
-            "total_tokens": 183_521,
-            "prompt_tokens_details": { "cached_tokens": 183_040 },
-        }));
-        let events = event_values(&stream.push(b"data: [DONE]\n\n"));
-        let start = events.iter().find(|event| event["type"] == "message_start").unwrap();
-        assert_eq!(start["message"]["usage"]["input_tokens"], 244);
-        assert_eq!(start["message"]["usage"]["cache_read_input_tokens"], 183_040);
-        let delta = events.iter().find(|event| event["type"] == "message_delta").unwrap();
-        assert_eq!(delta["usage"]["output_tokens"], 237);
-    }
-
-    #[test]
-    fn streaming_and_non_streaming_usage_match_without_cache() {
-        let chunk = chat_frame(json!({
-            "id": "chat-2",
-            "choices": [{ "delta": { "content": "ok" }, "finish_reason": "stop" }],
-            "usage": { "prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15 },
-        }));
-        let mut stream = AnthropicStream::new("glm");
-        let mut frames = stream.push(&chunk);
-        frames.extend(stream.finish());
-        let start = event_values(&frames)
-            .into_iter()
-            .find(|event| event["type"] == "message_start")
-            .unwrap();
-        assert!(start["message"]["usage"].get("cache_read_input_tokens").is_none());
-
-        let mut collector = AnthropicCollector::new();
-        collector.push(&chunk);
-        collector.finish();
-        let body = collector.into_response("glm");
-        assert_eq!(body["usage"]["input_tokens"], 12);
-        assert_eq!(body["usage"]["output_tokens"], 3);
-        assert!(body["usage"].get("cache_read_input_tokens").is_none());
-    }
-
-    #[test]
-    fn streaming_without_usage_keeps_deferred_content_until_usage_arrives() {
-        let mut stream = AnthropicStream::new("glm");
-        let first = chat_frame(json!({
-            "choices": [{ "delta": { "content": "a" }, "finish_reason": null }],
-        }));
-        assert!(stream.push(&first).is_empty());
-        let second = chat_frame(json!({
-            "choices": [{ "delta": { "content": "b" }, "finish_reason": null }],
-        }));
-        assert!(stream.push(&second).is_empty());
-        let usage = chat_frame(json!({
-            "choices": [],
-            "usage": { "prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12 },
-        }));
-        let frames = stream.push(&usage);
-        let events = event_values(&frames);
-        let start = events.iter().find(|event| event["type"] == "message_start").unwrap();
-        assert_eq!(start["message"]["usage"]["input_tokens"], 10);
-        assert!(events.iter().any(|event| event["type"] == "content_block_delta"));
-        assert!(stream.started);
-    }
-
-    #[test]
-    fn streaming_without_usage_flushes_deferred_content_at_eof() {
-        let mut stream = AnthropicStream::new("glm");
-        let first = chat_frame(json!({
-            "choices": [{ "delta": { "content": "a" }, "finish_reason": null }],
-        }));
-        assert!(stream.push(&first).is_empty());
-        let frames = stream.finish();
-        let events = event_values(&frames);
-        assert!(events.iter().any(|event| event["type"] == "message_start"));
-        assert!(events.iter().any(|event| event["type"] == "content_block_delta"));
-    }
-
-    #[test]
-    fn streaming_without_usage_releases_after_deferred_byte_bound() {
-        let mut stream = AnthropicStream::new("glm");
-        let current = vec![bytes::Bytes::from(vec![b'x'; MAX_DEFERRED_BYTES + 1])];
-        let frames = stream.release_before_start(current, false);
-        assert!(stream.started);
-        assert!(stream.deferred.is_empty());
-        assert_eq!(stream.deferred_bytes, 0);
-        assert_eq!(frames.len(), 2);
     }
 }

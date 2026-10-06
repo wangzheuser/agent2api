@@ -245,7 +245,9 @@ pub async fn dispatch(
         // `?id=` 是「手点某一行积分按钮」的单查形态，语义见 accounts_usage 的说明。
         ("GET", "usage") => return super::accounts_usage::accounts_usage(&state, query).await,
         // 定时查询那一轮的结果快照（形状同 usage，多一个 `at`）
-        ("GET", "usage/snapshot") => return super::accounts_usage::accounts_usage_snapshot().await,
+        ("GET", "usage/snapshot") => {
+            return super::accounts_usage::accounts_usage_snapshot(&state).await
+        }
         // AutoClaw 只读任务列表；`?id=` 必须指定一个账号，避免无意间并发请求所有账号。
         ("GET", "autoclaw/tasks") => {
             let Some(id) = query_param(query, "id").filter(|value| !value.is_empty()) else {
@@ -630,6 +632,15 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
                 Err(error) => return management_error(error.status_code, error.message),
             };
             store.add_minimax_code_account(&credentials, import_name, "manual")
+        }
+        Some(crate::server::core::providers::ProviderKind::Loomy) => {
+            if import_desktop {
+                return management_error(
+                    400,
+                    "Loomy 不支持导入桌面端登录态，请用「手机号验证码登录」或粘贴 session 添加账号",
+                );
+            }
+            store.add_loomy_account(&payload, import_name)
         }
         // WorkBuddy 系的两家（国内版 / 国际版）：同一套凭证形态与落账号路径，
         // 差别只有归属 —— provider id 自己就是归属（拆家后不再从 payload 里的

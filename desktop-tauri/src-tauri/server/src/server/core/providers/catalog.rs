@@ -131,6 +131,10 @@ pub(crate) fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
         ),
         // MiniMax Code / LobsterAI 当前使用静态目录；协议保留远程刷新扩展点。
         ProviderKind::MiniMaxCode | ProviderKind::LobsterAI => (false, 0),
+        ProviderKind::Loomy => (
+            super::loomy::models::remote_refreshed(),
+            super::loomy::models::last_refreshed_at(),
+        ),
     }
 }
 

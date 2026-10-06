@@ -247,6 +247,19 @@ impl ProviderAdapter for ZcodeAdapter {
         ))
     }
 
+    /// 推理请求恒为 stream:true；ZCode 的 JSON 响应是业务拒绝，HTTP 200
+    /// 也要先读错误体（实测 1005 / exceed quota limit），不能当 SSE 消费。
+    fn is_error_response(&self, status: u16, headers: &HeaderMap) -> bool {
+        if !(200..300).contains(&status) {
+            return true;
+        }
+        headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+    }
+
     /// 上游错误分类。
     ///
     ///   - `401` → TokenExpired（编排层会刷新后同账号重试一次；本家当前的
@@ -255,6 +268,8 @@ impl ProviderAdapter for ZcodeAdapter {
     ///     上游不给结构化的恢复时间，`reset_at` 给 None 让冷却走兜底时长。
     ///     「套餐已到期」也是这条 —— 上游用 429 表达它，而**换通道**
     ///     （账号设置里的「使用套餐」）才是出路，见 `plan` 的模块头）
+    ///   - 业务码 `1005` → QuotaLimited / 429（活动套餐可用 HTTP 200 返回
+    ///     exceed quota limit；不猜测额度恢复时间）
     ///   - 其余 → 交给共用的内容拦截判定（`content_block`），
     ///     与其余各家同一口径 —— 编码套餐同样会有内容策略拦截
     ///
@@ -302,14 +317,17 @@ impl ProviderAdapter for ZcodeAdapter {
         if status == 401 {
             return UpstreamErrorClass::TokenExpired { message };
         }
-        if status == 429 {
+        if status == 429 || code == Some(1005) {
             return UpstreamErrorClass::QuotaLimited {
                 reset_at: None,
                 message,
                 upstream_code: code,
-                status,
+                status: 429,
             };
         }
+        // 被响应头检查拒绝的 2xx JSON 必须产生失败状态；保留原始 HTTP
+        // 状态在 message 中，未知业务码不猜测为凭证失效或额度用尽。
+        let status = if (200..300).contains(&status) { 502 } else { status };
         content_block::classify_or_fatal(status, error_body, message, code)
     }
 

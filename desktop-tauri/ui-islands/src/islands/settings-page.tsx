@@ -62,6 +62,8 @@ import {
   panelLogout,
   refreshAccountSelection,
   refreshDebug,
+  refreshClineHeaders,
+  refreshCors,
   refreshPrompt,
   refreshQueue,
   refreshRetention,
@@ -73,6 +75,7 @@ import {
   removeRetryCode,
   renderAccountSelection,
   renderDebug,
+  renderCors,
   renderPrompt,
   renderRetention,
   renderRetry,
@@ -84,6 +87,8 @@ import {
   restoreCategory,
   saveAccountSelection,
   saveCaptcha,
+  saveClineHeaders,
+  saveCors,
   saveDebug,
   savePromptFile,
   savePromptMode,
@@ -102,6 +107,7 @@ import {
   toggleLan,
   toggleLanPanel,
   useSettings,
+  type ClineHeadersState,
   type DebugState,
   type LanConfirm,
   type LanRegister,
@@ -1204,6 +1210,8 @@ function GatewayPane({ snap }: { snap: SettingsSnapshot }) {
         </div>
       </section>
 
+      <ClineHeadersPanel snap={snap} />
+
       <PromptPanel snap={snap} />
 
       <section className='panel'>
@@ -1235,6 +1243,162 @@ function GatewayPane({ snap }: { snap: SettingsSnapshot }) {
   )
 }
 
+/* ─── Cline 伪装头（网关分类）───────────────── */
+
+/** 伪装头面板的可编辑行：默认行的键锁定，自定义行的键可写 */
+type ClineHeaderRow = { key: string; value: string; isDefault: boolean }
+
+/**
+ * 从快照拼出可编辑的行：默认清单全量在前（保持后端给的顺序），覆盖表里
+ * 多出来的自定义头跟在后面。默认行的值取「覆盖值优先」（空串 = 用户显式
+ * 删了这个头），自定义行原样来自覆盖表。
+ */
+function clineRowsFrom(state: ClineHeadersState): ClineHeaderRow[] {
+  const rows: ClineHeaderRow[] = Object.entries(state.defaults).map(([key, value]) => ({
+    key,
+    value: key in state.overrides ? state.overrides[key] : value,
+    isDefault: true,
+  }))
+  for (const [key, value] of Object.entries(state.overrides)) {
+    if (!(key in state.defaults)) rows.push({ key, value, isDefault: false })
+  }
+  return rows
+}
+
+/** 两张覆盖表是否等价（键集合 + 每个键的值，与键序无关） */
+function sameOverrides(a: Record<string, string>, b: Record<string, string>): boolean {
+  const keys = Object.keys(a)
+  if (keys.length !== Object.keys(b).length) return false
+  return keys.every(key => a[key] === b[key])
+}
+
+/**
+ * Cline 伪装头面板：一张「头名 → 头值」的行编辑器。
+ *
+ * 编辑都在**本组件的草稿**里进行（与 NumberRow 同一取向，只是整张表一份草稿）；
+ * 后端值一变（加载完成 / 保存成功 / 刷新 / 失败回滚）草稿整体重置。「保存」把
+ * 草稿折算成覆盖表交给状态层 —— 默认行改回了默认不进表（后端存的是「改过的
+ * 键」，不是全量配置）、默认行值留空 = 这个头不发、自定义行必须有名有值。
+ */
+function ClineHeadersPanel({ snap }: { snap: SettingsSnapshot }) {
+  const state = snap.clineHeaders
+  const [rows, setRows] = React.useState<ClineHeaderRow[]>(() => clineRowsFrom(state))
+  React.useEffect(() => { setRows(clineRowsFrom(state)) }, [state])
+
+  const busy = snap.busy === 'clineHeaders'
+  const ready = state.status === 'ready'
+
+  function updateRow(index: number, patch: Partial<ClineHeaderRow>): void {
+    setRows(current => current.map((row, i) => (i === index ? { ...row, ...patch } : row)))
+  }
+
+  function buildOverrides(): Record<string, string> {
+    const out: Record<string, string> = {}
+    for (const row of rows) {
+      const key = row.key.trim()
+      if (!key) continue
+      if (row.isDefault) {
+        if (row.value !== (state.defaults[key] ?? '')) out[key] = row.value
+      } else if (row.value !== '') {
+        out[key] = row.value
+      }
+    }
+    return out
+  }
+
+  // 与后端的覆盖表比「键值是否相同」，**不比对键序**：草稿按行顺序产出（默认行
+  // 在前、自定义行追加在后），而后端的 BTreeMap 是字典序 —— 串起来比字符串会让
+  // 「覆盖了某个默认头 + 加了一个排序在它前面的自定义头」这种组合在保存成功后
+  // 仍被判定为「有未保存的修改」，保存按钮一直亮着。
+  const dirty = ready && !sameOverrides(buildOverrides(), state.overrides)
+
+  return (
+    <section className='panel'>
+      <PanelHead
+        title='Cline 伪装头'
+        tip={TIPS.clineHeaders}
+        badge={state.status === 'ready'
+          ? <StatusBadge tone='ok'>已生效</StatusBadge>
+          : state.status === 'unavailable'
+            ? <StatusBadge tone='bad'>不可用</StatusBadge>
+            : <StatusBadge tone='idle'>检测中…</StatusBadge>}
+        actions={<RefreshButton id='btn-cline-headers-refresh' onClick={() => void refreshClineHeaders()} />}
+      />
+      <div className='panel-body'>
+        <div className='retention-list'>
+          {ready
+            ? rows.map((row, index) => (
+              <div key={String(index)} className='flex items-center gap-2'>
+                <Input
+                  className='w-[190px] shrink-0 font-mono text-[13px]'
+                  value={row.key}
+                  readOnly={row.isDefault}
+                  disabled={busy}
+                  placeholder='X-Custom-Header'
+                  onChange={event => updateRow(index, { key: event.target.value })}
+                />
+                <Input
+                  className='flex-1 font-mono text-[13px]'
+                  value={row.value}
+                  disabled={busy}
+                  placeholder={row.isDefault ? '值（留空 = 不发送）' : '值'}
+                  onChange={event => updateRow(index, { value: event.target.value })}
+                />
+                <Button
+                  variant='ghost'
+                  disabled={busy}
+                  onClick={() => {
+                    if (row.isDefault) {
+                      updateRow(index, { value: state.defaults[row.key] ?? '' })
+                    } else {
+                      setRows(current => current.filter((_, i) => i !== index))
+                    }
+                  }}
+                >
+                  {row.isDefault ? '还原' : '删除'}
+                </Button>
+              </div>
+            ))
+            : null}
+          <div className='flex items-center gap-2'>
+            <Button
+              variant='outline'
+              disabled={busy || !ready}
+              onClick={() => setRows(current => [...current, { key: '', value: '', isDefault: false }])}
+            >
+              添加自定义头
+            </Button>
+            <div className='flex-1' />
+            <Button
+              variant='ghost'
+              disabled={busy || !ready || Object.keys(state.overrides).length === 0}
+              onClick={() => void saveClineHeaders({})}
+            >
+              恢复默认
+            </Button>
+            <Button disabled={busy || !ready || !dirty} onClick={() => void saveClineHeaders(buildOverrides())}>
+              保存
+            </Button>
+          </div>
+        </div>
+        <div className='settings-state'>
+          {state.status === 'loading'
+            ? STATES.appLoading
+            : state.status === 'unavailable'
+              ? '未能读取 Cline 伪装头设置，请稍后重试'
+              : dirty
+                ? '有未保存的修改'
+                : `${Object.keys(state.effective).length} 个头将随每个 Cline 请求发送`
+                  + (Object.keys(state.overrides).length > 0
+                    ? `（${Object.keys(state.overrides).length} 项被覆盖）`
+                    : '（全部为默认值）')}
+        </div>
+        <div className='hint retention-note'>{NOTES.clineHeaders}</div>
+      </div>
+    </section>
+  )
+}
+
 /* ─── 安全分类 ─────────────────────────────── */
 
 function SecurityPane({ snap }: { snap: SettingsSnapshot }) {
@@ -1249,6 +1413,41 @@ function SecurityPane({ snap }: { snap: SettingsSnapshot }) {
 
   return (
     <>
+      <section className='panel'>
+        <PanelHead
+          title='网关跨域访问（CORS）'
+          tip={TIPS.cors}
+          badge={snap.cors.status === 'ready'
+            // 极性与指纹脱敏相反：这个开关「关闭」才是不扩大暴露面的常态，
+            // 所以开着时给提醒色（bad），关着才是 ok
+            ? (snap.cors.on ? <StatusBadge tone='bad'>已开启</StatusBadge> : <StatusBadge tone='ok'>已关闭</StatusBadge>)
+            : snap.cors.status === 'unavailable'
+              ? <StatusBadge tone='bad'>不可用</StatusBadge>
+              : <StatusBadge tone='idle'>检测中…</StatusBadge>}
+          actions={<RefreshButton id='btn-cors-refresh' onClick={() => void refreshCors()} />}
+        />
+        <div className='panel-body'>
+          <div className='settings-switches'>
+            <SwitchRow
+              id='settings-cors'
+              label='允许浏览器里的页面跨来源调用网关（/v1/*）'
+              checked={snap.cors.on}
+              // 读到后端值之前不许切（同指纹脱敏：切了也不知道后端原本是什么）
+              disabled={snap.cors.status !== 'ready' || snap.busy === 'cors'}
+              onCheckedChange={next => void saveCors(next)}
+            />
+          </div>
+          <div className='settings-state'>
+            {snap.cors.status === 'loading'
+              ? STATES.appLoading
+              : snap.cors.status === 'unavailable'
+                ? STATES.corsUnavailable
+                : snap.cors.on ? STATES.corsOn : STATES.corsOff}
+          </div>
+          <div className='hint retention-note'>{NOTES.cors}</div>
+        </div>
+      </section>
+
       <section className='panel'>
         <PanelHead title='机器人校验' />
         <div className='panel-body'>

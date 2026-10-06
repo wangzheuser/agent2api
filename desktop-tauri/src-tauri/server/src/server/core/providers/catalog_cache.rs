@@ -90,6 +90,8 @@ pub const SCOPE_ACCIO_CN: &str = "accioCn";
 pub const SCOPE_CODEARTS: &str = "codearts";
 /// Trae SOLO（`/api/ide/v1/get_detail_param`）
 pub const SCOPE_TRAE: &str = "trae";
+/// Loomy（讯飞；`GET {集成网关}/api/v1/models`，OpenAI 格式目录）
+pub const SCOPE_LOOMY: &str = "loomy";
 
 /// 全部 scope（事实来源：`cached_scopes` 按它遍历；新增一家时加在这里）。
 pub const ALL_SCOPES: &[&str] = &[
@@ -106,6 +108,7 @@ pub const ALL_SCOPES: &[&str] = &[
     SCOPE_ACCIO_CN,
     SCOPE_CODEARTS,
     SCOPE_TRAE,
+    SCOPE_LOOMY,
 ];
 
 /// 一份清单缓存

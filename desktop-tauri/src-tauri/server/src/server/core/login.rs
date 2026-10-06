@@ -1083,6 +1083,10 @@ impl LoginService {
                 &format!("拉取账号列表失败（不影响登录）: {}", error.message),
             ),
         }
+        // ── 身份的三步兜底（后一步只在前一步没给出 uid 时生效）──────
+        //   ① `login/account`（上面那次调用）
+        //   ② `/accounts` 列表里「最近登录过的那条」，退而求其次取第一条
+        //   ③ access token 自己的 JWT 声明（见 `account_from_token_claims`）
         let account_uid = account.get("uid").and_then(Value::as_str).unwrap_or("");
         if account_uid.is_empty() {
             let fallback = accounts
@@ -1097,6 +1101,29 @@ impl LoginService {
                 .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
             account = fallback;
         }
+        // ③ 最后一步是**网络之外**的来源，这一层不能少：
+        //
+        // 前两步都是网络调用，任何一条卡住就把整轮登录作废。2026-10-03 实测
+        // （国际版，用户现场）：Chrome 里授权已经成功、token 也拿到了，只因
+        // 紧接着的 `login/account` 连了 30 秒没连上（日志「连接上游超时」），
+        // 用户看到的就是「登录成功但获取账号信息失败（缺少 uid），请重试」——
+        // 而 uid 本来就在 token 里。资料接口的职责是把昵称等资料带得更全，
+        // 身份不必依赖它们；补上这一层之后，「浏览器授权成功」在 token 可解
+        // （上游常态）时就等于「账号一定落库」，资料接口全挂也只会少一个昵称。
+        if account
+            .get("uid")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .is_empty()
+        {
+            if let Some(from_token) = account_from_token_claims(&enriched) {
+                logging::log(
+                    "[Auth]",
+                    "资料接口未给出 uid，已回退用 access token 的 JWT 声明（sub）",
+                );
+                account = from_token;
+            }
+        }
 
         Ok(json!({
             "endpoint": context.base_url,
@@ -1109,6 +1136,55 @@ impl LoginService {
             "lastRefreshTime": logging::now_ms(),
         }))
     }
+}
+
+/// 从 access token 的 JWT 声明里取账号身份（`uid` + 昵称）。
+///
+/// ── 为什么 token 里就有（2026-10-03 实测）────────────────────
+/// 上游签发的是 Keycloak 风格 JWT，`sub` **就是账号主键**：实测 CN 账号的
+/// `sub` 与库里既有记录的 uid 逐字相同（记录 id 形如 `user-<uid>`），
+/// `nickname` 是上游给的用户名（账号页显示的就是它），更次一档的展示名来源是
+/// `preferred_username` 与 `email`。国际版是同一套结构（`iss` 换成它自己的
+/// realm），`sub` 同样是上游主键。
+///
+/// 这一路只在**两条资料接口都没给出 uid** 时才走（见
+/// `build_session_from_token` 的第三步兜底），正常路径行为一字不变。
+///
+/// 只解 payload、不验签：网关不做鉴权判定，token 能不能用由上游说了算
+/// —— 与 `raccoon::jwt` 同一纪律（那份解码是与 provider 无关的纯函数，
+/// 本文件的登录流程本来也已经 import 了 `raccoon::oauth`）。
+fn account_from_token_claims(auth: &Value) -> Option<Value> {
+    let token = auth.get("accessToken").and_then(Value::as_str)?;
+    let claims = crate::server::core::providers::raccoon::jwt::decode_jwt_claims(token)?;
+    let uid = text_of(&claims, &["sub", "userId", "uid"]);
+    if uid.is_empty() {
+        return None;
+    }
+    let mut account = serde_json::Map::new();
+    account.insert("uid".to_string(), Value::String(uid));
+    // 昵称：`nickname` 优先（CN 是真实姓名），退到用户名 / 邮箱；
+    // 都没有就不出这个键 —— 账号存储会按 uid 生成「账号 xxxxxxxx」的兜底名
+    let name = text_of(
+        &claims,
+        &["nickname", "name", "preferred_username", "email"],
+    );
+    if !name.is_empty() {
+        account.insert("nickname".to_string(), Value::String(name));
+    }
+    Some(Value::Object(account))
+}
+
+/// 取候选键里第一个非空字符串（去空白）
+fn text_of(object: &Value, keys: &[&str]) -> String {
+    for key in keys {
+        if let Some(text) = object.get(*key).and_then(Value::as_str) {
+            let text = text.trim();
+            if !text.is_empty() {
+                return text.to_string();
+            }
+        }
+    }
+    String::new()
 }
 
 /// 标记任务完成并写入会话摘要
@@ -1144,4 +1220,91 @@ fn finish_task_error(handle: &LoginTaskHandle, message: &str) {
         task.error = Some(message.clone());
         task.finished_at = Some(logging::now_ms());
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 造一个 `header.payload.签名` 形态的 token（只用于本地解析，不验签）。
+    fn fake_token(claims: Value) -> String {
+        use base64::Engine;
+        let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let header = engine.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+        let payload = engine.encode(serde_json::to_vec(&claims).expect("声明可序列化"));
+        format!("{header}.{payload}.signature")
+    }
+
+    /// 与线上同构的 token 声明。**值全是构造出来的示例** —— 真实账号的
+    /// 姓名 / 手机号 / uid 一律不进仓库（测试要的是字段名与层级，不是谁的数据）。
+    fn sample_claims() -> Value {
+        json!({
+            "sub": "11111111-2222-4333-8444-555555555555",
+            "nickname": "示例用户",
+            "preferred_username": "sample-user",
+            "iss": "https://idp.invalid/auth/realms/copilot",
+            "aud": "account",
+            "typ": "Bearer"
+        })
+    }
+
+    /// uid 就写在 token 里 —— 这就是「资料接口两条都挂时登录不该失败」的依据。
+    ///
+    /// 2026-10-03 实测：国际版登录在浏览器里已经授权成功、token 也拿到了，
+    /// 只因为紧接着的 `login/account` 连了 30 秒没连上（连接上游超时），
+    /// 整轮登录被判死。而 `sub` 与账号存储里的 uid 逐字相同
+    /// （记录 id 形如 `user-<uid>`）。
+    #[test]
+    fn uid_comes_from_token_subject() {
+        let account =
+            account_from_token_claims(&json!({ "accessToken": fake_token(sample_claims()) }))
+                .expect("应当能从 token 里解出身份");
+        assert_eq!(account["uid"], "11111111-2222-4333-8444-555555555555");
+        // 昵称是账号页显示的那个名字（账号存储按 `account.nickname` 取）
+        assert_eq!(account["nickname"], "示例用户");
+    }
+
+    /// 昵称的退档顺序：没有 `nickname` 就退到用户名 / 邮箱；都没有就不出这个键
+    /// （账号存储会按 uid 生成「账号 xxxxxxxx」的兜底名）。
+    #[test]
+    fn nickname_falls_back_then_may_be_absent() {
+        let username = account_from_token_claims(&json!({
+            "accessToken": fake_token(json!({ "sub": "u-1", "preferred_username": "sample-user" }))
+        }))
+        .expect("有 sub 就应当能解出身份");
+        assert_eq!(username["nickname"], "sample-user");
+
+        let email = account_from_token_claims(&json!({
+            "accessToken": fake_token(json!({ "sub": "u-2", "email": "user@example.invalid" }))
+        }))
+        .expect("有 sub 就应当能解出身份");
+        assert_eq!(email["nickname"], "user@example.invalid");
+
+        let bare = account_from_token_claims(&json!({
+            "accessToken": fake_token(json!({ "sub": "u-3" }))
+        }))
+        .expect("有 sub 就应当能解出身份");
+        assert_eq!(bare["uid"], "u-3");
+        assert!(
+            bare.get("nickname").is_none(),
+            "没有可用展示名时不该出这个键"
+        );
+    }
+
+    /// 不是 JWT（上游换成不透明 token）／没有 sub／没有 accessToken：
+    /// 一律返回 None，让调用方维持原来的报错 —— 不能凭一个空对象伪造身份。
+    #[test]
+    fn opaque_or_subjectless_token_yields_none() {
+        assert!(
+            account_from_token_claims(&json!({ "accessToken": "opaque-token-not-a-jwt" }))
+                .is_none()
+        );
+        assert!(account_from_token_claims(&json!({
+            "accessToken": fake_token(json!({ "nickname": "无 sub" }))
+        }))
+        .is_none());
+        assert!(account_from_token_claims(&json!({})).is_none());
+        // 手改/截断的 token 不能 panic（release 是 panic=abort）
+        assert!(account_from_token_claims(&json!({ "accessToken": "a.!!!.c" })).is_none());
+    }
 }

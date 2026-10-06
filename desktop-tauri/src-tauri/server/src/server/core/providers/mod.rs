@@ -118,6 +118,7 @@ pub mod content_block;
 pub mod custom;
 /// LobsterAI 原生 Provider：OpenAI Chat Completions、OAuth、额度与活动奖励。
 pub mod lobsterai;
+pub mod loomy;
 /// MiniMax Code（mcode）原生 Provider：Anthropic Messages 反代、OAuth 续期、额度与签到。
 pub mod minimax_code;
 pub mod qoder;
@@ -312,6 +313,8 @@ pub enum ProviderKind {
     /// `core::auto_checkin` 的提供商清单不含本家。每日签到存在，但要单独授权
     /// 才会接（见 cpa-deploy/notes/agent2api-trae-port-plan.md 的 §8 决策 3）。
     Trae,
+    /// Loomy（讯飞）OpenAI 兼容推理与每日首次登录积分刷新。
+    Loomy,
     /// MiniMax Code（mcode）。原生 Anthropic Messages 上游与 Code 专属额度池。
     MiniMaxCode,
     /// LobsterAI。原生 OpenAI Chat Completions、活动奖励与额度查询。
@@ -417,6 +420,10 @@ pub const PROVIDERS: &[ProviderMeta] = &[
         id: "lobsterai",
         label: "LobsterAI",
     },
+    ProviderMeta {
+        id: "loomy",
+        label: "Loomy",
+    },
 ];
 
 /// provider id 在注册表里的下标（未知 id → None）。
@@ -494,6 +501,7 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
         "trae" => Some(ProviderKind::Trae),
         "minimax-code" => Some(ProviderKind::MiniMaxCode),
         "lobsterai" => Some(ProviderKind::LobsterAI),
+        "loomy" => Some(ProviderKind::Loomy),
         // 走到这里 = 上面的注册表判定已放行、这个 match 却没有对应分支：
         // 只可能是有人给 `PROVIDERS` 加了条目忘了加这里。开发期喊出来；
         // release 返回 None（见上：宁可为「未知」，不可误认成别家）。
@@ -529,6 +537,7 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
         ProviderKind::Trae => "trae",
         ProviderKind::MiniMaxCode => "minimax-code",
         ProviderKind::LobsterAI => "lobsterai",
+        ProviderKind::Loomy => "loomy",
     }
 }
 

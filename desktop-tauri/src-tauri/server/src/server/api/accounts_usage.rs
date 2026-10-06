@@ -47,6 +47,10 @@ pub async fn accounts_usage(state: &ServerState, query: &str) -> Response {
 /// 形状与 `/api/accounts/usage` 的响应**逐字一致**（多一个 `at`）：
 /// 前端因此可以用同一个 `applyBalances` 写缓存，不必为「手动」与「定时」两条
 /// 来源各写一套解析。多出来的 `at` 只用于「这份快照我应用过了没」的判断。
-pub async fn accounts_usage_snapshot() -> Response {
-    ok_json(usage_query::snapshot())
+///
+/// 读快照要带上账号存储：出口会按账号记录改动时间丢掉过期的失败行
+/// （见 `core::usage_query::prune_stale_failures`），所以这不是一条纯读内存的
+/// 接口 —— 但它只多读一次账号表，仍是 20 秒一次的轮询量级。
+pub async fn accounts_usage_snapshot(state: &ServerState) -> Response {
+    ok_json(usage_query::snapshot(state.store()))
 }

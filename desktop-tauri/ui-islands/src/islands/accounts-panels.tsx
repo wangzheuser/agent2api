@@ -34,6 +34,11 @@ import {
   SelectTrigger,
   SelectValue,
   Switch,
+  Tooltip,
+  TooltipArrow,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
   cn,
 } from '@ui'
 import { formatTime, poolItemLabel, POOL_VALUE_PREFIX, shared, type AccountRecord, type UsageEntry } from './accounts-shared'
@@ -50,7 +55,7 @@ import {
   PROXY_CUSTOM_CURRENT, PROXY_CUSTOM_EDIT, applyProxyPick, checkinErrorOf,
   commitPriority, connectionsOf, maskName, moveAccount, openCreditsDialog, openSettingsDialog, poolError,
   proxyPoolSnapshot, queryUsageOnce, runCheckin, setAccountEnabled, setPanelOpen,
-  startCodeArtsWelfare, startZcodeClaim, toggleNamesHidden, usageEntries, usageFailureOf,
+  startCodeArtsWelfare, startZcodeClaim, toggleNamesHidden, usageEntryOf, usageFailureOf,
 } from './accounts-data'
 /** 图标（icons.js 的内联 SVG 串）：整站共用一份图标集，这里只做注入 */
 function iconHtml(name: string, size: number): string {
@@ -427,7 +432,9 @@ export function UsageCell({ account }: { account: AccountRecord }) {
   if (!supportsUsage(account)) {
     return <span className='muted' title='该提供商没有余额查询'>—</span>
   }
-  const entry = usageEntries().get(account.id)
+  // 读入口走 usageEntryOf（不是裸的 usageEntries().get）：它会作废「比账号记录还旧」
+  // 的失败结论，理由与后端快照出口一致
+  const entry = usageEntryOf(account)
   const summary = usageSummary(entry)
   // 所有已接入余额的 provider 都可双击打开统一余额弹窗；有结构化钱包时，
   // 余额列继续保留原来的主额度进度条作为快速读数。
@@ -463,44 +470,69 @@ export function UsageCell({ account }: { account: AccountRecord }) {
 /**
  * 账号：第一行名称，第二行邮箱（有才渲染），第三行只在异常时出现（代理不可用原因）。
  *
- * 标识（UID / userId）与 Token 尾号**不再上屏**（对「这条账号能不能用」没有信息量，
- * 却把副标题占掉大半），仍留在账号名的悬停提示里。健康说明放这一列而不是「状态」列：
- * 状态列只有几十像素，放不下必须读全的文案；账号列是唯一随列宽变化伸缩的一列。
+ * 主名走 displayNameOf 的纯 nameCustom 分流：显式设置过备注名（打标）的账号
+ * 备注名恒为主名；未打标的账号维持历史口径 —— 邮箱系三家（Qoder / AutoClaw
+ * 国际版 / Accio）邮箱当主名，其余昵称优先。更新前设置的旧备注没有标记，
+ * 到设置里把备注名改一次值（同值提交不打标）即生效。
  *
- * 第二行是**邮箱**（不是「桌面端」标签）：这一列要回答的是「这是谁的号」，而
- * AutoClaw 国际版这类网页登录建出来的账号，名字可能只是上游昵称，邮箱才认得出是谁。
- * 名字本身就是邮箱时不重复渲染。Qoder / AutoClaw 国际版反过来：邮箱当**主名**
- * （features.emailAsName），昵称不再占一行（要看就悬停）。
+ * 悬停气泡就是这一列的「详细信息」面板：**一行一条**，组件库 Tooltip 即现
+ * （原生 title 由浏览器控制出现时机与断行，两样都不合用），带指向箭头 ——
+ * 邮箱、标识、备注名（未生效时气泡可查）、上游昵称、更新时间、来源。
+ * 标识（UID / userId）与 Token 尾号不上屏也不进气泡：对「这条账号能不能用」
+ * 没有信息量（Token 尾号曾试过放在气泡里，用户实测反馈去掉）。
+ * 隐藏账号名开关打开时邮箱 / 昵称在气泡里同样打码 ——
+ * 不给「悬停一下就绕过打码」的口子。
  */
 export function AccountCell({ account, namesHidden }: { account: AccountRecord; namesHidden: boolean }) {
   const ident = identifierOf(account)
   const features = providerFeatures(providerOf(account))
   const name = displayNameOf(account) || '未命名账号'
   const email = String(account.email || '').trim()
-  const emailAsName = features.emailAsName && email ? email : ''
-  const title = [
+  const nickname = String(account.nickname || '').trim()
+  // 记录里原样的备注名（未经 displayNameOf 的兜底链）：未设备注时它建号时就有种子值，
+  // 主名被邮箱 / 昵称占着，这里让它在气泡里可查
+  const rawName = String(account.name || '').trim()
+  const mask = (value: string): string => (namesHidden ? maskName(value) : value)
+  const titleLines = [
+    email && email !== name ? `邮箱 ${mask(email)}` : '',
     ident ? `${features.identifier} ${ident}` : '',
-    // 邮箱顶掉了名字的位置，名字（昵称 / 备注名）改从这里看；隐藏账号名开关打开时
-    // 连这里也不给 —— 否则悬停一下就能绕过打码，那个开关就白开了
-    emailAsName && name !== email && !namesHidden ? `账号名 ${name}` : '',
+    !account.nameCustom && rawName && rawName !== email && rawName !== nickname
+      ? `备注名 ${mask(rawName)}`
+      : '',
+    nickname && nickname !== name && nickname !== email ? `昵称 ${mask(nickname)}` : '',
     isDesktopAccount(account) ? '桌面端实时登录态（凭证每次从客户端登录态文件读取）' : '',
-    account.tokenTail ? `Token 尾号 ${account.tokenTail}` : '',
     account.updatedAt ? `更新于 ${formatTime(account.updatedAt)}` : '',
     account.source ? `来源 ${account.source === 'imported' ? '旧数据导入' : '手动添加'}` : '',
-  ].filter(Boolean).join('；')
+  ].filter(Boolean)
 
-  const showEmail = !emailAsName && email && email !== name
-  const primary = emailAsName || name
-  const shown = namesHidden ? maskName(primary) : primary
+  const showEmail = email && email !== name
   const proxyError = account.proxy?.error
+  // 原生 title 的出现时机由浏览器/系统定（悬停约一秒才出，改不了），换成组件库
+  // Tooltip：Provider delay=0 悬停即现；Portal 渲染不被表格滚动容器裁剪；
+  // 内容一行一个 div（用户要的「一行一个信息」）。
+  const nameNode = titleLines.length ? (
+    <TooltipProvider delay={0}>
+      <Tooltip>
+        <TooltipTrigger render={<div className='acct-name' />}>
+          <span className='name'>{mask(name)}</span>
+        </TooltipTrigger>
+        <TooltipContent>
+          <TooltipArrow />
+          {titleLines.map((line, index) => <div key={index}>{line}</div>)}
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  ) : (
+    <div className='acct-name'>
+      <span className='name'>{mask(name)}</span>
+    </div>
+  )
   return (
     <>
-      <div className='acct-name' title={title || undefined}>
-        <span className='name'>{shown}</span>
-      </div>
+      {nameNode}
       {showEmail ? (
         <div className='acct-sub'>
-          <span className='acct-email' title='账号邮箱'>{namesHidden ? maskName(email) : email}</span>
+          <span className='acct-email' title='账号邮箱'>{mask(email)}</span>
         </div>
       ) : null}
       {proxyError ? (

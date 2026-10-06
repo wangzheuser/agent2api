@@ -111,9 +111,10 @@ impl LoginService {
     /// 用途：回调监听器的**转发目标**，以及抢不到登记端口时的**回落地址**。
     ///
     /// `local_browser` = 浏览器与网关在同一台机器上（桌面形态、本机 headless）。
-    /// 本机形态会临时占用登记端口并自动转发；容器 / 远程部署里浏览器解析到的
-    /// `localhost` 是它自己那台机器，因此 Zai 改用登记端口生成 redirect，交由
-    /// 面板手动粘贴完整回调地址，Google 继续使用网关地址的兼容路径。
+    /// 只有这种形态才去占登记端口：容器 / 远程部署里浏览器解析到的 `localhost`
+    /// 是**它自己**那台机器，占了也接不到回调，反而会把 Google 那条本来能走的
+    /// 路（宽松白名单 + 网关自己的端口）弄坏。判据由调用方给（见
+    /// `api::session::login_oauth_start`），本模块不猜部署形态。
     ///
     /// 返回 `(任务句柄, 给界面看的提示)`：提示非空时表示这一轮有需要用户知道
     /// 的降级（登记端口一个都没抢到），前端会 toast 出来；成功走完那条链时是
@@ -126,6 +127,13 @@ impl LoginService {
         gateway_base: &str,
         local_browser: bool,
     ) -> Result<(LoginTaskHandle, Option<String>), String> {
+        if vendor == Vendor::Zai && !local_browser {
+            return Err(
+                "当前部署形态下网关不在浏览器所在的机器上，Zai 登录无法完成 —— \
+                 请改用 Google 登录，或用「填写凭证」/「导入桌面端登录态」"
+                    .to_string(),
+            );
+        }
         let state = random_hex()?;
         let device_id = oauth::new_oauth_device_id();
         let endpoint = self.callback_endpoint(gateway_base, vendor, local_browser).await;
@@ -187,9 +195,9 @@ impl LoginService {
     ///      直接拒），回调靠壳侧内嵌窗口截回网关（见 `src/login.rs` 的
     ///      `autoclaw_callback_forward`）—— 同时给一句提示，因为「系统浏览器」
     ///      方式没有窗口可截，那条路得先退出官方客户端；
-    /// 3. 浏览器不在本机（容器 / 远程面板）：Google 沿用网关自己的地址；Zai
-    ///    使用登记端口生成 redirect，但不在服务器上占端口，完成授权后由网页
-    ///    shim 接收用户粘贴的完整回调地址。
+    /// 3. 浏览器不在本机（容器 / 远程面板）：Google 不占端口，沿用网关自己的地址 ——
+    ///    浏览器解析到的 `localhost` 是它自己那台机器，占了也没用。Zai 在这种
+    ///    形态下会在发起请求前被拒绝（白名单只接受官方 loopback 端口）。
     async fn callback_endpoint(
         &self,
         gateway_base: &str,
@@ -197,16 +205,6 @@ impl LoginService {
         local_browser: bool,
     ) -> CallbackEndpoint {
         if !local_browser {
-            if vendor == Vendor::Zai {
-                return CallbackEndpoint {
-                    base: oauth::registered_callback_base(),
-                    listener: None,
-                    notice: Some(
-                        "远程部署：授权完成后请复制浏览器地址栏中的完整回调地址并粘贴提交；localhost 页面无法访问属于预期现象"
-                            .to_string(),
-                    ),
-                };
-            }
             return CallbackEndpoint {
                 base: gateway_base.trim_end_matches('/').to_string(),
                 listener: None,

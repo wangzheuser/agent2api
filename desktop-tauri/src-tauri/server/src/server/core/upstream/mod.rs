@@ -55,7 +55,6 @@ pub mod sse;
 pub mod stall;
 pub mod translate;
 pub mod usage;
-
 /// 仅在原始响应入口采集；预读前缀已采集过，重放和协议转换不再追加。
 pub(super) fn capture_stream(
     stream: futures::stream::BoxStream<'static, Result<bytes::Bytes, std::io::Error>>,
@@ -67,7 +66,6 @@ pub(super) fn capture_stream(
         if let Ok(bytes) = item { capture.push(bytes); }
     }).boxed()
 }
-
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -87,6 +85,9 @@ use crate::server::logging;
 
 use self::connections::{ConnectionGuard, Connections};
 use self::sse::{ModelRewrite, ReasoningCoalescer};
+
+#[cfg(test)]
+mod capture_tests;
 
 /// 去重等待上限（对照 Node 的 INFLIGHT_WAIT_MS）
 const INFLIGHT_WAIT_MS: u64 = 45_000;
@@ -212,6 +213,15 @@ pub struct ForwardRequest {
     /// 本文件在 `server::core::upstream` 下，`super::key_scope` 指的是
     /// `server::core::upstream::key_scope`（不存在）—— 这里跨了一层模块。
     pub allowed_providers: Option<crate::server::core::key_scope::KeyScope>,
+    /// **只准用这个账号**转发（`None` = 走正常的全局优先级队列）。
+    ///
+    /// 目前唯一的调用方是模型测试（`api::model_test`）：它问的是「这一行的这个
+    /// 模型、用这个账号，现在到底行不行」，所以必须把选路收窄到一个账号上，
+    /// 并且**不顺延**（`pick_next_account` 在同池里找不到第二个候选）。
+    /// 生产链路一律传 `None` —— 这条字段不是「指定账号」的通用入口，
+    /// 它没有「账号被禁用 / 已被删除时换一个」的兜底语义（见
+    /// `rotate::accounts_in_providers` 的说明）。
+    pub pinned_account: Option<String>,
 }
 
 /// 转发结果：要么是可直接下发的流，要么是聚合好的 JSON
@@ -336,6 +346,9 @@ impl UpstreamService {
         // 会因为「同时持有 request 的可变借用（上面改过 body）」而借不过 ——
         // 移出后所有权清晰，也不必再多一次克隆。
         let key_scope = request.allowed_providers;
+        // 钉住的账号与它同样处理：ownership 移出来、借给 context，
+        // 于是 `request` 在下面不再被借用（理由同上一条）
+        let pinned_account = request.pinned_account;
         let context = payload::ProviderContext {
             body: &upstream_body,
             stream: request.stream,
@@ -344,6 +357,7 @@ impl UpstreamService {
             sanitize_fingerprints,
             prompt,
             key_scope: key_scope.as_ref(),
+            pinned_account: pinned_account.as_deref(),
         };
         provider_loop::forward_with_providers(self, context, &mut slot, &mut connections).await
     }
@@ -473,6 +487,12 @@ pub struct ForwardStream {
     _connection: ConnectionGuard,
     /// usage / 尝试次数的旁路槽：与合并器共用同一份（见 `ForwardStream::new`）
     telemetry: Arc<usage::RequestTelemetry>,
+    /// 调试模式的采集器（构造时取一次，None = 未开启调试模式）。
+    ///
+    /// 在这里缓存而不是每个分片现取（`telemetry.capture()`）：采集发生在
+    /// **每个上游 chunk** 上，每次都加锁取一遍是纯浪费；而一条请求的采集器
+    /// 在转发开始时就装好了，中途不会变。
+    capture: Option<Arc<crate::server::core::debug_traffic::TrafficCapture>>,
 }
 
 impl ForwardStream {
@@ -495,25 +515,16 @@ impl ForwardStream {
         });
         // 流式响应空闲超时（设置页「请求超时」第三项）：逐分片计时，
         // 收到新数据即重置；计时器在流启动时就武装（见 stall 的模块头）
-        let inner = capture_stream(Box::pin(inner), telemetry.capture());
-        Self::from_stream(inner, slot, connection, telemetry, model_rewrite)
-    }
-
-    /// 构造已在原始入口采集、可能预读过首段的字节流。
-    pub(super) fn from_stream(
-        inner: futures::stream::BoxStream<'static, Result<Bytes, std::io::Error>>,
-        slot: Option<InFlightGuard>,
-        connection: ConnectionGuard,
-        telemetry: Arc<usage::RequestTelemetry>,
-        model_rewrite: Option<ModelRewrite>,
-    ) -> Self {
         let guarded = stall::idle_guard(
-            inner,
+            Box::pin(inner),
             std::time::Duration::from_millis(
                 crate::server::config::timeout_settings().stream_idle_ms(),
             ),
         );
-        Self::from_translated(guarded, slot, connection, telemetry, model_rewrite)
+        let capture = telemetry.capture();
+        let mut stream = Self::from_translated(guarded, slot, connection, telemetry, model_rewrite);
+        stream.capture = capture;
+        stream
     }
 
     /// 翻译协议的构造入口：`inner` 已经是**标准 chat SSE** 帧流。
@@ -552,6 +563,8 @@ impl ForwardStream {
             _slot: slot,
             _connection: connection,
             telemetry,
+            // 原始字节已由翻译流采集，不能把生成的 chat 帧再次混入报文。
+            capture: None,
         }
     }
 }
@@ -580,6 +593,12 @@ impl Stream for ForwardStream {
                     }
                 }
                 std::task::Poll::Ready(Some(Ok(bytes))) => {
+                    // 调试模式：把**上游原始字节**旁路给采集器 —— 在合并器
+                    // 之前，因为用户要看的是上游原样吐出来的东西，而不是
+                    // 我们改写 / 合并后的帧（那正是「上游到底发了什么」要回答的）
+                    if let Some(capture) = &self.capture {
+                        capture.push(&bytes);
+                    }
                     for frame in self.coalescer.push(&bytes[..]) {
                         self.pending.push_back(frame);
                     }

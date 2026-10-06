@@ -40,7 +40,7 @@ use crate::server::core::account_store::priority::{
     next_free_priority, normalize_priority, renumber_consecutively, DEFAULT_PRIORITY,
 };
 use crate::server::core::account_store::sql;
-use crate::server::core::account_store::state::StoredAccount;
+use crate::server::core::account_store::state::{mark_name_custom, StoredAccount};
 use crate::server::core::account_store::store::{AccountStore, AccountStoreError};
 use crate::server::core::account_store::store_util::{
     js_string, number_or, object_or_empty, optional_text, pick_token, token_tail_of, truncate_chars,
@@ -224,12 +224,14 @@ impl AccountStore {
             .filter(|value| !value.is_empty())
             .map(|value| truncate_chars(value, 100))
             .filter(|value| !value.is_empty());
+        let explicit = explicit_name.is_some();
         let record_name = explicit_name
             .or_else(|| optional_text(account.get("nickname")))
             .or_else(|| optional_text(payload_object.get("nickname")))
             .or_else(|| existing.as_ref().and_then(|item| optional_text(item.get("name"))))
             .unwrap_or_else(|| format!("账号 {}", truncate_chars(&uid, 8)));
         record.insert("name".to_string(), Value::String(record_name.clone()));
+        mark_name_custom(&mut record, explicit, existing.as_ref());
         record.insert(
             "uid".to_string(),
             Value::String(uid.clone()),
@@ -615,6 +617,11 @@ impl AccountStore {
                     return Err(AccountStoreError::bad_request("备注名不能为空"));
                 }
                 record.set("name", Value::String(next.clone()));
+                // 用户**真正改到**备注名时打标（设置表单每次都会把 name 原样发回来，
+                // 不能按「提交过」打，否则从未设备注的账号保存任意设置后也会被当成
+                // 设过）。种子名与用户改的名在记录里无法区分，界面全靠这个标记区分
+                // 「备注名赢过默认口径」还是「维持原行为」（见 displayNameOf）
+                record.set("nameCustom", Value::Bool(true));
                 changes.push(format!("备注名 → {next}"));
             }
         }
@@ -791,5 +798,46 @@ impl AccountStore {
             },
             "list": self.snapshot(&state),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 备注名标记只随「真正改到 name」出现：设置表单每次都原样回传 name（含从未
+    /// 设过备注的账号），按「提交过」打标会把它们的显示顶成种子值（见 mark_name_custom）。
+    #[test]
+    fn renaming_marks_name_custom_but_same_value_or_other_fields_do_not() {
+        let base = || {
+            StoredAccount::from_map(
+                json!({ "id": "a1", "provider": "workbuddy", "name": "种子名" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+        };
+        let no_holder = |_| Ok(None);
+
+        // 改名：打标
+        let mut record = base();
+        let patch = json!({ "name": "新备注" }).as_object().unwrap().clone();
+        let changes = AccountStore::apply_patch(&mut record, &patch, no_holder).unwrap();
+        assert_eq!(changes, vec!["备注名 → 新备注"]);
+        assert_eq!(record.get("nameCustom"), Some(&Value::Bool(true)));
+
+        // 同值提交（表单原样回传）：不打标
+        let mut record = base();
+        let patch = json!({ "name": "种子名" }).as_object().unwrap().clone();
+        let changes = AccountStore::apply_patch(&mut record, &patch, no_holder).unwrap();
+        assert!(changes.is_empty());
+        assert_eq!(record.get("nameCustom"), None);
+
+        // 改别的字段（优先级）：不打标
+        let mut record = base();
+        let patch = json!({ "priority": 5 }).as_object().unwrap().clone();
+        AccountStore::apply_patch(&mut record, &patch, no_holder).unwrap();
+        assert_eq!(record.get("nameCustom"), None);
     }
 }

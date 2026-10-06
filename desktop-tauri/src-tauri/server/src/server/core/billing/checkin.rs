@@ -380,6 +380,15 @@ pub async fn checkin_for(store: &AccountStore, billing: &BillingService, account
                 "daily_checkin",
             )
         }
+        "loomy" => {
+            // Loomy 每日赠送积分由首次登录接口刷新。
+            let claim = crate::server::core::providers::loomy::checkin::claim_daily_login(
+                store, &id,
+            )
+            .await
+            .map_err(|error| error.message);
+            claim_result(id, name, &display, true, claim)
+        }
         // WorkBuddy 国内版与国际版共用签到入口：按 provider/edition 选择任务形态。
         _ if provider_id == crate::server::core::providers::DEFAULT_PROVIDER_ID
             || provider_id == "workbuddy-intl" =>

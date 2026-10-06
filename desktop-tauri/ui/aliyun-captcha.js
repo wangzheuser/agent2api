@@ -247,7 +247,6 @@
   function settlePending(pending, outcome) {
     if (pendingVerification !== pending || pending.settled) return false;
     pending.settled = true;
-    pendingVerification = null;
     window.clearTimeout(pending.timer);
     if (outcome.error) pending.reject(outcome.error);
     else pending.resolve(outcome.value);
@@ -472,8 +471,39 @@
   /** 正在等结果的那一次铸造 */
   let mintWaiter = null;
   let mintGeneration = 0;
-  let mintInstanceGeneration = 0;
-  let mintActive = false;
+  let mintInitializedAt = 0;
+
+  /**
+   * 模拟真实用户行为事件（激活状态、鼠标移动），提升阿里云无痕风控通过率，
+   * 并防止后台窗口被判断为完全无交互的 headless 环境。
+   */
+  function simulateHumanActivity() {
+    try {
+      if (document.hidden) {
+        Object.defineProperty(document, 'hidden', { value: false, configurable: true });
+      }
+      if (document.visibilityState !== 'visible') {
+        Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
+      }
+    } catch { /* 忽略只读拦截 */ }
+
+    try {
+      for (let i = 0; i < 3; i++) {
+        const x = Math.floor(100 + Math.random() * 300);
+        const y = Math.floor(100 + Math.random() * 200);
+        const event = new MouseEvent('mousemove', {
+          bubbles: true,
+          cancelable: true,
+          view: window,
+          clientX: x,
+          clientY: y,
+          screenX: x + 50,
+          screenY: y + 50,
+        });
+        window.dispatchEvent(event);
+      }
+    } catch { /* 忽略事件派发失败 */ }
+  }
 
   /**
    * 备好铸造用的容器与触发按钮。
@@ -513,11 +543,11 @@
 
   /** 铸造实例作废（失败/超时后调；下一次会用新实例重来） */
   function invalidateMintInstance() {
-    mintInstanceGeneration += 1;
     const instance = mintInstanceRef;
     mintInstancePromise = null;
     mintInstanceKey = '';
     mintInstanceRef = null;
+    mintInitializedAt = 0;
     try { instance?.destroy?.(); } catch { /* 忽略：实例已不可用 */ }
     // 容器一起清掉：同一个容器在 destroy 之后再 init 会卡住（见 mintIds 的说明）
     try { document.getElementById(mintElementId)?.remove(); } catch { /* 忽略 */ }
@@ -579,11 +609,11 @@
     } catch (error) {
       failure = error;
     }
+    mintWaiter = null;
     if (failure) {
       failMint(failure);
       return;
     }
-    mintWaiter = null;
     // ── 铸完就作废实例（**一次一铸**，实测结论）────────────────────
     // SDK 的同一个实例第二次调 `startTracelessVerification()` 必失败
     // （2026-09-28 实测：第一次 958ms 拿到串，第二次直接走 fail 回调）。
@@ -612,18 +642,16 @@
    * 返回值就是这个串。**一次一用**：铸好不用，两分钟后自己过期（上游拒收）。
    */
   async function mintTraceless(config) {
-    if (mintActive) throw new CaptchaError('静默铸造正在进行');
-    mintActive = true;
-    try {
-      return await runMint(config);
-    } finally {
-      mintActive = false;
-    }
-  }
-
-  async function runMint(config) {
     const instance = await ensureMintInstance(config);
-    if (instance !== mintInstanceRef) throw new CaptchaError('验证码组件初始化已失效，请重试');
+    // ── SDK 预热等待 ───────────────────────────────────────────
+    // 阿里云 SDK 初始化后必须收集足够的设备环境与指纹数据（至少等 2.1 秒），
+    // 否则直接调用 startTracelessVerification 会触发 fail/onError。
+    const elapsed = Date.now() - mintInitializedAt;
+    if (elapsed < MINIMUM_WARMUP_MS) {
+      await sleep(MINIMUM_WARMUP_MS - elapsed);
+    }
+    simulateHumanActivity();
+
     const generation = ++mintGeneration;
     return new Promise((resolve, reject) => {
       const timer = window.setTimeout(() => {
@@ -657,9 +685,8 @@
     const language = resolveAliyunCaptchaLanguage(currentLanguage());
     const key = config.region + ':' + config.prefix + ':' + config.sceneId + ':' + language;
     if (mintInstancePromise && mintInstanceKey === key) return mintInstancePromise;
-    invalidateMintInstance();
+    if (mintInstanceRef) invalidateMintInstance();
     mintInstanceKey = key;
-    const instanceGeneration = mintInstanceGeneration;
     const pending = (async () => {
       await loadAliyunCaptchaScript(config);
       const ids = mintIds();
@@ -670,20 +697,11 @@
       if (!initAliyunCaptcha) throw new CaptchaError('验证码组件不可用，请重试');
       return new Promise((resolve, reject) => {
         let settled = false;
-        const fail = error => {
-          if (instanceGeneration !== mintInstanceGeneration) return;
-          if (!settled) {
-            settled = true;
-            window.clearTimeout(timer);
-            invalidateMintInstance();
-            reject(error);
-          } else {
-            failMint(error);
-          }
-        };
         const timer = window.setTimeout(() => {
           if (settled) return;
-          fail(new CaptchaError('验证码组件初始化超时，请重试'));
+          settled = true;
+          mintInstancePromise = null;
+          reject(new CaptchaError('验证码组件初始化超时，请重试'));
         }, INIT_TIMEOUT_MS);
         try {
           initAliyunCaptcha({
@@ -697,34 +715,34 @@
             showErrorTip: false,
             language,
             getInstance: instance => {
-              if (settled || instanceGeneration !== mintInstanceGeneration) {
-                try { instance?.destroy?.(); } catch { /* 忽略过期实例 */ }
-                return;
-              }
+              if (settled) return;
               settled = true;
               window.clearTimeout(timer);
               mintInstanceRef = instance;
+              mintInitializedAt = Date.now();
               resolve(instance);
             },
-            success: result => {
-              if (instanceGeneration === mintInstanceGeneration) deliverMintResult(result);
-            },
-            fail: error => {
-              const code = /^[A-Z]\d{3}$/.test(error?.verifyCode || '') ? ` [SDK:${error.verifyCode}]` : '';
-              fail(new CaptchaError(((error && error.message) || '验证码校验失败，请重试') + code));
-            },
-            onError: error => fail(new CaptchaError(
+            success: result => deliverMintResult(result),
+            fail: error => failMint(new CaptchaError(
+              (error && error.message) || '验证码校验失败，请重试',
+            )),
+            onError: error => failMint(new CaptchaError(
               (error && error.message) || '验证码组件出错，请重试',
             )),
           });
         } catch (error) {
-          fail(new CaptchaError((error && error.message) || '验证码组件初始化失败'));
+          if (settled) return;
+          settled = true;
+          window.clearTimeout(timer);
+          mintInstancePromise = null;
+          reject(new CaptchaError((error && error.message) || '验证码组件初始化失败'));
         }
       });
     })();
     // 初始化失败不要把失败的 promise 缓存住（下一次要能重来）
     pending.catch(() => {
-      if (instanceGeneration === mintInstanceGeneration) invalidateMintInstance();
+      mintInstancePromise = null;
+      mintInstanceKey = '';
     });
     mintInstancePromise = pending;
     return pending;
@@ -748,6 +766,7 @@
     isBusy,
     // 静默铸串（活动套餐转发通道的令牌来源，见 mintTraceless）
     mintTraceless,
+    resetMint: invalidateMintInstance,
     CaptchaError,
     CaptchaCancelledError,
   };

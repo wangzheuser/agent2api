@@ -487,6 +487,14 @@ pub trait ProviderAdapter: Send + Sync {
             .filter(|level| !crate::server::core::model_rules::reasoning_is_off(level))
     }
 
+    /// 响应头是否表明上游错误；默认沿用 HTTP 非 2xx 的判定。
+    ///
+    /// 部分流式上游用 HTTP 200 + application/json 返回业务错误，适配器可
+    /// 在成功流交给客户端之前将它送入既有错误读取、分类与账号轮换流程。
+    fn is_error_response(&self, status: u16, _headers: &HeaderMap) -> bool {
+        !(200..300).contains(&status)
+    }
+
     /// 判定上游错误类型（status + 已解析的错误体）。
     ///
     /// `error_body` 是**已归一化**的错误对象：至少含 `code`（上游业务码，
@@ -1020,6 +1028,7 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         ProviderKind::Trae => &super::trae::adapter::TRAE_ADAPTER,
         ProviderKind::MiniMaxCode => &super::minimax_code::MINIMAX_CODE_ADAPTER,
         ProviderKind::LobsterAI => &super::lobsterai::adapter::LOBSTERAI_ADAPTER,
+        ProviderKind::Loomy => &super::loomy::LOOMY_ADAPTER,
     }
 }
 
@@ -1088,6 +1097,7 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         ProviderKind::Trae,
         ProviderKind::MiniMaxCode,
         ProviderKind::LobsterAI,
+        ProviderKind::Loomy,
     ]
 }
 
