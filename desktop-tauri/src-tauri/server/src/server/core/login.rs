@@ -49,6 +49,7 @@ use crate::server::core::auth::{
 use crate::server::core::endpoints::{resolve_edition, Context, DEFAULT_EDITION};
 use crate::server::core::providers::workbuddy::Region;
 use crate::server::core::providers::adapter::adapter_for;
+use crate::server::core::providers::minimax_code::oauth as minimax_oauth;
 use crate::server::core::providers::raccoon::oauth;
 use crate::server::core::providers::{kind_from_id, kind_id, ProviderKind};
 use crate::server::errors::GatewayError;
@@ -83,6 +84,7 @@ pub struct LoginTaskState {
     /// 空串在回调侧按「不认识」拒绝，不会静默落到某一家。
     pub provider: String,
     pub canceled: bool,
+    callback_claimed: bool,
     finished_at: Option<i64>,
 }
 
@@ -378,6 +380,7 @@ impl LoginService {
                 edition: info.id.to_string(),
                 provider: provider.to_string(),
                 canceled: false,
+                callback_claimed: false,
                 finished_at: None,
             })),
             ticket,
@@ -417,6 +420,91 @@ impl LoginService {
             "[Login]",
             &format!("发起{label}网页登录（等待浏览器回调…）"),
         );
+        Ok(handle)
+    }
+
+    /// MiniMax Code 使用带 PKCE 的设备授权，不走网页登录回调。
+    pub async fn start_minimax_code_login(
+        &self,
+        name: Option<String>,
+    ) -> Result<LoginTaskHandle, String> {
+        let start = minimax_oauth::start_device_authorization()
+            .await
+            .map_err(|error| error.message)?;
+        let state = format!(
+            "minimax-code-{}",
+            crate::server::core::upstream::request::new_request_id()
+        );
+        let auth_url = start
+            .verification_uri_complete
+            .clone()
+            .unwrap_or_else(|| start.verification_uri.clone());
+        let handle = self.new_handle_for_provider(
+            resolve_edition(Some(DEFAULT_EDITION)),
+            "minimax-code",
+        );
+        handle.update(|task| {
+            task.state = Some(state.clone());
+            task.auth_url = Some(auth_url.clone());
+        });
+        self.tasks.register(&state, handle.clone());
+        let service = self.clone();
+        tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now()
+                + Duration::from_secs(start.expires_in_seconds.max(1));
+            let mut interval = start.interval_seconds.max(1);
+            loop {
+                let Some(task) = service.tasks.get(&state) else { return };
+                if task.snapshot().canceled {
+                    return;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    finish_task_error(&task, "MiniMax Code 登录超时，请重新发起登录");
+                    return;
+                }
+                tokio::time::sleep(Duration::from_secs(interval)).await;
+                let Some(task) = service.tasks.get(&state) else { return };
+                if task.snapshot().canceled {
+                    return;
+                }
+                match minimax_oauth::poll_device_token(&start.device_code, &start.code_verifier).await {
+                    Ok(minimax_oauth::DevicePoll::Pending { slow_down }) => {
+                        if slow_down {
+                            interval = interval.saturating_add(5);
+                        }
+                    }
+                    Ok(minimax_oauth::DevicePoll::Authorized(credentials)) => {
+                        let Some(task) = service.tasks.get(&state) else { return };
+                        if task.snapshot().canceled {
+                            return;
+                        }
+                        match service.store.add_minimax_code_account(
+                            &credentials,
+                            name.as_deref(),
+                            "web",
+                        ) {
+                            Ok(account) => {
+                                let account_id = account
+                                    .get("id")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string();
+                                finish_task(
+                                    &task,
+                                    &json!({"account": {"uid": account_id}, "edition": ""}),
+                                );
+                            }
+                            Err(error) => finish_task_error(&task, &error.message),
+                        }
+                        return;
+                    }
+                    Err(error) => {
+                        finish_task_error(&task, &error.message);
+                        return;
+                    }
+                }
+            }
+        });
         Ok(handle)
     }
 
@@ -647,6 +735,9 @@ impl LoginService {
             return Err(GatewayError::with_status(400, "登录已取消，请重新发起"));
         }
         if task.done {
+            if let Some(error) = task.error.as_deref() {
+                return Err(GatewayError::with_status(400, error));
+            }
             // 幂等：同一个回调被送来两次（深链 + 导航各触发一次）不是错误
             return Ok(LoginCallbackSubmission::Completed(String::new()));
         }
@@ -657,6 +748,16 @@ impl LoginService {
                 format!("登录任务记录的提供商「{}」无法识别", task.provider),
             ));
         };
+        if matches!(kind, ProviderKind::Raccoon | ProviderKind::LobsterAI) {
+            let mut already_claimed = false;
+            handle.update(|task| {
+                already_claimed = task.callback_claimed;
+                task.callback_claimed = true;
+            });
+            if already_claimed {
+                return Ok(LoginCallbackSubmission::Completed(String::new()));
+            }
+        }
         // CodeArts：粘贴回来的整条回调 URL 在这里收尾。
         // 为什么不是「按 state 取 code」那套：portal 的回调**可能只带一个 code**、
         // 不带我们的配对信息，收尾要「逐个候选试 verifier」，还要认第一次回调下发的
@@ -822,12 +923,6 @@ impl LoginService {
         } else {
             let code_result = match kind {
                 ProviderKind::Raccoon => oauth::parse_callback_code(callback_url, state),
-                ProviderKind::MiniMaxCode => {
-                    crate::server::core::providers::minimax_code::oauth::parse_callback_code(
-                        callback_url,
-                        state,
-                    )
-                }
                 ProviderKind::LobsterAI => {
                     crate::server::core::providers::lobsterai::oauth::parse_callback_code(
                         callback_url,

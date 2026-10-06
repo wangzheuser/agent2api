@@ -276,6 +276,26 @@ pub async fn login_start(State(state): State<ServerState>, body: Bytes) -> Respo
         return ok_json(json!({ "state": task_state, "authUrl": auth_url,
             "edition": task_edition, "provider": "trae" }));
     }
+    // MiniMax Code：OAuth 服务要求 RFC 8628 设备码 + S256 PKCE，不能把它当成
+    // 浏览器 authorization-code 回调。后台任务会轮询 token 并在成功后落账号。
+    if kind == crate::server::core::providers::ProviderKind::MiniMaxCode {
+        let name = payload
+            .as_ref()
+            .and_then(|payload| payload.get("name").and_then(Value::as_str))
+            .map(str::to_string)
+            .filter(|value| !value.trim().is_empty());
+        let handle = match state.login().start_minimax_code_login(name).await {
+            Ok(handle) => handle,
+            Err(error) => return management_error(400, error),
+        };
+        let task = handle.snapshot();
+        return ok_json(json!({
+            "state": task.state,
+            "authUrl": task.auth_url,
+            "edition": task.edition,
+            "provider": "minimax-code"
+        }));
+    }
     // Cline：**设备授权登录**（WorkOS RFC 8628）。形态上介于「网页登录」与
     // 「Qoder 设备授权」之间：同步问上游要 user_code 与授权页地址（一次 POST），
     // 把地址交给界面打开；用户确认后由后台任务轮询换令牌。
@@ -1047,6 +1067,40 @@ pub async fn login_oauth_start(State(state): State<ServerState>, body: Bytes) ->
 /// `find_pending_for_vendor`）。
 ///
 /// 响应是给人看的 HTML（浏览器停在这一页），因此不走 `ok_json` 那套信封。
+pub async fn login_lobsterai_callback(
+    State(state): State<ServerState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let task_state = params.get("state").cloned().unwrap_or_default();
+    let callback_url = {
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        for (key, value) in &params {
+            query.append_pair(key, value);
+        }
+        format!("http://127.0.0.1/auth/callback?{}", query.finish())
+    };
+    let return_to = params
+        .get("return_to")
+        .and_then(|value| crate::server::core::providers::lobsterai::oauth::safe_return_to(value));
+    match state
+        .login()
+        .submit_login_callback(&task_state, &callback_url)
+        .await
+    {
+        Ok(crate::server::core::login::LoginCallbackSubmission::Completed(_)) => {
+            oauth_callback_page_with_redirect(
+                200,
+                "登录成功，正在返回 LobsterAI。",
+                return_to.as_deref(),
+            )
+        }
+        Ok(crate::server::core::login::LoginCallbackSubmission::ContinueTo(_)) => {
+            oauth_callback_page(400, "登录回调仍需继续，请重新发起网页登录。")
+        }
+        Err(error) => oauth_callback_page(error.status_code, &format!("登录失败：{}", error.message)),
+    }
+}
+
 pub async fn login_autoclaw_oauth_callback(
     State(state): State<ServerState>,
     axum::extract::Path(vendor_id): axum::extract::Path<String>,
@@ -1079,6 +1133,14 @@ pub async fn login_autoclaw_oauth_callback(
 /// 但状态码可能是 410（登录上下文已丢失）这类非 200 —— 统一用 `from_u16`
 /// 兜底成 200，避免一个非法状态码让响应构造失败。
 fn oauth_callback_page(status: i32, message: &str) -> Response {
+    oauth_callback_page_with_redirect(status, message, None)
+}
+
+fn oauth_callback_page_with_redirect(
+    status: i32,
+    message: &str,
+    return_to: Option<&str>,
+) -> Response {
     use axum::response::IntoResponse;
 
     let escaped = message
@@ -1086,11 +1148,24 @@ fn oauth_callback_page(status: i32, message: &str) -> Response {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;");
+    let redirect_script = return_to
+        .and_then(crate::server::core::providers::lobsterai::oauth::safe_return_to)
+        .and_then(|url| serde_json::to_string(&url).ok())
+        .map(|url| {
+            let url = url
+                .replace('<', "\\u003c")
+                .replace('>', "\\u003e")
+                .replace('&', "\\u0026");
+            format!(
+                "<script>setTimeout(function(){{window.location.replace({url})}},300);</script>"
+            )
+        })
+        .unwrap_or_default();
     let html = format!(
         "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">\
          <title>登录回调</title></head>\
          <body style=\"font-family:system-ui,sans-serif;padding:48px;text-align:center\">\
-         <p style=\"font-size:16px\">{escaped}</p></body></html>"
+         <p style=\"font-size:16px\">{escaped}</p>{redirect_script}</body></html>"
     );
     let status = u16::try_from(status)
         .ok()
@@ -1098,7 +1173,11 @@ fn oauth_callback_page(status: i32, message: &str) -> Response {
         .unwrap_or(axum::http::StatusCode::OK);
     (
         status,
-        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        [
+            (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+            (axum::http::header::REFERRER_POLICY, "no-referrer"),
+        ],
         html,
     )
         .into_response()

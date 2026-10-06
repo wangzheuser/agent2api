@@ -167,7 +167,8 @@ pub fn shim_js() -> &'static str {
   function needsManualCallback(provider) {
     return provider === 'trae'
       || provider === 'accio' || provider === 'accio-cn'
-      || provider === 'codearts' || provider === 'autoclaw-intl';
+      || provider === 'codearts' || provider === 'autoclaw-intl'
+      || provider === 'lobsterai';
   }
 
   function escapeHtml(value) {
@@ -199,7 +200,8 @@ pub fn shim_js() -> &'static str {
     var label = provider === 'raccoon' ? '小浣熊'
       : provider === 'trae' ? 'Trae'
       : provider.indexOf('accio') === 0 ? 'Accio'
-      : provider === 'codearts' ? 'CodeArts' : 'AutoClaw';
+      : provider === 'codearts' ? 'CodeArts'
+      : provider === 'lobsterai' ? 'LobsterAI' : 'AutoClaw';
     var callbackInstruction = '授权完成后，复制授权页浏览器地址栏中的<strong>完整地址</strong>，'
         + '粘贴到下面提交。不要复制授权页原始地址，也不要改动参数。';
     while (true) {
