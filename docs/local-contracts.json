@@ -1388,5 +1388,31 @@
         }
       ]
     }
+  ],
+  "replay_patches": [
+    {
+      "base_ref": "46a37d63561b83a6319db5d45afeb7fd75addbf3",
+      "path": "scripts/replay-patches/46a37d6-credit-focus.patch",
+      "files": [
+        {
+          "path": "desktop-tauri/ui-islands/tests/accounts-credit-dialog.browser.cjs",
+          "sha256": "1faf2649ec4ff56c8926ccc645c1dee26fdda4ca2c266dbadb34649f54bf80d2"
+        }
+      ],
+      "reason": "Linux Chromium 可在 Base UI 的 sibling focus guard 过渡帧完成 Tab；仅等待原有焦点回环完成，保留原输入/期望，并增加反向回环，不改生产实现或跳过断言。",
+      "review": "behavior_review 独立核查 DialogPopup → FloatingFocusManager → enqueueFocus 的 rAF 路径；原最终断言保留，每步焦点须回到 dialog，永久逃逸仍超时失败。"
+    },
+    {
+      "base_ref": "85a1fbbf042a753447e024cbfaa78201a7ad0092",
+      "path": "scripts/replay-patches/46a37d6-credit-focus.patch",
+      "files": [
+        {
+          "path": "desktop-tauri/ui-islands/tests/accounts-credit-dialog.browser.cjs",
+          "sha256": "1faf2649ec4ff56c8926ccc645c1dee26fdda4ca2c266dbadb34649f54bf80d2"
+        }
+      ],
+      "reason": "Linux Chromium 可在 Base UI 的 sibling focus guard 过渡帧完成 Tab；仅等待原有焦点回环完成，保留原输入/期望，并增加反向回环，不改生产实现或跳过断言。",
+      "review": "behavior_review 独立核查 DialogPopup → FloatingFocusManager → enqueueFocus 的 rAF 路径；原最终断言保留，每步焦点须回到 dialog，永久逃逸仍超时失败。；复用 b0ba9e0 的同一补丁和独立审阅：85a1fbb 中该测试字节 SHA256 与 46a37d6 完全一致，仅扩展到这个明确的历史基线。"
+    }
   ]
 }
