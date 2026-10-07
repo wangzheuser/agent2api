@@ -451,7 +451,8 @@ pub trait ProviderAdapter: Send + Sync {
     /// `model` 是**即将发给上游的那个名字**（已按家改写，见 `WireTarget.model`）：
     /// 需要按模型判断档位的家（Qoder 要拿它去查模型的 `efforts`）用它，
     /// 不看模型的家忽略它。
-    fn reasoning_patch(&self, _level: &str, _model: &str, _body: &Value) -> ReasoningPatch {
+    /// `force` 只绕过客户端优先判定，不绕过提供商/模型的能力和等级校验。
+    fn reasoning_patch(&self, _level: &str, _model: &str, _body: &Value, _force: bool) -> ReasoningPatch {
         ReasoningPatch::Skip {
             reason: "该提供商不支持思考等级绑定（上游无对应字段）",
         }

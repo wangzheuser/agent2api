@@ -68,7 +68,7 @@ fn with_state<R>(f: impl FnOnce(&mut Option<CatalogState>) -> R) -> R {
 }
 
 /// 该模型 id 是不是思考模型（客户端只对 spark-x 挂 reasoning 能力位）
-fn is_reasoning_model(id: &str) -> bool {
+pub(crate) fn is_reasoning_model(id: &str) -> bool {
     id.eq_ignore_ascii_case("spark-x") || id.to_ascii_lowercase().contains("spark-x")
 }
 

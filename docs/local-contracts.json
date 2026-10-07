@@ -1342,6 +1342,69 @@
           "id": "case-041aea87c3a8"
         }
       ]
+    },
+    {
+      "id": "model-reasoning-force-override",
+      "level": "P1",
+      "status": "必须保留",
+      "behavior": "独立 reasoningOverride 强制配置优先于客户端，原 reasoning 继续仅为默认；缺失保持、空值清除；按绑定和提供商隔离，三协议覆盖复用既有归一，冲突控制仅在发送副本清除；不支持的强制配置明确报错且不降级为未设置的另一家。",
+      "source_commits": [
+        "32f5fc7"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/model_rules/mod.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/model_rules/reasoning.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/providers/catalog/routing.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/upstream/payload.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/upstream/provider_loop.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/providers/custom/forward.rs",
+        "desktop-tauri/ui-islands/src/islands/models-page.tsx",
+        "desktop-tauri/ui-islands/src/islands/models-custom-source.ts"
+      ],
+      "tests": [
+        {
+          "id": "reasoning-force-native-precedence",
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/payload.rs",
+          "name": "server::core::upstream::payload::force_tests::all_supported_providers_force_without_changing_default_precedence"
+        },
+        {
+          "id": "reasoning-force-unsupported",
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/payload.rs",
+          "name": "server::core::upstream::payload::force_tests::unset_override_is_legacy_and_unsupported_force_is_an_error"
+        },
+        {
+          "id": "reasoning-force-coding-wire",
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/adapter/tests.rs",
+          "name": "server::core::providers::zcode::adapter::tests::forced_binding_three_protocols_both_regions_coding_wire"
+        },
+        {
+          "id": "reasoning-force-http-wire",
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/reasoning_override.rs",
+          "name": "management_and_three_protocol_wire_force_clear_and_legacy_preservation"
+        },
+        {
+          "id": "reasoning-force-ui-index",
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/models-reasoning-override.test.cjs",
+          "name": "default and forced indices remain independent and provider scoped"
+        },
+        {
+          "id": "reasoning-force-ui-custom",
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/models-reasoning-override.test.cjs",
+          "name": "custom edits, refresh imports and legacy same-name clear preserve binding semantics"
+        },
+        {
+          "id": "reasoning-force-ui-browser",
+          "kind": "browser",
+          "path": "desktop-tauri/ui-islands/tests/models-reasoning-override.browser.cjs",
+          "name": ""
+        }
+      ]
     }
   ],
   "replay_patches": [

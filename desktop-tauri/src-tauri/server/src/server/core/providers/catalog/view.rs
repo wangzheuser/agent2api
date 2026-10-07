@@ -163,6 +163,7 @@ pub fn manage_view(store: &AccountStore) -> Value {
             mappings.push(json!({
                 "alias": id, "target": id, "provider": provider, "enabled": enabled,
                 "reasoning": default.and_then(|mapping| mapping.reasoning.clone()),
+                "reasoningOverride": default.and_then(|mapping| mapping.reasoning_override.clone()),
                 "isDefault": true, "dangling": false, "carried": true,
             }));
             let mut aliases = Vec::new();
@@ -179,6 +180,7 @@ pub fn manage_view(store: &AccountStore) -> Value {
                 mappings.push(json!({
                     "alias": effective.alias, "target": id, "provider": provider,
                     "enabled": effective.enabled, "reasoning": effective.reasoning,
+                    "reasoningOverride": effective.reasoning_override,
                     "isDefault": false, "dangling": false, "carried": true,
                 }));
             }
@@ -225,6 +227,7 @@ pub fn manage_view(store: &AccountStore) -> Value {
         mappings.push(json!({
             "alias": mapping.alias, "target": mapping.target, "provider": mapping.provider,
             "enabled": mapping.enabled, "reasoning": mapping.reasoning,
+            "reasoningOverride": mapping.reasoning_override,
             "isDefault": mapping.alias.eq_ignore_ascii_case(&mapping.target),
             "dangling": true, "carried": carried,
         }));

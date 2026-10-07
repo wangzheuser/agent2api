@@ -72,6 +72,7 @@ export type ManageMapping = {
   provider: string
   enabled: boolean
   reasoning: string
+  reasoningOverride?: string
   isDefault?: boolean
   dangling?: boolean
   carried?: boolean
@@ -91,8 +92,8 @@ export type CustomProviderRecord = {
   name?: string
   createdAt?: unknown
   /** `capabilities` 是该条模型的能力位覆盖（可选稀疏表，键名见 `model-capability`） */
-  models?: Array<{ id?: unknown; enabled?: unknown; reasoning?: unknown; capabilities?: unknown }>
-  mappings?: Array<{ alias?: unknown; target?: unknown; enabled?: unknown; reasoning?: unknown }>
+  models?: Array<{ id?: unknown; enabled?: unknown; reasoning?: unknown; reasoningOverride?: unknown; capabilities?: unknown }>
+  mappings?: Array<{ alias?: unknown; target?: unknown; enabled?: unknown; reasoning?: unknown; reasoningOverride?: unknown }>
 }
 
 /** 目录模块（providers.js）里本模块用到的那几个方法 */
@@ -103,7 +104,7 @@ type ProvidersBridge = {
 }
 
 /** 提交入口的入参：三态语义与后端一致（字段不给 = 不改） */
-type BindingPatch = { enabled?: boolean; reasoning?: string }
+type BindingPatch = { enabled?: boolean; reasoning?: string; reasoningOverride?: string }
 
 /* ─── 运行期读 window ─────────────────────────── */
 
@@ -151,8 +152,8 @@ export function record(id: string): CustomProviderRecord | null {
  * 每次提交都从**目录缓存的当前值**重建，所以本函数是幂等的：连点两次开关，第二次读到
  * 的就是第一次提交后的值。
  */
-type DraftModel = { id: string; enabled: boolean; reasoning: string; capabilities?: Record<string, number | boolean> }
-type DraftMapping = { alias: string; target: string; enabled: boolean; reasoning: string }
+type DraftModel = { id: string; enabled: boolean; reasoning: string; reasoningOverride?: string; capabilities?: Record<string, number | boolean> }
+type DraftMapping = { alias: string; target: string; enabled: boolean; reasoning: string; reasoningOverride?: string }
 
 /**
  * 记录条目的能力位 → 可提交的稀疏对象（空表给 `undefined`：整表提交里不带
@@ -175,6 +176,7 @@ function draftOf(provider: CustomProviderRecord | null): { models: DraftModel[];
         id: String(model?.id ?? '').trim(),
         enabled: model?.enabled !== false,
         reasoning: typeof model?.reasoning === 'string' ? model.reasoning : '',
+        reasoningOverride: typeof model?.reasoningOverride === 'string' ? model.reasoningOverride : '',
       }
       // 能力位覆盖**必须原样带回**：整表替换的语义下，草稿漏了它，用户填过的
       // 能力就会被一次「切开关」的提交顺手清掉
@@ -188,6 +190,7 @@ function draftOf(provider: CustomProviderRecord | null): { models: DraftModel[];
       target: String(mapping?.target ?? '').trim(),
       enabled: mapping?.enabled !== false,
       reasoning: typeof mapping?.reasoning === 'string' ? mapping.reasoning : '',
+      reasoningOverride: typeof mapping?.reasoningOverride === 'string' ? mapping.reasoningOverride : undefined,
     }))
     .filter(mapping => mapping.alias && mapping.target)
 
@@ -196,6 +199,7 @@ function draftOf(provider: CustomProviderRecord | null): { models: DraftModel[];
     if (!legacy) continue
     model.enabled = model.enabled && legacy.enabled
     model.reasoning = legacy.reasoning || model.reasoning
+    if (legacy.reasoningOverride !== undefined) model.reasoningOverride = legacy.reasoningOverride
   }
   const cleaned = mappings.filter(mapping =>
     !(same(mapping.alias, mapping.target) && models.some(model => same(model.id, mapping.target))))
@@ -241,6 +245,7 @@ export function buildView(id: string): { models: ManageModel[]; mappings: Manage
       provider: id,
       enabled: model.enabled,
       reasoning: model.reasoning,
+      reasoningOverride: model.reasoningOverride,
       isDefault: true,
       dangling: false,
       carried: true,
@@ -254,6 +259,7 @@ export function buildView(id: string): { models: ManageModel[]; mappings: Manage
       provider: id,
       enabled: mapping.enabled,
       reasoning: mapping.reasoning,
+      reasoningOverride: mapping.reasoningOverride,
       isDefault: false,
       // 目标不在清单里 = 这条映射挂不到任何一行（表格底部的「未挂载」分组）。
       // 自定义家不该出现这种条目（移除模型会连带删映射），但手改过的数据文件或早期
@@ -299,19 +305,21 @@ async function submit<T>(id: string, mutate: (draft: ReturnType<typeof draftOf>)
  * `patch` 里没给的字段保持现值（与后端「三态」协议同一取向：不带 = 不改）。
  */
 export async function setBinding(id: string, alias: string, target: string, patch: BindingPatch = {}): Promise<void> {
-  const { enabled, reasoning } = patch
+  const { enabled, reasoning, reasoningOverride } = patch
   await submit(id, draft => {
     if (same(alias, target)) {
       const model = draft.models.find(item => same(item.id, target))
       if (!model) throw new Error(`该提供商的清单里没有模型「${target}」`)
       if (enabled !== undefined) model.enabled = Boolean(enabled)
       if (reasoning !== undefined) model.reasoning = String(reasoning ?? '')
+      if (reasoningOverride !== undefined) model.reasoningOverride = String(reasoningOverride ?? '')
       return null
     }
     const existing = draft.mappings.find(item => same(item.alias, alias) && same(item.target, target))
     if (existing) {
       if (enabled !== undefined) existing.enabled = Boolean(enabled)
       if (reasoning !== undefined) existing.reasoning = String(reasoning ?? '')
+      if (reasoningOverride !== undefined) existing.reasoningOverride = String(reasoningOverride ?? '')
       return null
     }
     if (enabled === false) throw new Error(`映射「${alias} → ${target}」不存在`)
@@ -321,6 +329,7 @@ export async function setBinding(id: string, alias: string, target: string, patc
       // 走到这里 enabled 只剩 true / undefined（false 上面已经抛错），缺省即启用
       enabled: enabled ?? true,
       reasoning: String(reasoning ?? ''),
+      reasoningOverride: String(reasoningOverride ?? ''),
     })
     return null
   })

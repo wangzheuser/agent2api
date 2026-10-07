@@ -12,6 +12,7 @@ use super::{adapter_for, all_kinds, manifest_for};
 pub struct WireTarget {
     pub model: String,
     pub reasoning: Option<String>,
+    pub reasoning_override: Option<String>,
 }
 
 pub(super) fn entry_id_in_manifest(manifest: &[Value], requested: &str) -> Option<String> {
@@ -47,6 +48,7 @@ pub(super) fn builtin_target(
                 reasoning: rules
                     .binding(provider, &id, &id)
                     .and_then(|m| m.reasoning.clone()),
+                reasoning_override: rules.binding(provider, &id, &id).and_then(|m| m.reasoning_override.clone()),
                 model: id,
             });
         }
@@ -88,6 +90,7 @@ pub(super) fn builtin_target(
         reasoning: rules
             .binding(provider, &mapping.alias, &mapping.target)
             .and_then(|effective| effective.reasoning.clone()),
+        reasoning_override: rules.binding(provider, &mapping.alias, &mapping.target).and_then(|m| m.reasoning_override.clone()),
     })
 }
 
@@ -186,6 +189,7 @@ pub fn wire_target_for_provider(
     resolved.unwrap_or_else(|| WireTarget {
         model: requested.to_string(),
         reasoning: None,
+        reasoning_override: None,
     })
 }
 
