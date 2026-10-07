@@ -12,7 +12,7 @@
 
 | 提供商 | 模型协议 | 主要上游 | 奖励链路 | 额度展示 |
 | --- | --- | --- | --- | --- |
-| MiniMax Code | Anthropic Messages | `agent.minimax.cn/mavis/api/v1/llm/v1/messages?beta=true` | `signin/status` → `signin/claim` | `gift`、`paid`、`platform` 分桶，按包保留最早到期时间 |
+| MiniMax Code | Anthropic Messages | `agent.minimax.cn/mavis/api/v1/llm/v1/messages?beta=true` | `signin/status` → `signin/claim` | 已迁移账号使用个人工作区会员额度摘要；未迁移账号保留 `gift`、`paid`、`platform` 明细分桶 |
 | LobsterAI | OpenAI Chat Completions | `lobsterai-server.youdao.com/api/proxy/v1/chat/completions` | 动态 `slot` → `context` → `actions/check_in` | `free`、`campaign`、`subscription`、`creditItems` 与总额 |
 | AStudio | OpenAI 兼容预置 API | `maas-api.cn-huabei-1.xf-yun.com/v1` | 预置 API `rewardProfile=astudio` | 复用现有 AStudio 奖励解析 |
 | DuMate | OpenAI 兼容预置 API | `dumate-svc.baidu.com/gateway/apis/v1` | 预置 API `rewardProfile=dumate` | 复用现有 DuMate 奖励解析 |
@@ -70,7 +70,15 @@ LobsterAI（活动奖励）
 
 ## P1 后续项
 
-当前原生 Provider 使用静态模型兜底清单，并在目录层保留远程刷新扩展点。后续可以在确认官方目录端点和缓存语义后增加远程模型刷新、账号详情额度分桶、延迟到账核验、刷新/活动状态指标和协议变更 fixture。没有授权测试账号时，不能把 fixture 或 HTTP 200 解释为真实奖励到账。
+当前原生 Provider 使用静态模型兜底清单，并在目录层保留远程刷新扩展点。后续可以在确认官方目录端点和缓存语义后增加远程模型刷新、账号详情额度分桶、刷新/活动状态指标和协议变更 fixture。没有授权测试账号时，不能把 fixture 或 HTTP 200 解释为真实奖励到账。
+
+### 2026-10-07 签到修正
+
+- LobsterAI 的 `loginRequired` 表示活动要求登录，不表示当前未登录；`authenticated=true` 时继续检查资格及动作，明确未登录或缺少必要认证状态时仍不领取。参考[官方活动测试](https://github.com/netease-youdao/LobsterAI/blob/1c20890672581321db4c9f21c6670ccc0bf03dfd/src/main/ipcHandlers/activity/handlers.test.ts)。
+- MiniMax 管理接口按[官方 public-gateway](https://github.com/MiniMax-AI/MiniMax-Code/blob/4401b0edb0e6ad753d3952b75a31ec87807b6aab/packages/tui/src/runtime/public-gateway.ts)补齐客户端归因参数与签名，从 `/v1/api/user/info` 获取业务 `realUserID`，不改本地账号 ID、OAuth 或模型转发协议。
+- 通过 `get_user_extra_info` 选择个人工作区，再读 `get_membership_info`；已迁移账号使用 `op_credit_summary`/`opcredit_balance`，不与旧 `credit/details` 重复累加。缺少有效余额时报错，不伪装成零余额；未报告的到期时间不臆造。参考[官方账户客户端](https://github.com/MiniMax-AI/MiniMax-Code/blob/4401b0edb0e6ad753d3952b75a31ec87807b6aab/packages/tui/src/account/matrix-account-client.ts)。
+- MiniMax 领取成功后延迟一次余额查询，返回 `creditVerification`（`balance_increased` / `unverified` / `query_failed`）及 `balanceBefore`、`balanceAfter`、`balanceDelta`；余额核验失败不重试领取。`success` 仍表示上游领取接口确认，不等同到账。`points` 已包含 `bonus_points`，不重复加分；日志只保留类型受控的金额、状态与领取标识哈希。
+- 单个及批量签到提示保留“额度到账待核验”。已有今日领取记录只查询状态和余额，不重放领取；历史未到账需由后续余额变化或上游核查确认，代码修正不承诺补发。
 
 ## 验证与交付
 
