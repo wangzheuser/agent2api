@@ -47,6 +47,8 @@
 pub mod aggregate;
 pub mod affinity;
 pub mod route_session;
+#[cfg(test)]
+mod model_test_affinity_tests;
 pub mod completion_evidence;
 pub mod cancellation;
 pub mod connections;
@@ -83,6 +85,7 @@ use axum::http::HeaderMap;
 use crate::server::core::account_store::AccountStore;
 use crate::server::core::auth::AuthService;
 use crate::server::core::proxies::ResolvedProxy;
+use crate::server::core::providers::catalog::WireTarget;
 use crate::server::errors::GatewayError;
 use crate::server::logging;
 
@@ -294,9 +297,20 @@ impl UpstreamService {
     ///     一个卡住的前序请求被无限期挂住。
     ///   - **槽位一直占到大半个响应结束**（流式请求也一样，见 InFlightGuard）。
     pub async fn forward(&self, request: ForwardRequest) -> Result<ForwardOutcome, GatewayError> {
+        self.forward_inner(request, None).await
+    }
+
+    /// 管理测试入口传入已校验的原始目标；不改变普通请求的结构或绑定启停。
+    pub(crate) async fn forward_model_test(&self, request: ForwardRequest, target: WireTarget) -> Result<ForwardOutcome, GatewayError> {
+        self.forward_inner(request, Some(target)).await
+    }
+
+    async fn forward_inner(&self, request: ForwardRequest, test_target: Option<WireTarget>) -> Result<ForwardOutcome, GatewayError> {
         // 在去重排队等任何 await 之前冻结，旧请求不借用设置切换后的 epoch。
         let affinity_epoch = self.affinity.epoch();
-        let affinity_enabled = request.pinned_account.is_none()
+        // 管理模型测试不建立持久亲和，即使调用者携带 route_session。
+        let affinity_enabled = test_target.is_none()
+            && request.pinned_account.is_none()
             && crate::server::config::account_selection()
                 == crate::server::config::AccountSelectionStrategy::CacheAffinity;
         // ── 调试模式：为本次请求装一个原始报文采集器 ─────────────────
@@ -378,6 +392,7 @@ impl UpstreamService {
             route_session: route_session.as_ref().filter(|_| affinity_enabled),
             affinity_enabled,
             affinity_epoch,
+            test_target: test_target.as_ref(),
         };
         provider_loop::forward_with_providers(self, context, &mut slot, &mut connections).await
     }

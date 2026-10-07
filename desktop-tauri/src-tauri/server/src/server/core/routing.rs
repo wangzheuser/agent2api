@@ -80,13 +80,19 @@ static ROUTE_CURSOR: AtomicUsize = AtomicUsize::new(0);
 pub struct CooldownKeys<'a> {
     /// 客户端请求名（原始形态，未解析）
     requested: &'a str,
+    /// 管理模型测试已校验的上游真名，跳过普通绑定解析。
+    wire_model: Option<&'a str>,
     /// provider id → 该家收到的上游真名
     resolved: Mutex<HashMap<String, String>>,
 }
 
 impl<'a> CooldownKeys<'a> {
     pub fn new(requested: &'a str) -> Self {
-        Self { requested, resolved: Mutex::new(HashMap::new()) }
+        Self { requested, wire_model: None, resolved: Mutex::new(HashMap::new()) }
+    }
+
+    pub fn for_wire_model(wire_model: &'a str) -> Self {
+        Self { wire_model: Some(wire_model), ..Self::new(wire_model) }
     }
 
     /// 该家实际收到的上游模型名 —— 也就是它的冷却键。
@@ -98,6 +104,9 @@ impl<'a> CooldownKeys<'a> {
     /// 锁中毒（别的线程 panic 过）时**不做缓存**、直接现算 —— 缓存只是加速，
     /// 选路结果不该因为一个内部加速器而失败。
     pub fn for_provider(&self, provider_id: &str) -> String {
+        if let Some(wire_model) = self.wire_model {
+            return wire_model.to_string();
+        }
         if self.requested.is_empty() || provider_id.is_empty() {
             return self.requested.to_string();
         }
@@ -590,6 +599,32 @@ mod selection_tests {
             "enabled": true,
             "maxConcurrent": max_concurrent,
         })
+    }
+
+    #[test]
+    fn model_test_raw_wire_key_ignores_same_name_alias_cooldown() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        // 模拟已解析的同名 alias Raw -> Other；不改全局模型配置。
+        let ordinary = CooldownKeys::new("Raw");
+        ordinary.resolved.lock().unwrap().insert("raccoon".into(), "Other".into());
+        let tested = CooldownKeys::for_wire_model("Raw");
+        tested.resolved.lock().unwrap().insert("raccoon".into(), "Other".into());
+        let mut raw_cooled = account("raw-cooled", 1, 0);
+        raw_cooled["rateLimits"] = json!({"Raw":{"resetAt":100}});
+        let mut alias_cooled = account("alias-cooled", 2, 0);
+        alias_cooled["rateLimits"] = json!({"Other":{"resetAt":100}});
+        let accounts = vec![raw_cooled, alias_cooled];
+        assert!(is_rate_limited(&accounts[0], &tested, 0));
+        assert!(!is_rate_limited(&accounts[1], &tested, 0));
+        for (keys, expected) in [(&ordinary, "raw-cooled"), (&tested, "alias-cooled")] {
+            let picked = pick_account_with_strategy(
+                &accounts, keys, &HashMap::new(), &[], 0,
+                crate::server::config::AccountSelectionStrategy::Priority, false,
+            ).expect("应有未冷却账号");
+            assert_eq!(picked["id"], expected);
+        }
+        // 成本排序与积分资格判定同样使用该解析器，不再读取普通映射名。
+        assert_eq!(tested.for_provider("workbuddy"), "Raw");
     }
 
     #[test]

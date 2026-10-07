@@ -443,6 +443,12 @@ impl Affinity {
         state.recent.clear();
         state.last_allocation.clear();
     }
+
+    #[cfg(test)]
+    pub(super) fn test_snapshot(&self) -> (usize, usize, usize, usize) {
+        let state = self.lock();
+        (state.bindings.len(), state.leases.len(), state.recent.len(), state.last_allocation.len())
+    }
 }
 
 fn selection(mut account: Value, lease: Option<AffinityLease>, reason: &'static str) -> Selection {

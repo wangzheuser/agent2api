@@ -1344,6 +1344,121 @@
       ]
     },
     {
+      "id": "model-reasoning-force-override",
+      "level": "P1",
+      "status": "必须保留",
+      "behavior": "独立 reasoningOverride 强制配置优先于客户端，原 reasoning 继续仅为默认；缺失保持、空值清除；按绑定和提供商隔离，三协议覆盖复用既有归一，冲突控制仅在发送副本清除；不支持的强制配置明确报错且不降级为未设置的另一家。",
+      "source_commits": [
+        "32f5fc7"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/model_rules/mod.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/model_rules/reasoning.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/providers/catalog/routing.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/upstream/payload.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/upstream/provider_loop.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/providers/custom/forward.rs",
+        "desktop-tauri/ui-islands/src/islands/models-page.tsx",
+        "desktop-tauri/ui-islands/src/islands/models-custom-source.ts"
+      ],
+      "tests": [
+        {
+          "id": "reasoning-force-native-precedence",
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/payload.rs",
+          "name": "server::core::upstream::payload::force_tests::all_supported_providers_force_without_changing_default_precedence"
+        },
+        {
+          "id": "reasoning-force-unsupported",
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/payload.rs",
+          "name": "server::core::upstream::payload::force_tests::unset_override_is_legacy_and_unsupported_force_is_an_error"
+        },
+        {
+          "id": "reasoning-force-coding-wire",
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/adapter/tests.rs",
+          "name": "server::core::providers::zcode::adapter::tests::forced_binding_three_protocols_both_regions_coding_wire"
+        },
+        {
+          "id": "reasoning-force-http-wire",
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/reasoning_override.rs",
+          "name": "management_and_three_protocol_wire_force_clear_and_legacy_preservation"
+        },
+        {
+          "id": "reasoning-force-ui-index",
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/models-reasoning-override.test.cjs",
+          "name": "default and forced indices remain independent and provider scoped"
+        },
+        {
+          "id": "reasoning-force-ui-custom",
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/models-reasoning-override.test.cjs",
+          "name": "custom edits, refresh imports and legacy same-name clear preserve binding semantics"
+        },
+        {
+          "id": "reasoning-force-ui-browser",
+          "kind": "browser",
+          "path": "desktop-tauri/ui-islands/tests/models-reasoning-override.browser.cjs",
+          "name": ""
+        }
+      ]
+    },
+    {
+      "id": "model-test-disabled-bindings",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "管理模型测试按提供商目录原始模型和指定账号转发，即使默认绑定或全部绑定关闭；保留绑定等级、管理认证、账号隔离和测试记账，不修改配置、不开放普通三协议请求或广告列表。",
+      "source_commits": [
+        "0636ad112e0bcca898ca36e2fae1f54618c661c8"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/api/model_test.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/providers/catalog/routing.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/custom_providers/bindings.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/upstream/mod.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/upstream/payload.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/upstream/provider_loop.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/providers/custom/forward.rs",
+        "desktop-tauri/ui-islands/src/islands/model-test-dialog.tsx",
+        "desktop-tauri/ui-islands/src/islands/models-page.tsx",
+        "desktop-tauri/src-tauri/server/src/server/core/routing.rs"
+      ],
+      "tests": [
+        {
+          "id": "model-test-disabled-native-target",
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/catalog/routing.rs",
+          "name": "server::core::providers::catalog::routing::tests::native_test_target_keeps_disabled_default_and_does_not_follow_same_name_alias"
+        },
+        {
+          "id": "model-test-disabled-custom-target",
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/custom_providers/bindings.rs",
+          "name": "server::core::custom_providers::bindings::tests::test_resolution_ignores_model_switches_but_not_provider_switch_or_raw_catalog"
+        },
+        {
+          "id": "model-test-disabled-end-to-end",
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/model_test_disabled_bindings.rs",
+          "name": "model_tests_ignore_binding_switches_without_opening_public_routes"
+        },
+        {
+          "id": "model-test-disabled-browser",
+          "kind": "browser",
+          "path": "desktop-tauri/ui-islands/tests/model-test.browser.cjs"
+        },
+        {
+          "id": "model-test-raw-wire-cooldown",
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/routing.rs",
+          "name": "server::core::routing::selection_tests::model_test_raw_wire_key_ignores_same_name_alias_cooldown"
+        }
+      ]
+    },
+    {
       "id": "session-affinity-allocation",
       "level": "P0",
       "status": "必须保留",
@@ -1446,6 +1561,12 @@
           "path": "desktop-tauri/src-tauri/server/tests/session_affinity.rs",
           "name": "session_affinity_real_forward_protocols_lifecycle_and_strategy_rollback",
           "id": "case-session-affinity-http"
+        },
+        {
+          "id": "affinity-management-test-no-binding",
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/model_test_affinity_tests.rs",
+          "name": "server::core::upstream::model_test_affinity_tests::model_test_entry_does_not_bind_reliable_session"
         }
       ]
     },
@@ -1717,69 +1838,6 @@
           "id": "case-session-affinity-settings-browser"
         }
       ]
-    },
-    {
-      "id": "model-reasoning-force-override",
-      "level": "P1",
-      "status": "必须保留",
-      "behavior": "独立 reasoningOverride 强制配置优先于客户端，原 reasoning 继续仅为默认；缺失保持、空值清除；按绑定和提供商隔离，三协议覆盖复用既有归一，冲突控制仅在发送副本清除；不支持的强制配置明确报错且不降级为未设置的另一家。",
-      "source_commits": [
-        "32f5fc7"
-      ],
-      "implementation": [
-        "desktop-tauri/src-tauri/server/src/server/core/model_rules/mod.rs",
-        "desktop-tauri/src-tauri/server/src/server/core/model_rules/reasoning.rs",
-        "desktop-tauri/src-tauri/server/src/server/core/providers/catalog/routing.rs",
-        "desktop-tauri/src-tauri/server/src/server/core/upstream/payload.rs",
-        "desktop-tauri/src-tauri/server/src/server/core/upstream/provider_loop.rs",
-        "desktop-tauri/src-tauri/server/src/server/core/providers/custom/forward.rs",
-        "desktop-tauri/ui-islands/src/islands/models-page.tsx",
-        "desktop-tauri/ui-islands/src/islands/models-custom-source.ts"
-      ],
-      "tests": [
-        {
-          "id": "reasoning-force-native-precedence",
-          "kind": "rust",
-          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/payload.rs",
-          "name": "server::core::upstream::payload::force_tests::all_supported_providers_force_without_changing_default_precedence"
-        },
-        {
-          "id": "reasoning-force-unsupported",
-          "kind": "rust",
-          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/payload.rs",
-          "name": "server::core::upstream::payload::force_tests::unset_override_is_legacy_and_unsupported_force_is_an_error"
-        },
-        {
-          "id": "reasoning-force-coding-wire",
-          "kind": "rust",
-          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/adapter/tests.rs",
-          "name": "server::core::providers::zcode::adapter::tests::forced_binding_three_protocols_both_regions_coding_wire"
-        },
-        {
-          "id": "reasoning-force-http-wire",
-          "kind": "rust",
-          "path": "desktop-tauri/src-tauri/server/tests/reasoning_override.rs",
-          "name": "management_and_three_protocol_wire_force_clear_and_legacy_preservation"
-        },
-        {
-          "id": "reasoning-force-ui-index",
-          "kind": "node",
-          "path": "desktop-tauri/ui-islands/tests/models-reasoning-override.test.cjs",
-          "name": "default and forced indices remain independent and provider scoped"
-        },
-        {
-          "id": "reasoning-force-ui-custom",
-          "kind": "node",
-          "path": "desktop-tauri/ui-islands/tests/models-reasoning-override.test.cjs",
-          "name": "custom edits, refresh imports and legacy same-name clear preserve binding semantics"
-        },
-        {
-          "id": "reasoning-force-ui-browser",
-          "kind": "browser",
-          "path": "desktop-tauri/ui-islands/tests/models-reasoning-override.browser.cjs",
-          "name": ""
-        }
-      ]
     }
   ],
   "replay_patches": [
@@ -1794,6 +1852,18 @@
       ],
       "reason": "Linux Chromium 可在 Base UI 的 sibling focus guard 过渡帧完成 Tab；仅等待原有焦点回环完成，保留原输入/期望，并增加反向回环，不改生产实现或跳过断言。",
       "review": "behavior_review 独立核查 DialogPopup → FloatingFocusManager → enqueueFocus 的 rAF 路径；原最终断言保留，每步焦点须回到 dialog，永久逃逸仍超时失败。"
+    },
+    {
+      "base_ref": "85a1fbbf042a753447e024cbfaa78201a7ad0092",
+      "path": "scripts/replay-patches/46a37d6-credit-focus.patch",
+      "files": [
+        {
+          "path": "desktop-tauri/ui-islands/tests/accounts-credit-dialog.browser.cjs",
+          "sha256": "1faf2649ec4ff56c8926ccc645c1dee26fdda4ca2c266dbadb34649f54bf80d2"
+        }
+      ],
+      "reason": "Linux Chromium 可在 Base UI 的 sibling focus guard 过渡帧完成 Tab；仅等待原有焦点回环完成，保留原输入/期望，并增加反向回环，不改生产实现或跳过断言。",
+      "review": "behavior_review 独立核查 DialogPopup → FloatingFocusManager → enqueueFocus 的 rAF 路径；原最终断言保留，每步焦点须回到 dialog，永久逃逸仍超时失败。；复用 b0ba9e0 的同一补丁和独立审阅：85a1fbb 中该测试字节 SHA256 与 46a37d6 完全一致，仅扩展到这个明确的历史基线。"
     },
     {
       "path": "scripts/replay-patches/session-affinity-zcode-request.patch",
@@ -1854,6 +1924,18 @@
       ],
       "reason": "Base UI 在浏览器异步渲染下拉选项；仅等待新增选项可见，保留四项计数、保存参数及失败恢复的全部输入和断言。",
       "review": "architect_review 独立审阅原始时序失败、异步渲染路径及仅等待的接线差异；不修改生产实现或跳过断言。"
+    },
+    {
+      "path": "scripts/replay-patches/session-affinity-zcode-request.patch",
+      "files": [
+        {
+          "path": "desktop-tauri/src-tauri/server/tests/zcode_restore.rs",
+          "sha256": "7464daff25b517d9e47faea366b43fed9ddd7ffe7fd65ab7c023c3fe507036e4"
+        }
+      ],
+      "reason": "ForwardRequest 新增可选会话上下文；原始指定账号测试仍传 None，不改变输入及断言。",
+      "review": "独立 architect_review 对照基线检查：补丁仅为 pinned 测试增加 route_session: None，保留原始断言。",
+      "base_ref": "cdfa29251b790908d14f7e43b59872c518e74119"
     }
   ]
 }

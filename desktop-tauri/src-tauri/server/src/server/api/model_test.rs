@@ -17,7 +17,7 @@
 //! 表现**迟早分叉**（参考项目 OmniProxy 在 `modelTestRun.ts` 里也走过这一步：
 //! 它后来改成「按被测目标的原生协议打本机真实网关」）。
 //!
-//! ── 与生产请求的三处不同（都靠 `ForwardRequest` 的收窄字段实现）──
+//! ── 与生产请求的不同（请求级收窄，不修改配置）───────────────
 //!   1. **钉住这一家**：`allowed_providers = KeyScope::provider_only(provider)`
 //!      —— 同一个对外名允许在多家各挂一条映射，不定家的话「测这一行」测出来的
 //!      是别人，结论无法归因；
@@ -27,7 +27,10 @@
 //!      而测试常常就要并发地对多个账号各发一次同样的 body（前端一个账号一条
 //!      请求），去重会让它们互相等待、甚至只跑一条。
 //!
-//! 除了这三处，其它一切都与真实请求一致 —— 包括**会消耗额度**。
+//!   4. **忽略对外绑定开关**：`forward_model_test` 接收目录校验后的原始模型与默认等级，
+//!      不依赖默认绑定或别名是否启用，也不修改配置、广告列表或正常请求选路。
+//!
+//! 除了这些请求级差异，其它一切都与真实请求一致 —— 包括**会消耗额度**。
 //!
 //! ── 记账：进请求日志，但被报表排除 ────────────────────────────
 //! 测试请求走的是同一条链路，所以它会像真实请求一样被记下来（`is_test = 1`）。
@@ -185,15 +188,15 @@ pub async fn run_model_test(State(state): State<ServerState>, body: Bytes) -> Re
     // 模型必须**这一家认识**：清单里没有它时，转发层的收窄会以「不在这把网关
     // Key 的可用提供商列表里」收场 —— 那句话对测试场景毫无信息量，这里先拒掉
     // 并说清下一步（多半是清单没刷新，或者模型名被上游改名了）
-    let carriers = catalog::providers_for_model(&model);
-    if !carriers.iter().any(|id| id.eq_ignore_ascii_case(&provider)) {
-        return errors::management_error(
+    let test_target = match catalog::test_target_for_provider(&model, &provider) {
+        Some(target) => target,
+        None => return errors::management_error(
             400,
             format!(
                 "{provider} 的当前清单里没有模型 {model}：先点「获取模型」刷新清单，或确认模型名没被上游改名"
             ),
-        );
-    }
+        ),
+    };
     let account_id = text_field(&payload, "account_id", 128);
     let prompt = {
         let text = text_field(&payload, "prompt", MAX_PROMPT_CHARS);
@@ -240,7 +243,7 @@ pub async fn run_model_test(State(state): State<ServerState>, body: Bytes) -> Re
     let raw_request = pipeline::raw_body_text(&body);
     let request_body = build_body(&model, &prompt, &system_prompt, &reasoning, stream);
 
-    let outcome = run_forward(&state, &telemetry, &provider, &account_id, request_body, stream).await;
+    let outcome = run_forward(&state, &telemetry, &provider, &account_id, request_body, stream, test_target).await;
     let finished_at = logging::now_ms();
     let snapshot = telemetry.snapshot();
     let ttfb_ms = snapshot
@@ -301,8 +304,9 @@ async fn run_forward(
     account_id: &str,
     request_body: Value,
     stream: bool,
+    test_target: catalog::WireTarget,
 ) -> TestOutcome {
-    let forward = state.upstream().forward(ForwardRequest {
+    let forward = state.upstream().forward_model_test(ForwardRequest {
         body: request_body,
         stream,
         // 不去重（见模块头）：并发测多个账号时，去重会让它们互相等待
@@ -320,7 +324,7 @@ async fn run_forward(
         } else {
             Some(account_id.to_string())
         },
-    });
+    }, test_target);
     // 总预算套在整段转发之外（含流式聚合）：测试是一次弹窗等待，必须有上界，
     // 否则一个卡住的上游会让弹窗一直转圈（见 TEST_TIMEOUT）
     match tokio::time::timeout(TEST_TIMEOUT, forward).await {

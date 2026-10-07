@@ -821,6 +821,10 @@ pub fn wire_model_for(provider_id: &str, requested_name: &str) -> (String, Optio
         .unwrap_or_else(|| (requested.to_string(), None, None))
 }
 
+pub(crate) fn test_wire_model_for(provider_id: &str, model: &str) -> Option<(String, Option<String>, Option<String>)> {
+    get(provider_id).and_then(|provider| bindings::resolve_test(&provider, model.trim()))
+}
+
 /// **服务端代理拉取**上游的模型清单（`POST /api/custom-providers/fetch-models`）。
 ///
 /// 为什么由网关代拉而不是浏览器直连：桌面壳的页面跑在本地 origin 上，

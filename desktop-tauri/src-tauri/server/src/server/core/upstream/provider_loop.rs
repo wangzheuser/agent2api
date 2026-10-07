@@ -289,7 +289,10 @@ pub(super) async fn forward_with_providers(
     // 候选家来自 `route_for_forward`（目录里没有这个模型名时会回落成默认
     // provider 一家；模型有家承载但全被禁用时**不回落**，见那个函数）——
     // 本函数是唯一消费方，日志也打在这里。
-    let candidates = route_for_forward(&model);
+    let candidates = match ctx.test_target {
+        Some(target) => crate::server::core::providers::catalog::providers_for_model(&target.model),
+        None => route_for_forward(&model),
+    };
     if crate::server::core::providers::catalog::providers_for_model(&model).is_empty() {
         logging::verbose(
             "[Upstream]",
@@ -413,7 +416,10 @@ async fn attempt_queue(
     // 限额冷却键的解析器：把请求名解析成**各家上游真名**（见 `routing::CooldownKeys`）。
     // 建一次、整条请求共用 —— 选路、429 记账、成功清理三处读的必须是同一个键，
     // 否则冷却会写在一个名字上、查在另一个名字上。
-    let cooldown_keys = rotate::CooldownKeys::new(&model);
+    let cooldown_keys = match ctx.test_target {
+        Some(target) => rotate::CooldownKeys::for_wire_model(&target.model),
+        None => rotate::CooldownKeys::new(&model),
+    };
     let mut tried_ids: Vec<String> = Vec::new();
     // ── 两份独立的预算（见 config::RetrySettings）─────────────────────
     //   - `budget`：同一个账号上还能**原地重发**几次。整份请求共用一份，
@@ -530,10 +536,8 @@ async fn attempt_queue(
                             // 自定义家没有「同名多池」之类的键重排，冷却键
                             // 与发送名同源（`custom::forward::cooldown_model`）。
                             if error.is_quota_limit() {
-                                let wire_model = custom_forward::cooldown_model(
-                                    &custom_provider_id,
-                                    &model,
-                                );
+                                let wire_model = ctx.test_target.map(|target| target.model.clone())
+                                    .unwrap_or_else(|| custom_forward::cooldown_model(&custom_provider_id, &model));
                                 rotate::mark_account_limited(
                                     service,
                                     &account_id,
@@ -1444,23 +1448,21 @@ async fn attempt_custom(
     }
     let started_at = logging::now_ms();
     // 内容处理（系统提示词 + 脱敏）与内置家同一时机：凭证已就绪、这一家
-    // **即将发送**。`send_body` 对自定义 id 是零改写（它的模型名改写只认
-    // modelRules），处理结果就是「提示词/脱敏后的客户端请求体」—— 自定义
-    // 语义的改写（映射 alias → 真名、思考等级）在 forward 里做。
+    // **即将发送**。自定义绑定（原始测试目标、默认和强制等级）由 forward 收口，
+    // 这里仍处理提示词与脱敏，不用原生适配器预检自定义档位。
     let send = send_body(ctx, &provider_id, target.account.as_ref(), degraded).map_err(|error| {
         ctx.telemetry.finish_last_attempt(Some(i64::from(error.status_code)), Some(&error.message));
         error
     })?;
-    // 「上游模型」列以**真名**为准：send_body 对自定义 id 是零改写（它记的
-    // 是请求名），真名的解析与改写发生在 forward 内部 —— 这里按同源解析
-    // 覆盖一次（note_upstream_model 是覆盖式，最后一次为准；空串被内部过滤）。
-    let wire_model = custom_forward::cooldown_model(&provider_id, &model_of(ctx.body));
+    // 测试沿用已校验目标；普通请求用自定义绑定解析。日志与冷却都取同一真名。
+    let wire_model = ctx.test_target.map(|target| target.model.clone())
+        .unwrap_or_else(|| custom_forward::cooldown_model(&provider_id, &model_of(ctx.body)));
     ctx.telemetry.note_upstream_model(&wire_model);
     logging::verbose(
         "[Upstream]",
         &format!(
             "自定义转发 model={} stream={} account={} priority={} 出口={} provider={provider_id}",
-            limit_model_label(&model_of(ctx.body), &custom_forward::cooldown_model(&provider_id, &model_of(ctx.body))),
+            limit_model_label(&model_of(ctx.body), &wire_model),
             ctx.stream,
             target.account_id.as_deref().unwrap_or("-"),
             target
@@ -1480,6 +1482,7 @@ async fn attempt_custom(
         ctx.telemetry,
         slot,
         connections,
+        ctx.test_target,
     )
     .await
     {
@@ -1495,10 +1498,10 @@ async fn attempt_custom(
             cap_cleared(
                 service,
                 &target,
-                &custom_forward::cooldown_model(&provider_id, &model_of(ctx.body)),
+                &wire_model,
                 &limit_model_label(
                     &model_of(ctx.body),
-                    &custom_forward::cooldown_model(&provider_id, &model_of(ctx.body)),
+                    &wire_model,
                 ),
                 &Value::Null,
                 &provider_id,
