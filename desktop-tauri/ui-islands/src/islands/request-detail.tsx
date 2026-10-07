@@ -1,5 +1,6 @@
 import * as React from 'react'
 import { createRoot } from 'react-dom/client'
+import { amountText } from './accounts-growth-data'
 import {
   Badge, BadgeDot, Button, Dialog, DialogBody, DialogContent, DialogFooter,
   DialogHeader, DialogTitle, SegmentedControl, Spinner, Table, TableBody,
@@ -99,6 +100,8 @@ type RequestRow = {
   completionTokens?: unknown
   totalTokens?: unknown
   cacheReadTokens?: unknown
+  cacheCreationTokens?: unknown
+  upstreamCredits?: unknown
   /** 模型名与推理等级：下游 / 上游各一份 */
   model?: unknown
   clientModel?: unknown
@@ -470,8 +473,12 @@ function DetailPane({ row }: { row: RequestRow | null }) {
         </Field>
         <Field label='令牌'>
           输入 {fmtTokens(row.promptTokens)} · 输出 {fmtTokens(row.completionTokens)} · 总计{' '}
-          {fmtTokens(row.totalTokens)} · 缓存读 {fmtTokens(row.cacheReadTokens)}
+          {fmtTokens(row.totalTokens)} · 缓存读 {fmtTokens(row.cacheReadTokens)} · 缓存创建{' '}
+          {row.cacheCreationTokens == null ? '未上报' : fmtTokens(row.cacheCreationTokens)}
         </Field>
+        {(row.provider === 'workbuddy' || row.provider === 'workbuddy-intl' || row.upstreamCredits != null) && (
+          <Field label='实扣积分'>{amountText(row.upstreamCredits, '未上报')}</Field>
+        )}
         {/* 测试发起的请求**按需多一行**：它是这一条明细的性质（走的是真实转发链路、但不进报表），
             正常转发的行不必为此多读一行「正常转发」 —— 那种字段每个租户都有时等于没有 */}
         {row.isTest ? (

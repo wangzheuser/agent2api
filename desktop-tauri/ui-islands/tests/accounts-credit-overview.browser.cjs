@@ -12,7 +12,7 @@ const styles = ['css/tokens.css', 'css/layout.css', 'css/components.css', 'css/p
 const accounts = [
   { id: 'A', uid: 'same', name: '国内长期账号', edition: 'cn', priority: 1 },
   { id: 'B', uid: 'urgent', name: '国内临期账号', edition: 'cn', priority: 2 },
-  { id: 'C', uid: 'same', name: '国际示例账号', edition: 'intl', priority: 3 },
+  { id: 'C', uid: 'same', name: '国际示例账号', provider: 'workbuddy-intl', edition: 'intl', priority: 3 },
   { id: 'E', uid: 'enterprise', name: '企业额度账号', priority: 4 },
   { id: 'F', uid: 'partial', name: '明细不完整账号', priority: 5 },
   { id: 'G', uid: 'disabled', name: '禁用待查询账号', enabled: false, priority: 6 },
@@ -48,7 +48,7 @@ async function resolvePending(page, id, value, failure = false) {
   }, { id, value: value && usage(value), failure })
 }
 async function run() {
-  const browser = await chromium.launch({ channel: 'msedge', headless: true })
+  const browser = await chromium.launch({ ...(process.platform === 'win32' ? { channel: 'msedge' } : {}), headless: true })
   const checks = [], errors = [], metrics = []
   try {
     const page = await browser.newPage({ viewport: { width: 1200, height: 1000 }, locale: 'zh-CN', timezoneId: 'Asia/Shanghai' })

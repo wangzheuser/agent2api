@@ -10,7 +10,7 @@ const ui = path.join(root, 'desktop-tauri/ui');
 const href = relative => pathToFileURL(path.join(ui, relative)).href;
 const styles = ['css/tokens.css','css/layout.css','css/components.css','css/page-accounts.css','css/page-accounts-providers.css','css/page-accounts-table.css','islands/ui.css'];
 const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">${styles.map(file=>`<link rel="stylesheet" href="${href(file)}">`).join('')}<style>body{padding:20px}.page{display:block!important}</style></head><body><section class="page active" data-page="accounts"></section><script>
-window.fixture={calls:[],pending:[],accounts:[{id:'A',uid:'demo-cn',name:'国内示例账号',provider:'workbuddy',edition:'cn',enabled:true,addedAt:1},{id:'B',uid:'demo-intl',name:'国际示例账号',provider:'workbuddy',edition:'intl',enabled:true,addedAt:2},{id:'C',name:'其他提供商',provider:'catpaw',enabled:true,addedAt:3}]};
+window.fixture={calls:[],pending:[],accounts:[{id:'A',uid:'demo-cn',name:'国内示例账号',provider:'workbuddy',edition:'cn',enabled:true,addedAt:1},{id:'B',uid:'demo-intl',name:'国际示例账号',provider:'workbuddy-intl',edition:'intl',enabled:true,addedAt:2},{id:'C',name:'其他提供商',provider:'catpaw',enabled:true,addedAt:3},{id:'D',uid:'legacy-intl',name:'旧版国际示例账号',provider:'workbuddy',edition:'intl',enabled:true,addedAt:4}]};
 window.wbApp={getState:()=>({accounts:{accounts:fixture.accounts}}),toast(){}};
 window.workbuddyDesktop={getAllBalances(id){fixture.calls.push(id);return new Promise((resolve,reject)=>fixture.pending.push({resolve,reject}));}};
 </script><script src="${href('islands/ui.js')}"></script></body></html>`;
@@ -25,7 +25,7 @@ const usage=d=>({kind:d.kind,totalLeft:Math.floor(d.remaining||0),planLeft:380,b
 async function apply(page,d,id='A') {await page.evaluate(({id,value})=>window.wbAccountsView.applyBalances({results:[{id,usage:value}]}),{id,value:usage(d)});}
 async function resolve(page,d) {await page.evaluate(value=>fixture.pending.shift().resolve({results:[{id:'A',usage:value}]}),usage(d));}
 async function run() {
- const browser=await chromium.launch({channel:'msedge',headless:true});
+ const browser=await chromium.launch({...(process.platform==='win32'?{channel:'msedge'}:{}),headless:true});
  const checks=[];
  try {
   const page=await browser.newPage({viewport:{width:1100,height:960},locale:'zh-CN',timezoneId:'Asia/Shanghai'});
@@ -76,8 +76,12 @@ async function run() {
   await page.keyboard.press('Escape');
   await apply(page,details(),'B');
   await page.locator('.credit-balance-trigger').nth(1).press('Enter');
-  assert.match(await page.locator('.credits-description').innerText(),/国际/);checks.push('international account routes through same dialog');
-  assert.equal(await page.locator('.credit-balance-trigger').count(),3);checks.push('all balance-capable providers expose the same dialog trigger');
+  assert.match(await page.locator('.credits-description').innerText(),/WorkBuddy 国际版/);checks.push('native international account routes through same dialog');
+  await page.keyboard.press('Escape');
+  await apply(page,details(),'D');
+  await page.locator('.credit-balance-trigger').nth(3).press('Enter');
+  assert.match(await page.locator('.credits-description').innerText(),/WorkBuddy 国际版/);checks.push('legacy international account keeps dialog compatibility');
+  assert.equal(await page.locator('.credit-balance-trigger').count(),4);checks.push('all balance-capable providers expose the same dialog trigger');
   await page.close();
   const touch=await browser.newPage({viewport:{width:1100,height:960},hasTouch:true,locale:'zh-CN'});
   touch.on('pageerror',e=>errors.push(e.message));await touch.goto(pathToFileURL(path.join(evidence,'browser-fixture.html')).href);

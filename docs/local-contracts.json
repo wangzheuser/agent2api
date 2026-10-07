@@ -1,0 +1,1347 @@
+{
+  "schema_version": 1,
+  "contracts": [
+    {
+      "id": "anthropic-stream-usage",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "晚到用量和 telemetry 能输出真实输入、输出及缓存计数，分片不丢失、不重复终止。",
+      "source_commits": [
+        "6ae1095",
+        "69ba0e9",
+        "bcbbea0"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/protocol/anthropic.rs",
+        "desktop-tauri/src-tauri/server/src/server/api/protocol.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/merge_contracts.rs",
+          "name": "anthropic_late_usage_survives_network_splits",
+          "id": "case-f323a4f90235"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/merge_contracts.rs",
+          "name": "telemetry_zero_placeholder_does_not_erase_real_usage",
+          "id": "case-55bcd0b41abe"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/protocol/anthropic.rs",
+          "name": "server::core::protocol::anthropic::tests::streaming_usage_falls_back_to_internal_telemetry",
+          "id": "case-d1b57778a401"
+        }
+      ]
+    },
+    {
+      "id": "usage-zero-cache-semantics",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "零值占位不覆盖真实计数；缓存创建缺失与显式零不同；不凭部分计数发明总量。",
+      "source_commits": [
+        "1a08fee",
+        "69ba0e9"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/upstream/usage.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/protocol/anthropic_outbound.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/usage.rs",
+          "name": "server::core::upstream::usage::tests::cache_creation_aliases_partial_frames_and_zero_placeholders",
+          "id": "case-dd6baa10154c"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/usage.rs",
+          "name": "server::core::upstream::usage::tests::report_usage_does_not_erase_real_counts_with_zero_partial_fields",
+          "id": "case-b440adbbb330"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/usage.rs",
+          "name": "server::core::upstream::usage::tests::report_usage_does_not_invent_total_for_prompt_only_frame",
+          "id": "case-d1204a311331"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/protocol/anthropic_outbound.rs",
+          "name": "server::core::protocol::anthropic_outbound::tests::cache_creation_native_round_trip_preserves_zero_missing_and_partial_usage",
+          "id": "case-8d3745331895"
+        }
+      ]
+    },
+    {
+      "id": "responses-stream-usage",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "Responses 流式与聚合用量一致，telemetry 补齐不丢失协议扩展字段。",
+      "source_commits": [
+        "6ae1095",
+        "69ba0e9"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/protocol/responses.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/merge_contracts.rs",
+          "name": "responses_stream_and_collector_have_identical_usage",
+          "id": "case-2baa9fb29646"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/protocol/responses.rs",
+          "name": "server::core::protocol::responses::tests::telemetry_fallback_keeps_existing_usage_details",
+          "id": "case-5f07484b6196"
+        }
+      ]
+    },
+    {
+      "id": "stream-bounds",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "没有 usage 时缓存有界，超过边界释放正文，结束只发送一次。",
+      "source_commits": [
+        "bcbbea0",
+        "a02f714"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/protocol/anthropic.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/upstream/provider_loop.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/merge_contracts.rs",
+          "name": "anthropic_missing_usage_is_bounded_and_terminates_once",
+          "id": "case-2c426f64c587"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/provider_loop/tests.rs",
+          "name": "server::core::upstream::provider_loop::tests::success_head_wait_is_cancelled_without_waiting_for_another_chunk",
+          "id": "case-3a9a1bbb0ebe"
+        }
+      ]
+    },
+    {
+      "id": "raw-capture-once",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "原始报文只采集一次，协议翻译与预读重放不追加重复报文。",
+      "source_commits": [
+        "69ba0e9",
+        "a02f714"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/debug_traffic.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/upstream/mod.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/upstream/provider_loop.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/capture_tests.rs",
+          "name": "server::core::upstream::capture_tests::translated_responses_capture_only_original_anthropic_bytes",
+          "id": "case-e3d814d63c6d"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/capture_tests.rs",
+          "name": "server::core::upstream::capture_tests::direct_chat_responses_still_capture_original_bytes_once",
+          "id": "case-07ab46cbb48f"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/provider_loop/tests.rs",
+          "name": "server::core::upstream::provider_loop::tests::cache_creation_raw_capture_is_exact_for_prefetched_and_translated_streams",
+          "id": "case-5016e0959a8e"
+        }
+      ]
+    },
+    {
+      "id": "routing-strategies",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "balanced 按容量归一负载，priority 保持主备，roundRobin 轮询；预览不推进游标。",
+      "source_commits": [
+        "7be9cf8"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/routing.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/routing.rs",
+          "name": "server::core::routing::selection_tests::balanced_prefers_lower_normalized_load",
+          "id": "case-0430efa77b89"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/routing.rs",
+          "name": "server::core::routing::selection_tests::priority_keeps_stable_primary_account",
+          "id": "case-58303596cf72"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/routing.rs",
+          "name": "server::core::routing::selection_tests::round_robin_rotates_available_accounts",
+          "id": "case-524fff1f5ebf"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/routing.rs",
+          "name": "server::core::routing::selection_tests::peek_does_not_advance_round_robin_cursor",
+          "id": "case-9539e0970fab"
+        }
+      ]
+    },
+    {
+      "id": "routing-eligibility",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "禁用、额度冷却、并发满载和排除账号不能被选中；兜底不能绕过积分保护。",
+      "source_commits": [
+        "7be9cf8",
+        "ebe1914"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/routing.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/upstream/rotate.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/merge_contracts.rs",
+          "name": "routing_never_selects_disabled_cooled_busy_or_excluded_accounts",
+          "id": "case-533a40ac160f"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/rotate.rs",
+          "name": "server::core::upstream::rotate::policy_tests::credit_floor_blocks_normal_cooldown_squeeze_and_default_session_routes",
+          "id": "case-daa449e1864c"
+        }
+      ]
+    },
+    {
+      "id": "http200-business-errors",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "HTTP 200 内的额度与 Token 错误不得当作流式成功；可识别嵌套和字符串错误码。",
+      "source_commits": [
+        "4d8f5cc",
+        "1d147ee",
+        "a02f714"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/adapter/tests.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/providers/minimax_code/adapter.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/providers/lobsterai/adapter.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/upstream/provider_loop.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/adapter/tests.rs",
+          "name": "server::core::providers::zcode::adapter::tests::http_200_quota_envelopes_are_blocked_before_downstream_bytes",
+          "id": "case-d8f474f24dc4"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/minimax_code/adapter.rs",
+          "name": "server::core::providers::minimax_code::adapter::tests::nested_and_string_sse_error_codes_trigger_refresh_classification",
+          "id": "case-f94b720c22c9"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/lobsterai/adapter.rs",
+          "name": "server::core::providers::lobsterai::adapter::tests::nested_and_string_sse_error_codes_trigger_refresh_classification",
+          "id": "case-eb568aea52d4"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/provider_loop/tests.rs",
+          "name": "server::core::upstream::provider_loop::tests::native_reward_providers_http_200_errors_reach_the_rotation_classifier",
+          "id": "case-d38455385c50"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/provider_loop/tests.rs",
+          "name": "server::core::upstream::provider_loop::tests::zcode_http_200_quota_envelope_returns_a_rotatable_failure",
+          "id": "case-cfe2b558cec2"
+        }
+      ]
+    },
+    {
+      "id": "direct-switch-defaults",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "默认 402/405 命中直接换号名单，500 不命中；用户显式清空名单不回落默认。此测试保护配置快照语义，实际换号流程仍须审查。",
+      "source_commits": [
+        "8f04559",
+        "a02f714"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/config/types.rs",
+        "desktop-tauri/src-tauri/server/src/server/config/parse.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/upstream/provider_loop.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/merge_contracts.rs",
+          "name": "retry_defaults_keep_402_405_and_respect_explicit_empty_list",
+          "id": "case-bbf34dd81219"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/provider_loop/tests.rs",
+          "name": "server::core::upstream::provider_loop::tests::http_405_switches_accounts_without_same_account_retry",
+          "id": "case-c578f3d7736f"
+        }
+      ]
+    },
+    {
+      "id": "native-provider-registry",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "MiniMax Code 和 LobsterAI 原生提供商保持注册及奖励分派，不冒充 reward-custom；国际 WorkBuddy 仍进入活跃任务。",
+      "source_commits": [
+        "634019b",
+        "3764beb"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/providers/mod.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/billing/checkin.rs",
+        "desktop-tauri/src-tauri/src/login.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/merge_contracts.rs",
+          "name": "native_reward_providers_remain_registered_and_not_custom_profiles",
+          "id": "case-22aca4d54899"
+        }
+      ]
+    },
+    {
+      "id": "minimax-login-refresh",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "MiniMax 设备登录、PKCE 和续期参数正确；部分 access token 更新不抹掉 refresh token。",
+      "source_commits": [
+        "3764beb",
+        "1d147ee"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/account_store/minimax_code_accounts.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/providers/minimax_code/oauth.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/providers/minimax_code/refresh.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/account_store/minimax_code_accounts.rs",
+          "name": "server::core::account_store::minimax_code_accounts::tests::partial_access_token_update_keeps_existing_refresh_token",
+          "id": "case-aabb92286970"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/minimax_code/oauth.rs",
+          "name": "server::core::providers::minimax_code::oauth::tests::pkce_challenge_is_base64url_sha256",
+          "id": "case-d97ea0ff1334"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/minimax_code/oauth.rs",
+          "name": "server::core::providers::minimax_code::oauth::tests::device_errors_follow_rfc8628_pending_semantics",
+          "id": "case-20956e8b5a6b"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/minimax_code/refresh.rs",
+          "name": "server::core::providers::minimax_code::refresh::tests::oauth_constants_are_sent_as_expected",
+          "id": "case-3028ff0e5aba"
+        }
+      ]
+    },
+    {
+      "id": "minimax-checkin-credit",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "签到确认后不重复领取；签名查询真实额度；确认领取不冒充积分到账，余额保留精度与包类型。",
+      "source_commits": [
+        "51f6897",
+        "1d147ee"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/providers/minimax_code/checkin.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/providers/minimax_code/balance.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/minimax_code/checkin.rs",
+          "name": "server::core::providers::minimax_code::checkin::tests::signed_checkin_queries_personal_balance_and_never_reclaims_after_confirmation",
+          "id": "case-230693261a24"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/minimax_code/checkin.rs",
+          "name": "server::core::providers::minimax_code::checkin::tests::claim_confirmation_does_not_assert_credit_receipt",
+          "id": "case-61713db678f7"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/minimax_code/balance.rs",
+          "name": "server::core::providers::minimax_code::balance::tests::numeric_credit_types_keep_gift_paid_and_platform_separate",
+          "id": "case-9ec218157cf5"
+        }
+      ]
+    },
+    {
+      "id": "lobster-login-refresh",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "Lobster OAuth 回调绑定 state 和目标，续期保留身份字段及已有 refresh token。",
+      "source_commits": [
+        "3764beb",
+        "1d147ee"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/providers/lobsterai/oauth.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/providers/lobsterai/refresh.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/account_store/lobsterai_accounts.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/lobsterai/oauth.rs",
+          "name": "server::core::providers::lobsterai::oauth::tests::callback_state_is_bound_to_the_pending_login",
+          "id": "case-08102b21f094"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/lobsterai/oauth.rs",
+          "name": "server::core::providers::lobsterai::oauth::tests::return_to_is_limited_to_youdao_or_loopback",
+          "id": "case-ffd1ba40c503"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/lobsterai/refresh.rs",
+          "name": "server::core::providers::lobsterai::refresh::tests::refresh_payload_contains_required_identity_fields",
+          "id": "case-003421b8ac75"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/account_store/lobsterai_accounts.rs",
+          "name": "server::core::account_store::lobsterai_accounts::tests::partial_access_token_update_keeps_existing_refresh_token",
+          "id": "case-9bec91075e9f"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/account_store/lobsterai_accounts.rs",
+          "name": "server::core::account_store::lobsterai_accounts::tests::session_restores_refresh_identity_fields",
+          "id": "case-d3de519f7194"
+        }
+      ]
+    },
+    {
+      "id": "lobster-checkin-credit",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "已登录且活动符合条件才领取；中性/未授权状态不误领；领取结果须有明确成功或奖励。",
+      "source_commits": [
+        "51f6897"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/providers/lobsterai/checkin.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/lobsterai/checkin.rs",
+          "name": "server::core::providers::lobsterai::checkin::tests::authenticated_activity_with_login_requirement_can_claim_once",
+          "id": "case-5d8725febdb8"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/lobsterai/checkin.rs",
+          "name": "server::core::providers::lobsterai::checkin::tests::unauthenticated_context_is_neutral",
+          "id": "case-96b62bc7c6c7"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/lobsterai/checkin.rs",
+          "name": "server::core::providers::lobsterai::checkin::tests::successful_result_requires_explicit_success_or_reward",
+          "id": "case-0bb04b5b5514"
+        }
+      ]
+    },
+    {
+      "id": "custom-reward-isolation",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "奖励凭证与推理凭证分离，显式 opt-in 才纳入，公开视图和错误不泄露凭证。",
+      "source_commits": [
+        "3201cd4",
+        "634019b"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/reward_profiles.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/billing/checkin.rs",
+        "desktop-tauri/src-tauri/server/src/server/api/rewards.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/reward_profiles.rs",
+          "name": "server::core::reward_profiles::tests::native_provider_ids_are_not_custom_reward_profiles",
+          "id": "case-97d0eee553ad"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/reward_profiles.rs",
+          "name": "server::core::reward_profiles::tests::credential_validation_rejects_newline_and_error_never_echoes_secret",
+          "id": "case-a5fec2adf31d"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/billing/checkin.rs",
+          "name": "server::core::billing::checkin::tests::custom_provider_is_not_regular_checkin_without_reward_opt_in",
+          "id": "case-f4b839dcf3bb"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/billing/checkin.rs",
+          "name": "server::core::billing::checkin::tests::reward_custom_filter_matches_generated_provider_ids_only_via_virtual_option",
+          "id": "case-505b2324020d"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/api/rewards.rs",
+          "name": "server::api::rewards::tests::error_sanitizer_removes_credential_and_labels",
+          "id": "case-17406be54619"
+        }
+      ]
+    },
+    {
+      "id": "checkin-retry-window",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "已完成不重领；保活不等同签到；部分失败关闭当日窗口并保留详情，不触发整批高频重试。",
+      "source_commits": [
+        "1d34feb",
+        "d4ed573",
+        "a854fb1"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/auto_checkin.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/billing/checkin.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/auto_checkin.rs",
+          "name": "server::core::auto_checkin::tests::completed_checkin_errors_do_not_trigger_retries",
+          "id": "case-0d7590644cab"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/auto_checkin.rs",
+          "name": "server::core::auto_checkin::tests::successful_activity_keepalive_does_not_trigger_retries",
+          "id": "case-acb50c301c2c"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/auto_checkin.rs",
+          "name": "server::core::auto_checkin::tests::partial_failure_closes_daily_window_and_keeps_failure_details",
+          "id": "case-ac989003332b"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/billing/checkin.rs",
+          "name": "server::core::billing::checkin::tests::activity_keepalive_does_not_mark_regular_checkin",
+          "id": "case-d3c40ac5c396"
+        }
+      ]
+    },
+    {
+      "id": "workbuddy-intl-acp",
+      "level": "P1",
+      "status": "必须保留",
+      "behavior": "国际版会话 ACP 确认、正文和正常结束才算活跃成功；空流、重定向和截断失败。",
+      "source_commits": [
+        "c890246",
+        "9083eb0",
+        "96f3a9a",
+        "ed57c42"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/billing/web_activity.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/providers/workbuddy/adapter.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/billing/web_activity/tests.rs",
+          "name": "server::core::billing::web_activity::tests::acp_only_counts_real_answer_and_matching_result",
+          "id": "case-dc6e30cb9179"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/billing/web_activity/tests.rs",
+          "name": "server::core::billing::web_activity::tests::acp_waits_for_rpc_ack_and_consumes_fragmented_sse",
+          "id": "case-d530b9c61d5c"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/billing/web_activity/tests.rs",
+          "name": "server::core::billing::web_activity::tests::broken_sse_and_redirects_fail_closed",
+          "id": "case-ff65589576b6"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/billing/checkin.rs",
+          "name": "server::core::billing::checkin::tests::workbuddy_international_is_included_in_checkin_targets",
+          "id": "case-aeb50e37849e"
+        }
+      ]
+    },
+    {
+      "id": "growth-capability-credit",
+      "level": "P1",
+      "status": "必须保留",
+      "behavior": "成长任务依真实进度和条件开放；业务错误不当成功；零奖励、未知奖励和未到账分别展示。",
+      "source_commits": [
+        "91c0b81",
+        "80e5f8c"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/billing/growth/mod.rs",
+        "desktop-tauri/ui-islands/src/islands/accounts-growth-data.ts"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/billing/growth/tests.rs",
+          "name": "server::core::billing::growth::tests::business_errors_and_zero_rewards_do_not_become_claimed_credit",
+          "id": "case-0803f81cd511"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/billing/growth/tests.rs",
+          "name": "server::core::billing::growth::tests::task_capability_follows_official_progress_and_conditions",
+          "id": "case-fea228c49818"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/billing/growth/tests.rs",
+          "name": "server::core::billing::growth::tests::travel_requires_real_record_buddy_and_destination_data",
+          "id": "case-49f336dd1008"
+        },
+        {
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/accounts-growth.test.mjs",
+          "name": "reward and actual-credit display preserve zero, fractions and missing reports",
+          "id": "case-b3c9c6c88fdf"
+        }
+      ]
+    },
+    {
+      "id": "growth-replay-identity",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "任务重放绑定账号、参数和 logical key；未观察进度或服务端操作未结束时不得重发。",
+      "source_commits": [
+        "91c0b81",
+        "ebe1914"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/workbuddy_growth.rs",
+        "desktop-tauri/ui-islands/src/islands/accounts-growth-data.ts"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/workbuddy_growth.rs",
+          "name": "server::core::workbuddy_growth::tests::action_contract_and_replay_bind_token_to_parameters",
+          "id": "case-7ab5ac445da5"
+        },
+        {
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/accounts-growth.test.mjs",
+          "name": "a new task execution requires observed progress and no unresolved server operation",
+          "id": "case-42f56b37e10a"
+        },
+        {
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/accounts-growth.test.mjs",
+          "name": "domestic batch isolates enterprise, international and duplicate identities without losing unknown UID records",
+          "id": "case-114452de1208"
+        }
+      ]
+    },
+    {
+      "id": "credit-precision-expiry",
+      "level": "P1",
+      "status": "必须保留",
+      "behavior": "积分包精度、资源身份和周期身份保留；时区与权益期/积分到期不混淆；未知与零分开。",
+      "source_commits": [
+        "263e47d",
+        "0da274a"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/billing/credit_details.rs",
+        "desktop-tauri/ui-islands/src/islands/accounts-credit-details.ts"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/billing/credit_details/tests.rs",
+          "name": "server::core::billing::credit_details::tests::zero_priority_fractions_unknown_total_and_resource_identity",
+          "id": "case-1741cade376e"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/billing/credit_details/tests.rs",
+          "name": "server::core::billing::credit_details::tests::sampled_cn_intl_naive_times_match_epoch_and_preserve_amount_precision",
+          "id": "case-c4b1a332df08"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/billing/credit_details/tests.rs",
+          "name": "server::core::billing::credit_details::tests::unresolved_slice_allocation_does_not_advertise_long_term_entitlement_as_credit_expiry",
+          "id": "case-ddba3c0e4f16"
+        },
+        {
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/accounts-credit-details.test.cjs",
+          "name": "legacy usage has no credit details",
+          "id": "case-86567e5405e9"
+        }
+      ]
+    },
+    {
+      "id": "credit-overview-regions",
+      "level": "P1",
+      "status": "必须保留",
+      "behavior": "国内、国际和 Qoder 分开统计；身份去重、时区未知和共享企业额度不制造个人余额；到期桶不重复。",
+      "source_commits": [
+        "0da274a",
+        "1b0e8d2"
+      ],
+      "implementation": [
+        "desktop-tauri/ui-islands/src/islands/accounts-credit-overview.ts"
+      ],
+      "tests": [
+        {
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/accounts-credit-overview.test.mjs",
+          "name": "domestic and international totals remain separate even for the same UID",
+          "id": "case-5f5e01f19261"
+        },
+        {
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/accounts-credit-overview.test.mjs",
+          "name": "Qoder totals stay separate from WorkBuddy and use userId for deduplication",
+          "id": "case-b7dd8beac309"
+        },
+        {
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/accounts-credit-overview.test.mjs",
+          "name": "buckets are disjoint at exact 24h, 7d and 30d boundaries and preserve fractions",
+          "id": "case-22feccb42f8c"
+        },
+        {
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/accounts-credit-overview.test.mjs",
+          "name": "missing data is unknown while a verified zero remains zero",
+          "id": "case-2488708f4374"
+        }
+      ]
+    },
+    {
+      "id": "credit-cache-identity",
+      "level": "P1",
+      "status": "必须保留",
+      "behavior": "过期、失败和未知快照不伪造新鲜成功；账号更换或删除阻止晚到数据覆盖，手动刷新不被旧快照覆盖。",
+      "source_commits": [
+        "263e47d",
+        "0da274a"
+      ],
+      "implementation": [
+        "desktop-tauri/ui-islands/src/islands/accounts-data.ts"
+      ],
+      "tests": [
+        {
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/accounts-credit-cache.test.mjs",
+          "name": "replaced identity rejects late responses and stale snapshots, including old failures",
+          "id": "case-1f5da4b3d6c5"
+        },
+        {
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/accounts-credit-cache.test.mjs",
+          "name": "delete and re-add the same id and identity cannot resurrect prior snapshot",
+          "id": "case-712265149243"
+        },
+        {
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/accounts-credit-cache.test.mjs",
+          "name": "snapshot started before a manual query cannot override that query after it completes",
+          "id": "case-6fac26f91226"
+        },
+        {
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/accounts-credit-cache.test.mjs",
+          "name": "check-in confirmation preserves pending-credit wording without changing other providers",
+          "id": "case-df5ca7fa2615"
+        }
+      ]
+    },
+    {
+      "id": "workbuddy-credit-policy",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "积分底线要求新鲜完整身份，未知不当作零；到期与成本策略只使用可信额度与真实模型样本。",
+      "source_commits": [
+        "91c0b81",
+        "ebe1914",
+        "a02f714"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/workbuddy_policy.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/workbuddy_policy.rs",
+          "name": "server::core::workbuddy_policy::tests::floor_uses_fresh_complete_identity_and_preserves_zero",
+          "id": "case-4fac1c0d224b"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/workbuddy_policy.rs",
+          "name": "server::core::workbuddy_policy::tests::expiry_reorders_only_known_same_region_slots",
+          "id": "case-626ccbe8b54d"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/workbuddy_policy.rs",
+          "name": "server::core::workbuddy_policy::tests::cost_requires_real_model_samples_and_respects_missing",
+          "id": "case-137c9f9bcca2"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/workbuddy_policy.rs",
+          "name": "server::core::workbuddy_policy::region_restore_tests::migrated_international_identity_retains_policy_and_does_not_collide_with_cn",
+          "id": "case-668453898c2f"
+        }
+      ]
+    },
+    {
+      "id": "upstream-credit-telemetry",
+      "level": "P1",
+      "status": "必须保留",
+      "behavior": "上游积分观测保留小数和显式零，账号尝试切换清空旧身份与成本；不重写上游响应。",
+      "source_commits": [
+        "ebe1914",
+        "a02f714"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/upstream/usage.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/usage.rs",
+          "name": "server::core::upstream::usage::tests::workbuddy_credit_is_observed_from_stream_and_aggregate_without_rewriting",
+          "id": "case-9bdac9bdad1c"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/usage.rs",
+          "name": "server::core::upstream::usage::tests::workbuddy_credit_preserves_zero_missing_and_attempt_identity",
+          "id": "case-8915eedd1a6d"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/usage.rs",
+          "name": "server::core::upstream::usage::intl_credit_restore_tests::international_receipts_keep_identity_cost_tokens_and_reset_on_rotation",
+          "id": "case-9197025859cd"
+        }
+      ]
+    },
+    {
+      "id": "qoder-regional-campaign",
+      "level": "P1",
+      "status": "必须保留",
+      "behavior": "两地区签到和模型刷新均覆盖；活动窗口拒绝未来/过期，单地区失败不抹掉另一区成功。",
+      "source_commits": [
+        "e1559fb",
+        "85e8b90",
+        "1b0e8d2",
+        "bf71126"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/auto_checkin.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/mod.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/checkin.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/auto_checkin.rs",
+          "name": "server::core::auto_checkin::tests::qoder_is_default_and_labeled_for_both_regions",
+          "id": "case-c32f46f77b5e"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/mod.rs",
+          "name": "server::core::providers::qoder::tests::region_refresh_merge_keeps_a_success_when_the_other_region_fails",
+          "id": "case-20d5e3f2441c"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/checkin.rs",
+          "name": "server::core::providers::qoder::checkin::tests::campaign_window_rejects_future_and_expired_rows",
+          "id": "case-ecfb016d15c1"
+        }
+      ]
+    },
+    {
+      "id": "zcode-claim-egress",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "套餐领取和推理出口独立，显式直连不覆盖账号推理代理。",
+      "source_commits": [
+        "8de8373",
+        "41511a8"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/zcode_claim.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/adapter/tests.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/zcode_claim.rs",
+          "name": "server::core::zcode_claim::tests::explicit_claim_direct_preserves_the_inference_proxy",
+          "id": "case-59b5f4334d1e"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/adapter/tests.rs",
+          "name": "server::core::providers::zcode::adapter::tests::direct_egress_requires_start_plan_and_explicit_enable",
+          "id": "case-18635935549b"
+        }
+      ]
+    },
+    {
+      "id": "zcode-claim-dedup",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "两地区领取资格与开关有效，历史套餐去重不阻挡新套餐，领取成功后持久化通道切换和账本。",
+      "source_commits": [
+        "9973da5",
+        "2562e7e"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/zcode_claim.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/zcode_claim.rs",
+          "name": "server::core::zcode_claim::tests::both_regions_require_enabled_claimable_accounts",
+          "id": "case-b908751077d0"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/zcode_claim.rs",
+          "name": "server::core::zcode_claim::tests::ledger_deduplicates_old_plans_without_blocking_new_ones",
+          "id": "case-3e94b6fa1b4a"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/zcode_claim.rs",
+          "name": "server::core::zcode_claim::tests::completion_persists_plan_switch_and_ledger_for_both_regions",
+          "id": "case-e8d8e59e1d03"
+        }
+      ]
+    },
+    {
+      "id": "zcode-reasoning-binding",
+      "level": "P1",
+      "status": "必须保留",
+      "behavior": "三协议两地区思考等级保持绑定和归一；客户端显式参数优先，不给不支持模型注入默认值。",
+      "source_commits": [
+        "32f5fc7"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/adapter/tests.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/adapter/tests.rs",
+          "name": "server::core::providers::zcode::adapter::tests::three_protocols_both_regions_binding_and_client_precedence",
+          "id": "case-c1c7c83b3318"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/adapter/tests.rs",
+          "name": "server::core::providers::zcode::adapter::tests::messages_budget_and_responses_nested_effort_reach_zcode",
+          "id": "case-b07ff1c8c77e"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/adapter/tests.rs",
+          "name": "server::core::providers::zcode::adapter::tests::unsupported_models_keep_passthrough_without_injecting_defaults",
+          "id": "case-e4995783dafd"
+        }
+      ]
+    },
+    {
+      "id": "captcha-lifecycle",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "验证码一次性消费，过期清理，超时/取消释放等待者；旧实例回调不污染新生成任务。",
+      "source_commits": [
+        "2987dd1",
+        "41036f1",
+        "fb704d1",
+        "a02f714"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/captcha.rs",
+        "desktop-tauri/src-tauri/server/src/server/captcha_worker.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/upstream/provider_loop.rs",
+        "desktop-tauri/src-tauri/server/src/web_shim.rs",
+        "desktop-tauri/ui/aliyun-captcha.js"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/captcha.rs",
+          "name": "server::core::providers::zcode::captcha::tests::empty_pool_waits_and_wakes_without_reusing_proofs",
+          "id": "case-6c9ac8b9466e"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/captcha.rs",
+          "name": "server::core::providers::zcode::captcha::tests::timeout_and_cancellation_release_waiters",
+          "id": "case-1d4bd41b2cca"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/captcha.rs",
+          "name": "server::core::providers::zcode::captcha::tests::expiry_and_replacement_preserve_fresh_inventory",
+          "id": "case-4fcb75423333"
+        },
+        {
+          "kind": "node",
+          "path": "scripts/aliyun-captcha.test.cjs",
+          "name": "旧实例 success/fail/onError 不改变新生成任务",
+          "id": "case-46c918e5a682"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/zcode_restore.rs",
+          "name": "both_regions_wait_for_refill_and_cancel_without_sending_empty_proofs",
+          "id": "case-c08dfdefaadd"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/provider_loop/tests.rs",
+          "name": "server::core::upstream::provider_loop::tests::one_time_proof_retries_return_for_rebuild_while_normal_requests_reuse_transport",
+          "id": "case-bdbcc45e377d"
+        },
+        {
+          "kind": "node",
+          "path": "scripts/zcode-captcha-bridge.test.cjs",
+          "name": "headless 验证码桥接读取库存、回传令牌并保留错误语义",
+          "id": "case-71b447e7bd6a"
+        },
+        {
+          "kind": "node",
+          "path": "scripts/aliyun-captcha.test.cjs",
+          "name": "预热期间仍保护并发，重置后拒绝启动过期实例",
+          "id": "case-909176337fda"
+        }
+      ]
+    },
+    {
+      "id": "panel-session-rotation",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "面板 cookie 与头的优先级一致，旧 cookie 不屏蔽有效头；轮转重放和退出撤销维持身份链。",
+      "source_commits": [
+        "954125b",
+        "18e26cf"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/access.rs",
+        "desktop-tauri/src-tauri/server/src/web_shim.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/access.rs",
+          "name": "server::access::credential_candidate_tests::a_stale_cookie_cannot_shadow_the_header_token",
+          "id": "case-04a95f9ead8d"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/access.rs",
+          "name": "server::access::credential_candidate_tests::rotation_skips_a_rotated_stale_refresh_to_the_live_one",
+          "id": "case-dc6bdd177aa1"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/access.rs",
+          "name": "server::access::credential_candidate_tests::a_replayed_refresh_alone_still_kills_its_chain",
+          "id": "case-298653078d68"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/access.rs",
+          "name": "server::access::credential_candidate_tests::logout_revokes_through_the_stale_cookie_and_the_header_together",
+          "id": "case-caaa85542fea"
+        },
+        {
+          "kind": "node",
+          "path": "scripts/web-shim-contract.test.cjs",
+          "name": "panel body-token refresh rotates stored tokens and retries once",
+          "id": "case-517ae1b2aae7"
+        },
+        {
+          "kind": "node",
+          "path": "scripts/web-shim-contract.test.cjs",
+          "name": "cookie-mode refresh never opts into body tokens",
+          "id": "case-a4d5b7d782f1"
+        }
+      ]
+    },
+    {
+      "id": "schema-dual-history",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "全新库、上游 v7、本地 v7-v9 和缺列合并库均补齐实际结构；零/NULL/精度/来源保留，失败不推进版本且可重试。",
+      "source_commits": [
+        "69ba0e9",
+        "18b125b"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/db/schema.rs",
+        "desktop-tauri/src-tauri/server/src/server/request_stats/sql.rs",
+        "desktop-tauri/src-tauri/server/tests/fixtures/requests-v6.sql"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/merge_contracts.rs",
+          "name": "migration_upstream_v7_preserves_test_origin_and_counts",
+          "id": "case-c95d1e9c7aa3"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/merge_contracts.rs",
+          "name": "migration_local_v7_v8_v9_preserves_zero_null_and_precision",
+          "id": "case-03432365dcec"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/merge_contracts.rs",
+          "name": "migration_repairs_already_merged_v9_missing_local_column",
+          "id": "case-f8296709a583"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/merge_contracts.rs",
+          "name": "migration_new_database_has_nullable_counters_and_zero_test_default",
+          "id": "case-5b0339c30c60"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/merge_contracts.rs",
+          "name": "migration_failed_repair_keeps_version_and_can_retry",
+          "id": "case-a1dca0da3302"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/merge_contracts.rs",
+          "name": "request_stats_preserves_zero_null_fractional_and_failed_charge",
+          "id": "case-9adfb40218fa"
+        }
+      ]
+    },
+    {
+      "id": "ui-real-artifacts",
+      "level": "P1",
+      "status": "必须保留",
+      "behavior": "余额明细、跨账号总览和成长面板真实构建产物可操作，窄屏/焦点/刷新失败与身份隔离正确。",
+      "source_commits": [
+        "263e47d",
+        "0da274a",
+        "91c0b81"
+      ],
+      "implementation": [
+        "desktop-tauri/ui-islands/src/islands/accounts-panels.tsx",
+        "desktop-tauri/ui-islands/src/islands/accounts-growth-panel.tsx",
+        "desktop-tauri/ui/islands/ui.js",
+        "desktop-tauri/ui/islands/ui.css",
+        "desktop-tauri/ui-islands/src/islands/request-detail.tsx",
+        "desktop-tauri/ui-islands/src/islands/requests-page.tsx",
+        "desktop-tauri/ui-islands/src/islands/accounts-credit-dialog.tsx",
+        "desktop-tauri/ui-islands/src/islands/accounts-credit-overview-dialog.tsx"
+      ],
+      "tests": [
+        {
+          "kind": "browser",
+          "path": "desktop-tauri/ui-islands/tests/accounts-credit-dialog.browser.cjs",
+          "id": "case-fdba098929e9"
+        },
+        {
+          "kind": "browser",
+          "path": "desktop-tauri/ui-islands/tests/accounts-credit-overview.browser.cjs",
+          "id": "case-cd45adda0b4d"
+        },
+        {
+          "kind": "browser",
+          "path": "desktop-tauri/ui-islands/tests/accounts-growth.browser.cjs",
+          "id": "case-37283718eb97"
+        }
+      ]
+    },
+    {
+      "id": "workbuddy-split-migration",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "国际版账号迁移只改 provider，不改 ID、凭证、未知字段或账号数量，重复迁移稳定。",
+      "source_commits": [
+        "18b125b"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/account_store/store_admin.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/merge_contracts.rs",
+          "name": "workbuddy_split_migration_preserves_ids_credentials_and_unknown_fields",
+          "id": "case-26780ec40e02"
+        }
+      ]
+    },
+    {
+      "id": "remote-callback-bridge",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "headless 回调仅提交给本网关并保留 state；小浣熊授权跳转回面板 Origin。",
+      "source_commits": [
+        "a5dc9c5",
+        "57c7523",
+        "a02f714"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/web_shim.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/login/autoclaw.rs"
+      ],
+      "tests": [
+        {
+          "kind": "node",
+          "path": "scripts/web-shim-contract.test.cjs",
+          "name": "remote callback preserves state and posts only to the gateway",
+          "id": "case-1c0bc34e6410"
+        },
+        {
+          "kind": "node",
+          "path": "scripts/web-shim-contract.test.cjs",
+          "name": "raccoon web login redirects to the panel origin with the original state",
+          "id": "case-cbf397dec267"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/login/autoclaw.rs",
+          "name": "server::core::login::autoclaw::remote_restore_tests::remote_zai_keeps_registered_redirect_without_binding_server_loopback",
+          "id": "case-edf7849074f3"
+        }
+      ]
+    },
+    {
+      "id": "restored-management-chain",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "账号选路和原生奖励管理入口保持认证与参数校验；成长、任务、策略及选路桥接调用正确API并保留错误语义。",
+      "source_commits": [
+        "263e47d",
+        "91c0b81",
+        "a02f714"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/http.rs",
+        "desktop-tauri/src-tauri/server/src/web_shim.rs",
+        "desktop-tauri/src-tauri/server/src/server/api/rewards.rs",
+        "desktop-tauri/src-tauri/server/src/server/api/accounts.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/management_restore.rs",
+          "name": "restored_management_routes_preserve_auth_validation_and_selection",
+          "id": "case-16de476861e8"
+        },
+        {
+          "kind": "node",
+          "path": "scripts/zcode-captcha-bridge.test.cjs",
+          "name": "合并前的成长、任务和账号选路桥接仍发送正确的管理请求",
+          "id": "case-9f1d19b7e41a"
+        }
+      ]
+    },
+    {
+      "id": "cline-reset-formats",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "Cline限额冷却识别结构化绝对秒/毫秒/RFC3339和相对retry_after，保留官方人话时长兼容，过期值不用于未来冷却。",
+      "source_commits": [
+        "ebe1914",
+        "a02f714"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/providers/cline/adapter.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/cline/adapter.rs",
+          "name": "server::core::providers::cline::adapter::reset_tests::parses_absolute_seconds_milliseconds_and_iso",
+          "id": "case-dd2ae16244fe"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/cline/adapter.rs",
+          "name": "server::core::providers::cline::adapter::reset_tests::parses_relative_retry_after_and_ignores_expired_values",
+          "id": "case-dbeaf0ff9c7d"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/cline/adapter.rs",
+          "name": "server::core::providers::cline::adapter::tests::a_429_with_a_parseable_wait_yields_a_future_reset_at",
+          "id": "case-041aea87c3a8"
+        }
+      ]
+    }
+  ]
+}

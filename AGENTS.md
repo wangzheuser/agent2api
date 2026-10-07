@@ -158,12 +158,12 @@ bash scripts/release.sh vX.Y.Z <run-id>   # 或显式指定 run
 ### 8.2 建立并保护本地行为契约
 
 - 合并前从本地独有提交、当前净差异、原始修复、最后有效实现、设计文档和已有测试梳理能力清单。提交仍在历史中、函数仍存在或文件仍有差异，都不是功能保留的证明。
-- 每项记录：稳定契约 ID、业务行为、来源提交、影响入口与调用链、配置/数据依赖、验证方法、验收证据及状态。新功能和修复应在同一变更中更新契约并提供验证。
-- 推荐机器可读清单位置为 `docs/local-contracts.json`；存在时以合并前受保护版本为最低基线，不允许候选通过删除清单或降低断言自行缩减要求。尚未建立时，先在本轮合并方案中列出明确的能力表，不宣称自动门禁已存在。
+- 每项记录：稳定契约 ID、稳定测试 ID、业务行为、来源提交、影响入口与调用链、配置/数据依赖、验证方法、验收证据及状态。新功能和修复应在同一变更中更新契约并提供验证。
+- `docs/local-contracts.json` 是唯一的本地能力保护清单，记录稳定 ID、来源、入口和测试映射；本章表格只解释保护域，不维护第二套逐项清单。以合并前本地提交 `H` 中的版本为最低基线，不允许候选通过删除清单、入口或降低断言自行缩减要求。
 - 状态仅使用：`必须保留`、`上游等价实现`、`已批准替代/移除`、`缺失`、`待验证`。上游吸收须有等价行为证据；替代或移除须明确业务变化并得到用户确认，不能静默降级。
 - 初建清单不得把当前已知回归当成正确基线；“缺失”和“待验证”必须保留为待解决项，不能因当前版本也失败而降低预期。
 
-首批保护域至少包含下表；后续按新增能力扩展，不把本表当作永久完整清单：
+保护域说明如下；新增能力须更新 JSON 清单，不把本表当作永久完整清单：
 
 | 保护域 | 必须核验的行为 |
 |---|---|
@@ -207,7 +207,9 @@ bash scripts/release.sh vX.Y.Z <run-id>   # 或显式指定 run
 - 用量测试按最终完整计数验收，并验证正文及时输出；不要把“字段必须全部在首帧出现”当成唯一修复方式，也不要通过整轮等待掩盖流式回归。
 - P0 每次必跑：用量、账号选路/错误切换、凭证刷新、奖励去重及关键迁移。P1 按影响链路扩展提供商、积分/成长、地区及配置测试。涉及 UI、headless、登录或运行材料时补对应平台和生成产物验收。
 - Rust 从 `desktop-tauri/src-tauri` 执行 `cargo check --locked`、`cargo test -p agent2api-server --locked`，并显式执行关键契约用例。前端除 typecheck/build 外还须执行受影响的 Node/浏览器业务测试；build 不等于业务测试通过。
-- CI 门禁及检查脚本存在时，PR/集成分支推送和部署候选必须使用同一契约基线；门禁自身及保护清单的削弱须单独审查，不能由候选悄悄取消。未落地时明确记录缺口并执行本地对应检查，不把本章文字当成已配置的自动强制措施。
+- `scripts/check-merge-contracts.py` 使用标准库检查清单、入口、测试存在性与合并前基线；`--rust-list` 校验所有 target 的真实编译列表，`--node-report` 校验完整 TAP 中实际通过且未跳过的 Node 用例；失败、取消、截断和过滤后零用例均不能通过。基线的实现入口、状态、来源与测试映射不得由候选静默削弱。它不证明断言未削弱或业务正确，仍须代码审查和行为测试。
+- `.github/workflows/verify.yml` 在 PR、`main` / `dev/pr-integration` / `codex/**` 推送及手动触发时运行清单、Rust、Node、类型、构建与浏览器回归；使用 `scripts/replay-merge-baseline.py` 统一冻结事件保护基线：push 用 `before`，PR 用目标分支 base SHA（不冒充实际本地合并 H），手动可指定 `base_ref`，新分支或缺省手动输入用 first-parent；拒绝 HEAD、非祖先和浅历史。所有 job 使用同一完整 SHA。存在合并前检查器自测和独立契约测试时，先用当前向后兼容的检查器运行 H 原始门禁反例，再在隔离候选副本中按原路径重放 H 业务断言及全部样本；只冻结测试/辅助样本，不覆盖候选实现。原始运行报告独立生成，禁止与候选报告混合掩盖缺测。内联 Rust 原始断言仍需差异审查，不冒充已全部重放。首次建立基线须单独核验来源及覆盖，明确 BOOTSTRAP，不能冒充已有基线比较。
+- 按用户选择，GitHub 分支保护保持关闭；CI 是验证反馈，不阻断直推。提交、push 前必须完成本地候选验收，push 后检查对应提交的 `verify` 结果；失败不得部署。门禁自身、清单、保护用例和断言的削弱须单独审查。
 - 业务模拟优先使用无秘密、无真实领取及模型费用的样本；真实外部验证遵循既有授权与副作用边界。
 
 ### 8.6 双来源数据兼容
@@ -238,14 +240,67 @@ bash scripts/release.sh vX.Y.Z <run-id>   # 或显式指定 run
 - 独立文档提交只包含明确指定文件，保留其他任务的未提交工作；它不意味着业务工作区已干净或可部署。纯文档变更检查文档结构和差异，不为此启动业务构建、真实模型请求或部署。
 - 后续本地修复/新功能同步更新契约与验证；上游吸收后改为等价实现并保留验证，已批准移除才退出保护。通用修复可评估回馈上游以减少长期差异，但不自动对外提交。
 
-### 8.9 可复用执行要求
+### 8.9 实现演进不是删除行为
+
+1. 契约 `id` 与每个 `tests[].id` 是持久身份，不随文件名、函数名或模块移动重新生成。一个业务能力可以拆成多个入口/用例；新能力增加新契约，不以替换原 ID 掩盖旧能力丢失。
+2. 默认保护 H 的业务行为、P0 等级、来源提交、状态、实现入口和测试映射。等价技术重构允许改路径、API 或测试接线，但须在对应契约的 `evolution` 声明旧→新映射、原因、独立审查证据，并绑定 H 契约核心内容的 SHA256。摘要用检查器的 `contract_digest()` 计算，不是整个 JSON 文件的哈希。
+3. `implementation_moves` 的 `from` 是 H 路径、`to` 是候选入口列表；`test_moves` 的 `from` 是 H 测试 ID、`to` 是候选测试 ID 列表，`mode` 为 `adapted` 或 `replacement`，附具体原因。目标不能为空，不能指向不存在的用例；当前跨测试kind迁移需先扩展对应真实报告接线与反例验证，再放行，不能把义务迁出所有验收域；本轮差异必须覆盖完整，旧摘要不得用于本轮放行。历史声明可以保留，但无本轮变化时不当作新的证明。
+4. 原始独立 Rust/Node/浏览器断言先原样执行，原始报告与候选报告分开。API 变更导致旧接线编译/运行失败时，先分类并保留失败，再用清单顶层 `replay_patches` 在隔离副本中适配；每项包含 `path`、`files:[{path,sha256}]`、`reason`、`review`，绑定 H 原测试原始字节。补丁只改声明的原独立测试文件，等价适配禁止改生产实现、样本输入、降低期望或跳过断言；已获具体授权的退休用例如与保留用例共用文件，调整须显式审阅并保留原始失败，不能顺带弱化保留契约。
+5. 接线适配须由独立审阅者确认输入/断言语义不变；脚本只核验边界、哈希、补丁可应用和实际结果，不把非空 `review` 当语义证明。适配结果标注 `ADAPTED_REPLAY`，保留 `.original` 失败与 `.adapted` 结果，不把它说成原样通过。H 内联 Rust 用例按声明映射到候选编译/执行证据单独验证，不与 H 独立报告合并，也不宣称冻结了原内联断言。
+6. 真实业务替代/退出保护不是等价技术重构。须先获得用户对具体行为变化的授权，在绑定 H 的 `evolution.business_change` 中保存 `authorization`、`reason` 和准确的 `previous_behavior`，由独立审阅核对授权与变化。退休契约保留原 ID、来源和审计信息，状态为 `已批准替代/移除`；新增替代能力另建契约。AI 自己填写一段“已批准”不是授权。
+
+等价技术演进的字段形状如下（示意值须替换为本轮真实 ID、路径、哈希和证据）：
+
+```json
+{
+  "evolution": {
+    "baseline_sha256": "<H契约核心SHA256>",
+    "reason": "上游把入口拆分；业务输入输出不变",
+    "review": "<独立审阅记录及对应候选树>",
+    "implementation_moves": [{"from": "old.rs", "to": ["new.rs"]}],
+    "test_moves": [{"from": "stable-case-id", "to": ["stable-case-id"], "mode": "adapted", "reason": "模块路径调整"}]
+  }
+}
+```
+
+### 8.10 AI 执行入口、验收封存与提交
+
+`scripts/merge-flow.py` 是标准库薄记录入口，不替 AI 做业务判断，也不自动 merge、stage、commit 或 push。每轮在被忽略的诊断目录保留独立记录，续作复用同一记录：
+
+```sh
+python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json freeze --upstream upstream/main
+# 读取上游/本地历史、预演、按调用链实施；不切换当前工作分支。
+# 先生成产物并明确暂存本轮文件；其他任务有改动时使用隔离候选，不替别人stash或提交。
+python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json impact
+python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json run --name tools -- python -B -m unittest discover -s scripts -p 'test_*merge*.py' -v
+python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json run --name server --cwd desktop-tauri/src-tauri -- cargo test -p agent2api-server --locked
+# 按同样方式记录清单检查、完整Node TAP、前端typecheck/build、浏览器、H重放和新增专项验收。
+python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json seal --required tools server <本轮其他必需验收名>
+python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json check
+# 用户授权提交/push后执行；提交树须仍等于封存的候选tree。
+python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json check --commit HEAD
+```
+
+- 同一记录的 run/seal/check 串行执行；原生排他锁阻止多代理覆盖回执。异常退出残留锁时先核对锁文件内 PID 与相关进程确实结束，再处理该锁，不自动抢占。
+- 回执记录 argv、工作目录、候选 Git tree、实际退出码、输出哈希和执行前后是否变动。生成/测试命令修改受控文件、新源码未暂存、冲突未解、分支改变、旧树回执或输出篡改均不封存。新修改后明确重新暂存并重跑受影响验收，不复用旧树绿灯。
+- 必需验收项由本轮影响分析明确，P0 必跑、受影响 P1/新增能力补齐；不把脚本允许的一条任意成功命令当业务验收。脚本不检查任意 shell 命令的语义，独立审阅须核对回执覆盖真实业务入口。
+- 当前名字报告接口遇到受保护同名跨文件/target或重复运行名时拒绝歧义，不把另一个同名PASS当证据；保留稳定ID、用演进声明调整测试显示名，或先补精确locator报告。仅名字证据不覆盖未执行源与未映射同名输出的所有情况，须审阅真实target/文件。
+- Rust 用全量 `cargo test -p agent2api-server --locked` 和所有 target 的 `-- --list`，清单检查器接收 `--rust-list`；Node/浏览器由 `replay-merge-baseline.py candidate-node|candidate-browser` 从清单动态发现，用例新增不必另改硬编码 CI 清单。`candidate-node --report <完整TAP文件>` 的结果交给检查器 `--node-report`。
+- H 验收执行 `replay-merge-baseline.py gate|rust|frontend --base-ref <H>`；后两项各用独立 `--report`，Rust 同时传 `--candidate-rust-list <候选全量编译列表>` 校验演进后的内联入口。原样与适配两种结果分开，首次无 H 清单明确 BOOTSTRAP。
+- 提交前检查 staged 范围及敏感信息；提交后核对封存 tree，push 到授权目标并核对远端完整 SHA；等待该 SHA 的 `verify` 全部通过。CI 基线和本地 H 分别记录，不混称。部署仍是独立授权流程，不能在 CI 尚未完成时结案为可部署。
+
+### 8.11 每轮可复用的 AI 提示词
 
 ```text
-先冻结 H/U/B 和合并前保护清单，保留当前分支及其他任务工作。
-按本地独有历史、原始修复和当前差异列出行为契约，不把已知回归当基线。
-审查上游增量以及候选相对本地、上游的两份差异，不只检查冲突文件。
-读取完整调用链后整合本地行为与上游适配，检查测试删除及断言削弱。
-对两条历史数据线、关键协议/路由/奖励及受影响平台执行真实对应的验证。
-逐项给出状态、源码树/提交、命令和结果；关键缺失或待验证不进入发布验收。
-候选改变后更新验收；仅提交授权范围文件，push/部署核对同一已验收提交。
+按 AGENTS.md 第8章执行本轮已授权的上游同步/合入。
+先检查分支、dirty/index/MERGE_HEAD/worktrees与历史完整性，保留他人工作，冻结H/U/B。
+从原始修复和独有历史梳理契约；审查B→U、H→候选、U→候选，不只处理冲突。
+逐项分类：保留、上游等价吸收、技术演进、新增能力、回归、需用户决定的业务变化。
+读入口/调用方/分派/配置/数据/bridge/UI整条链，制定文件级方案及验收矩阵再实施。
+允许重构入口，用稳定契约/测试ID及绑定H的演进映射证明等价；不把路径钉死。
+原样重放H独立断言；接线不兼容时先保留失败、只做经审阅的测试接线适配，保留输入及期望。
+新功能增加契约；行为删改先获得具体授权，不由AI自签批准。内联断言改动独立审阅。
+生成产物后暂存明确范围，记录同一候选tree的实际命令/输出/退出码；候选变化重验。
+独立审阅双来源迁移、关键协议/路由/凭证/奖励及本轮受影响平台，逐项报告证据及已知边界。
+按授权提交与push，验证提交tree/远端SHA及该SHA的verify结果；不自动部署/发版/强推。
 ```

@@ -972,7 +972,7 @@ mod tests {
 
     /// 进程级缓存的串行锁：`store_catalog` / `list` 这一组测试共用它，
     /// 否则两个测试会互相把对方的清单盖掉（同一份 OnceLock 单例）。
-    static CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(super) static CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// 缓存 → `list()` 的形状：camelCase 键、`contextWindow` 为 0 时不写这个键、
     /// 倍率走共用的 `credits` 键（空串不写 = 界面 `—`，而不是"0 倍"）。
@@ -1028,11 +1028,15 @@ mod tests {
     #[test]
     fn benefit_models_are_flagged_in_the_entry() {
         let _guard = CACHE_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let models = parse_benefit(BENEFIT_CONFIG).unwrap();
+        assert!(!models.is_empty(), "福利样本必须包含真实模型");
+        let expected = models.len();
         store_catalog(Catalog {
-            models: parse_benefit(BENEFIT_CONFIG).unwrap(),
+            models,
             warnings: Vec::new(),
         });
         let entries = list();
+        assert_eq!(expected, entries.len(), "福利目录不得被其他测试或空目录替换");
         assert!(entries.iter().all(|entry| entry["benefit"] == true));
         assert!(entries.iter().all(|entry| entry["source"] == "benefit"));
     }
@@ -1083,6 +1087,7 @@ mod restart_tests {
 
     #[test]
     fn the_forward_path_sees_the_persisted_catalog_after_a_restart() {
+        let _guard = super::tests::CACHE_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let id = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let dir = std::env::temp_dir().join(format!("codearts-catalog-{}-{id}", std::process::id()));

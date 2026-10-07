@@ -879,7 +879,7 @@ function requestCell(entry: RequestEntry, column: VisibleColumn): React.ReactNod
     case 'usage': {
       // 进行中：用量要等收尾才记账，此刻没有任何读数可给 —— 留空比「-」更准确
       if (isRunning(entry)) return <span key={key} className={className} />
-      const credit = entry.provider === 'workbuddy' || entry.upstreamCredits != null ? `实扣积分: ${amountText(entry.upstreamCredits, '未上报')}` : ''
+      const credit = entry.provider === 'workbuddy' || entry.provider === 'workbuddy-intl' || entry.upstreamCredits != null ? `实扣积分: ${amountText(entry.upstreamCredits, '未上报')}` : ''
       // 失败请求的 token 由后端一律清零，写「0」会让人以为真的消耗了这些量
       if (!isOk(entry)) {
         return (
