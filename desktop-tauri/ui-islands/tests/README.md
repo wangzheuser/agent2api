@@ -21,3 +21,5 @@ node tests/accounts-growth.browser.cjs
 合入验收同时执行根目录的检查器自检与 `check-merge-contracts.py --base-ref <H>`；Rust 使用所有 target 的 `-- --list` 报告，Node 使用上述命令的完整 TAP。CI 在隔离候选副本中按原路径重放 H 的独立 Rust、Node、浏览器断言，并用当前检查器执行 H 原始门禁自测，使用独立 H 报告避免同名候选用例掩盖原始缺测。首次 H 无清单时明确 BOOTSTRAP；内联 Rust 断言仍需对照差异审查。
 
 未来新增用例由清单稳定测试 ID 映射，Node/浏览器通过 `replay-merge-baseline.py candidate-node|candidate-browser` 动态执行；模块/API 演进、独立原始断言接线适配及精确候选 tree 封存按 AGENTS.md 第 8.9–8.11 节执行。
+
+浏览器键盘回环须等待组件真实的异步焦点归还后再输入下一键，不以固定 sleep 或瞬时 sibling guard 状态判定永久逃逸；每步仍验证焦点位于对话框，保留正反向回环及关闭后的焦点归位。

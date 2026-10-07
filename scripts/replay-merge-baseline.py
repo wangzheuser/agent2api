@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import shutil
 import subprocess
 import sys
@@ -161,10 +162,18 @@ def replay_patches(root, ref, baseline, candidate, kind):
     declarations = candidate.get('replay_patches', [])
     if not isinstance(declarations, list):
         raise ValueError('replay_patches 必须为列表')
+    ref = git(root, 'rev-parse', '--verify', '--end-of-options', ref + '^{commit}').decode().strip()
     selected = []
     for declaration in declarations:
         if not isinstance(declaration, dict) or any(not isinstance(declaration.get(k), str) or not declaration[k].strip() for k in ('path', 'reason', 'review')):
             raise ValueError('重放补丁须声明 path/reason/review')
+        if 'base_ref' in declaration:
+            scope = declaration['base_ref']
+            if not isinstance(scope, str) or not re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', scope):
+                raise ValueError('重放补丁 base_ref 必须是完整 40/64 位十六进制提交 SHA')
+            if scope.lower() != ref:
+                print(f'REPLAY_PATCH_SKIPPED: {declaration["path"]}; declared={scope}; current={ref}', flush=True)
+                continue
         patch = root / declaration['path']
         if not patch.is_file():
             raise ValueError('重放补丁文件缺失')
