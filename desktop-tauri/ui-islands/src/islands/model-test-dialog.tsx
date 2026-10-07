@@ -50,7 +50,7 @@ import * as customSource from './models-custom-source'
 import type { ManageModel } from './models-custom-source'
 import { levels as reasoningLevels } from './models-reasoning'
 import {
-  bindingsOf, errorMessage, getSnapshot, levelOf, modelRowOf, providerLabelOf, toast,
+  bindingsOf, errorMessage, getSnapshot, levelOf, overrideLevelOf, modelRowOf, providerLabelOf, toast,
 } from './models-panel-state'
 
 /* ─── 类型 ─────────────────────────────────── */
@@ -437,6 +437,7 @@ export function ModelTestDialog({ target, onClose }: { target: ModelTestTarget; 
   // 本名直发时生效的思考等级只认「名字不变的那条按家映射」（见 model_rules::reasoning 第 4 条），
   // 而那正是这一行的默认绑定 —— 与表格里默认 chip 上显示的是同一个值
   const boundLevel = levelOf(model.id, model.id, provider)
+  const forcedLevel = overrideLevelOf(model.id, model.id, provider)
   const aliases = bindingsOf(model)
     .filter(binding => !binding.isDefault)
     .map(binding => binding.alias)
@@ -601,9 +602,10 @@ export function ModelTestDialog({ target, onClose }: { target: ModelTestTarget; 
               {aliases.length
                 ? `（这一行另有 ${aliases.length} 条别名映射：${aliases.join('、')}，别名不参与本次测试）`
                 : ''}
-              ；映射上绑定的思考等级{boundLevel
+              {forcedLevel ? <>；强制覆盖思考为 <b className='text-foreground'>{forcedLevel}</b>，优先于本次测试参数</> : null}
+              {!forcedLevel ? <>；映射上绑定的默认思考等级{boundLevel
                 ? <> 是 <b className='text-foreground'>{boundLevel}</b>，选「跟随映射」时按它注入</>
-                : '未绑定 —— 选「跟随映射」等于这次不注入等级'}。
+                : '未绑定 —— 选「跟随映射」等于这次不注入等级'}</> : null}。
             </p>
           </div>
 

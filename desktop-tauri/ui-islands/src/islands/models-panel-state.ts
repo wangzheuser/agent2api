@@ -75,7 +75,7 @@ export type SharedWindow = {
   workbuddyDesktop?: {
     getModelManage(): Promise<ManageView | null | undefined>
     addModelMapping(
-      alias: string, target: string, provider: string, reasoning?: string, enabled?: boolean,
+      alias: string, target: string, provider: string, reasoning?: string, enabled?: boolean, reasoningOverride?: string,
     ): Promise<ManageView | null | undefined>
     removeModelMapping(alias: string, target: string, provider: string): Promise<ManageView | null | undefined>
     addCustomModel(provider: string, id: string): Promise<ManageView | null | undefined>
@@ -383,9 +383,11 @@ export function mappings(): ManageMapping[] {
  * render 之前调用它（理论上不会，但弹窗是独立入口）也不会炸，只是显示成「未绑定」。
  */
 let reasoningOf = (_alias: unknown, _target: unknown, _provider: unknown): string => ''
+let forcedReasoningOf = reasoningOf
 
 function rebuildReasoningIndex(): void {
   reasoningOf = buildReasoningIndex(mappings())
+  forcedReasoningOf = buildReasoningIndex(mappings(), "reasoningOverride")
 }
 
 /** 内置各家的 id → {label, n}。从**内置全量**（`data.models`）收集，不能用 models() ——
@@ -590,12 +592,12 @@ export function accept(next: unknown): void {
 
 /** 开关 / 新增 / 改一条绑定（alias == target 时即该模型的默认绑定） */
 export async function writeBinding(
-  provider: string, alias: string, target: string, change: { reasoning?: string; enabled?: boolean },
+  provider: string, alias: string, target: string, change: { reasoning?: string; enabled?: boolean; reasoningOverride?: string },
 ): Promise<unknown> {
   if (customSource.isCustom(provider)) return customSource.setBinding(provider, alias, target, change)
   const api = shared().workbuddyDesktop
   if (!api) throw new Error('后端桥不可用')
-  return api.addModelMapping(alias, target, provider, change.reasoning, change.enabled)
+  return api.addModelMapping(alias, target, provider, change.reasoning, change.enabled, change.reasoningOverride)
 }
 
 export async function writeRemoveMapping(provider: string, alias: string, target: string): Promise<unknown> {
@@ -886,6 +888,10 @@ declare global {
  */
 export function levelOf(alias: unknown, target: unknown, provider: unknown): string {
   return reasoningOf(alias, target, provider)
+}
+
+export function overrideLevelOf(alias: unknown, target: unknown, provider: unknown): string {
+  return forcedReasoningOf(alias, target, provider)
 }
 
 /**

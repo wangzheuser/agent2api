@@ -46,7 +46,7 @@ fn ingress(protocol: &str, model: &str, effort: Option<&str>, stream: bool) -> V
 
 fn bind(adapter: &ZcodeAdapter, body: &mut Value, level: &str) {
     let model = body["model"].as_str().unwrap();
-    if let ReasoningPatch::Set { field, value } = adapter.reasoning_patch(level, model, body) {
+    if let ReasoningPatch::Set { field, value } = adapter.reasoning_patch(level, model, body, false) {
         body[field] = value;
     }
 }
@@ -183,6 +183,25 @@ fn messages_budget_and_responses_nested_effort_reach_zcode() {
     assert_eq!(wire(&ZCODE_ADAPTER, &body)["reasoning_effort"], "max");
     let body = ingress("responses", "GLM-5.3-FLASH", Some("xhigh"), true);
     assert_eq!(wire(&ZCODE_INTL_ADAPTER, &body)["reasoning_effort"], "max");
+}
+
+#[test]
+fn forced_binding_three_protocols_both_regions_coding_wire() {
+    for adapter in [&ZCODE_ADAPTER, &ZCODE_INTL_ADAPTER] {
+        for protocol in ["chat", "responses", "messages"] {
+            for stream in [false, true] {
+                for effort in ["minimal", "medium", "max", "off", "unknown"] {
+                    let mut body = ingress(protocol, "glm-5.3-flash", Some(effort), stream);
+                    let original = body.clone();
+                    let ReasoningPatch::Set { field, value } = adapter.reasoning_patch("max", "glm-5.3-flash", &body, true) else { panic!("已确认支持的模型必须翻译强制档位"); };
+                    crate::server::core::model_rules::clear_client_controls(&mut body);
+                    body[field] = value;
+                    assert_eq!(wire(adapter, &body)["reasoning_effort"], "max", "{protocol} {stream} {effort}");
+                    assert_eq!(body["messages"], original["messages"]);
+                }
+            }
+        }
+    }
 }
 
 #[test]

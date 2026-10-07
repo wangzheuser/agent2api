@@ -224,12 +224,13 @@ pub(crate) async fn forward(
         .unwrap_or("")
         .trim()
         .to_string();
-    let (mut outbound, rewrite) = rewrite_body(body, provider_id, &requested);
+    let (mut outbound, rewrite) = rewrite_body(body, provider_id, &requested)?;
     // 客户端形态伪装（OpenCode 免费档）：补桩工具。未开启时不碰请求体。
     // 放在 `rewrite_body` 之后、序列化之前 —— 会话种子取自**改写后**的体，
     // 与最终发出去的字节同源（模型名换了不影响 messages，两种取法等价，
     // 但同源更不容易在将来改坏）
     quirks.apply_emulation_to_body(&mut outbound);
+    telemetry.note_upstream_reasoning(model_rules::read_client_level(&outbound));
     let payload = serde_json::to_string(&outbound)
         .map_err(|error| GatewayError::with_status(500, format!("请求体序列化失败: {error}")))?;
     // ── 出站头（三段拼装，顺序不可换）────────────────────────────
@@ -465,7 +466,7 @@ async fn forward_translated(
         .unwrap_or("")
         .trim()
         .to_string();
-    let (mut outbound_chat, rewrite) = rewrite_body(body, provider_id, &requested);
+    let (mut outbound_chat, rewrite) = rewrite_body(body, provider_id, &requested)?;
     // 客户端形态伪装：与 chat 分支同一时机（改写后、翻译前）—— 桩工具要由
     // 转换器一起翻成上游协议的形态（anthropic 的 tools 数组）
     quirks.apply_emulation_to_body(&mut outbound_chat);
@@ -555,6 +556,7 @@ async fn forward_translated(
             (url, headers, payload)
         }
     };
+    telemetry.note_upstream_reasoning(model_rules::read_client_level(&outbound_chat));
     let payload = serde_json::to_string(&payload)
         .map_err(|error| GatewayError::with_status(500, format!("请求体序列化失败: {error}")))?;
 
@@ -769,12 +771,12 @@ impl futures::Stream for ProtocolTranslateStream {
 ///
 /// `rewrite` 是 SSE/聚合的 model 回写参数：请求带了 model 才给 ——
 /// 客户端没点名模型时（上游用自家默认）没有「回写成什么」的答案。
-fn rewrite_body(body: &Value, provider_id: &str, requested: &str) -> (Value, Option<ModelRewrite>) {
+fn rewrite_body(body: &Value, provider_id: &str, requested: &str) -> Result<(Value, Option<ModelRewrite>), GatewayError> {
     let mut outbound = body.clone();
     if requested.is_empty() {
-        return (outbound, None);
+        return Ok((outbound, None));
     }
-    let (wire_model, reasoning) = custom_providers::wire_model_for(provider_id, requested);
+    let (wire_model, reasoning, forced) = custom_providers::wire_model_for(provider_id, requested);
     if !wire_model.eq_ignore_ascii_case(requested) {
         logging::verbose(
             "[CustomProvider]",
@@ -784,7 +786,15 @@ fn rewrite_body(body: &Value, provider_id: &str, requested: &str) -> (Value, Opt
             object.insert("model".to_string(), Value::String(wire_model));
         }
     }
-    if let Some(level) = reasoning
+    if let Some(level) = forced.as_deref() {
+        if model_rules::reasoning_rank(level).is_none() {
+            return Err(model_rules::override_error("自定义提供商强制思考只支持标准正向等级；请清空强制配置或选择有效等级"));
+        }
+        model_rules::clear_client_controls(&mut outbound);
+        let object = outbound.as_object_mut().ok_or_else(|| model_rules::override_error("强制覆盖思考要求请求体为 JSON 对象"))?;
+        object.insert("reasoning_effort".to_string(), Value::String(level.to_lowercase()));
+        logging::verbose("[CustomProvider]", &format!("provider={provider_id} 映射 {requested} 强制覆盖思考 reasoning_effort={level}"));
+    } else if let Some(level) = reasoning
         .as_deref()
         .map(str::trim)
         .filter(|text| !text.is_empty())
@@ -820,12 +830,12 @@ fn rewrite_body(body: &Value, provider_id: &str, requested: &str) -> (Value, Opt
             );
         }
     }
-    (
+    Ok((
         outbound,
         Some(ModelRewrite {
             requested: requested.to_string(),
         }),
-    )
+    ))
 }
 
 /// 非 2xx 的响应 → 分类后的 `GatewayError`（分类语义见模块头）。
