@@ -22,6 +22,7 @@ async function run() {
     await page.evaluate(() => {wbSettingsPanel.showCategory('gateway');wbSettingsPanel.renderAccountSelection({accountSelection:'balanced'})})
     const select = page.getByRole('combobox', { name: '账号选路策略' })
     await select.click()
+    await page.getByRole('option', { name: '会话均衡亲和', exact: true }).waitFor()
     assert.equal(await page.getByRole('option').count(), 4)
     await page.getByRole('option', { name: '会话均衡亲和', exact: true }).click()
     await page.waitForFunction(() => fixture.calls.length === 1)

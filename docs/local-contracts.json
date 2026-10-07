@@ -1830,6 +1830,30 @@
       "reason": "ForwardRequest 新增可选会话上下文；原始指定账号测试仍传 None，不改变输入及断言。",
       "review": "独立 architect_review 对照基线检查：补丁仅为 pinned 测试增加 route_session: None，保留原始断言。",
       "base_ref": "f7b838daa1c4de103abdddfa7d860ba187ea130c"
+    },
+    {
+      "base_ref": "9a20253988ee6f2086870011b76f346ae2d8d21f",
+      "path": "scripts/replay-patches/session-affinity-settings-render.patch",
+      "files": [
+        {
+          "path": "desktop-tauri/ui-islands/tests/settings-cache-affinity.browser.cjs",
+          "sha256": "b56ee0323c353dc6ffa954e7fd0c7ec2e3bd6b64f471bafe0ee4b19008043ecf"
+        }
+      ],
+      "reason": "Base UI 在浏览器异步渲染下拉选项；仅等待新增选项可见，保留四项计数、保存参数及失败恢复的全部输入和断言。",
+      "review": "architect_review 独立审阅原始时序失败、异步渲染路径及仅等待的接线差异；不修改生产实现或跳过断言。"
+    },
+    {
+      "base_ref": "3b59bc92b5dd34204c0fb2282415055907c5eea1",
+      "path": "scripts/replay-patches/session-affinity-settings-render.patch",
+      "files": [
+        {
+          "path": "desktop-tauri/ui-islands/tests/settings-cache-affinity.browser.cjs",
+          "sha256": "b56ee0323c353dc6ffa954e7fd0c7ec2e3bd6b64f471bafe0ee4b19008043ecf"
+        }
+      ],
+      "reason": "Base UI 在浏览器异步渲染下拉选项；仅等待新增选项可见，保留四项计数、保存参数及失败恢复的全部输入和断言。",
+      "review": "architect_review 独立审阅原始时序失败、异步渲染路径及仅等待的接线差异；不修改生产实现或跳过断言。"
     }
   ]
 }
