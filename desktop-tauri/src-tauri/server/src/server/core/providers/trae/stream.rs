@@ -232,7 +232,7 @@ impl SoloStream {
 
 /// 流式 tool_call 片段的字段整形：`function_call` → `function`，
 /// 并剥掉 SOLO 专属的 `namespace` / `partial_arguments`（上游带着它们）。
-fn normalize_stream_tool_calls(calls: Value) -> Value {
+pub(crate) fn normalize_stream_tool_calls(calls: Value) -> Value {
     let Value::Array(list) = calls else {
         // 上游偶尔给单个对象；按参考实现的处理方式包成数组。
         return Value::Array(vec![normalize_one_call(calls)]);

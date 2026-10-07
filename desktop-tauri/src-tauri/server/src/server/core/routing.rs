@@ -291,6 +291,48 @@ fn pick_account_with_strategy(
     strategy: crate::server::config::AccountSelectionStrategy,
     advance_cursor: bool,
 ) -> Option<Value> {
+    let mut candidates = eligible_accounts(accounts, keys, counts, exclude_ids, now, true);
+    if candidates.is_empty() {
+        return None;
+    }
+
+    match strategy {
+        crate::server::config::AccountSelectionStrategy::CacheAffinity => {
+            // 无会话上下文的预览只读：不建立绑定、不推进原策略游标。
+            candidates.sort_by(|left, right| load_score(left, counts)
+                .partial_cmp(&load_score(right, counts)).unwrap_or(std::cmp::Ordering::Equal));
+            candidates.into_iter().next()
+        }
+        crate::server::config::AccountSelectionStrategy::Priority => {
+            candidates.into_iter().next()
+        }
+        crate::server::config::AccountSelectionStrategy::RoundRobin => {
+            let len = candidates.len();
+            choose_by_cursor(candidates, advance_cursor, len)
+        }
+        crate::server::config::AccountSelectionStrategy::Balanced => {
+            candidates.sort_by(|left, right| {
+                load_score(left, counts)
+                    .partial_cmp(&load_score(right, counts))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let best = load_score(&candidates[0], counts);
+            let tie_len = candidates.iter().take_while(|account|
+                (load_score(account, counts) - best).abs() < f64::EPSILON).count();
+            choose_by_cursor(candidates, advance_cursor, tie_len)
+        }
+    }
+}
+
+/// 实际亲和分配和旧策略共用资格判定；仅调用方选择是否排除忙账号。
+pub(crate) fn eligible_accounts(
+    accounts: &[Value],
+    keys: &CooldownKeys<'_>,
+    counts: &HashMap<String, usize>,
+    exclude_ids: &[String],
+    now: i64,
+    check_capacity: bool,
+) -> Vec<Value> {
     let policy = super::workbuddy_policy::RoutePolicy::load();
     let mut candidates: Vec<Value> = accounts
         .iter()
@@ -304,49 +346,13 @@ fn pick_account_with_strategy(
             usability_with_policy(account, keys, now, &policy).usable
                 // 并发过滤放在 usability 之后：先答「这个账号让不让你用」，
                 // 再答「它忙不忙」—— 禁用 / 限流的原因不变，这里只追加一条。
-                && !at_concurrency_limit(account, id, counts)
+                && (!check_capacity || !at_concurrency_limit(account, id, counts))
         })
         .cloned()
         .collect();
-    if candidates.is_empty() {
-        return None;
-    }
-
-    match strategy {
-        crate::server::config::AccountSelectionStrategy::Priority => {
-            candidates.sort_by(compare_by_priority);
-            policy.reorder(&mut candidates, &keys.for_provider("workbuddy"), now);
-            candidates.into_iter().next()
-        }
-        crate::server::config::AccountSelectionStrategy::RoundRobin => {
-            // 保留账号页的主备排序作为轮询的稳定基准；WorkBuddy 的福利策略
-            // 仍作为同一候选池的次级顺序，不会绕过余额保底过滤。
-            candidates.sort_by(compare_by_priority);
-            policy.reorder(&mut candidates, &keys.for_provider("workbuddy"), now);
-            let len = candidates.len();
-            choose_by_cursor(candidates, advance_cursor, len)
-        }
-        crate::server::config::AccountSelectionStrategy::Balanced => {
-            // 福利/到期/成本策略先形成稳定的次级顺序，再由负载作为主排序键；
-            // `sort_by` 是稳定排序，负载相同时仍保留该次级顺序，最后由游标
-            // 轮换同负载账号，避免空闲时永远命中同一优先级账号。
-            candidates.sort_by(compare_by_priority);
-            policy.reorder(&mut candidates, &keys.for_provider("workbuddy"), now);
-            candidates.sort_by(|left, right| {
-                load_score(left, counts)
-                    .partial_cmp(&load_score(right, counts))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            let best = load_score(&candidates[0], counts);
-            let tie_len = candidates
-                .iter()
-                .take_while(|account| {
-                    (load_score(account, counts) - best).abs() < f64::EPSILON
-                })
-                .count();
-            choose_by_cursor(candidates, advance_cursor, tie_len)
-        }
-    }
+    candidates.sort_by(compare_by_priority);
+    policy.reorder(&mut candidates, &keys.for_provider("workbuddy"), now);
+    candidates
 }
 
 /// 以「有效并发容量」归一化在途负载：有限上限使用 `count / limit`，不限上限

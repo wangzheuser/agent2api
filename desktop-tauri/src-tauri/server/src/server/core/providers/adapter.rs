@@ -379,6 +379,19 @@ pub trait ProviderAdapter: Send + Sync {
         client_headers: &HeaderMap,
     ) -> Result<ChatRequestPlan, GatewayError>;
 
+    /// 可靠会话的发送前装饰；仅会话亲和策略调用，其他提供商保持原计划。
+    fn apply_route_session(
+        &self,
+        _plan: &mut ChatRequestPlan,
+        _account: &Value,
+        _original_body: &Value,
+        _context: &crate::server::core::upstream::route_session::RouteSession,
+    ) {
+    }
+
+    /// 可靠会话亲和请求的每次实际发送刷新；默认不修改其他提供商的头。
+    fn refresh_route_request_id(&self, _headers: &mut Vec<(String, String)>) {}
+
     /// 一次性请求凭证的提供商：重试须重新构造计划，禁止复用旧请求头。
     fn request_is_single_use(&self, _account: &Value) -> bool {
         false

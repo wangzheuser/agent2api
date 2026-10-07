@@ -1343,5 +1343,18 @@
         }
       ]
     }
+  ],
+  "replay_patches": [
+    {
+      "path": "scripts/replay-patches/session-affinity-zcode-request.patch",
+      "files": [
+        {
+          "path": "desktop-tauri/src-tauri/server/tests/zcode_restore.rs",
+          "sha256": "7464daff25b517d9e47faea366b43fed9ddd7ffe7fd65ab7c023c3fe507036e4"
+        }
+      ],
+      "reason": "ForwardRequest 新增可选会话上下文；原始指定账号测试仍传 None，不改变输入及断言。",
+      "review": "独立 architect_review 对照基线检查：补丁仅为 pinned 测试增加 route_session: None，保留原始断言。"
+    }
   ]
 }

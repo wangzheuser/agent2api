@@ -45,6 +45,9 @@
 //! SSE 流的中断（客户端断开、上游断开）是**正常路径**，一律用 Result/Option。
 
 pub mod aggregate;
+pub mod affinity;
+pub mod route_session;
+pub mod completion_evidence;
 pub mod cancellation;
 pub mod connections;
 pub mod request;
@@ -177,6 +180,7 @@ pub struct UpstreamService {
     in_flight: Arc<Mutex<HashMap<String, Arc<InFlight>>>>,
     /// 账号级活跃连接计数（账号页「连接数」列的数据源，见 `connections.rs`）
     connections: Connections,
+    pub(super) affinity: affinity::Affinity,
 }
 
 /// 一次转发的入参
@@ -222,6 +226,8 @@ pub struct ForwardRequest {
     /// 它没有「账号被禁用 / 已被删除时换一个」的兜底语义（见
     /// `rotate::accounts_in_providers` 的说明）。
     pub pinned_account: Option<String>,
+    /// 由已认证的客户端身份和原始请求提取，不参与权限判断。
+    pub route_session: Option<route_session::RouteSession>,
 }
 
 /// 转发结果：要么是可直接下发的流，要么是聚合好的 JSON
@@ -262,6 +268,7 @@ impl UpstreamService {
             auth,
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             connections: Connections::new(),
+            affinity: affinity::Affinity::default(),
         }
     }
 
@@ -271,6 +278,10 @@ impl UpstreamService {
     /// 读到的都是同一张表。
     pub fn connections(&self) -> Connections {
         self.connections.clone()
+    }
+
+    pub fn reset_affinity(&self) {
+        self.affinity.reset();
     }
 
     /// 转发一次对话请求。
@@ -283,6 +294,11 @@ impl UpstreamService {
     ///     一个卡住的前序请求被无限期挂住。
     ///   - **槽位一直占到大半个响应结束**（流式请求也一样，见 InFlightGuard）。
     pub async fn forward(&self, request: ForwardRequest) -> Result<ForwardOutcome, GatewayError> {
+        // 在去重排队等任何 await 之前冻结，旧请求不借用设置切换后的 epoch。
+        let affinity_epoch = self.affinity.epoch();
+        let affinity_enabled = request.pinned_account.is_none()
+            && crate::server::config::account_selection()
+                == crate::server::config::AccountSelectionStrategy::CacheAffinity;
         // ── 调试模式：为本次请求装一个原始报文采集器 ─────────────────
         // 装在这里（转发入口）而不是各家适配器里：四条路径（流式 / 非流式 ×
         // 无状态 / 有状态）都要采，装一次全都覆盖到。开关关着时**不创建**
@@ -349,6 +365,7 @@ impl UpstreamService {
         // 钉住的账号与它同样处理：ownership 移出来、借给 context，
         // 于是 `request` 在下面不再被借用（理由同上一条）
         let pinned_account = request.pinned_account;
+        let route_session = request.route_session;
         let context = payload::ProviderContext {
             body: &upstream_body,
             stream: request.stream,
@@ -358,6 +375,9 @@ impl UpstreamService {
             prompt,
             key_scope: key_scope.as_ref(),
             pinned_account: pinned_account.as_deref(),
+            route_session: route_session.as_ref().filter(|_| affinity_enabled),
+            affinity_enabled,
+            affinity_epoch,
         };
         provider_loop::forward_with_providers(self, context, &mut slot, &mut connections).await
     }
@@ -515,12 +535,17 @@ impl ForwardStream {
         });
         // 流式响应空闲超时（设置页「请求超时」第三项）：逐分片计时，
         // 收到新数据即重置；计时器在流启动时就武装（见 stall 的模块头）
-        let guarded = stall::idle_guard(
+        let mut guarded = stall::idle_guard(
             Box::pin(inner),
             std::time::Duration::from_millis(
                 crate::server::config::timeout_settings().stream_idle_ms(),
             ),
         );
+        if telemetry.observes_affinity() {
+            guarded = completion_evidence::observe_stream(
+                guarded, telemetry.clone(), completion_evidence::EvidenceProtocol::Chat,
+            );
+        }
         let capture = telemetry.capture();
         let mut stream = Self::from_translated(guarded, slot, connection, telemetry, model_rewrite);
         stream.capture = capture;

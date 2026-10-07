@@ -163,3 +163,29 @@ pub fn allows_model(scope: Option<&KeyScope>, model: &str) -> bool {
 pub fn allows_provider(scope: Option<&KeyScope>, provider: &str) -> bool {
     scope.map_or(true, |scope| scope.allows_provider(provider))
 }
+
+/// 已认证客户端的路由分区；与 KeyScope 权限无关，不保存明文凭证。
+#[derive(Clone)]
+pub struct RoutingPrincipal(String);
+
+impl RoutingPrincipal {
+    pub(crate) fn from_entry(entry: &ApiKeyEntry) -> Self {
+        Self(format!("entry:{}", entry.id))
+    }
+
+    /// 仅在环境 Key 已通过认证之后调用；进程重启后不复用指纹。
+    pub(crate) fn from_environment_key(key: &str) -> Self {
+        use sha2::{Digest, Sha256};
+        use std::sync::OnceLock;
+        static SALT: OnceLock<String> = OnceLock::new();
+        let salt = SALT.get_or_init(|| crate::server::access::random_hex(32));
+        let mut hash = Sha256::new();
+        hash.update(salt.as_bytes());
+        hash.update(key.as_bytes());
+        Self(format!("environment:{:x}", hash.finalize()))
+    }
+
+    pub(crate) fn partition(&self) -> &str {
+        &self.0
+    }
+}

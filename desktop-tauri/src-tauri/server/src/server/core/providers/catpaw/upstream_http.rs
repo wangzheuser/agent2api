@@ -278,6 +278,9 @@ pub(super) async fn turn_request(
     for (key, value) in request_headers(&ctx.credentials, "text/event-stream") {
         builder = builder.header(key, value);
     }
+    if let Some(telemetry) = &ctx.telemetry {
+        telemetry.record_affinity_send();
+    }
     let response = builder.send().await.map_err(|error| {
         CatPawError::upstream(format!(
             "上游请求失败（{}）: {}",

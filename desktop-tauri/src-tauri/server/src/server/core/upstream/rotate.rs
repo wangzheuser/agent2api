@@ -117,6 +117,7 @@ pub(super) async fn select_target_account(
     keys: &routing::CooldownKeys<'_>,
     tried_ids: &[String],
     pinned: Option<&str>,
+    affinity: Option<&super::payload::ProviderContext<'_>>,
 ) -> Result<RouteTarget, GatewayError> {
     let accounts = accounts_in_providers(service, providers, pinned);
     // 这些家都没有账号记录 → 用第一家的默认登录态（环境变量旁路等）
@@ -136,6 +137,46 @@ pub(super) async fn select_target_account(
     let counts = connection_counts(service);
     let mut excluded: Vec<String> = tried_ids.to_vec();
     let now = logging::now_ms();
+    if let Some(context) = affinity {
+        let session_key = context.route_session.map(|session| session.key.as_str());
+        let telemetry = context.telemetry;
+        let epoch = context.affinity_epoch;
+        telemetry.begin_affinity_attempt(service.affinity.clone(), "", None, epoch);
+        // 凭证和模型解析均在亲和锁外；只把身份摘要带入内存候选。
+        let healthy = routing::eligible_accounts(&accounts, keys, &counts, &excluded, now, false);
+        let mut reusable = Vec::with_capacity(healthy.len());
+        for mut account in healthy {
+            let Some(id) = routing::account_id(&account) else { continue; };
+            let Some(entry) = service.store.get_session_by_id(id) else { continue; };
+            let session = entry.session;
+            let identity = super::payload::affinity_target_identity(&service.store, &account, &session, context.body);
+            account["_affinityIdentity"] = identity;
+            reusable.push(account);
+        }
+        let normal: Vec<Value> = reusable.iter().filter(|account| {
+            let cap = routing::max_concurrent_of(account);
+            let count = routing::account_id(account).and_then(|id| counts.get(id)).copied().unwrap_or(0);
+            cap == 0 || (count as u64) < cap
+        }).cloned().collect();
+        if let Some(selection) = service.affinity.select_in_epoch(session_key, &normal, &reusable, &counts, epoch) {
+            let picked = selection.account;
+            if let Some(id) = routing::account_id(&picked).map(str::to_string) {
+                if let Some(entry) = service.store.get_session_by_id(&id) {
+                    let identity = super::payload::affinity_target_identity(&service.store, &picked, &entry.session, context.body);
+                    telemetry.begin_affinity_attempt(service.affinity.clone(), &id, selection.lease, epoch);
+                    telemetry.validate_affinity_identity(&identity);
+                    telemetry.guard_affinity_identity(service.store.clone(), &picked, context.body, &identity);
+                    let mut target = with_proxy_notice(picked, entry.proxy, entry.proxy_error, id);
+                    let notice = format!("会话均衡亲和: {}", selection.reason);
+                    target.proxy_notice = Some(match target.proxy_notice {
+                        Some(existing) => format!("{existing}；{notice}"),
+                        None => notice,
+                    });
+                    return Ok(target);
+                }
+            }
+        }
+    }
     loop {
         let picked = routing::pick_account_by_priority(&accounts, keys, &counts, &excluded, now);
         let Some(picked) = picked else {
@@ -480,31 +521,31 @@ mod policy_tests {
         let identity_b = workbuddy_policy::identity(&b).unwrap();
         let service = UpstreamService::new(store.clone(),AuthService::for_store(store.clone()));
         let keys = routing::CooldownKeys::new("fixture-model");
-        let initial = select_target_account(&service,&["workbuddy"],&keys,&[],None).await.unwrap();
+        let initial = select_target_account(&service,&["workbuddy"],&keys,&[],None,None).await.unwrap();
         assert_eq!(initial.account_id.as_deref(),Some(a_id));
         workbuddy_policy::patch_policy(a_id,&identity_a,&json!({"creditFloor":10})).unwrap();
         let now = logging::now_ms();
         let usage = json!({"creditDetails":{"kind":"personal","complete":true,"remaining":10,"fetchedAt":now,"segments":[]}});
         workbuddy_policy::observe_usage(&a,&usage);
         assert!(matches!(session_for(&service,"workbuddy",Some(a_id)).await,Err(error) if error.status_code==503));
-        let normal = select_target_account(&service,&["workbuddy"],&keys,&[],None).await.unwrap();
+        let normal = select_target_account(&service,&["workbuddy"],&keys,&[],None,None).await.unwrap();
         assert_eq!(normal.account_id.as_deref(),Some(b_id));
         store.mark_rate_limited(b_id,"fixture-model",429,None,Some((now+60_000) as f64),"fixture cooldown");
-        let cooling = select_target_account(&service,&["workbuddy"],&keys,&[],None).await.unwrap();
+        let cooling = select_target_account(&service,&["workbuddy"],&keys,&[],None,None).await.unwrap();
         assert_eq!(cooling.account_id.as_deref(),Some(b_id));
         store.update_account(b_id,&json!({"maxConcurrent":1})).unwrap();
         let mut connection = super::super::connections::ConnectionGuard::new(service.connections());
         connection.rebind(Some(b_id.to_string()));
-        let squeezed = select_target_account(&service,&["workbuddy"],&keys,&[],None).await.unwrap();
+        let squeezed = select_target_account(&service,&["workbuddy"],&keys,&[],None,None).await.unwrap();
         assert_eq!(squeezed.account_id.as_deref(),Some(b_id));
         // 唯一未受保护的账号已经试过时，旧逻辑会返回默认会话，借回 A。
-        let failed = select_target_account(&service,&["workbuddy"],&keys,&[b_id.to_string()],None).await;
+        let failed = select_target_account(&service,&["workbuddy"],&keys,&[b_id.to_string()],None,None).await;
         assert!(matches!(failed,Err(error) if error.status_code==503));
         workbuddy_policy::patch_policy(b_id,&identity_b,&json!({"creditFloor":0})).unwrap();
-        let all_blocked = select_target_account(&service,&["workbuddy"],&keys,&[],None).await;
+        let all_blocked = select_target_account(&service,&["workbuddy"],&keys,&[],None,None).await;
         assert!(matches!(all_blocked,Err(error) if error.status_code==503));
         workbuddy_policy::patch_policy(a_id,&identity_a,&json!({"creditFloor":null})).unwrap();
-        let restored = select_target_account(&service,&["workbuddy"],&keys,&[],None).await.unwrap();
+        let restored = select_target_account(&service,&["workbuddy"],&keys,&[],None,None).await.unwrap();
         assert_eq!(restored.account_id.as_deref(),Some(a_id));
     }
 }

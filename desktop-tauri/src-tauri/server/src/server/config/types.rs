@@ -330,6 +330,7 @@ pub enum AccountSelectionStrategy {
     Balanced,
     Priority,
     RoundRobin,
+    CacheAffinity,
 }
 
 impl AccountSelectionStrategy {
@@ -338,11 +339,13 @@ impl AccountSelectionStrategy {
             Self::Balanced => "balanced",
             Self::Priority => "priority",
             Self::RoundRobin => "roundRobin",
+            Self::CacheAffinity => "cacheAffinity",
         }
     }
 
     pub fn parse(value: Option<&Value>) -> Self {
         match value.and_then(Value::as_str) {
+            Some("cacheAffinity") => Self::CacheAffinity,
             Some("priority") => Self::Priority,
             Some("roundRobin") | Some("round_robin") => Self::RoundRobin,
             _ => Self::Balanced,
@@ -874,4 +877,37 @@ impl Default for QueueSettings {
 pub struct QueuePatch {
     pub max_waits: Option<i64>,
     pub wait_seconds: Option<i64>,
+}
+
+#[cfg(test)]
+mod route_strategy_tests {
+    use super::*;
+
+    #[test]
+    fn cache_affinity_strategy_roundtrips_and_keeps_balanced_default() {
+        assert_eq!(
+            AccountSelectionStrategy::default(),
+            AccountSelectionStrategy::Balanced
+        );
+        for (name, strategy) in [
+            ("balanced", AccountSelectionStrategy::Balanced),
+            ("priority", AccountSelectionStrategy::Priority),
+            ("roundRobin", AccountSelectionStrategy::RoundRobin),
+            ("cacheAffinity", AccountSelectionStrategy::CacheAffinity),
+        ] {
+            assert_eq!(
+                AccountSelectionStrategy::parse(Some(&Value::String(name.into()))),
+                strategy
+            );
+            assert_eq!(strategy.as_str(), name);
+        }
+        assert_eq!(
+            AccountSelectionStrategy::parse(None),
+            AccountSelectionStrategy::Balanced
+        );
+        assert_eq!(
+            AccountSelectionStrategy::parse(Some(&Value::String("unknown".into()))),
+            AccountSelectionStrategy::Balanced
+        );
+    }
 }

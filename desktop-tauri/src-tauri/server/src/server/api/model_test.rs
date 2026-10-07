@@ -314,6 +314,7 @@ async fn run_forward(
         // 钉住这一家（同一个对外名可能挂在多家上，见模块头）
         allowed_providers: Some(KeyScope::provider_only(provider)),
         // 钉住这一个账号，且不顺延
+        route_session: None,
         pinned_account: if account_id.is_empty() {
             None
         } else {

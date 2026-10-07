@@ -74,6 +74,7 @@ pub async fn chat_completions(
     // axum 对 `Option<Extension<T>>` 有专门实现：取不到就是 `None`，不会像
     // 裸 `Extension<T>` 那样直接拒绝请求（那会把整个免鉴权模式打回 500）。
     key_scope: Option<Extension<crate::server::core::key_scope::KeyScope>>,
+    principal: Option<Extension<crate::server::core::key_scope::RoutingPrincipal>>,
     body: Bytes,
 ) -> Response {
     let scope = key_scope.map(|Extension(scope)| scope);
@@ -86,6 +87,11 @@ pub async fn chat_completions(
         record_early_failure(&state, started_at, "", "", &error);
         return error.payload_response();
     };
+    let principal = principal.map(|Extension(principal)| principal);
+    let route_session = crate::server::core::upstream::route_session::RouteSession::from_body(
+        &payload,
+        principal.as_ref(),
+    );
     // ② messages 必须是数组
     if !payload
         .get("messages")
@@ -201,6 +207,7 @@ pub async fn chat_completions(
             allowed_providers: scope,
             // 转发主链路不钉账号：谁承载由全局优先级队列决定
             pinned_account: None,
+            route_session,
         })
         .await;
     let stats = state.request_stats();

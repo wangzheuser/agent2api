@@ -20,7 +20,8 @@ async fn native_reward_providers_http_200_errors_reach_the_rotation_classifier()
             &RequestTelemetry::new(),
             false,
             false,
-        )
+            false,
+    )
         .await
         {
             Ok(_) => panic!("首包业务错误不应进入成功下行"),
@@ -75,7 +76,7 @@ async fn success_head_wait_is_cancelled_without_waiting_for_another_chunk() {
                 &telemetry,
                 false,
                 false
-            ),
+            , false),
             cancel
         );
         let failure = match result {
@@ -150,7 +151,8 @@ async fn zcode_http_200_quota_json_is_classified_before_streaming_without_resend
             &RequestTelemetry::new(),
             false,
             false,
-        )
+            false,
+    )
         .await;
         task.abort();
         let failure = match result {
@@ -207,7 +209,8 @@ async fn zcode_http_auth_and_quota_errors_keep_their_status() {
             &RequestTelemetry::new(),
             false,
             false,
-        )
+            false,
+    )
         .await;
         task.abort();
         let failure = match result {
@@ -241,7 +244,8 @@ async fn zcode_unknown_or_malformed_success_json_returns_an_error() {
             &RequestTelemetry::new(),
             false,
             false,
-        )
+            false,
+    )
         .await;
         task.abort();
         let failure = match result {
@@ -278,7 +282,8 @@ async fn zcode_success_sse_and_other_providers_json_remain_unconsumed() {
             &RequestTelemetry::new(),
             false,
             false,
-        )
+            false,
+    )
         .await;
         task.abort();
         let response = match result {
@@ -348,7 +353,8 @@ async fn one_time_proof_retries_return_for_rebuild_while_normal_requests_reuse_t
             &telemetry,
             false,
             single_use,
-        )
+            false,
+    )
         .await;
         assert_eq!(budget.remaining, 0);
         if single_use {
@@ -363,7 +369,7 @@ async fn one_time_proof_retries_return_for_rebuild_while_normal_requests_reuse_t
                 &telemetry,
                 false,
                 true
-            )
+            , false)
             .await
             .is_ok());
             assert_eq!(*seen.lock().unwrap(), vec!["first", "second"]);
@@ -439,7 +445,8 @@ async fn cache_creation_raw_capture_is_exact_for_prefetched_and_translated_strea
                 &telemetry,
                 false,
                 false,
-            )
+                false,
+    )
             .await
             .ok()
             .expect("本地 SSE 应通过首包检查");
@@ -523,6 +530,7 @@ async fn http_405_switches_accounts_without_same_account_retry() {
         &telemetry,
         false,
         false,
+        false,
     )
     .await
     {
@@ -576,6 +584,7 @@ async fn zcode_http_200_quota_envelope_returns_a_rotatable_failure() {
         &mut budget,
         None,
         &telemetry,
+        false,
         false,
         false,
     )

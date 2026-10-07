@@ -223,6 +223,8 @@ impl ProviderAdapter for CodeArtsAdapter {
             for (name, value) in headers {
                 request = request.header(name.as_str(), value.as_str());
             }
+            telemetry.validate_affinity_session(&credential.to_record_value());
+            telemetry.record_affinity_send();
             let response = match request.body(payload).send().await {
                 Ok(response) => response,
                 Err(error) => {
@@ -255,12 +257,20 @@ impl ProviderAdapter for CodeArtsAdapter {
                     return Err(error);
                 }
             };
+            // 已预读与剩余部分都是真实 Chat 字节；观察器位于原样透传之前。
+            let original = futures::StreamExt::chain(
+                futures::stream::iter([Ok(bytes::Bytes::from(prefetched))]), rest,
+            );
+            let observed = crate::server::core::upstream::completion_evidence::observe_stream(
+                Box::pin(original), telemetry.clone(),
+                crate::server::core::upstream::completion_evidence::EvidenceProtocol::CodeArts,
+            );
 
             if !stream {
                 // 非流式：把剩下的读完再折叠（上游只有流式，与参考实现同一做法）
                 use futures::StreamExt;
-                let mut all = prefetched;
-                let mut rest = rest;
+                let mut all = Vec::new();
+                let mut rest = observed;
                 let read_error = loop {
                     match rest.next().await {
                         None => break None,
@@ -290,14 +300,7 @@ impl ProviderAdapter for CodeArtsAdapter {
             crate::spawn_task(async move {
                 use futures::StreamExt;
                 let mut sniffer = chat::UsageSniffer::default();
-                if !prefetched.is_empty() {
-                    sniffer.feed(&prefetched, &sniff_telemetry);
-                    if sender.send(Ok(bytes::Bytes::from(prefetched))).await.is_err() {
-                        session.stop().await;
-                        return;
-                    }
-                }
-                let mut rest = rest;
+                let mut rest = observed;
                 while let Some(item) = rest.next().await {
                     // 只读地看一眼这一片里有没有 usage 帧，字节原样转发
                     if let Ok(bytes) = item.as_ref() {

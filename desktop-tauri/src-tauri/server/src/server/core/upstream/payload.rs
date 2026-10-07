@@ -108,6 +108,9 @@ pub(super) struct ProviderContext<'a> {
     /// 读同一份，语义不会中途漂移。收窄的语义见
     /// [`super::ForwardRequest::pinned_account`] 与 `rotate::accounts_in_providers`。
     pub pinned_account: Option<&'a str>,
+    pub route_session: Option<&'a super::route_session::RouteSession>,
+    pub affinity_enabled: bool,
+    pub affinity_epoch: u64,
 }
 
 /// 某一家 provider 实际要发送的请求体（**每次转发前**决定，不做跨家复用），
@@ -250,7 +253,10 @@ pub(super) fn send_body<'a>(
         .to_string();
     if requested.is_empty() {
         // 没有 model 字段：不改写，也没有可用的冷却键（空串，与改造前一致）
-        return SendBody { body, wire_model: requested };
+        return SendBody {
+            body,
+            wire_model: requested,
+        };
     }
     // 一次解析出两个属性：该家要收的名字 + 跟着那条映射走的思考等级
     // （同源，见模块头「思考等级绑定为什么也在这一步」）
@@ -276,7 +282,10 @@ pub(super) fn send_body<'a>(
     // 注入路径已经问过一次适配器，这里再查一次注册表是两次哈希查找，可忽略。
     let upstream_reasoning = injected.or_else(|| outbound_reasoning_of(provider_id, &body));
     ctx.telemetry.note_upstream_reasoning(upstream_reasoning);
-    SendBody { body, wire_model: wire.model }
+    SendBody {
+        body,
+        wire_model: wire.model,
+    }
 }
 
 /// 承载家的 [`ProviderAdapter::outbound_reasoning`]（读发送体里随行的等级）。
@@ -286,6 +295,139 @@ pub(super) fn send_body<'a>(
 fn outbound_reasoning_of(provider_id: &str, body: &Value) -> Option<String> {
     let kind = crate::server::core::providers::kind_from_id(provider_id)?;
     crate::server::core::providers::adapter::adapter_for(kind).outbound_reasoning(body)
+}
+
+/// 仅复制路由相关小字段，复用发送侧的档位解析；不复制长历史、不写旁路记账。
+pub(super) fn affinity_route_body(account: &Value, body: &Value) -> Value {
+    use crate::server::core::providers::adapter::{adapter_for, ReasoningPatch};
+    use crate::server::core::providers::{catalog, kind_from_id};
+    let provider = super::rotate::provider_of(account);
+    let requested = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let custom = crate::server::core::custom_providers::get(provider);
+    let (wire_model, wire_reasoning) = if custom.is_some() {
+        crate::server::core::custom_providers::wire_model_for(provider, requested)
+    } else {
+        let target = catalog::wire_target_for_provider(requested, provider, Some(account));
+        (target.model, target.reasoning)
+    };
+    let mut reasoning_body = serde_json::json!({"model":wire_model});
+    for field in [
+        "reasoning_effort",
+        "reasoningEffort",
+        "effort",
+        "reasoning",
+        "thinking",
+    ] {
+        if let Some(value) = body.get(field) {
+            reasoning_body[field] = value.clone();
+        }
+    }
+    if custom.is_some()
+        && reasoning_body.get("reasoning_effort").is_none()
+        && reasoning_body.get("reasoning").is_none()
+    {
+        if let Some(level) = wire_reasoning.as_deref().map(str::trim).filter(|level| {
+            !level.is_empty() && !crate::server::core::model_rules::reasoning_is_off(level)
+        }) {
+            reasoning_body["reasoning_effort"] = Value::String(level.to_string());
+        }
+    }
+    if let (Some(kind), Some(level)) = (
+        kind_from_id(provider),
+        wire_reasoning
+            .as_deref()
+            .filter(|level| !crate::server::core::model_rules::reasoning_is_off(level)),
+    ) {
+        if let ReasoningPatch::Set { field, value } =
+            adapter_for(kind).reasoning_patch(level, &wire_model, &reasoning_body)
+        {
+            reasoning_body[field] = value;
+        }
+    }
+    reasoning_body
+}
+
+pub(super) fn affinity_identity(account: &Value, session: &Value, body: &Value) -> Value {
+    use sha2::{Digest, Sha256};
+    let provider = super::rotate::provider_of(account);
+    let custom = crate::server::core::custom_providers::get(provider);
+    let reasoning_body = affinity_route_body(account, body);
+    let public_identity: Vec<Value> = [
+        "provider",
+        "uid",
+        "userId",
+        "region",
+        "edition",
+        "mode",
+        "variant",
+        "zcodePlan",
+        "baseUrl",
+    ]
+    .iter()
+    .map(|field| account.get(*field).cloned().unwrap_or(Value::Null))
+    .collect();
+    let identity = serde_json::json!([
+        public_identity,
+        session.pointer("/account/uid"),
+        session.get("userId"),
+        session.get("edition"),
+        session.get("mode"),
+        session.get("endpoint"),
+        session.get("zcodePlan"),
+        reasoning_body,
+        custom.as_ref().and_then(|item| item.get("baseUrl")),
+        custom.as_ref().and_then(|item| item.get("protocol")),
+    ]);
+    Value::String(format!(
+        "{:x}",
+        Sha256::digest(identity.to_string().as_bytes())
+    ))
+}
+
+/// 自定义静态凭据也是上游身份；原生可刷新 token 不参加该摘要。
+pub(super) fn affinity_custom_snapshot(
+    store: &crate::server::core::account_store::AccountStore,
+    account: &Value,
+) -> Option<Value> {
+    use sha2::{Digest, Sha256};
+    let definition =
+        crate::server::core::custom_providers::get(super::rotate::provider_of(account))?;
+    let credential =
+        store.custom_credential_by_id(crate::server::core::routing::account_id(account)?)?;
+    let base = credential
+        .base_url_override
+        .as_deref()
+        .or_else(|| definition.get("baseUrl").and_then(Value::as_str))
+        .unwrap_or_default();
+    let identity =
+        serde_json::json!({"apiKey":credential.api_key,"baseUrl":base,"noAuth":credential.no_auth});
+    Some(
+        serde_json::json!({"credential":format!("{:x}",Sha256::digest(identity.to_string().as_bytes())),"baseUrl":base,"protocol":definition.get("protocol")}),
+    )
+}
+
+pub(super) fn affinity_target_identity(
+    store: &crate::server::core::account_store::AccountStore,
+    account: &Value,
+    session: &Value,
+    body: &Value,
+) -> Value {
+    use sha2::{Digest, Sha256};
+    let identity = affinity_identity(account, session, body);
+    match affinity_custom_snapshot(store, account) {
+        Some(snapshot) => Value::String(format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::json!([identity, snapshot])
+                    .to_string()
+                    .as_bytes()
+            )
+        )),
+        None => identity,
+    }
 }
 
 /// 请求体里的消息条数（提示词层的详细日志用；没有 messages 数组时给 0）。
@@ -426,5 +568,47 @@ fn apply_reasoning(
             );
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod affinity_identity_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn affinity_identity_tracks_semantics_not_rotating_tokens() {
+        let account =
+            json!({"provider":"workbuddy", "uid":"fixture", "userId":"user-a", "mode":"standard"});
+        let session = json!({"account":{"uid":"fixture"}, "accessToken":"one"});
+        let body = json!({"model":"fixture-model", "reasoning_effort":"low"});
+        let original = affinity_identity(&account, &session, &body);
+        assert_eq!(original.as_str().unwrap().len(), 64);
+        let mut refreshed = session.clone();
+        refreshed["accessToken"] = json!("two");
+        assert_eq!(original, affinity_identity(&account, &refreshed, &body));
+        for (field, value) in [
+            ("userId", "user-b"),
+            ("mode", "other"),
+            ("zcodePlan", "pro"),
+        ] {
+            let mut changed = account.clone();
+            changed[field] = json!(value);
+            assert_ne!(original, affinity_identity(&changed, &session, &body));
+        }
+        let mut changed = body.clone();
+        changed["reasoning_effort"] = json!("high");
+        assert_ne!(original, affinity_identity(&account, &session, &changed));
+        changed["thinking"] = json!({"budget_tokens":1024,"payload":"x".repeat(32_768)});
+        assert_eq!(
+            affinity_identity(&account, &session, &changed)
+                .as_str()
+                .unwrap()
+                .len(),
+            64
+        );
+        let prior = affinity_identity(&account, &session, &changed);
+        changed["thinking"]["budget_tokens"] = json!(2048);
+        assert_ne!(prior, affinity_identity(&account, &session, &changed));
     }
 }

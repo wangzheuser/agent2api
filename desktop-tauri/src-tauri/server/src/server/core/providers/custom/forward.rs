@@ -165,6 +165,11 @@ pub(crate) async fn forward(
             "该自定义提供商没有可用的 baseUrl（提供商与账号上都没有配置）",
         ));
     }
+    telemetry.validate_affinity_session(&serde_json::json!({
+        "apiKey": credential.api_key,
+        "baseUrl": base_url,
+        "noAuth": credential.no_auth,
+    }));
     // 翻译协议在这里分出去（凭证与基址已就绪；chat 路径继续往下走）
     let quirks = ProviderQuirks::from_provider(&provider);
     if let Some(kind) = kind {
@@ -225,6 +230,7 @@ pub(crate) async fn forward(
         .trim()
         .to_string();
     let (mut outbound, rewrite) = rewrite_body(body, provider_id, &requested);
+    telemetry.validate_affinity_custom_target(protocol, &base_url, &outbound);
     // 客户端形态伪装（OpenCode 免费档）：补桩工具。未开启时不碰请求体。
     // 放在 `rewrite_body` 之后、序列化之前 —— 会话种子取自**改写后**的体，
     // 与最终发出去的字节同源（模型名换了不影响 messages，两种取法等价，
@@ -264,6 +270,7 @@ pub(crate) async fn forward(
         payload,
         proxy,
     };
+    telemetry.record_affinity_send();
     let response = send_chat_request(&transport)
         .await
         .map_err(|error| error.to_gateway_error())?;
@@ -466,6 +473,8 @@ async fn forward_translated(
         .trim()
         .to_string();
     let (mut outbound_chat, rewrite) = rewrite_body(body, provider_id, &requested);
+    let protocol = match kind { OutboundKind::Responses => custom_providers::PROTOCOL_RESPONSES, OutboundKind::Anthropic => custom_providers::PROTOCOL_ANTHROPIC };
+    telemetry.validate_affinity_custom_target(protocol, base_url, &outbound_chat);
     // 客户端形态伪装：与 chat 分支同一时机（改写后、翻译前）—— 桩工具要由
     // 转换器一起翻成上游协议的形态（anthropic 的 tools 数组）
     quirks.apply_emulation_to_body(&mut outbound_chat);
@@ -573,6 +582,7 @@ async fn forward_translated(
         payload,
         proxy,
     };
+    telemetry.record_affinity_send();
     let response = send_chat_request(&transport)
         .await
         .map_err(|error| error.to_gateway_error())?;
@@ -689,8 +699,15 @@ impl ProtocolTranslateStream {
                 std::io::Error::other(crate::server::core::egress::describe_error_detail(&error))
             })
         });
+        let original = crate::server::core::upstream::completion_evidence::observe_stream(
+            Box::pin(described), telemetry.clone(),
+            match kind {
+                OutboundKind::Responses => crate::server::core::upstream::completion_evidence::EvidenceProtocol::Responses,
+                OutboundKind::Anthropic => crate::server::core::upstream::completion_evidence::EvidenceProtocol::Anthropic,
+            },
+        );
         let guarded = crate::server::core::upstream::stall::idle_guard(
-            Box::pin(described),
+            original,
             std::time::Duration::from_millis(
                 crate::server::config::timeout_settings().stream_idle_ms(),
             ),

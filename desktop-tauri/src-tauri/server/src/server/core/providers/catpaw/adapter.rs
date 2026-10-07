@@ -419,6 +419,7 @@ impl ProviderAdapter for CatPawAdapter {
     > {
         Box::pin(async move {
             let credentials = resolve_credentials(store, account_id)?;
+            telemetry.validate_affinity_session(&serde_json::json!({"uid": credentials.uid}));
             // ── 账号身份对账（转发选路时，见 registry 的 `AccountIdentity`）──
             // 必须在这里做，而不是只在导入/添加账号时：桌面端实时登录态
             // （`~/.meituan-catpaw/auth.json`）由 CatPaw 客户端自己维护，用户可以在

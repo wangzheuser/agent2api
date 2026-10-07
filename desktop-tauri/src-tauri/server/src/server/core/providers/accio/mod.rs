@@ -369,6 +369,8 @@ impl ProviderAdapter for AccioAdapter {
                 capture.reset_request(&plan.url, "accio", &headers, body);
             }
 
+            telemetry.validate_affinity_session(&context.credentials.to_value());
+            telemetry.record_affinity_send();
             let response = chat::send(&plan, effective_proxy.as_ref()).await?;
             if let Some(capture) = capture.as_deref() {
                 capture.attach_response(response.status().as_u16(), response.headers());
@@ -398,7 +400,7 @@ impl ProviderAdapter for AccioAdapter {
             };
             if stream {
                 // 首帧预读：额度/鉴权错误在 200 + 帧里，拦在返回之前换号无损
-                let (prefetched, source) = chat::prefetch_stream_head(response, &limit).await?;
+                let (prefetched, source) = chat::prefetch_stream_head(response, &limit, telemetry).await?;
                 let (sender, receiver) =
                     tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
                 let telemetry = telemetry.clone();
@@ -463,4 +465,3 @@ pub fn adapter_label() -> &'static str {
 pub fn adapter_for_self(region: Region) -> &'static dyn ProviderAdapter {
     adapter_for(region.kind())
 }
-

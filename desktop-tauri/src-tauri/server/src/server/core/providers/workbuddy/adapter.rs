@@ -189,6 +189,45 @@ impl ProviderAdapter for WorkBuddyAdapter {
         Ok(ChatRequestPlan::chat(url, headers, with_system))
     }
 
+    fn apply_route_session(
+        &self,
+        plan: &mut ChatRequestPlan,
+        account: &Value,
+        original_body: &Value,
+        context: &crate::server::core::upstream::route_session::RouteSession,
+    ) {
+        let Some(session_id) =
+            normalize::route_session_id(account, context, self.region.provider_id())
+        else {
+            return;
+        };
+        for (name, value) in &mut plan.headers {
+            if name.eq_ignore_ascii_case("X-Conversation-ID")
+                || name.eq_ignore_ascii_case("X-Session-ID")
+            {
+                *value = session_id.clone();
+            }
+        }
+        normalize::apply_route_cache_key(
+            &mut plan.body,
+            account,
+            original_body,
+            context,
+            self.region.provider_id(),
+        );
+    }
+
+    fn refresh_route_request_id(&self, headers: &mut Vec<(String, String)>) {
+        let request_id = crate::server::core::upstream::request::new_request_id();
+        for (name, value) in headers {
+            if name.eq_ignore_ascii_case("X-Request-ID")
+                || name.eq_ignore_ascii_case("X-Conversation-Request-ID")
+            {
+                *value = request_id.clone();
+            }
+        }
+    }
+
     /// 上游错误分类（照抄改造前 `upstream` 的判定与文案）：
     ///   - 401 → TokenExpired（刷新后同账号重试一次）
     ///   - 429 或 code 6004 → QuotaLimited（冷却 + 换账号）
@@ -777,6 +816,121 @@ fn value_text(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn header<'a>(plan: &'a ChatRequestPlan, name: &str) -> &'a str {
+        plan.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .unwrap()
+            .1
+            .as_str()
+    }
+
+    #[test]
+    fn route_session_stabilizes_only_conversation_headers_and_isolates_targets() {
+        use crate::server::core::key_scope::RoutingPrincipal;
+        use crate::server::core::upstream::route_session::RouteSession;
+        let principal = RoutingPrincipal::from_environment_key("fixture-client");
+        let body = json!({"model":"glm", "conversation_id":"fixture-session", "messages":[{"role":"user", "content":"hi"}]});
+        let context = RouteSession::from_body(&body, Some(&principal)).unwrap();
+        let account = json!({"account":{"uid":"fixture-account-a"}});
+        let mut first = WORKBUDDY_ADAPTER
+            .build_chat_request(&account, &body, &HeaderMap::new())
+            .unwrap();
+        let mut second = WORKBUDDY_ADAPTER
+            .build_chat_request(&account, &body, &HeaderMap::new())
+            .unwrap();
+        // 旧策略/缺少上下文不调用钩子，保留逐请求会话头与原自动缓存键。
+        assert_ne!(
+            header(&first, "X-Session-ID"),
+            header(&second, "X-Session-ID")
+        );
+        assert_eq!(
+            header(&first, "X-Session-ID"),
+            header(&first, "X-Request-ID")
+        );
+        let original_request = header(&first, "X-Request-ID").to_string();
+        let old_cache = first.body["prompt_cache_key"].clone();
+        WORKBUDDY_ADAPTER.apply_route_session(&mut first, &account, &body, &context);
+        WORKBUDDY_ADAPTER.apply_route_session(&mut second, &account, &body, &context);
+        assert_eq!(
+            header(&first, "X-Session-ID"),
+            header(&second, "X-Session-ID")
+        );
+        assert_eq!(
+            header(&first, "X-Session-ID"),
+            header(&first, "X-Conversation-ID")
+        );
+        assert_eq!(header(&first, "X-Request-ID"), original_request);
+        assert_eq!(
+            header(&first, "X-Conversation-Request-ID"),
+            original_request
+        );
+        assert_ne!(
+            header(&first, "X-Request-ID"),
+            header(&second, "X-Request-ID")
+        );
+        assert_eq!(
+            first.body["prompt_cache_key"],
+            second.body["prompt_cache_key"]
+        );
+        assert_ne!(first.body["prompt_cache_key"], old_cache);
+        for (adapter, other_account) in [
+            (&WORKBUDDY_INTL_ADAPTER, account.clone()),
+            (
+                &WORKBUDDY_ADAPTER,
+                json!({"account":{"uid":"fixture-account-b"}}),
+            ),
+        ] {
+            let mut other = adapter
+                .build_chat_request(&other_account, &body, &HeaderMap::new())
+                .unwrap();
+            adapter.apply_route_session(&mut other, &other_account, &body, &context);
+            assert_ne!(
+                header(&first, "X-Session-ID"),
+                header(&other, "X-Session-ID")
+            );
+            assert_ne!(
+                first.body["prompt_cache_key"],
+                other.body["prompt_cache_key"]
+            );
+        }
+        let mut explicit = body.clone();
+        explicit["prompt_cache_key"] = json!(" client-explicit ");
+        let mut plan = WORKBUDDY_ADAPTER
+            .build_chat_request(&account, &explicit, &HeaderMap::new())
+            .unwrap();
+        WORKBUDDY_ADAPTER.apply_route_session(&mut plan, &account, &explicit, &context);
+        assert_eq!(plan.body["prompt_cache_key"], " client-explicit ");
+        let unknown = json!({});
+        let mut plan = WORKBUDDY_ADAPTER
+            .build_chat_request(&unknown, &body, &HeaderMap::new())
+            .unwrap();
+        let old = header(&plan, "X-Session-ID").to_string();
+        WORKBUDDY_ADAPTER.apply_route_session(&mut plan, &unknown, &body, &context);
+        assert_eq!(header(&plan, "X-Session-ID"), old);
+    }
+
+    #[test]
+    fn route_request_retry_ids_are_unique_and_keep_stable_session_headers() {
+        for adapter in [&WORKBUDDY_ADAPTER, &WORKBUDDY_INTL_ADAPTER] {
+            let mut plan = ChatRequestPlan::chat(String::new(), vec![
+                ("X-Request-ID".into(), "original-request".into()),
+                ("X-Conversation-Request-ID".into(), "original-request".into()),
+                ("X-Conversation-ID".into(), "stable-conversation".into()),
+                ("X-Session-ID".into(), "stable-session".into()),
+            ], json!({}));
+            adapter.refresh_route_request_id(&mut plan.headers);
+            let first = header(&plan, "X-Request-ID").to_string();
+            assert_ne!(first, "original-request");
+            assert_eq!(header(&plan, "X-Conversation-Request-ID"), first);
+            adapter.refresh_route_request_id(&mut plan.headers);
+            assert_ne!(header(&plan, "X-Request-ID"), first);
+            assert_eq!(header(&plan, "X-Conversation-Request-ID"), header(&plan, "X-Request-ID"));
+            assert_eq!(header(&plan, "X-Conversation-ID"), "stable-conversation");
+            assert_eq!(header(&plan, "X-Session-ID"), "stable-session");
+        }
+    }
 
     #[test]
     fn daily_activity_request_matches_reference_minimal_body() {

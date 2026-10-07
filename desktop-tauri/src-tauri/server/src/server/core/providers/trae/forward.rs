@@ -200,9 +200,14 @@ fn frame_error(code: i64, message: &str, limit: &Limit) -> GatewayError {
 pub(crate) async fn prefetch_head(
     response: reqwest::Response,
     limit: &Limit,
+    telemetry: &Arc<RequestTelemetry>,
 ) -> Result<(Vec<Frame>, futures::stream::BoxStream<'static, Result<bytes::Bytes, io::Error>>, SoloStream), GatewayError> {
     let source = response.bytes_stream().map(|item| item.map_err(|error| io::Error::other(egress::describe_error_detail(&error))));
-    let mut source = stall::idle_guard(Box::pin(source), stream_idle());
+    let source = crate::server::core::upstream::completion_evidence::observe_stream(
+        Box::pin(source), telemetry.clone(),
+        crate::server::core::upstream::completion_evidence::EvidenceProtocol::Trae,
+    );
+    let mut source = stall::idle_guard(source, stream_idle());
     let mut scanner = ByteLines::default();
     // `id` / `created` 从这里开始就得有值：预读到的帧要原样补发给客户端。
     let mut stream = SoloStream::new(request_id(), logging::now_ms() / 1000);
@@ -342,12 +347,30 @@ pub(crate) async fn forward_at(
     if let Some(capture) = capture.as_deref() {
         capture.reset_request(&plan.url, PROVIDER_ID, &plan.headers, body);
     }
+    telemetry.validate_affinity_session(&serde_json::json!({
+        "uid": credential.uid,
+        "variant": credential.variant(),
+        "domain": credential.domain,
+        "apiHost": credential.api_host,
+        "machineId": credential.machine_id,
+        "deviceId": credential.device_id,
+    }));
+    telemetry.record_affinity_send();
     let mut response = send(&plan, effective.as_ref()).await?;
     // 401 只救一次：强制换发后重发（这条路径不换号，见模块头）。
     if response.status().as_u16() == 401 {
         let _ = response.text().await;
         credential = super::adapter::renew_forced(store, &record, &credential, effective.as_ref()).await?;
         plan = build_plan(&credential, body, base)?;
+        telemetry.validate_affinity_session(&serde_json::json!({
+            "uid": credential.uid,
+            "variant": credential.variant(),
+            "domain": credential.domain,
+            "apiHost": credential.api_host,
+            "machineId": credential.machine_id,
+            "deviceId": credential.device_id,
+        }));
+        telemetry.record_affinity_send();
         response = send(&plan, effective.as_ref()).await?;
     }
     let status = response.status().as_u16();
@@ -363,7 +386,7 @@ pub(crate) async fn forward_at(
         return drive_aggregate(response, plan.requested_model.clone(), telemetry, &limit).await;
     }
 
-    let (prefetched, source, mut solo) = prefetch_head(response, &limit).await?;
+    let (prefetched, source, mut solo) = prefetch_head(response, &limit, telemetry).await?;
     let (sender, receiver) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, io::Error>>(64);
     let telemetry = telemetry.clone();
     let requested = plan.requested_model.clone();
@@ -454,11 +477,15 @@ fn note(frame: &Frame, telemetry: &RequestTelemetry, usage_seen: &mut Option<Val
 async fn drive_aggregate(
     response: reqwest::Response,
     requested: String,
-    telemetry: &RequestTelemetry,
+    telemetry: &Arc<RequestTelemetry>,
     limit: &Limit,
 ) -> Result<ForwardOutcome, GatewayError> {
     let source = response.bytes_stream().map(|item| item.map_err(|error| io::Error::other(egress::describe_error_detail(&error))));
-    let mut source = stall::idle_guard(Box::pin(source), stream_idle());
+    let source = crate::server::core::upstream::completion_evidence::observe_stream(
+        Box::pin(source), telemetry.clone(),
+        crate::server::core::upstream::completion_evidence::EvidenceProtocol::Trae,
+    );
+    let mut source = stall::idle_guard(source, stream_idle());
     let mut scanner = ByteLines::default();
     let mut text = String::new();
     while let Some(item) = source.next().await {

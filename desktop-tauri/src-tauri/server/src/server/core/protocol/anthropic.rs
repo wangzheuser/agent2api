@@ -96,7 +96,7 @@ pub fn chat_from_anthropic(body: &Value) -> Result<Value, ConvertError> {
         .unwrap_or(DEFAULT_MAX_TOKENS);
     out.insert("max_tokens".to_string(), Value::from(max_tokens));
 
-    for key in ["temperature", "top_p", "metadata"] {
+    for key in ["temperature", "top_p", "metadata", "prompt_cache_key"] {
         if let Some(value) = body.get(key).filter(|value| !value.is_null()) {
             out.insert(key.to_string(), value.clone());
         }
@@ -1332,6 +1332,13 @@ pub fn responses_error_code(status: u16) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_cache_key_survives_request_conversion() {
+        let body = json!({"model":"fixture", "input":"hello", "messages":[{"role":"user", "content":"hello"}], "max_tokens":16, "prompt_cache_key":"client-explicit"});
+        let chat = chat_from_anthropic(&body).unwrap();
+        assert_eq!(chat["prompt_cache_key"], "client-explicit");
+    }
 
     #[test]
     fn cache_creation_stream_usage_is_independent_of_network_splits() {

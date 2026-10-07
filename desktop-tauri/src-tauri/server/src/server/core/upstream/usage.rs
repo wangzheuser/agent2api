@@ -48,8 +48,13 @@ pub struct UsageTokens {
 pub fn upstream_credits(usage: &Value) -> Option<f64> {
     usage.get("credit").and_then(Value::as_f64)
         .filter(|value| value.is_finite() && *value >= 0.0)
-        .or_else(|| usage.get("usage").and_then(|nested| nested.get("credit"))
-            .and_then(Value::as_f64).filter(|value| value.is_finite() && *value >= 0.0))
+        .or_else(|| {
+            usage
+                .get("usage")
+                .and_then(|nested| nested.get("credit"))
+                .and_then(Value::as_f64)
+                .filter(|value| value.is_finite() && *value >= 0.0)
+        })
 }
 
 /// 从 usage 对象里提取 token 数（字段名兼容见模块头部）。
@@ -186,7 +191,10 @@ pub fn merge_usage(existing: Option<&Value>, authoritative: &Value) -> Value {
     }
     if let Some(creation) = cache_creation_tokens(authoritative) {
         // 不同帧可能使用不同别名；同步已有别名，防止旧的正数盖过新报告的 0。
-        merged_object.insert("cache_creation_input_tokens".to_string(), Value::from(creation));
+        merged_object.insert(
+            "cache_creation_input_tokens".to_string(),
+            Value::from(creation),
+        );
         if let Some(value) = merged_object.get_mut("cache_creation_tokens") {
             *value = Value::from(creation);
         }
@@ -219,15 +227,28 @@ mod tests {
         telemetry.note_attempt(Some("a"),"A","workbuddy");
         let mut stream = super::super::sse::ReasoningCoalescer::with_telemetry(telemetry.clone());
         let frames = stream.push(frame.as_bytes());
-        let first: Value = serde_json::from_str(std::str::from_utf8(&frames[0]).unwrap().trim().strip_prefix("data: ").unwrap()).unwrap();
-        assert_eq!(first["usage"],chunk["usage"]);
-        assert_eq!(telemetry.snapshot().upstream_credits,Some(0.125));
-        let aggregate_telemetry=Arc::new(RequestTelemetry::new());
-        aggregate_telemetry.note_attempt(Some("a"),"A","workbuddy");
-        let input=futures::stream::iter(vec![Ok(bytes::Bytes::from(frame))]);
-        let aggregate=super::super::aggregate::aggregate_frame_stream(Box::pin(input),aggregate_telemetry.clone(),None).await.unwrap();
-        assert_eq!(aggregate.body["usage"]["credit"],json!(0.125));
-        assert_eq!(aggregate_telemetry.snapshot().upstream_credits,Some(0.125));
+        let first: Value = serde_json::from_str(
+            std::str::from_utf8(&frames[0])
+                .unwrap()
+                .trim()
+                .strip_prefix("data: ")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first["usage"], chunk["usage"]);
+        assert_eq!(telemetry.snapshot().upstream_credits, Some(0.125));
+        let aggregate_telemetry = Arc::new(RequestTelemetry::new());
+        aggregate_telemetry.note_attempt(Some("a"), "A", "workbuddy");
+        let input = futures::stream::iter(vec![Ok(bytes::Bytes::from(frame))]);
+        let aggregate = super::super::aggregate::aggregate_frame_stream(
+            Box::pin(input),
+            aggregate_telemetry.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(aggregate.body["usage"]["credit"], json!(0.125));
+        assert_eq!(aggregate_telemetry.snapshot().upstream_credits, Some(0.125));
     }
 
     #[test]
@@ -1009,6 +1030,101 @@ pub struct RequestTelemetry {
     /// 轮询）手上只有 telemetry，令牌放这里它们才够得着；接线在入口 handler
     /// （`api::chat` / `api::protocol` 在 `record_started` 之后装入）。
     cancel: Mutex<Option<Arc<super::cancellation::CancelToken>>>,
+    affinity: Mutex<AffinityObservation>,
+}
+
+#[derive(Default)]
+struct AffinityObservation {
+    lease: Option<super::affinity::AffinityLease>,
+    sends: Option<(super::affinity::Affinity, String, u64)>,
+    terminal: bool,
+    payload: bool,
+    usage_complete: bool,
+    failed: bool,
+    identity_guard: Option<AffinityIdentityGuard>,
+}
+
+fn affinity_snapshot_hash(value: &Value) -> Value {
+    use sha2::{Digest, Sha256};
+    Value::String(format!(
+        "{:x}",
+        Sha256::digest(value.to_string().as_bytes())
+    ))
+}
+fn normalized_identity_field(value: &Value) -> Value {
+    match value.as_str() {
+        Some(text) if text.trim().is_empty() => Value::Null,
+        Some(text) => Value::String(text.trim().into()),
+        None => value.clone(),
+    }
+}
+fn affinity_session_matches(account: &Value, custom: Option<&Value>, snapshot: &Value) -> bool {
+    if let Some(custom) = custom {
+        return custom["credential"] == affinity_snapshot_hash(snapshot);
+    }
+    ["uid", "userId", "mode", "variant", "zcodePlan"]
+        .iter()
+        .all(|field| {
+            let expected = account
+                .get(*field)
+                .or_else(|| (*field == "mode").then(|| account.get("edition")).flatten());
+            match (snapshot.get(*field), expected) {
+                (Some(actual), Some(expected)) => {
+                    normalized_identity_field(actual) == normalized_identity_field(expected)
+                }
+                _ => true,
+            }
+        })
+}
+
+fn affinity_body_fields(body: &Value) -> Value {
+    let mut result = serde_json::json!({});
+    for field in [
+        "model",
+        "reasoning_effort",
+        "reasoningEffort",
+        "effort",
+        "reasoning",
+        "thinking",
+    ] {
+        if let Some(value) = body.get(field) {
+            result[field] = value.clone();
+        }
+    }
+    result
+}
+
+#[derive(Clone)]
+struct AffinityIdentityGuard {
+    store: crate::server::core::account_store::AccountStore,
+    account: String,
+    account_snapshot: Value,
+    outbound: Value,
+    custom_snapshot: Option<Value>,
+    body: Value,
+    expected: Value,
+}
+
+impl AffinityIdentityGuard {
+    fn valid(&self) -> bool {
+        let Some(entry) = self.store.get_session_by_id(&self.account) else {
+            return false;
+        };
+        let accounts = self.store.list_accounts();
+        let account = crate::server::core::routing::accounts_of(&accounts)
+            .into_iter()
+            .find(|account| {
+                crate::server::core::routing::account_id(account) == Some(self.account.as_str())
+            });
+        account.is_some_and(|account| {
+            super::payload::affinity_target_identity(
+                &self.store,
+                &account,
+                &entry.session,
+                &self.body,
+            ) == self.expected
+        })
+    }
 }
 
 impl Default for RequestTelemetry {
@@ -1024,6 +1140,199 @@ impl RequestTelemetry {
             capture: Mutex::new(None),
             live: Mutex::new(LiveWrite::default()),
             cancel: Mutex::new(None),
+            affinity: Mutex::new(AffinityObservation::default()),
+        }
+    }
+
+    pub(crate) fn begin_affinity_attempt(
+        &self,
+        affinity: super::affinity::Affinity,
+        account_id: &str,
+        lease: Option<super::affinity::AffinityLease>,
+        epoch: u64,
+    ) {
+        let mut state = self.affinity.lock().unwrap_or_else(|p| p.into_inner());
+        *state = AffinityObservation {
+            lease,
+            sends: Some((affinity, account_id.to_string(), epoch)),
+            ..Default::default()
+        };
+    }
+
+    pub(crate) fn record_affinity_send(&self) {
+        self.check_affinity_identity();
+        let counter = {
+            let mut state = self.affinity.lock().unwrap_or_else(|p| p.into_inner());
+            // 原地重发也有独立结果，上一轮的部分用量/终态不能为下一轮背书。
+            state.terminal = false;
+            state.payload = false;
+            state.usage_complete = false;
+            state.failed = false;
+            state.sends.clone()
+        };
+        if let Some((affinity, account, epoch)) = counter {
+            affinity.record_send_for_epoch(&account, epoch);
+        }
+    }
+
+    pub(crate) fn set_affinity_sender(
+        &self,
+        affinity: super::affinity::Affinity,
+        account_id: &str,
+        epoch: u64,
+    ) {
+        self.affinity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .sends = Some((affinity, account_id.to_string(), epoch));
+    }
+
+    pub(crate) fn guard_affinity_identity(
+        &self,
+        store: crate::server::core::account_store::AccountStore,
+        account: &Value,
+        body: &Value,
+        expected: &Value,
+    ) {
+        if !self.observes_affinity() {
+            return;
+        }
+        let mut route = serde_json::json!({});
+        for field in [
+            "model",
+            "reasoning_effort",
+            "reasoningEffort",
+            "effort",
+            "reasoning",
+            "thinking",
+        ] {
+            if let Some(value) = body.get(field) {
+                route[field] = value.clone();
+            }
+        }
+        let id = crate::server::core::routing::account_id(account).unwrap_or_default();
+        let custom_snapshot = super::payload::affinity_custom_snapshot(&store, account);
+        let outbound = super::payload::affinity_route_body(account, body);
+        let mut state = self.affinity.lock().unwrap_or_else(|p| p.into_inner());
+        if state.lease.is_none() {
+            return;
+        }
+        state.identity_guard = Some(AffinityIdentityGuard {
+            account: id.into(),
+            account_snapshot: account.clone(),
+            outbound,
+            custom_snapshot,
+            store,
+            body: route,
+            expected: expected.clone(),
+        });
+    }
+
+    /// 对比实际拿到的凭据快照，不用“当前 store 又变回原值”代替实际发送身份。
+    pub(crate) fn validate_affinity_session(&self, snapshot: &Value) {
+        let mut state = self.affinity.lock().unwrap_or_else(|p| p.into_inner());
+        let invalid = state.identity_guard.as_ref().is_some_and(|guard| {
+            !affinity_session_matches(
+                &guard.account_snapshot,
+                guard.custom_snapshot.as_ref(),
+                snapshot,
+            )
+        });
+        if invalid {
+            state.lease = None;
+        }
+    }
+
+    pub(crate) fn validate_affinity_body(&self, body: &Value) {
+        let mut state = self.affinity.lock().unwrap_or_else(|p| p.into_inner());
+        if state
+            .identity_guard
+            .as_ref()
+            .is_some_and(|guard| guard.outbound != affinity_body_fields(body))
+        {
+            state.lease = None;
+        }
+    }
+
+    pub(crate) fn validate_affinity_custom_target(&self, protocol: &str, base: &str, body: &Value) {
+        let mut state = self.affinity.lock().unwrap_or_else(|p| p.into_inner());
+        if state.identity_guard.as_ref().is_some_and(|guard| {
+            guard.custom_snapshot.as_ref().is_some_and(|custom| {
+                custom["protocol"].as_str() != Some(protocol)
+                    || custom["baseUrl"].as_str() != Some(base)
+                    || guard.outbound != affinity_body_fields(body)
+            })
+        }) {
+            state.lease = None;
+        }
+    }
+
+    fn check_affinity_identity(&self) {
+        let guard = self
+            .affinity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .identity_guard
+            .clone();
+        // 凭证/配置读取在亲和内存锁之外；每次真正发送和最终确认都复核。
+        if guard.is_some_and(|guard| !guard.valid()) {
+            self.affinity
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .lease = None;
+        }
+    }
+
+    pub(crate) fn observes_affinity(&self) -> bool {
+        self.affinity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .lease
+            .is_some()
+    }
+
+    pub(crate) fn validate_affinity_identity(&self, identity: &Value) {
+        let mut state = self.affinity.lock().unwrap_or_else(|p| p.into_inner());
+        if state
+            .lease
+            .as_ref()
+            .is_some_and(|lease| !lease.matches_identity(identity))
+        {
+            state.lease = None;
+        }
+    }
+
+    pub(crate) fn note_completion_evidence(
+        &self,
+        terminal: bool,
+        payload: bool,
+        usage_complete: bool,
+        failed: bool,
+    ) {
+        let mut state = self.affinity.lock().unwrap_or_else(|p| p.into_inner());
+        state.terminal |= terminal;
+        state.payload |= payload;
+        state.usage_complete |= usage_complete;
+        state.failed |= failed;
+    }
+
+    /// 最终记账点收尾一次；未成功、取消或缺少原始终态时仅释放预占。
+    pub(crate) fn settle_affinity(&self, success: bool) {
+        self.check_affinity_identity();
+        let (lease, confirmed) = {
+            let mut state = self.affinity.lock().unwrap_or_else(|p| p.into_inner());
+            let confirmed = success
+                && state.terminal
+                && state.payload
+                && state.usage_complete
+                && !state.failed
+                && !self.is_cancelled();
+            (state.lease.take(), confirmed)
+        };
+        if let Some(mut lease) = lease {
+            if confirmed {
+                lease.confirm();
+            }
         }
     }
 
@@ -1048,9 +1357,7 @@ impl RequestTelemetry {
     }
 
     /// 取采集器（未开启调试模式时为 None，调用点据此完全跳过采集）
-    pub fn capture(
-        &self,
-    ) -> Option<Arc<crate::server::core::debug_traffic::TrafficCapture>> {
+    pub fn capture(&self) -> Option<Arc<crate::server::core::debug_traffic::TrafficCapture>> {
         self.capture
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1601,8 +1908,12 @@ mod intl_credit_restore_tests {
     fn international_receipts_keep_identity_cost_tokens_and_reset_on_rotation() {
         let telemetry = RequestTelemetry::new();
         telemetry.note_attempt(Some("intl"), "fixture", "workbuddy-intl");
-        telemetry.note_workbuddy_account(Some(&json!({"uid":"fixture","provider":"workbuddy-intl","edition":"intl"})));
-        telemetry.report_usage(&json!({"credit":0.125,"prompt_tokens":100,"completion_tokens":7,"total_tokens":107}));
+        telemetry.note_workbuddy_account(Some(
+            &json!({"uid":"fixture","provider":"workbuddy-intl","edition":"intl"}),
+        ));
+        telemetry.report_usage(
+            &json!({"credit":0.125,"prompt_tokens":100,"completion_tokens":7,"total_tokens":107}),
+        );
         let snapshot = telemetry.snapshot();
         assert_eq!(snapshot.upstream_credits, Some(0.125));
         assert_eq!(snapshot.workbuddy_cost_tokens, Some(107));
@@ -1612,5 +1923,51 @@ mod intl_credit_restore_tests {
         assert_eq!(telemetry.snapshot().upstream_credits, None);
         telemetry.report_usage(&json!({"credit":1.0}));
         assert_eq!(telemetry.snapshot().upstream_credits, None);
+    }
+}
+
+#[cfg(test)]
+mod affinity_snapshot_tests {
+    use super::*;
+    #[test]
+    fn actual_snapshot_rejects_identity_aba_and_ignores_refresh_tokens() {
+        let selected = json!({"userId":"same-user","edition":"cn"});
+        assert!(affinity_session_matches(
+            &selected,
+            None,
+            &json!({"userId":"same-user","mode":"cn","accessToken":"refreshed"})
+        ));
+        assert!(!affinity_session_matches(
+            &selected,
+            None,
+            &json!({"userId":"same-user","mode":"intl"})
+        ));
+        assert!(!affinity_session_matches(
+            &selected,
+            None,
+            &json!({"userId":"other-user","mode":"cn"})
+        ));
+        let actual = json!({"apiKey":"fixture-a","baseUrl":"http://127.0.0.1","noAuth":false});
+        let custom = json!({"credential":affinity_snapshot_hash(&actual)});
+        assert!(affinity_session_matches(
+            &Value::Null,
+            Some(&custom),
+            &actual
+        ));
+        let changed = json!({"apiKey":"fixture-b","baseUrl":"http://127.0.0.1","noAuth":false});
+        assert!(!affinity_session_matches(
+            &Value::Null,
+            Some(&custom),
+            &changed
+        ));
+        assert_ne!(
+            affinity_snapshot_hash(&actual),
+            affinity_snapshot_hash(&changed)
+        );
+        assert_eq!(custom["credential"].as_str().unwrap().len(), 64);
+        assert_ne!(
+            affinity_body_fields(&json!({"model":"A","reasoning_effort":"low"})),
+            affinity_body_fields(&json!({"model":"B","reasoning_effort":"high"}))
+        );
     }
 }

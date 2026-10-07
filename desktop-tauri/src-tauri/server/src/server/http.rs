@@ -800,6 +800,15 @@ async fn require_api_key(mut request: Request, next: Next) -> Response {
         .find(|expected| request_matches_key(&request, expected))
         .cloned();
     if let Some(matched) = matched {
+        // 身份只从已成功匹配的认证分支派生，不使用权限或面板 cookie。
+        let principal =
+            match crate::server::core::api_keys::entry_for_key_from(&snapshot.raw(), &matched) {
+                Some(entry) => crate::server::core::key_scope::RoutingPrincipal::from_entry(&entry),
+                None => {
+                    crate::server::core::key_scope::RoutingPrincipal::from_environment_key(&matched)
+                }
+            };
+        request.extensions_mut().insert(principal);
         // 命中的那把 Key 的限制随请求带到 handler（见函数头）
         if let Some(scope) = scope_for_key(&snapshot.raw(), &matched) {
             crate::server::core::key_scope::attach(&mut request, scope);

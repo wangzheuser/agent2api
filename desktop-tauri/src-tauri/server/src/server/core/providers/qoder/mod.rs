@@ -575,6 +575,8 @@ impl ProviderAdapter for QoderAdapter {
                     capture.reset_request(&plan.url, "qoder", &headers, body);
                 }
 
+                telemetry.validate_affinity_session(&context.credentials.to_value());
+                telemetry.record_affinity_send();
                 let response = match chat::send(&plan, effective_proxy.as_ref()).await {
                     Ok(response) => response,
                     Err(error) => {
@@ -888,7 +890,13 @@ async fn drive_aggregate(
     use futures::StreamExt;
 
     let mut lines = stream::LineBuffer::new();
-    let mut source = response.bytes_stream();
+    let source = response.bytes_stream().map(|item| item.map_err(|error| {
+        std::io::Error::other(crate::server::core::egress::describe_error_detail(&error))
+    }));
+    let mut source = crate::server::core::upstream::completion_evidence::observe_stream(
+        Box::pin(source), telemetry.clone(),
+        crate::server::core::upstream::completion_evidence::EvidenceProtocol::Qoder,
+    );
     let mut business_failure: Option<chat::AttemptError> = None;
     // 调试模式的采集器（与 drive_stream 同一位置：解析之前采原始字节）
     let capture = telemetry.capture();
@@ -899,7 +907,7 @@ async fn drive_aggregate(
                 502,
                 format!(
                     "Qoder 上游流式传输中断: {}",
-                    crate::server::core::egress::describe_error_detail(&error)
+                    error
                 ),
             ))
         })?;

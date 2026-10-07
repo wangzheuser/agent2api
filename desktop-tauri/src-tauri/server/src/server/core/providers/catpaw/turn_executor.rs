@@ -699,6 +699,20 @@ fn report_telemetry(ctx: &TurnContext, result: &TurnResult) {
         return;
     };
     telemetry.report_usage(&result.final_usage());
+    // 本点仅在消息 finished 且真实上游 EOF、工具校验成功后调用。
+    // final_usage() 缺省会生成三个 0，所以完整性必须看原事件字段，而不是兜底输出。
+    telemetry.note_completion_evidence(
+        true, !result.text.is_empty() || !result.tool_calls.is_empty(),
+        final_usage_complete(&result.raw), false,
+    );
+}
+
+fn final_usage_complete(raw: &Value) -> bool {
+    let usage = raw.get("usage").or_else(|| raw.pointer("/contextInfo/usage"));
+    let valid = |snake: &str, camel: &str| usage
+        .and_then(|usage| usage.get(snake).or_else(|| usage.get(camel)))
+        .and_then(Value::as_f64).is_some_and(|count| count.is_finite() && count >= 0.0);
+    valid("prompt_tokens", "promptTokens") && valid("completion_tokens", "completionTokens")
 }
 
 /// tool_calls → 待响应 id 列表
@@ -709,4 +723,20 @@ fn call_ids(tool_calls: &[Value]) -> Vec<String> {
         .filter(|id| !id.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+#[cfg(test)]
+mod affinity_completion_tests {
+    use super::final_usage_complete;
+    use serde_json::json;
+
+    #[test]
+    fn catpaw_affinity_requires_original_usage_presence_not_fallback_zero() {
+        assert!(!final_usage_complete(&json!({})));
+        assert!(!final_usage_complete(&json!({"usage":{"total_tokens":7}})));
+        assert!(!final_usage_complete(&json!({"usage":{"prompt_tokens":7}})));
+        assert!(!final_usage_complete(&json!({"usage":{"prompt_tokens":7,"completion_tokens":-1}})));
+        assert!(final_usage_complete(&json!({"usage":{"prompt_tokens":7,"completion_tokens":0}})));
+        assert!(final_usage_complete(&json!({"contextInfo":{"usage":{"promptTokens":7,"completionTokens":2}}})));
+    }
 }

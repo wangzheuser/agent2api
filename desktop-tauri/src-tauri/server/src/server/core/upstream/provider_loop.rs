@@ -477,8 +477,15 @@ async fn attempt_queue(
             &cooldown_keys,
             &tried_ids,
             ctx.pinned_account,
+            ctx.affinity_enabled.then_some(ctx),
         )
         .await?;
+        // 兜底路由仍计实际发送，但不建立亲和绑定。
+        if ctx.affinity_enabled {
+            if let Some(id) = target.account_id.as_deref() {
+                ctx.telemetry.set_affinity_sender(service.affinity.clone(), id, ctx.affinity_epoch);
+            }
+        }
         // 连接计数改绑到这一轮选中的账号：失败重试换账号时计数跟着走，
         // 于是「一个请求任意时刻只占一个账号」这条口径不需要每个分支各维护一次
         // （429 降级、401 刷新后换号、会话式失败顺延三条路径都经过这里）。
@@ -824,10 +831,14 @@ async fn attempt_queue(
             // 字段时零拷贝借出原体（绝大多数请求的形态）。
             let stripped = strip_internal_fields(&send.body);
             let body: &serde_json::Value = &stripped;
+            ctx.telemetry.validate_affinity_body(body);
             // 这一家实际收到的上游模型名 = 它的限额冷却键（与字节同源，见 `SendBody`）。
             // 随发送体一起取（发送体换了，真名也随之重算），成功时随返回值交给
             // 循环外（`cap_cleared` 要读它）—— 所以它是 break 的第二个元素。
             let wire_model = send.wire_model.clone();
+            if let Some(account) = target.account.as_ref().filter(|_| ctx.affinity_enabled) {
+                ctx.telemetry.validate_affinity_identity(&super::payload::affinity_identity(account, &session, ctx.body));
+            }
             // 构造请求计划**可能失败**（适配器自己的校验，例如小浣熊账号缺
             // accessToken → 401）。这里显式处理而不是用 `?` 直接抛出：
             // 上面的 `note_attempt_started` 已经为这一轮起了头，直接返回会让
@@ -843,7 +854,7 @@ async fn attempt_queue(
                 },
                 None => prepared.await,
             };
-            let plan = match result {
+            let mut plan = match result {
                 Ok(plan) => plan,
                 Err(error) => {
                     ctx.telemetry.finish_last_attempt(
@@ -853,6 +864,9 @@ async fn attempt_queue(
                     return Err(error);
                 }
             };
+            if let Some(session_context) = ctx.route_session {
+                adapter.apply_route_session(&mut plan, &session, ctx.body, session_context);
+            }
             // 序列化失败只可能是内部数据坏了（适配器给出的 body 里含不可序列化的
             // 值），按 500 收敛。同样要先给明细定稿（理由同上一条）。
             let payload = match serde_json::to_string(&plan.body) {
@@ -917,6 +931,7 @@ async fn attempt_queue(
                 ctx.telemetry,
                 degraded,
                 adapter.request_is_single_use(&session),
+                ctx.route_session.is_some(),
             )
             .await
             {
@@ -1282,6 +1297,12 @@ async fn attempt_queue(
         // （见 `upstream::translate` 与 `providers::zcode::plan`）。
         // 翻译在**两处出口之前**做，于是流式与非流式共用同一条下行语义：
         // reasoning 合并、usage 提取、model 回写、取消处理全都不需要第二套。
+        let mut response = response;
+        if ctx.telemetry.observes_affinity() {
+            response.stream = super::completion_evidence::observe_stream(
+                response.stream, ctx.telemetry.clone(), response_protocol,
+            );
+        }
         if response_protocol
             == crate::server::core::providers::adapter::UpstreamResponse::Anthropic
         {
@@ -1564,6 +1585,7 @@ async fn attempt_stateful(
     // 内置家透传出口的内部字段剥离：与无状态路径同一理由（见那里的说明）
     let stripped = strip_internal_fields(&send.body);
     let body: &serde_json::Value = &stripped;
+    ctx.telemetry.validate_affinity_body(body);
     // 这一家实际收到的上游模型名 = 限额冷却键（与字节同源，见 `SendBody`）
     let wire_model = &send.wire_model;
     // 旁路记账：本 provider + 本账号是这一轮的实际承载者（attempts +1）。
@@ -1802,6 +1824,9 @@ async fn send_or_cancel(
     transport: &TransportRequest,
     telemetry: &crate::server::core::upstream::usage::RequestTelemetry,
 ) -> Result<reqwest::Response, super::request::UpstreamRequestError> {
+    if !telemetry.is_cancelled() {
+        telemetry.record_affinity_send();
+    }
     let Some(token) = telemetry.cancel_token() else {
         return send_chat_request(transport).await;
     };
@@ -1955,6 +1980,7 @@ async fn send_with_retry(
     telemetry: &crate::server::core::upstream::usage::RequestTelemetry,
     degraded: bool,
     single_use: bool,
+    refresh_route_ids: bool,
 ) -> Result<PreparedResponse, OutboundFailure> {
     loop {
         // 手动终止：发送前先看令牌（退避睡眠 / 上一轮失败之后回到这里）。
@@ -1969,7 +1995,21 @@ async fn send_with_retry(
         // 睡醒重发时必须推回去 —— 否则那一段等待首字节的时间会被显示成
         // 「重试中」，而它其实已经在等上游出字了。
         telemetry.note_phase(LogPhase::Waiting);
-        let response = match send_or_cancel(transport, telemetry).await {
+        let fresh_transport;
+        let outbound = if refresh_route_ids {
+            let mut headers = transport.headers.clone();
+            adapter.refresh_route_request_id(&mut headers);
+            fresh_transport = TransportRequest {
+                url: transport.url.clone(), headers, payload: transport.payload.clone(), proxy: transport.proxy.clone(),
+            };
+            if let Some(capture) = capture {
+                if let Ok(body) = serde_json::from_str(&fresh_transport.payload) {
+                    capture.reset_request(&fresh_transport.url, kind_id(adapter.kind()), &fresh_transport.headers, &body);
+                }
+            }
+            &fresh_transport
+        } else { transport };
+        let response = match send_or_cancel(outbound, telemetry).await {
             Ok(response) => response,
             Err(error) => {
                 // 手动终止：不把它当传输失败去退避重发（原因不是链路抖动）

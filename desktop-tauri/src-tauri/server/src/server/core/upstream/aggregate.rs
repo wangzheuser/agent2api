@@ -74,7 +74,13 @@ pub async fn aggregate_sse_completion(
         }
         item
     });
-    aggregate_frame_stream(Box::pin(stream), telemetry, model_rewrite).await
+    let mut stream: futures::stream::BoxStream<'static, Result<bytes::Bytes, std::io::Error>> = Box::pin(stream);
+    if telemetry.observes_affinity() {
+        stream = super::completion_evidence::observe_stream(
+            stream, telemetry.clone(), super::completion_evidence::EvidenceProtocol::Chat,
+        );
+    }
+    aggregate_frame_stream(stream, telemetry, model_rewrite).await
 }
 
 /// 聚合一条**标准 chat SSE** 字节流（不限定来源）。

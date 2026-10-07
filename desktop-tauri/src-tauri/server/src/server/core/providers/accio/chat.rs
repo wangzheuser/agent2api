@@ -326,12 +326,17 @@ fn tail_frames(translator: &mut Translator) -> String {
 pub(super) async fn prefetch_stream_head(
     response: reqwest::Response,
     limit: &LimitContext,
+    telemetry: &std::sync::Arc<RequestTelemetry>,
 ) -> Result<(Vec<Frame>, futures::stream::BoxStream<'static, Result<bytes::Bytes, std::io::Error>>), GatewayError> {
     let source = response.bytes_stream().map(|item| {
         item.map_err(|error| std::io::Error::other(egress::describe_error_detail(&error)))
     });
+    let source = crate::server::core::upstream::completion_evidence::observe_stream(
+        Box::pin(source), telemetry.clone(),
+        crate::server::core::upstream::completion_evidence::EvidenceProtocol::Accio,
+    );
     let mut source = crate::server::core::upstream::stall::idle_guard(
-        Box::pin(source),
+        source,
         std::time::Duration::from_millis(crate::server::config::timeout_settings().stream_idle_ms()),
     );
     let mut buffer = LineBuffer::new();
@@ -465,7 +470,13 @@ pub async fn drive_aggregate(
     telemetry: std::sync::Arc<RequestTelemetry>,
     limit: &LimitContext,
 ) -> Result<Value, GatewayError> {
-    let mut source = response.bytes_stream();
+    let source = response.bytes_stream().map(|item| item.map_err(|error| {
+        std::io::Error::other(egress::describe_error_detail(&error))
+    }));
+    let mut source = crate::server::core::upstream::completion_evidence::observe_stream(
+        Box::pin(source), telemetry.clone(),
+        crate::server::core::upstream::completion_evidence::EvidenceProtocol::Accio,
+    );
     let mut buffer = LineBuffer::new();
     loop {
         let Some(item) = source.next().await else {
@@ -474,7 +485,7 @@ pub async fn drive_aggregate(
         let chunk = item.map_err(|error| {
             GatewayError::with_status(
                 502,
-                format!("Accio 上游流式传输中断: {}", egress::describe_error_detail(&error)),
+                format!("Accio 上游流式传输中断: {error}"),
             )
         })?;
         let text = String::from_utf8_lossy(&chunk).to_string();
