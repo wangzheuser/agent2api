@@ -23,8 +23,7 @@ pub async fn query_usage(store: &AccountStore, account_id: &str) -> Result<Value
         let fresh = refresh::ensure_fresh(store, &id, true).await?;
         result = query_usage_once(store, &id, &fresh).await;
     }
-    let payload = result?;
-    Ok(normalize(&payload, logging::now_ms()))
+    result
 }
 
 async fn query_usage_once(
@@ -34,19 +33,127 @@ async fn query_usage_once(
 ) -> Result<Value, GatewayError> {
     let (_, session, _) = refresh::snapshot(store, account_id)?;
     let proxy = auth::account_proxy(&session)?;
+    let user_id = auth::real_user_id(credentials, proxy.as_ref()).await?;
+    query_with_identity(credentials, &user_id, proxy.as_ref()).await
+}
+
+pub(super) async fn query_with_identity(
+    credentials: &super::credentials::Credentials,
+    user_id: &str,
+    proxy: Option<&crate::server::core::proxies::ResolvedProxy>,
+) -> Result<Value, GatewayError> {
+    let extra = auth::payload(
+        auth::request_json(
+            "POST",
+            &format!(
+                "{}/matrix/api/v1/user/get_user_extra_info",
+                auth::base_url()
+            ),
+            Some(&json!({})),
+            &credentials.access_token,
+            user_id,
+            proxy,
+        )
+        .await?,
+        "工作区查询",
+    )?;
+    let body = personal_workspace_body(&extra)?;
+    let membership = auth::payload(
+        auth::request_json(
+            "POST",
+            &format!(
+                "{}/matrix/api/v1/commerce/get_membership_info",
+                auth::base_url()
+            ),
+            Some(&body),
+            &credentials.access_token,
+            user_id,
+            proxy,
+        )
+        .await?,
+        "额度查询",
+    )?;
+    let membership = membership.get("data").unwrap_or(&membership);
+    if membership.get("is_migrated_to_op").and_then(Value::as_bool) == Some(true)
+        || membership.get("op_credit_summary").is_some()
+    {
+        return normalize_membership(membership);
+    }
     let url = format!(
         "{}{CREDIT_PATH}?timezone_id=Asia%2FShanghai",
         auth::base_url()
     );
-    let response = auth::request_json(
-        "GET",
-        &url,
-        None,
-        Some(&credentials.access_token),
-        proxy.as_ref(),
+    let response =
+        auth::request_json("GET", &url, None, &credentials.access_token, user_id, proxy).await?;
+    let details = auth::payload(response, "额度查询")?;
+    let data = details.get("data").unwrap_or(&details);
+    if !data.get("details").is_some_and(Value::is_array)
+        && data
+            .get("total_count")
+            .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))
+            != Some(0)
+    {
+        return Err(GatewayError::with_status(
+            502,
+            "MiniMax 额度响应缺少明细，未按零余额处理",
+        ));
+    }
+    Ok(normalize(&details, logging::now_ms()))
+}
+
+fn personal_workspace_body(payload: &Value) -> Result<Value, GatewayError> {
+    let data = payload.get("data").unwrap_or(payload);
+    let id = data
+        .get("workspaces")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item.get("workspace_type").and_then(Value::as_i64) == Some(0))
+        })
+        .and_then(|item| item.get("workspace_id"))
+        .filter(|id| id.is_number() || id.as_str().is_some_and(|text| !text.trim().is_empty()));
+    id.map(|id| json!({"workspace_id":id}))
+        .ok_or_else(|| GatewayError::with_status(502, "MiniMax 未返回个人工作区，未按零余额处理"))
+}
+
+fn amount(value: Option<&Value>) -> Option<f64> {
+    let value = value?;
+    let number = value
+        .as_f64()
+        .or_else(|| value.as_str()?.parse::<f64>().ok())?;
+    (number.is_finite() && number >= 0.0).then_some(number)
+}
+
+fn normalize_membership(data: &Value) -> Result<Value, GatewayError> {
+    let summary = data.get("op_credit_summary");
+    let available = amount(summary.and_then(|s| s.get("total_remaining_amount")))
+        .or_else(|| amount(data.get("opcredit_balance")))
+        .ok_or_else(|| {
+            GatewayError::with_status(502, "MiniMax 会员额度响应缺少余额，未按零余额处理")
+        })?;
+    let mut wallets = Vec::new();
+    for (field, kind, label) in [
+        (
+            "free_remaining_amount",
+            "gift",
+            "MiniMax Code 免费/活动额度",
+        ),
+        (
+            "purchased_remaining_amount",
+            "paid",
+            "MiniMax Code 购买额度",
+        ),
+    ] {
+        if let Some(balance) = amount(summary.and_then(|s| s.get(field))) {
+            wallets
+                .push(json!({"type":kind,"displayName":label,"balance":balance,"unit":"credits"}));
+        }
+    }
+    // 摘要和旧 details 不是两份钱包，不累加；摘要没有报告到期时间时不臆造。
+    Ok(
+        json!({"available":available,"unit":"credits","wallets":wallets,"source":"personal_workspace_membership"}),
     )
-    .await?;
-    auth::payload(response, "额度查询")
 }
 
 fn number(value: Option<&Value>) -> f64 {
@@ -203,6 +310,40 @@ pub fn normalize(payload: &Value, now_ms: i64) -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn migrated_balance_uses_personal_summary_not_empty_legacy_details() {
+        let body = personal_workspace_body(&json!({"workspaces":[
+            {"workspace_type":1,"workspace_id":"company"},
+            {"workspace_type":0,"workspace_id":"personal"}
+        ]}))
+        .expect("personal workspace");
+        assert_eq!(body, json!({"workspace_id":"personal"}));
+        assert!(personal_workspace_body(&json!({"workspaces":[]})).is_err());
+        let balance = normalize_membership(&json!({
+            "is_migrated_to_op":true,"total_remains_credit":0,"total_count":0,
+            "op_credit_summary":{"total_remaining_amount":"800","free_remaining_amount":"800","purchased_remaining_amount":"0"}
+        })).expect("summary");
+        assert_eq!(balance["available"], 800.0);
+        assert_eq!(balance["wallets"][0]["balance"], 800.0);
+        assert_eq!(balance["wallets"][1]["balance"], 0.0);
+        assert!(balance.get("raw").is_none());
+        assert_eq!(
+            normalize_membership(&json!({"op_credit_summary":{"total_remaining_amount":"0"}}))
+                .unwrap()["available"],
+            0.0
+        );
+        for value in [
+            json!({}),
+            json!({"total_remains_credit":0}),
+            json!({"opcredit_balance":"NaN"}),
+        ] {
+            assert!(
+                normalize_membership(&value).is_err(),
+                "missing/invalid is not zero"
+            );
+        }
+    }
 
     #[test]
     fn string_amounts_are_grouped_and_exhausted_items_are_filtered() {

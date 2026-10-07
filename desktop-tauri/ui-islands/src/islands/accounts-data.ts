@@ -770,8 +770,9 @@ function checkinOutcomeOf(row: Record<string, unknown> | undefined): CheckinOutc
   if (row.error) return { kind: 'failed', reason: String(row.error) }
   const claim = row.claim as Record<string, unknown> | null | undefined
   if (!claim) return { kind: 'failed', reason: '签到响应为空' }
-  if (claim.success === true) return { kind: 'ok', reason: '' }
-  if (claim.alreadyCompleted === true || claim.status === 'already_claimed') return { kind: 'already', reason: '' }
+  const receiptMessage = claim.creditVerification ? String(claim.msg || '签到已确认，额度到账待核验') : ''
+  if (claim.success === true) return { kind: 'ok', reason: receiptMessage }
+  if (claim.alreadyCompleted === true || claim.status === 'already_claimed') return { kind: 'already', reason: receiptMessage }
   if (claim.status === 'auth_expired') return { kind: 'failed', reason: String(claim.msg || '登录态已过期') }
   if (claim.status === 'task_not_found') return { kind: 'failed', reason: String(claim.msg || '签到任务不存在') }
   if (claim.status === 'unsupported') return { kind: 'failed', reason: String(claim.msg || '签到任务暂不可用') }
@@ -806,8 +807,11 @@ export async function checkinAll(): Promise<void> {
     let ok = 0
     let already = 0
     let active = 0
+    let pendingCredits = 0
     const failed: string[] = []
     for (const account of targets) {
+      const verification = (byId.get(account.id)?.claim as Record<string, unknown> | undefined)?.creditVerification
+      if (verification === 'unverified' || verification === 'query_failed') pendingCredits += 1
       const outcome = checkinOutcomeOf(byId.get(account.id))
       if (outcome.kind === 'ok') {
         ok += 1
@@ -825,9 +829,10 @@ export async function checkinAll(): Promise<void> {
     }
     bump()
     // 失败详情：个数 + 第一条原因（各账号自己的原因记进按钮 title，可逐个悬停复看）
-    const parts = [`成功领取 ${ok} 个`]
+    const parts = [pendingCredits ? `签到确认 ${ok} 个` : `成功领取 ${ok} 个`]
     if (already) parts.push(`今日已领取 ${already} 个`)
     if (active) parts.push(`完成有效对话 ${active} 个（日活奖励尚未确认）`)
+    if (pendingCredits) parts.push(`其中 ${pendingCredits} 个额度到账待核验`)
     if (failed.length) parts.push(`未领取 ${failed.length} 个（首个：${failed[0]}）`)
     const skipped = Number(data?.skipped) || 0
     toast(`签到完成：${parts.join('，')}`
@@ -873,7 +878,7 @@ export async function runCheckin(id: string): Promise<void> {
       toast(`签到失败：${label}：${outcome.reason}`, 'err')
     } else {
       checkinErrors.delete(id)
-      toast(outcome.kind === 'already'
+      toast(outcome.reason ? `${label}：${outcome.reason}` : outcome.kind === 'already'
         ? `${label}：今日已领取`
         : outcome.kind === 'active' ? `${label}：网页会话完成，日活奖励尚未确认` : `✅ ${label} 签到成功`, 'ok')
     }
