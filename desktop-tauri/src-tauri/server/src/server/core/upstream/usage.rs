@@ -1086,6 +1086,8 @@ fn affinity_body_fields(body: &Value) -> Value {
         "effort",
         "reasoning",
         "thinking",
+        "output_config",
+        "properties",
     ] {
         if let Some(value) = body.get(field) {
             result[field] = value.clone();
@@ -1205,6 +1207,8 @@ impl RequestTelemetry {
             "effort",
             "reasoning",
             "thinking",
+            "output_config",
+            "properties",
         ] {
             if let Some(value) = body.get(field) {
                 route[field] = value.clone();

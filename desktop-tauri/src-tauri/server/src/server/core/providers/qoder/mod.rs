@@ -431,10 +431,9 @@ impl ProviderAdapter for QoderAdapter {
     /// 「没指定」，理由写在那个函数的文档里），不存在「这里说没指定、
     /// 那边读出来一个值」。
     ///
-    /// `_model` 不用（档位是模型级知识，但那份知识在 `models::resolve` 的结果
-    /// 里，不在这条只有名字的路径上 —— 见上）。
-    fn reasoning_patch(&self, level: &str, _model: &str, body: &Value) -> ReasoningPatch {
-        if protocol::client_specified_reasoning(body) {
+    /// 强制路径按模型能力检查；默认路径保留原有客户端优先级。
+    fn reasoning_patch(&self, level: &str, model: &str, body: &Value, force: bool) -> ReasoningPatch {
+        if !force && protocol::client_specified_reasoning(body) {
             return ReasoningPatch::Skip {
                 reason: "客户端请求体里已指定思考档位，绑定不覆盖",
             };
@@ -443,6 +442,13 @@ impl ProviderAdapter for QoderAdapter {
             return ReasoningPatch::Skip {
                 reason: "该等级不在通用候选表内，本家无法判断上游收不收（档位由各模型自己声明）",
             };
+        }
+        if force {
+            // 保存时没有账号：任一地区可用即可；发送时另按选中账号地区校验。
+            if ![endpoints::Region::Global, endpoints::Region::Cn].into_iter()
+                .any(|region| supports_reasoning(model, level, region)) {
+                return ReasoningPatch::Skip { reason: "该 Qoder 模型不支持思考档位" };
+            }
         }
         ReasoningPatch::Set {
             field: REASONING_FIELD,
@@ -551,6 +557,7 @@ impl ProviderAdapter for QoderAdapter {
                     .inference_bases(&context.credentials.access_token);
                 let gateway = gateways.get(gateway_index).copied().unwrap_or(gateways[0]);
                 let plan = chat::build_plan_with_base(&context.credentials, body, &model_name, gateway)?;
+                telemetry.note_upstream_reasoning(plan.reasoning.clone());
 
                 logging::verbose(
                     "[Qoder]",
@@ -1026,4 +1033,11 @@ mod tests {
             &GatewayError::with_status(502, "bad request").with_optional_code(Some(403))
         ));
     }
+}
+
+/// 强制配置检查复用最终协议 resolver，避免地区目录与发送侧判据分叉。
+pub(crate) fn supports_reasoning(model: &str, level: &str, region: endpoints::Region) -> bool {
+    models::resolve(model, region).is_some_and(|entry| {
+        protocol::resolve_thinking(&serde_json::json!({"reasoning_effort":level}), &entry).effort.is_some()
+    })
 }

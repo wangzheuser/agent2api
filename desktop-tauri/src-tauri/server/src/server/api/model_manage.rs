@@ -170,6 +170,26 @@ pub async fn add_mapping(State(state): State<ServerState>, body: Bytes) -> Respo
         }
         Some(_) => return errors::management_error(400, "reasoning 必须是字符串或 null"),
     };
+    // 强制配置独立三态；不改原默认等级的优先级和校验。
+    let reasoning_override = match object.get("reasoningOverride") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::String(text)) if text.trim().is_empty() => Some(None),
+        Some(Value::String(text)) => {
+            if model_rules::normalize_reasoning(text).is_none() {
+                return errors::management_error(400, "强制思考等级过长（最多 32 个字符）");
+            }
+            if let Some(kind) = provider_opt.and_then(crate::server::core::providers::kind_from_id) {
+                let patch = crate::server::core::providers::adapter::adapter_for(kind)
+                    .reasoning_patch(text.trim(), &target, &Value::Null, true);
+                if let crate::server::core::providers::adapter::ReasoningPatch::Skip { reason } = patch {
+                    return errors::management_error(400, format!("强制覆盖思考不支持：{reason}"));
+                }
+            }
+            Some(Some(text.trim()))
+        }
+        Some(_) => return errors::management_error(400, "reasoningOverride 必须是字符串或 null"),
+    };
     // 映射开关的三态见函数头 / `model_rules::add_mapping`：键缺失 = 不动
     // （新建默认开）；带 bool = 显式开 / 关。非 bool 在这里就拒掉，不留一条
     // 读回来会被丢弃的脏数据。
@@ -182,7 +202,7 @@ pub async fn add_mapping(State(state): State<ServerState>, body: Bytes) -> Respo
         .filter(|id| crate::server::core::providers::kind_from_id(id).is_some())
         .filter(|id| Some(id.as_str()) != provider_opt)
         .collect::<Vec<_>>();
-    if let Err(error) = model_rules::add_mapping(&alias, &target, provider_opt, reasoning, enabled, &others) {
+    if let Err(error) = model_rules::add_mapping(&alias, &target, provider_opt, reasoning, enabled, &others, reasoning_override) {
         return errors::management_error(500, error);
     }
     let subject = match provider_opt {
@@ -200,7 +220,12 @@ pub async fn add_mapping(State(state): State<ServerState>, body: Bytes) -> Respo
         Some(false) => "，开关 关",
         None => "",
     };
-    logging::log("[Models]", &format!("保存映射 {subject}{reasoning_text}{enabled_text}"));
+    let override_text = match reasoning_override {
+        Some(Some(level)) => format!("，强制覆盖思考 {level}"),
+        Some(None) => "，清空强制覆盖思考".to_string(),
+        None => String::new(),
+    };
+    logging::log("[Models]", &format!("保存映射 {subject}{reasoning_text}{enabled_text}{override_text}"));
     ok_json(catalog::manage_view(state.store()))
 }
 

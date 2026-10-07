@@ -1596,7 +1596,8 @@
       "status": "必须保留",
       "behavior": "会话按已认证客户端、设备、请求模型隔离；支持JSON metadata.user_id与严格legacy格式，无可靠ID不持久绑定；UID、地区、实际模型/思考和custom静态凭据变更失效，实际快照ABA不误确认，原生token刷新保留亲和；显式cache key优先。WorkBuddy会话头稳定且按UID/地区隔离，每次实际重试生成唯一请求ID。",
       "source_commits": [
-        "8ca442f8985f3ed6176c0a6a27191fe64c407172"
+        "8ca442f8985f3ed6176c0a6a27191fe64c407172",
+        "f7b838daa1c4de103abdddfa7d860ba187ea130c"
       ],
       "implementation": [
         "desktop-tauri/src-tauri/server/src/server/core/upstream/route_session.rs",
@@ -1670,6 +1671,24 @@
           "path": "desktop-tauri/src-tauri/server/src/server/core/providers/workbuddy/adapter.rs",
           "name": "server::core::providers::workbuddy::adapter::tests::route_request_retry_ids_are_unique_and_keep_stable_session_headers",
           "id": "case-wb-route-request-retry-ids-are-unique-and-keep-stable-session-headers"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/payload.rs",
+          "name": "server::core::upstream::payload::affinity_reasoning_tests::affinity_force_fingerprint_matches_send_patch_and_keeps_default_precedence",
+          "id": "case-affinity-force-fingerprint-matches-send-patch-and-keeps-default-precedence"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/payload.rs",
+          "name": "server::core::upstream::payload::affinity_reasoning_tests::affinity_invalid_force_does_not_inject_and_send_remains_an_error",
+          "id": "case-affinity-invalid-force-does-not-inject-and-send-remains-an-error"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/payload.rs",
+          "name": "server::core::upstream::payload::affinity_reasoning_tests::affinity_custom_force_fingerprint_clears_controls_but_not_sibling_fields",
+          "id": "case-affinity-custom-force-fingerprint-clears-controls-but-not-sibling-fields"
         }
       ]
     },
@@ -1696,6 +1715,69 @@
           "kind": "browser",
           "path": "desktop-tauri/ui-islands/tests/settings-cache-affinity.browser.cjs",
           "id": "case-session-affinity-settings-browser"
+        }
+      ]
+    },
+    {
+      "id": "model-reasoning-force-override",
+      "level": "P1",
+      "status": "必须保留",
+      "behavior": "独立 reasoningOverride 强制配置优先于客户端，原 reasoning 继续仅为默认；缺失保持、空值清除；按绑定和提供商隔离，三协议覆盖复用既有归一，冲突控制仅在发送副本清除；不支持的强制配置明确报错且不降级为未设置的另一家。",
+      "source_commits": [
+        "32f5fc7"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/model_rules/mod.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/model_rules/reasoning.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/providers/catalog/routing.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/upstream/payload.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/upstream/provider_loop.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/providers/custom/forward.rs",
+        "desktop-tauri/ui-islands/src/islands/models-page.tsx",
+        "desktop-tauri/ui-islands/src/islands/models-custom-source.ts"
+      ],
+      "tests": [
+        {
+          "id": "reasoning-force-native-precedence",
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/payload.rs",
+          "name": "server::core::upstream::payload::force_tests::all_supported_providers_force_without_changing_default_precedence"
+        },
+        {
+          "id": "reasoning-force-unsupported",
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/payload.rs",
+          "name": "server::core::upstream::payload::force_tests::unset_override_is_legacy_and_unsupported_force_is_an_error"
+        },
+        {
+          "id": "reasoning-force-coding-wire",
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/adapter/tests.rs",
+          "name": "server::core::providers::zcode::adapter::tests::forced_binding_three_protocols_both_regions_coding_wire"
+        },
+        {
+          "id": "reasoning-force-http-wire",
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/reasoning_override.rs",
+          "name": "management_and_three_protocol_wire_force_clear_and_legacy_preservation"
+        },
+        {
+          "id": "reasoning-force-ui-index",
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/models-reasoning-override.test.cjs",
+          "name": "default and forced indices remain independent and provider scoped"
+        },
+        {
+          "id": "reasoning-force-ui-custom",
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/models-reasoning-override.test.cjs",
+          "name": "custom edits, refresh imports and legacy same-name clear preserve binding semantics"
+        },
+        {
+          "id": "reasoning-force-ui-browser",
+          "kind": "browser",
+          "path": "desktop-tauri/ui-islands/tests/models-reasoning-override.browser.cjs",
+          "name": ""
         }
       ]
     }
@@ -1736,6 +1818,18 @@
       "reason": "ForwardRequest 新增可选会话上下文；原始指定账号测试仍传 None，不改变输入及断言。",
       "review": "独立 architect_review 对照基线检查：补丁仅为 pinned 测试增加 route_session: None，保留原始断言。",
       "base_ref": "b0ba9e04535a951f6acc804d4dd7b10627cc5b7b"
+    },
+    {
+      "path": "scripts/replay-patches/session-affinity-zcode-request.patch",
+      "files": [
+        {
+          "path": "desktop-tauri/src-tauri/server/tests/zcode_restore.rs",
+          "sha256": "7464daff25b517d9e47faea366b43fed9ddd7ffe7fd65ab7c023c3fe507036e4"
+        }
+      ],
+      "reason": "ForwardRequest 新增可选会话上下文；原始指定账号测试仍传 None，不改变输入及断言。",
+      "review": "独立 architect_review 对照基线检查：补丁仅为 pinned 测试增加 route_session: None，保留原始断言。",
+      "base_ref": "f7b838daa1c4de103abdddfa7d860ba187ea130c"
     }
   ]
 }

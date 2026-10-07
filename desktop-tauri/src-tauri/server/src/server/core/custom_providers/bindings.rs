@@ -5,13 +5,15 @@ use serde_json::{json, Value};
 use crate::server::core::capability;
 use crate::server::core::models::model_id;
 
-pub fn resolve(provider: &Value, requested: &str) -> Option<(String, Option<String>)> {
+pub fn resolve(provider: &Value, requested: &str) -> Option<(String, Option<String>, Option<String>)> {
     if !provider.get("enabled").and_then(Value::as_bool).unwrap_or(false) {
         return None;
     }
     let models = provider.get("models").and_then(Value::as_array)?;
     let mappings = provider.get("mappings").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
     let level = |entry: &Value| entry.get("reasoning").and_then(Value::as_str)
+        .map(str::trim).filter(|text| !text.is_empty()).map(str::to_string);
+    let forced = |entry: &Value| entry.get("reasoningOverride").and_then(Value::as_str)
         .map(str::trim).filter(|text| !text.is_empty()).map(str::to_string);
     if let Some(model) = models.iter().find(|model| model_id(model).eq_ignore_ascii_case(requested)) {
         let default = mappings.iter().find(|mapping| {
@@ -21,7 +23,8 @@ pub fn resolve(provider: &Value, requested: &str) -> Option<(String, Option<Stri
         if model.get("enabled").and_then(Value::as_bool).unwrap_or(true)
             && default.map_or(true, |mapping| mapping.get("enabled").and_then(Value::as_bool).unwrap_or(true))
         {
-            return Some((model_id(model), default.and_then(level).or_else(|| level(model))));
+            return Some((model_id(model), default.and_then(level).or_else(|| level(model)),
+                default.filter(|entry| entry.get("reasoningOverride").is_some()).map_or_else(|| forced(model), forced)));
         }
     }
     mappings.iter().find_map(|mapping| {
@@ -34,7 +37,7 @@ pub fn resolve(provider: &Value, requested: &str) -> Option<(String, Option<Stri
         }
         // target 的 enabled 只控制原始 ID，不能阻止别名调用它。
         let model = models.iter().find(|model| model_id(model).eq_ignore_ascii_case(target))?;
-        Some((model_id(model), level(mapping)))
+        Some((model_id(model), level(mapping), forced(mapping)))
     })
 }
 
@@ -62,7 +65,7 @@ pub fn public_models(provider: &Value) -> Vec<Value> {
         {
             continue;
         }
-        let Some((target, _)) = resolve(provider, &name) else { continue };
+        let Some((target, _, _)) = resolve(provider, &name) else { continue };
         let mut item = json!({ "id": name });
         let capabilities = capability::normalize_object(
             models

@@ -96,12 +96,12 @@ impl ProviderAdapter for ZcodeAdapter {
     }
 
     /// 两地共用的默认等级绑定；客户端显式字段优先，能力按上游模型判定。
-    fn reasoning_patch(&self, level: &str, model: &str, body: &Value) -> ReasoningPatch {
-        if body.get(REASONING_FIELD).is_some()
+    fn reasoning_patch(&self, level: &str, model: &str, body: &Value, force: bool) -> ReasoningPatch {
+        if !force && (body.get(REASONING_FIELD).is_some()
             || body
                 .pointer("/thinking/type")
                 .and_then(Value::as_str)
-                .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("disabled"))
+                .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("disabled")))
         {
             return ReasoningPatch::Skip {
                 reason: "客户端请求体里已指定思考参数，绑定不覆盖",

@@ -191,15 +191,23 @@ impl ProviderAdapter for AccioAdapter {
     /// 档位不在通用 6 档表里时不注入（上游对未知档位要么忽略要么 400，都不如
     /// 明确跳过并说清原因）。`off` / `none` 在注入点就被拦下了（Accio 没有
     /// 可靠的「关闭思考」表达）。
-    fn reasoning_patch(&self, level: &str, _model: &str, body: &Value) -> ReasoningPatch {
+    fn reasoning_patch(&self, level: &str, model: &str, body: &Value, force: bool) -> ReasoningPatch {
         if crate::server::core::model_rules::reasoning_is_off(level) {
             return ReasoningPatch::Skip { reason: "Accio 没有「关闭思考」的可靠表达，跳过注入" };
         }
-        if crate::server::core::model_rules::read_client_level(body).is_some() {
+        if !force && crate::server::core::model_rules::read_client_level(body).is_some() {
             return ReasoningPatch::Skip { reason: "客户端请求体里已指定思考等级，绑定让位" };
         }
         if crate::server::core::model_rules::reasoning_rank(level).is_none() {
             return ReasoningPatch::Skip { reason: "该等级不在通用档位表内，Accio 不注入未知档位" };
+        }
+        if force {
+            let supported = models::resolve(model, self.region).is_some_and(|entry| {
+                let efforts: Vec<String> = entry.get("reasoningEfforts").and_then(Value::as_array)
+                    .map(|items| items.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default();
+                protocol::resolve_effort(level, &efforts).is_some()
+            });
+            if !supported { return ReasoningPatch::Skip { reason: "该 Accio 模型未声明可用思考档位" }; }
         }
         ReasoningPatch::Set {
             field: REASONING_FIELD,
@@ -348,6 +356,7 @@ impl ProviderAdapter for AccioAdapter {
             // 思考档位：客户端显式指定 > 映射绑定（`body` 里已由 payload 层注入）
             let effort = protocol::client_effort(body);
             let plan = chat::build_plan(&context.credentials, body, &model_name, effort.as_deref())?;
+            telemetry.note_upstream_reasoning(plan.reasoning.clone());
             let effective_proxy = proxy.or(context.proxy);
 
             logging::verbose(
