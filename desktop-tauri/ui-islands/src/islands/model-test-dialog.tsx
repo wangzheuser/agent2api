@@ -47,7 +47,6 @@ import {
 } from './accounts-domain'
 import type { AccountRecord } from './accounts-shared'
 import * as customSource from './models-custom-source'
-import type { ManageModel } from './models-custom-source'
 import { levels as reasoningLevels } from './models-reasoning'
 import {
   bindingsOf, errorMessage, getSnapshot, levelOf, modelRowOf, providerLabelOf, toast,
@@ -146,7 +145,7 @@ const DEFAULT_PROMPT = '你好'
 /** 提示词长度上限（与后端 `MAX_PROMPT_CHARS` 同值；超了后端会截断，这里先挡一道） */
 const MAX_PROMPT_CHARS = 4000
 
-/** 模型行的「来源」徽章（与模型表同一套口径；自定义家的 source 是空串，见 ManageModel） */
+/** 模型行的「来源」徽章（与模型表同一套口径；自定义家的 source 是空串） */
 const SOURCE_LABEL: Record<string, string> = {
   remote: '远程目录',
   builtin: '内置清单',
@@ -226,24 +225,10 @@ function formatMs(value: unknown): string {
 }
 
 /**
- * 「测试」那颗按钮的两条门禁，都写进按钮的悬停说明，不做成静默失败：
- *   · 这一行的**默认绑定**（名字与模型 ID 相同的那条）关着 → 测试正是以这个名字发出去的，
- *     后端会把这种请求判成「模型已在网关中关闭」，那句话对用户毫无指引；
- *   · 该家**没有可用账号**（启用 + 凭证完整）→ 一行都发不出去。
- * 返回空串 = 可以测；否则返回要挂在按钮 title 上的原因。
- *
- * 为什么判的是默认绑定而不是「有没有任意一条映射开着」：**别名不参与**这次测试（下游模型名
- * 就是本名），所以只开着别名映射时以本名发出去的路由仍然是断的 —— 那种情况下按钮该置灰并说清
- * 要打开哪一条，而不是让用户测出一次莫名其妙的 404。
+ * 测试直达原始模型，不要求启用默认绑定或别名；仅检查该家有可用账号。
+ * 返回空串 = 可以测；否则把账号原因挂到按钮 title 上。
  */
-export function testBlockReason(provider: string, model: ManageModel): string {
-  const bindings = bindingsOf(model)
-  const sameName = bindings.find(binding => binding.isDefault)
-  if (sameName && !sameName.enabled) {
-    return bindings.some(binding => binding.enabled)
-      ? '这一行的默认绑定（与模型 ID 同名的那条）是关着的，而测试就以这个名字发出去 —— 先打开它（别名映射不参与本次测试）'
-      : '这一行的映射全部关着，下游请求根本路由不到它 —— 先打开默认绑定那一条'
-  }
+export function testBlockReason(provider: string): string {
   if (!usableAccounts(provider).length) {
     return '该提供商没有可用账号（要在账号页启用一个、且凭证完整），一行都发不出去'
   }
@@ -604,6 +589,7 @@ export function ModelTestDialog({ target, onClose }: { target: ModelTestTarget; 
               ；映射上绑定的思考等级{boundLevel
                 ? <> 是 <b className='text-foreground'>{boundLevel}</b>，选「跟随映射」时按它注入</>
                 : '未绑定 —— 选「跟随映射」等于这次不注入等级'}。
+              测试不受绑定开关影响，也不会改变开关或对外模型列表。
             </p>
           </div>
 

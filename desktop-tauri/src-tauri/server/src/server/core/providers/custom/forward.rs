@@ -110,6 +110,7 @@ pub(crate) async fn forward(
     telemetry: &Arc<RequestTelemetry>,
     slot: &mut Option<InFlightGuard>,
     connections: &mut ConnectionGuard,
+    test_target: Option<&crate::server::core::providers::catalog::WireTarget>,
 ) -> Result<ForwardOutcome, GatewayError> {
     // ── 配置与凭证（顺序：先家后账号，错误文案各自指向要修的地方）──────
     let provider = custom_providers::get(provider_id).ok_or_else(|| {
@@ -181,6 +182,7 @@ pub(crate) async fn forward(
             telemetry,
             slot,
             connections,
+            test_target,
         )
         .await;
     }
@@ -224,7 +226,7 @@ pub(crate) async fn forward(
         .unwrap_or("")
         .trim()
         .to_string();
-    let (mut outbound, rewrite) = rewrite_body(body, provider_id, &requested);
+    let (mut outbound, rewrite) = rewrite_body(body, provider_id, &requested, test_target);
     // 客户端形态伪装（OpenCode 免费档）：补桩工具。未开启时不碰请求体。
     // 放在 `rewrite_body` 之后、序列化之前 —— 会话种子取自**改写后**的体，
     // 与最终发出去的字节同源（模型名换了不影响 messages，两种取法等价，
@@ -454,6 +456,7 @@ async fn forward_translated(
     telemetry: &Arc<RequestTelemetry>,
     slot: &mut Option<InFlightGuard>,
     connections: &mut ConnectionGuard,
+    test_target: Option<&crate::server::core::providers::catalog::WireTarget>,
 ) -> Result<ForwardOutcome, GatewayError> {
     // ── 请求体：先在 chat 体上做自定义语义的改写，再整体翻译 ──────
     // （模型名映射与思考等级绑定是「客户端语义」的修正，与协议无关；
@@ -465,7 +468,7 @@ async fn forward_translated(
         .unwrap_or("")
         .trim()
         .to_string();
-    let (mut outbound_chat, rewrite) = rewrite_body(body, provider_id, &requested);
+    let (mut outbound_chat, rewrite) = rewrite_body(body, provider_id, &requested, test_target);
     // 客户端形态伪装：与 chat 分支同一时机（改写后、翻译前）—— 桩工具要由
     // 转换器一起翻成上游协议的形态（anthropic 的 tools 数组）
     quirks.apply_emulation_to_body(&mut outbound_chat);
@@ -769,12 +772,13 @@ impl futures::Stream for ProtocolTranslateStream {
 ///
 /// `rewrite` 是 SSE/聚合的 model 回写参数：请求带了 model 才给 ——
 /// 客户端没点名模型时（上游用自家默认）没有「回写成什么」的答案。
-fn rewrite_body(body: &Value, provider_id: &str, requested: &str) -> (Value, Option<ModelRewrite>) {
+fn rewrite_body(body: &Value, provider_id: &str, requested: &str, test_target: Option<&crate::server::core::providers::catalog::WireTarget>) -> (Value, Option<ModelRewrite>) {
     let mut outbound = body.clone();
     if requested.is_empty() {
         return (outbound, None);
     }
-    let (wire_model, reasoning) = custom_providers::wire_model_for(provider_id, requested);
+    let (wire_model, reasoning) = test_target.map(|target| (target.model.clone(), target.reasoning.clone()))
+        .unwrap_or_else(|| custom_providers::wire_model_for(provider_id, requested));
     if !wire_model.eq_ignore_ascii_case(requested) {
         logging::verbose(
             "[CustomProvider]",

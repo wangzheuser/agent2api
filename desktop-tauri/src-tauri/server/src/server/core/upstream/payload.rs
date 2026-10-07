@@ -108,6 +108,7 @@ pub(super) struct ProviderContext<'a> {
     /// 读同一份，语义不会中途漂移。收窄的语义见
     /// [`super::ForwardRequest::pinned_account`] 与 `rotate::accounts_in_providers`。
     pub pinned_account: Option<&'a str>,
+    pub test_target: Option<&'a crate::server::core::providers::catalog::WireTarget>,
 }
 
 /// 某一家 provider 实际要发送的请求体（**每次转发前**决定，不做跨家复用），
@@ -254,11 +255,11 @@ pub(super) fn send_body<'a>(
     }
     // 一次解析出两个属性：该家要收的名字 + 跟着那条映射走的思考等级
     // （同源，见模块头「思考等级绑定为什么也在这一步」）
-    let wire = crate::server::core::providers::catalog::wire_target_for_provider(
+    let wire = ctx.test_target.cloned().unwrap_or_else(|| crate::server::core::providers::catalog::wire_target_for_provider(
         &requested,
         provider_id,
         account,
-    );
+    ));
     ctx.telemetry.note_upstream_model(&wire.model);
     rewrite_model(&mut body, &requested, &wire.model, provider_id);
     let injected = apply_reasoning(

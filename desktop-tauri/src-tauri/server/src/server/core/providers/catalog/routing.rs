@@ -41,14 +41,9 @@ pub(super) fn builtin_target(
     requested: &str,
 ) -> Option<WireTarget> {
     let provider = kind_id(kind);
-    if let Some(id) = entry_id_in_manifest(manifest, requested) {
-        if rules.default_enabled(provider, &id) {
-            return Some(WireTarget {
-                reasoning: rules
-                    .binding(provider, &id, &id)
-                    .and_then(|m| m.reasoning.clone()),
-                model: id,
-            });
+    if let Some(target) = default_target(rules, provider, manifest, requested) {
+        if rules.default_enabled(provider, &target.model) {
+            return Some(target);
         }
     }
     let candidates: Vec<_> = rules
@@ -89,6 +84,22 @@ pub(super) fn builtin_target(
             .binding(provider, &mapping.alias, &mapping.target)
             .and_then(|effective| effective.reasoning.clone()),
     })
+}
+
+fn default_target(rules: &model_rules::ModelRules, provider: &str, manifest: &[Value], requested: &str) -> Option<WireTarget> {
+    let id = entry_id_in_manifest(manifest, requested)?;
+    Some(WireTarget {
+        reasoning: rules.binding(provider, &id, &id).and_then(|binding| binding.reasoning.clone()),
+        model: id,
+    })
+}
+
+/// 只解析该家目录中的原始模型，保留默认等级；不开放别名或修改开关。
+pub fn test_target_for_provider(model: &str, provider: &str) -> Option<WireTarget> {
+    if let Some(kind) = kind_from_id(provider) {
+        return default_target(&model_rules::current(), kind_id(kind), &manifest_for(kind), model);
+    }
+    custom_providers::test_wire_model_for(provider, model).map(|(model, reasoning)| WireTarget { model, reasoning })
 }
 
 /// 原始能力查询不应用开关，供管理 API 展开旧版全局规则。
@@ -213,4 +224,27 @@ pub fn default_model_catalog() -> Vec<Value> {
 
 pub fn default_model_usable(model: &str) -> bool {
     entry_id_in_manifest(&default_model_catalog(), model).is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn native_test_target_keeps_disabled_default_and_does_not_follow_same_name_alias() {
+        let raw = json!({"modelRules":{"disabled":[{"provider":"qoder","id":"Raw-A"}],"mappings":[
+            {"provider":"qoder","alias":"Raw-A","target":"Raw-A","enabled":false,"reasoning":"high"}
+        ]}});
+        let mut rules = model_rules::ModelRules::from_raw(raw.as_object().unwrap());
+        let manifest = vec![json!({"id":"Raw-A"}), json!({"id":"Other"})];
+        assert!(builtin_target(&rules, ProviderKind::Qoder, &manifest, "Raw-A").is_none());
+        let expected = WireTarget { model: "Raw-A".into(), reasoning: Some("high".into()) };
+        assert_eq!(default_target(&rules, "qoder", &manifest, "raw-a"), Some(expected.clone()));
+        assert!(default_target(&rules, "qoder", &manifest, "absent").is_none());
+        let alias = json!({"modelRules":{"mappings":[{"provider":"qoder","alias":"Raw-A","target":"Other","enabled":true}]}});
+        rules.mappings.extend(model_rules::ModelRules::from_raw(alias.as_object().unwrap()).mappings);
+        assert_eq!(builtin_target(&rules, ProviderKind::Qoder, &manifest, "Raw-A").unwrap().model, "Other");
+        assert_eq!(default_target(&rules, "qoder", &manifest, "Raw-A"), Some(expected));
+    }
 }

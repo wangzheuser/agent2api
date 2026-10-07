@@ -6,6 +6,14 @@ use crate::server::core::capability;
 use crate::server::core::models::model_id;
 
 pub fn resolve(provider: &Value, requested: &str) -> Option<(String, Option<String>)> {
+    resolve_binding(provider, requested, false)
+}
+
+pub(super) fn resolve_test(provider: &Value, requested: &str) -> Option<(String, Option<String>)> {
+    resolve_binding(provider, requested, true)
+}
+
+fn resolve_binding(provider: &Value, requested: &str, testing: bool) -> Option<(String, Option<String>)> {
     if !provider.get("enabled").and_then(Value::as_bool).unwrap_or(false) {
         return None;
     }
@@ -18,12 +26,13 @@ pub fn resolve(provider: &Value, requested: &str) -> Option<(String, Option<Stri
             mapping.get("alias").and_then(Value::as_str).is_some_and(|alias| alias.eq_ignore_ascii_case(requested))
                 && mapping.get("target").and_then(Value::as_str).is_some_and(|target| target.eq_ignore_ascii_case(requested))
         });
-        if model.get("enabled").and_then(Value::as_bool).unwrap_or(true)
-            && default.map_or(true, |mapping| mapping.get("enabled").and_then(Value::as_bool).unwrap_or(true))
+        if testing || (model.get("enabled").and_then(Value::as_bool).unwrap_or(true)
+            && default.map_or(true, |mapping| mapping.get("enabled").and_then(Value::as_bool).unwrap_or(true)))
         {
             return Some((model_id(model), default.and_then(level).or_else(|| level(model))));
         }
     }
+    if testing { return None; }
     mappings.iter().find_map(|mapping| {
         let alias = mapping.get("alias")?.as_str()?;
         let target = mapping.get("target")?.as_str()?;
@@ -74,4 +83,25 @@ pub fn public_models(provider: &Value) -> Vec<Value> {
         result.push(item);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolution_ignores_model_switches_but_not_provider_switch_or_raw_catalog() {
+        let mut provider = json!({"enabled":true,"models":[{"id":"Raw-A","enabled":false,"reasoning":"low"}],
+            "mappings":[{"alias":"Raw-A","target":"Raw-A","enabled":false,"reasoning":"high"},
+                        {"alias":"alias","target":"Raw-A","enabled":true}]});
+        let original = provider.clone();
+        assert!(resolve(&provider, "Raw-A").is_none());
+        assert_eq!(resolve_test(&provider, "raw-a"), Some(("Raw-A".into(), Some("high".into()))));
+        assert!(resolve_test(&provider, "alias").is_none());
+        assert!(resolve_test(&provider, "absent").is_none());
+        assert_eq!(resolve(&provider, "alias"), Some(("Raw-A".into(), None)));
+        assert_eq!(provider, original);
+        provider["enabled"] = json!(false);
+        assert!(resolve_test(&provider, "Raw-A").is_none());
+    }
 }

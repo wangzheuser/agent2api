@@ -80,6 +80,7 @@ use axum::http::HeaderMap;
 use crate::server::core::account_store::AccountStore;
 use crate::server::core::auth::AuthService;
 use crate::server::core::proxies::ResolvedProxy;
+use crate::server::core::providers::catalog::WireTarget;
 use crate::server::errors::GatewayError;
 use crate::server::logging;
 
@@ -283,6 +284,15 @@ impl UpstreamService {
     ///     一个卡住的前序请求被无限期挂住。
     ///   - **槽位一直占到大半个响应结束**（流式请求也一样，见 InFlightGuard）。
     pub async fn forward(&self, request: ForwardRequest) -> Result<ForwardOutcome, GatewayError> {
+        self.forward_inner(request, None).await
+    }
+
+    /// 管理测试入口传入已校验的原始目标；不改变普通请求的结构或绑定启停。
+    pub(crate) async fn forward_model_test(&self, request: ForwardRequest, target: WireTarget) -> Result<ForwardOutcome, GatewayError> {
+        self.forward_inner(request, Some(target)).await
+    }
+
+    async fn forward_inner(&self, request: ForwardRequest, test_target: Option<WireTarget>) -> Result<ForwardOutcome, GatewayError> {
         // ── 调试模式：为本次请求装一个原始报文采集器 ─────────────────
         // 装在这里（转发入口）而不是各家适配器里：四条路径（流式 / 非流式 ×
         // 无状态 / 有状态）都要采，装一次全都覆盖到。开关关着时**不创建**
@@ -358,6 +368,7 @@ impl UpstreamService {
             prompt,
             key_scope: key_scope.as_ref(),
             pinned_account: pinned_account.as_deref(),
+            test_target: test_target.as_ref(),
         };
         provider_loop::forward_with_providers(self, context, &mut slot, &mut connections).await
     }

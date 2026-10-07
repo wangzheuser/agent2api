@@ -459,9 +459,9 @@ function ModelsPage() {
       case 'alias':
         return <td className={cellClass('cell-alias', column.align)}>{aliasCell(model)}</td>
       case 'act': {
-        // 「测试」的两条门禁（映射全关 / 该家没有可用账号）由 model-test-dialog 统一判定，
+        // 「测试」的账号可用性由 model-test-dialog 统一判定，绑定开关只控制对外请求。
         // 这里只把理由挂到 title 上 —— 禁用而不说原因等于让用户猜
-        const blocked = testBlockReason(model.provider || '', model)
+        const blocked = testBlockReason(model.provider || '')
         return (
           <td className={cellClass('cell-act r', column.align)}>
             <div className='row-actions'>
