@@ -23,7 +23,7 @@
 //! 落库的版本号继续 —— 不会出现「表建了一半但版本号已经写新」的错位。
 //!
 //! ── 为什么所有语句都带 IF NOT EXISTS ────────────────────────
-//! 版本号是**唯一**的推进依据，但现实里存在「表已经在了、版本号却是 0」的
+//! 版本号控制推进，但修复分叉历史时还须核验实际结构。现实里存在「表已经在了、版本号却是 0」的
 //! 情形：用户手工拷过库文件、或者从旧版本二进制回退再前进。DDL 幂等之后这种
 //! 库能直接跑过去（缺的补上、有的跳过），而不是在启动时报一句
 //! 「table already exists」把用户挡在门外。
@@ -202,7 +202,11 @@ pub fn is_reserved(key: &str) -> bool {
 ///
 /// ── 版本 9：requests 表加「测试来源」列 ─────────────────────
 /// 上游 2.9.5 曾把它编号为 v7；v9 的迁移对已有列幂等，兼容两条版本线。
-pub const SCHEMA_VERSION: i64 = 9;
+///
+/// ── 版本 10：补齐上游/本地两条历史线的请求计数列 ───────────
+/// 上游 v7 已有 is_test，但会跳过本地 v7 的缓存创建列；曾升级到 v9 的库
+/// 也可能缺这列。保留已发布 v7-v9 含义，在新的事务中按实际列补齐。
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
@@ -616,6 +620,22 @@ fn apply_version(conn: &Connection, version: i64) -> rusqlite::Result<()> {
                 |row| row.get(0),
             )?;
             if exists { Ok(()) } else { conn.execute_batch(V9_SCHEMA) }
+        }
+        // v10：按实际结构兼容分叉和已受影响的 v9；不覆盖旧值或降级未来库。
+        10 => {
+            for (column, ddl) in [
+                ("cache_creation_tokens", V7_SCHEMA),
+                ("upstream_credits", V8_SCHEMA),
+                ("is_test", V9_SCHEMA),
+            ] {
+                let exists: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('requests') WHERE name=?1)",
+                    [column],
+                    |row| row.get(0),
+                )?;
+                if !exists { conn.execute_batch(ddl)?; }
+            }
+            Ok(())
         }
         _ => Ok(()),
     }

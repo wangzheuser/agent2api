@@ -52,7 +52,7 @@ export function AccountsCreditOverviewDialog({ onClose, returnFocus }: { onClose
   const visibleIds = new Set(visibleList().map(account => account.id))
   const accounts = creditScopeAccounts(all, scope, visibleIds, store.selected)
   const groups = summarizeCreditOverview(accounts.map(account => creditOverviewSample(account)))
-  const growthAccounts = accounts.filter(account => providerOf(account) === 'workbuddy')
+  const growthAccounts = accounts.filter(account => providerOf(account) === 'workbuddy' || providerOf(account) === 'workbuddy-intl')
   const currentDetail = detail && findAccount(detail.account.id)
   const sameIdentity = detail && currentDetail && growthAccountKey(detail.account) === growthAccountKey(currentDetail)
 
