@@ -12,6 +12,7 @@ use super::{adapter_for, all_kinds, manifest_for};
 pub struct WireTarget {
     pub model: String,
     pub reasoning: Option<String>,
+    pub reasoning_override: Option<String>,
 }
 
 pub(super) fn entry_id_in_manifest(manifest: &[Value], requested: &str) -> Option<String> {
@@ -83,6 +84,7 @@ pub(super) fn builtin_target(
         reasoning: rules
             .binding(provider, &mapping.alias, &mapping.target)
             .and_then(|effective| effective.reasoning.clone()),
+        reasoning_override: rules.binding(provider, &mapping.alias, &mapping.target).and_then(|m| m.reasoning_override.clone()),
     })
 }
 
@@ -90,6 +92,7 @@ fn default_target(rules: &model_rules::ModelRules, provider: &str, manifest: &[V
     let id = entry_id_in_manifest(manifest, requested)?;
     Some(WireTarget {
         reasoning: rules.binding(provider, &id, &id).and_then(|binding| binding.reasoning.clone()),
+        reasoning_override: rules.binding(provider, &id, &id).and_then(|binding| binding.reasoning_override.clone()),
         model: id,
     })
 }
@@ -99,7 +102,7 @@ pub fn test_target_for_provider(model: &str, provider: &str) -> Option<WireTarge
     if let Some(kind) = kind_from_id(provider) {
         return default_target(&model_rules::current(), kind_id(kind), &manifest_for(kind), model);
     }
-    custom_providers::test_wire_model_for(provider, model).map(|(model, reasoning)| WireTarget { model, reasoning })
+    custom_providers::test_wire_model_for(provider, model).map(|(model, reasoning, reasoning_override)| WireTarget { model, reasoning, reasoning_override })
 }
 
 /// 原始能力查询不应用开关，供管理 API 展开旧版全局规则。
@@ -197,6 +200,7 @@ pub fn wire_target_for_provider(
     resolved.unwrap_or_else(|| WireTarget {
         model: requested.to_string(),
         reasoning: None,
+        reasoning_override: None,
     })
 }
 
@@ -239,12 +243,17 @@ mod tests {
         let mut rules = model_rules::ModelRules::from_raw(raw.as_object().unwrap());
         let manifest = vec![json!({"id":"Raw-A"}), json!({"id":"Other"})];
         assert!(builtin_target(&rules, ProviderKind::Qoder, &manifest, "Raw-A").is_none());
-        let expected = WireTarget { model: "Raw-A".into(), reasoning: Some("high".into()) };
+        let expected = WireTarget { model: "Raw-A".into(), reasoning: Some("high".into()), reasoning_override: None };
         assert_eq!(default_target(&rules, "qoder", &manifest, "raw-a"), Some(expected.clone()));
         assert!(default_target(&rules, "qoder", &manifest, "absent").is_none());
         let alias = json!({"modelRules":{"mappings":[{"provider":"qoder","alias":"Raw-A","target":"Other","enabled":true}]}});
         rules.mappings.extend(model_rules::ModelRules::from_raw(alias.as_object().unwrap()).mappings);
         assert_eq!(builtin_target(&rules, ProviderKind::Qoder, &manifest, "Raw-A").unwrap().model, "Other");
         assert_eq!(default_target(&rules, "qoder", &manifest, "Raw-A"), Some(expected));
+        let forced = json!({"modelRules":{"mappings":[
+            {"provider":"qoder","alias":"Raw-A","target":"Raw-A","enabled":false,"reasoningOverride":"max"}
+        ]}});
+        let forced_rules = model_rules::ModelRules::from_raw(forced.as_object().unwrap());
+        assert_eq!(default_target(&forced_rules, "qoder", &manifest, "Raw-A").unwrap().reasoning_override.as_deref(), Some("max"));
     }
 }

@@ -325,6 +325,58 @@ async fn model_tests_ignore_binding_switches_without_opening_public_routes() {
         config::current().raw().get("customProviders"),
         Some(&before)
     );
+    // 并行合入的强制配置在关闭绑定的管理测试中同样生效，显式清空不继承模型值。
+    let mut forced = before.clone();
+    for provider in forced.as_array_mut().unwrap() {
+        provider["models"][0]["reasoningOverride"] = json!("high");
+        provider["mappings"][0]["reasoningOverride"] = json!("max");
+    }
+    assert!(config::update_raw_field("customProviders", forced.clone()));
+    for (i, account) in accounts.iter().enumerate() {
+        for stream in [false, true] {
+            let (_, result) = request(&app, "/api/models/test",
+                json!({"provider":format!("custom-test-{i}"),"model":format!("Raw-{i}"),"account_id":account,
+                    "reasoning":"low","stream":stream,"test_id":format!("forced-{i}-{stream}")}), true).await;
+            assert_eq!(result["data"]["status"], 200, "{result}");
+            assert_eq!(result["data"]["upstream_reasoning"], "max", "{result}");
+            let wire = seen.lock().unwrap().last().unwrap().2.clone();
+            match i {
+                1 => assert_eq!(wire["reasoning"]["effort"], "max"),
+                2 => assert_eq!(wire["thinking"]["budget_tokens"], 32768),
+                _ => assert_eq!(wire["reasoning_effort"], "max"),
+            }
+            assert_eq!(
+                config::current().raw().get("customProviders"),
+                Some(&forced)
+            );
+        }
+    }
+    for provider in forced.as_array_mut().unwrap() {
+        provider["mappings"][0]["reasoningOverride"] = json!("");
+    }
+    assert!(config::update_raw_field("customProviders", forced.clone()));
+    for (i, account) in accounts.iter().enumerate() {
+        let (_, result) = request(&app, "/api/models/test",
+            json!({"provider":format!("custom-test-{i}"),"model":format!("Raw-{i}"),"account_id":account,
+                "reasoning":"low","stream":false,"test_id":format!("clear-{i}")}), true).await;
+        assert_eq!(result["data"]["status"], 200, "{result}");
+        assert_eq!(result["data"]["upstream_reasoning"], "low", "{result}");
+    }
+    forced[0]["mappings"][0]["reasoningOverride"] = json!("unknown");
+    assert!(config::update_raw_field("customProviders", forced.clone()));
+    let calls = seen.lock().unwrap().len();
+    let (_, invalid) = request(&app, "/api/models/test", sample, true).await;
+    assert_eq!(invalid["data"]["status"], 400, "{invalid}");
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        calls,
+        "无效强制配置不能发送或降级到其他账号"
+    );
+    assert_eq!(
+        config::current().raw().get("customProviders"),
+        Some(&forced)
+    );
     println!("PASS: disabled bindings, three upstream protocols, both stream modes, reasoning, public 404, auth, pinned-account isolation and test-only accounting");
+    println!("PASS: disabled bindings preserve forced reasoning, explicit clear and invalid-force rejection");
     server.abort();
 }

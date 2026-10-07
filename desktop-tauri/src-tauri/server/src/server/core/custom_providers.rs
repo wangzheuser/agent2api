@@ -371,6 +371,9 @@ fn model_entries_of(value: Option<&Value>) -> Vec<Value> {
                 MAX_REASONING_CHARS,
             ),
         });
+        if let Some(level) = object.get("reasoningOverride").and_then(Value::as_str).and_then(crate::server::core::model_rules::normalize_reasoning) {
+            entry["reasoningOverride"] = Value::String(level);
+        }
         // 能力位覆盖（可选的稀疏表，键名与归一规则见 `core::capability`：
         // 内置家的同一层覆盖在 `modelRules.capabilities`，两处共用该模块的判定）。
         // **空表不落键**：老记录（没有这个键的）读回再写时一个字节都不多，
@@ -421,7 +424,7 @@ fn mapping_entries_of(value: Option<&Value>) -> Vec<Value> {
         if alias.is_empty() || target.is_empty() {
             continue;
         }
-        entries.push(json!({
+        let mut entry = json!({
             "alias": alias,
             "target": target,
             "enabled": object.get("enabled").and_then(Value::as_bool).unwrap_or(true),
@@ -429,7 +432,14 @@ fn mapping_entries_of(value: Option<&Value>) -> Vec<Value> {
                 object.get("reasoning").and_then(Value::as_str).map(str::trim).unwrap_or(""),
                 MAX_REASONING_CHARS,
             ),
-        }));
+        });
+        // 同名 legacy 映射的显式清空须保留，不能重新继承模型上的强制配置。
+        if object.contains_key("reasoningOverride") {
+            let level = object.get("reasoningOverride").and_then(Value::as_str)
+                .and_then(crate::server::core::model_rules::normalize_reasoning).unwrap_or_default();
+            entry["reasoningOverride"] = Value::String(level);
+        }
+        entries.push(entry);
     }
     entries
 }
@@ -720,8 +730,8 @@ pub fn set_models(id: &str, models: Value, mappings: Value) -> Result<Value, Str
     let mappings_raw = mappings
         .as_array()
         .ok_or_else(|| "mappings 必须是数组".to_string())?;
-    let models = validate_model_entries(models_raw)?;
-    let mappings = validate_mapping_entries(mappings_raw)?;
+    let mut models = validate_model_entries(models_raw)?;
+    let mut mappings = validate_mapping_entries(mappings_raw)?;
     let mut items = read_items();
     let Some(index) = items
         .iter()
@@ -729,6 +739,20 @@ pub fn set_models(id: &str, models: Value, mappings: Value) -> Result<Value, Str
     else {
         return Err(format!("自定义提供商不存在: {id}"));
     };
+    // 老客户端整表更新省略新增字段时，按原绑定身份保留；显式空串才清空。
+    for (name, next, keys) in [("models", &mut models, &["id"][..]), ("mappings", &mut mappings, &["alias", "target"][..])] {
+        if let Some(previous) = items[index].get(name).and_then(Value::as_array) {
+            for entry in next {
+                if entry.get("reasoningOverride").is_some() { continue; }
+                if let Some(old) = previous.iter().find(|old| keys.iter().all(|key| {
+                    old.get(*key).and_then(Value::as_str).zip(entry.get(*key).and_then(Value::as_str))
+                        .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+                })) {
+                    if let Some(level) = old.get("reasoningOverride") { entry["reasoningOverride"] = level.clone(); }
+                }
+            }
+        }
+    }
     // 从既有记录的键表出发整体写回：除 models/mappings 外的键原样保留
     let mut merged = items[index].as_object().cloned().unwrap_or_default();
     merged.insert("models".to_string(), Value::Array(models));
@@ -790,14 +814,14 @@ pub fn carriers_of_model(name: &str) -> Vec<String> {
 /// `off`/`none`（本网关不向任何上游发「关闭思考」字段，判据
 /// `model_rules::reasoning_is_off`）。名字与等级**同源同次解析** —— 拆成两次
 /// 调用就会出现「A 条映射改了名、B 条映射的等级被注入」的串味。
-pub fn wire_model_for(provider_id: &str, requested_name: &str) -> (String, Option<String>) {
+pub fn wire_model_for(provider_id: &str, requested_name: &str) -> (String, Option<String>, Option<String>) {
     let requested = requested_name.trim();
     get(provider_id)
         .and_then(|provider| bindings::resolve(&provider, requested))
-        .unwrap_or_else(|| (requested.to_string(), None))
+        .unwrap_or_else(|| (requested.to_string(), None, None))
 }
 
-pub(crate) fn test_wire_model_for(provider_id: &str, model: &str) -> Option<(String, Option<String>)> {
+pub(crate) fn test_wire_model_for(provider_id: &str, model: &str) -> Option<(String, Option<String>, Option<String>)> {
     get(provider_id).and_then(|provider| bindings::resolve_test(&provider, model.trim()))
 }
 
@@ -940,6 +964,10 @@ fn validate_model_entries(raw: &[Value]) -> Result<Vec<Value>, String> {
             return Err(format!("模型 id 过长（最多 {MAX_MODEL_ID_CHARS} 个字符）"));
         }
         let reasoning = validate_reasoning(object.get("reasoning"))?;
+        let forced = validate_reasoning(object.get("reasoningOverride"))?;
+        if !forced.is_empty() && crate::server::core::model_rules::reasoning_rank(&forced).is_none() {
+            return Err("reasoningOverride 只支持标准正向思考等级；空串或 null 可清空".to_string());
+        }
         // 能力位覆盖（可选；校验见 validate_capabilities）—— 它是整表替换里
         // **必须原样带回**的字段：前端草稿漏了它，用户填过的能力就会被一次
         // 「切开关」的提交顺手清掉。
@@ -962,6 +990,7 @@ fn validate_model_entries(raw: &[Value]) -> Result<Vec<Value>, String> {
             "enabled": enabled,
             "reasoning": reasoning,
         });
+        if object.contains_key("reasoningOverride") { entry["reasoningOverride"] = Value::String(forced); }
         if let Some(capabilities) = capabilities {
             if let Some(map) = entry.as_object_mut() {
                 map.insert("capabilities".to_string(), Value::Object(capabilities));
@@ -1014,6 +1043,10 @@ fn validate_mapping_entries(raw: &[Value]) -> Result<Vec<Value>, String> {
             ));
         }
         let reasoning = validate_reasoning(object.get("reasoning"))?;
+        let forced = validate_reasoning(object.get("reasoningOverride"))?;
+        if !forced.is_empty() && crate::server::core::model_rules::reasoning_rank(&forced).is_none() {
+            return Err("reasoningOverride 只支持标准正向思考等级；空串或 null 可清空".to_string());
+        }
         let enabled = object
             .get("enabled")
             .and_then(Value::as_bool)
@@ -1031,12 +1064,14 @@ fn validate_mapping_entries(raw: &[Value]) -> Result<Vec<Value>, String> {
         if duplicated {
             continue;
         }
-        entries.push(json!({
+        let mut entry = json!({
             "alias": alias,
             "target": target,
             "enabled": enabled,
             "reasoning": reasoning,
-        }));
+        });
+        if object.contains_key("reasoningOverride") { entry["reasoningOverride"] = Value::String(forced); }
+        entries.push(entry);
     }
     Ok(entries)
 }

@@ -43,6 +43,7 @@ export type ReasoningMapping = {
   target?: unknown
   provider?: unknown
   reasoning?: unknown
+  reasoningOverride?: unknown
 }
 
 /** 三元组 → 索引键（小写；用不可能出现在任何名字里的 \u0001 作分隔符） */
@@ -64,10 +65,12 @@ function keyOf(alias: unknown, target: unknown, provider: unknown): string {
  */
 export function buildIndex(
   mappings: readonly ReasoningMapping[] | null | undefined,
+  field: "reasoning" | "reasoningOverride" = "reasoning",
 ): (alias: unknown, target: unknown, provider: unknown) => string {
   const index = new Map<string, string>()
   for (const mapping of Array.isArray(mappings) ? mappings : []) {
-    const level = typeof mapping?.reasoning === 'string' ? mapping.reasoning.trim() : ''
+    const raw = mapping?.[field]
+    const level = typeof raw === 'string' ? raw.trim() : ''
     if (!level) continue
     index.set(keyOf(mapping.alias, mapping.target, mapping.provider), level)
   }

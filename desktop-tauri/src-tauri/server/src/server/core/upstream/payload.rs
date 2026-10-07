@@ -63,6 +63,7 @@ use axum::http::HeaderMap;
 use serde_json::Value;
 
 use crate::server::logging;
+use crate::server::errors::GatewayError;
 
 use super::usage::RequestTelemetry;
 
@@ -162,7 +163,7 @@ pub(super) fn send_body<'a>(
     provider_id: &str,
     account: Option<&Value>,
     degraded: bool,
-) -> SendBody<'a> {
+) -> Result<SendBody<'a>, GatewayError> {
     // ── ① 系统提示词层（网关自有提示词：透传 / 替换 / 追加）──────────────
     // 在脱敏**之前**：与参考项目同序（提示词改写 → 脱敏），于是网关提示词
     // 自己万一命中指纹也会被后一层清掉；反过来的话，「刚换上去的那段提示词」
@@ -251,24 +252,36 @@ pub(super) fn send_body<'a>(
         .to_string();
     if requested.is_empty() {
         // 没有 model 字段：不改写，也没有可用的冷却键（空串，与改造前一致）
-        return SendBody { body, wire_model: requested };
+        return Ok(SendBody { body, wire_model: requested });
     }
     // 一次解析出两个属性：该家要收的名字 + 跟着那条映射走的思考等级
     // （同源，见模块头「思考等级绑定为什么也在这一步」）
-    let wire = ctx.test_target.cloned().unwrap_or_else(|| crate::server::core::providers::catalog::wire_target_for_provider(
+    // 自定义测试目标由 custom::rewrite_body 处理，强制档位不能交给原生适配器预检。
+    let wire = ctx.test_target.filter(|_| !crate::server::core::custom_providers::is_custom_provider_id(provider_id)).cloned().unwrap_or_else(|| crate::server::core::providers::catalog::wire_target_for_provider(
         &requested,
         provider_id,
         account,
     ));
     ctx.telemetry.note_upstream_model(&wire.model);
     rewrite_model(&mut body, &requested, &wire.model, provider_id);
+    // Qoder 两地区共用一个适配器，但模型能力必须以本次账号地区为准。
+    if provider_id == "qoder" {
+        if let Some(level) = wire.reasoning_override.as_deref() {
+            use crate::server::core::providers::qoder::{endpoints::Region, supports_reasoning};
+            let region = account.map(Region::from_payload).transpose()?.unwrap_or(Region::Global);
+            if !supports_reasoning(&wire.model, level, region) {
+                return Err(crate::server::core::model_rules::override_error("该账号地区的 Qoder 模型不支持强制思考档位"));
+            }
+        }
+    }
     let injected = apply_reasoning(
         &mut body,
         provider_id,
         &requested,
         &wire.model,
         wire.reasoning.as_deref(),
-    );
+        wire.reasoning_override.as_deref(),
+    )?;
     // 采集「实际随上游请求发出的思考等级」（请求日志模型列的 `(等级)`）。
     // 注入值优先（映射绑定生效时的最终档位，CatPaw 已在 patch 内归并）；
     // 没注入时问承载家的 `outbound_reasoning` —— 客户端显式指定的档位走这条
@@ -277,7 +290,7 @@ pub(super) fn send_body<'a>(
     // 注入路径已经问过一次适配器，这里再查一次注册表是两次哈希查找，可忽略。
     let upstream_reasoning = injected.or_else(|| outbound_reasoning_of(provider_id, &body));
     ctx.telemetry.note_upstream_reasoning(upstream_reasoning);
-    SendBody { body, wire_model: wire.model }
+    Ok(SendBody { body, wire_model: wire.model })
 }
 
 /// 承载家的 [`ProviderAdapter::outbound_reasoning`]（读发送体里随行的等级）。
@@ -353,8 +366,8 @@ fn rewrite_model(body: &mut Cow<'_, Value>, requested: &str, wire: &str, provide
 /// 同名映射（对外名与上游 id 相同）时两者相同，用户仍能从这一行看出
 /// 「这条等级来自哪条映射」；不同名时它就是「这条映射做了什么改写」的完整记录。
 ///
-/// **不碰客户端自己传的思考字段**：覆盖与否是适配器的判断（它复用本家那个
-/// resolver 读的键名），这里只往它指定的 `field` 上写。
+/// 默认绑定不碰客户端字段；强制绑定在确认适配器支持后，清除冲突的控制字段，
+/// 再写入同一个适配器返回的字段。历史消息和非控制子字段不参与清除。
 ///
 /// 返回值是**注入成功时的档位字符串**（`Set` 分支里写进 body 的那个值；
 /// `value` 不是字符串形态时给 None）：调用方拿它当「上游等级」采集的第一优先
@@ -367,11 +380,15 @@ fn apply_reasoning(
     requested: &str,
     wire_model: &str,
     level: Option<&str>,
-) -> Option<String> {
-    let Some(level) = level.map(str::trim).filter(|text| !text.is_empty()) else {
-        return None;
+    override_level: Option<&str>,
+) -> Result<Option<String>, GatewayError> {
+    let forced = override_level.map(str::trim).filter(|text| !text.is_empty());
+    let force = forced.is_some();
+    let Some(level) = forced.or_else(|| level.map(str::trim).filter(|text| !text.is_empty())) else {
+        return Ok(None);
     };
     if crate::server::core::model_rules::reasoning_is_off(level) {
+        if force { return Err(crate::server::core::model_rules::override_error("强制覆盖思考不支持关闭思考；请清空强制配置或选择有效等级")); }
         logging::verbose(
             "[Upstream]",
             &format!(
@@ -379,22 +396,25 @@ fn apply_reasoning(
                  「{level}」（关闭思考），本网关不向任何上游发「关闭思考」字段，跳过注入"
             ),
         );
-        return None;
+        return Ok(None);
     }
     // 未知 provider id 直接返回：选路早已按注册表校验过（`provider_loop` 对未知
     // id 直接 503），走到这里说明调用链坏了 —— 什么都不做比 panic 安全
     // （release 是 panic=abort）。
     let Some(kind) = crate::server::core::providers::kind_from_id(provider_id) else {
-        return None;
+        if force { return Err(crate::server::core::model_rules::override_error("强制覆盖思考的提供商未注册")); }
+        return Ok(None);
     };
     let adapter = crate::server::core::providers::adapter::adapter_for(kind);
-    match adapter.reasoning_patch(level, wire_model, body.as_ref()) {
+    match adapter.reasoning_patch(level, wire_model, body.as_ref(), force) {
         crate::server::core::providers::adapter::ReasoningPatch::Set { field, value } => {
             // 先取可变对象再打日志：请求体不是 JSON 对象时写不进去（正常路径不会
             // 发生 —— chat 入口已校验过是对象），此时**不能**打「已注入」——
             // 「日志里说的就是字节里有的」是这一整段可观测性的全部价值，
             // 一句与字节不符的「已注入」比没有日志更坏。
+            if force { crate::server::core::model_rules::clear_client_controls(body.to_mut()); }
             let Some(object) = body.to_mut().as_object_mut() else {
+                if force { return Err(crate::server::core::model_rules::override_error("强制覆盖思考要求请求体为 JSON 对象")); }
                 logging::verbose(
                     "[Upstream]",
                     &format!(
@@ -402,20 +422,20 @@ fn apply_reasoning(
                          绑定的思考等级 {level} 未注入：请求体不是 JSON 对象"
                     ),
                 );
-                return None;
+                return Ok(None);
             };
             logging::verbose(
                 "[Upstream]",
                 &format!(
                     "provider={provider_id} 映射 {requested} → {wire_model} \
-                     注入思考等级 {level} → {field}={value}"
+                     注入思考等级 {level}（force={force}） → {field}={value}"
                 ),
             );
             // 采集用值在 move 前取出：字符串形态才是「档位」，其它形态（将来
             // 某家的开关 / 对象）交给调用方那侧的 outbound_reasoning 再读
             let injected = value.as_str().map(str::to_string);
             object.insert(field.to_string(), value);
-            injected
+            Ok(injected)
         }
         crate::server::core::providers::adapter::ReasoningPatch::Skip { reason } => {
             logging::verbose(
@@ -425,7 +445,71 @@ fn apply_reasoning(
                      绑定的思考等级 {level} 未注入：{reason}"
                 ),
             );
-            None
+            if force {
+                Err(crate::server::core::model_rules::override_error(format!("强制覆盖思考 {level} 不支持：{reason}")))
+            } else { Ok(None) }
+        }
+    }
+}
+
+#[cfg(test)]
+mod force_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn all_supported_providers_force_without_changing_default_precedence() {
+        for (provider, model, expected) in [
+            ("zcode", "glm-5.3-flash", "max"),
+            ("zcode-intl", "glm-5.3-flash", "max"),
+            ("catpaw", "fixture", "max"),
+            ("qoder", "Qwen3.8-Flash", "max"),
+            ("accio", "claude-sonnet-4-6", "max"),
+            ("loomy", "spark-x", "high"),
+        ] {
+            for control in [json!("medium"), Value::Null, json!(false), json!(17), json!("off"), json!("unknown")] {
+                let original = json!({"model":model, "reasoning_effort":control,
+                    "reasoningEffort":"low", "effort":"low", "thinking":{"type":"disabled"},
+                    "reasoning":{"effort":"low","summary":"detailed"},
+                    "output_config":{"effort":"low","format":{"type":"json"}},
+                    "properties":{"reasoning_effort":"low","keep":true}, "max_tokens":48000,
+                    "messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"history","signature":"fixture"}]}]});
+                let mut body = Cow::Borrowed(&original);
+                let injected = apply_reasoning(&mut body, provider, model, model, Some("max"), None).unwrap();
+                if control.is_null() && provider.starts_with("qoder") {
+                    // Qoder 旧契约把第一个字段的 null 当未指定，不读取后面的冲突字段。
+                    assert_eq!(injected.as_deref(), Some("max"));
+                    let mut expected = original.clone(); expected["reasoning_effort"] = json!("max");
+                    assert_eq!(body.as_ref(), &expected);
+                } else {
+                    assert!(injected.is_none(), "{provider}");
+                    assert_eq!(body.as_ref(), &original, "默认绑定必须保持客户端优先 {provider}");
+                }
+                let mut body = Cow::Borrowed(&original);
+                assert_eq!(apply_reasoning(&mut body, provider, model, model, Some("low"), Some("max")).unwrap().as_deref(), Some(expected), "{provider}");
+                assert_eq!(body["reasoning_effort"], expected, "{provider}");
+                for key in ["reasoningEffort", "effort", "thinking"] { assert!(body.get(key).is_none(), "{provider} {key}"); }
+                assert_eq!(body["reasoning"], json!({"summary":"detailed"}));
+                assert_eq!(body["output_config"], json!({"format":{"type":"json"}}));
+                assert_eq!(body["properties"], json!({"keep":true}));
+                assert_eq!(body["max_tokens"], original["max_tokens"]);
+                assert_eq!(body["messages"], original["messages"]);
+                assert_eq!(original["thinking"]["type"], "disabled", "输入保持只读");
+            }
+        }
+    }
+
+    #[test]
+    fn unset_override_is_legacy_and_unsupported_force_is_an_error() {
+        let original = json!({"model":"glm-5.3-flash","messages":[]});
+        let mut body = Cow::Borrowed(&original);
+        assert_eq!(apply_reasoning(&mut body, "zcode", "alias", "glm-5.3-flash", Some("medium"), Some(" ")).unwrap().as_deref(), Some("high"));
+        assert_eq!(body["reasoning_effort"], "high");
+        for (provider, model, forced) in [("qoder", "not-a-model", "max"), ("accio", "glm-5", "max"), ("loomy", "other", "max"), ("zcode", "glm-4.7", "max"), ("workbuddy", "fixture", "max"), ("zcode", "glm-5.3-flash", "off"), ("zcode", "glm-5.3-flash", "unknown")] {
+            let mut body = Cow::Borrowed(&original);
+            let error = apply_reasoning(&mut body, provider, "alias", model, Some("medium"), Some(forced)).unwrap_err();
+            assert_eq!(error.status_code, 400);
+            assert_eq!(body.as_ref(), &original);
         }
     }
 }

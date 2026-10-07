@@ -210,13 +210,16 @@ impl ProviderAdapter for LoomyAdapter {
     /// 客户端显式指定时让位（用户的明确意图比映射默认值更具体）；
     /// `off` / `none` 不注入（客户端没有「关闭思考」的可靠表达）；表外自定义
     /// 等级不注入（上游对未知档位要么忽略要么 400，不如明确跳过）。
-    fn reasoning_patch(&self, level: &str, _model: &str, body: &Value) -> ReasoningPatch {
+    fn reasoning_patch(&self, level: &str, model: &str, body: &Value, force: bool) -> ReasoningPatch {
+        if force && !models::is_reasoning_model(model) {
+            return ReasoningPatch::Skip { reason: "该 Loomy 模型不支持思考档位" };
+        }
         if crate::server::core::model_rules::reasoning_is_off(level) {
             return ReasoningPatch::Skip {
                 reason: "Loomy 没有「关闭思考」的可靠表达，跳过注入",
             };
         }
-        if crate::server::core::model_rules::read_client_level(body).is_some() {
+        if !force && crate::server::core::model_rules::read_client_level(body).is_some() {
             return ReasoningPatch::Skip {
                 reason: "客户端请求体里已指定思考等级，绑定让位",
             };

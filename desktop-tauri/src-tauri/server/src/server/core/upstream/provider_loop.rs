@@ -498,6 +498,9 @@ async fn attempt_queue(
             match attempt_custom(service, ctx, target, slot, connections, degraded).await {
                 Ok(outcome) => return Ok(outcome),
                 Err(error) => {
+                    if error.code.as_deref() == Some(crate::server::core::model_rules::OVERRIDE_ERROR_CODE) {
+                        return Err(error);
+                    }
                     // 手动终止优先（与无状态路径同一判定与理由）：不把已受理的
                     // 终止当成「这一轮失败」去顺延下一个账号
                     if ctx.telemetry.is_cancelled() {
@@ -598,6 +601,9 @@ async fn attempt_queue(
             {
                 Ok(outcome) => return Ok(outcome),
                 Err(error) => {
+                    if error.code.as_deref() == Some(crate::server::core::model_rules::OVERRIDE_ERROR_CODE) {
+                        return Err(error);
+                    }
                     // 手动终止优先（与无状态 / 自定义两条路径同一判定与理由）：
                     // 会话式这一轮已经结束，但用户要的是终止 —— 不把它当成
                     // 普通失败去顺延下一个账号（那会把终止拖成另一轮转发）
@@ -816,9 +822,16 @@ async fn attempt_queue(
             // 发送体在这一轮发送前取一次（同一家同池同降级状态下复用缓存项）：
             // 借用在本次迭代内有效，`continue`（401 刷新 / 内容拦截补救）时
             // 重新取 —— 于是「换了 body 的那次重试」拿到的一定是新的一份。
-            let send = send_cache.entry((provider_id, account_pool.clone(), degraded)).or_insert_with(
-                || send_body(ctx, provider_id, target.account.as_ref(), degraded),
-            );
+            let send = match send_cache.entry((provider_id, account_pool.clone(), degraded)) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let send = send_body(ctx, provider_id, target.account.as_ref(), degraded).map_err(|error| {
+                        ctx.telemetry.finish_last_attempt(Some(i64::from(error.status_code)), Some(&error.message));
+                        error
+                    })?;
+                    entry.insert(send)
+                }
+            };
             // 内置家是「把 chat 体原样发给上游」的透传出口：入口翻译（Anthropic /
             // Responses）暂存的内部字段（_wb_*，见 protocol::mod 的说明）绝不能
             // 到这里 —— 严格校验的上游会拒绝消息上的未知字段整轮 400。没有暂存
@@ -1411,9 +1424,12 @@ async fn attempt_custom(
     }
     let started_at = logging::now_ms();
     // 内容处理（系统提示词 + 脱敏）与内置家同一时机：凭证已就绪、这一家
-    // **即将发送**。普通自定义请求在 send_body 不解析绑定，管理测试则使用
-    // 已校验的原始目标；自定义语义（别名改写、思考等级）仍由 forward 收口。
-    let send = send_body(ctx, &provider_id, target.account.as_ref(), degraded);
+    // **即将发送**。自定义绑定（原始测试目标、默认和强制等级）由 forward 收口，
+    // 这里仍处理提示词与脱敏，不用原生适配器预检自定义档位。
+    let send = send_body(ctx, &provider_id, target.account.as_ref(), degraded).map_err(|error| {
+        ctx.telemetry.finish_last_attempt(Some(i64::from(error.status_code)), Some(&error.message));
+        error
+    })?;
     // 测试沿用已校验目标；普通请求用自定义绑定解析。日志与冷却都取同一真名。
     let wire_model = ctx.test_target.map(|target| target.model.clone())
         .unwrap_or_else(|| custom_forward::cooldown_model(&provider_id, &model_of(ctx.body)));
@@ -1560,7 +1576,7 @@ async fn attempt_stateful(
     // `degraded` 由调用方（账号循环）给出：本路径**没有**就地补救（有状态
     // provider 一次转发就是一个会话轮次，没有「换提示词重发」这一步），
     // 但降级期内（状态机已生效）首发的提示词也要跟着换。
-    let send = send_body(ctx, provider_id, target.account.as_ref(), degraded);
+    let send = send_body(ctx, provider_id, target.account.as_ref(), degraded)?;
     // 内置家透传出口的内部字段剥离：与无状态路径同一理由（见那里的说明）
     let stripped = strip_internal_fields(&send.body);
     let body: &serde_json::Value = &stripped;

@@ -137,7 +137,8 @@ mod reasoning;
 
 pub use reasoning::{
     effort_rank as reasoning_rank, is_thinking_off as reasoning_is_off,
-    normalize as normalize_reasoning, read_client_level, REASONING_LEVELS,
+    normalize as normalize_reasoning, read_client_level, clear_client_controls, override_error,
+    OVERRIDE_ERROR_CODE, REASONING_LEVELS,
 };
 
 /// 一条映射：把上游模型（`provider` × `target`）以对外名 `alias` 暴露给下游。
@@ -161,6 +162,7 @@ pub struct Mapping {
     pub target: String,
     pub provider: Option<String>,
     pub reasoning: Option<String>,
+    pub reasoning_override: Option<String>,
     pub enabled: bool,
 }
 
@@ -279,6 +281,9 @@ impl Mapping {
             "provider": self.provider,
             "reasoning": self.reasoning,
         });
+        if let Some(level) = &self.reasoning_override {
+            object["reasoningOverride"] = Value::String(level.clone());
+        }
         if !self.enabled {
             if let Some(map) = object.as_object_mut() {
                 map.insert("enabled".to_string(), Value::Bool(false));
@@ -453,6 +458,7 @@ impl ModelRules {
                             target: target.to_string(),
                             provider: provider.map(str::to_string),
                             reasoning,
+                            reasoning_override: item.get("reasoningOverride").and_then(Value::as_str).and_then(normalize_reasoning),
                             enabled,
                         })
                     })
@@ -764,6 +770,7 @@ pub fn add_mapping(
     reasoning: Option<Option<&str>>,
     enabled: Option<bool>,
     other_providers: &[String],
+    reasoning_override: Option<Option<&str>>,
 ) -> Result<ModelRules, String> {
     let mut rules = current();
     let inherited = provider.and_then(|owner| rules.binding(owner, alias, target).cloned());
@@ -796,6 +803,13 @@ pub fn add_mapping(
                 touched = true;
             }
         }
+        if let Some(next) = reasoning_override {
+            let next = next.and_then(normalize_reasoning);
+            if existing.reasoning_override != next {
+                existing.reasoning_override = next;
+                touched = true;
+            }
+        }
         if let Some(next) = enabled {
             if existing.enabled != next {
                 existing.enabled = next;
@@ -810,6 +824,10 @@ pub fn add_mapping(
             reasoning: match reasoning {
                 Some(value) => value.and_then(normalize_reasoning),
                 None => inherited.as_ref().and_then(|mapping| mapping.reasoning.clone()),
+            },
+            reasoning_override: match reasoning_override {
+                Some(value) => value.and_then(normalize_reasoning),
+                None => inherited.as_ref().and_then(|mapping| mapping.reasoning_override.clone()),
             },
             enabled: enabled.unwrap_or_else(|| inherited.as_ref().map_or(true, |mapping| mapping.enabled)),
         });
@@ -1021,7 +1039,7 @@ pub fn remove_mapping(
 ) -> (ModelRules, bool) {
     let mut rules = current();
     let mut removed = false;
-    let mut global_hit = false;
+    let mut global_hit = None;
     rules.mappings.retain(|m| {
         if !(m.alias.eq_ignore_ascii_case(alias) && m.target.eq_ignore_ascii_case(target)) {
             return true;
@@ -1032,7 +1050,7 @@ pub fn remove_mapping(
             (Some(_), None) => true,
             // 旧版全局条目：对任何家都命中（与展示同口径）
             (None, _) => {
-                global_hit = true;
+                global_hit = Some(m.clone());
                 true
             }
         };
@@ -1041,7 +1059,7 @@ pub fn remove_mapping(
         }
         !hit
     });
-    if removed && global_hit {
+    if let Some(global) = global_hit.filter(|_| removed) {
         if let Some(owner) = provider {
             // 全局条目展开：其余承载 target 的家逐家补精确条目（已有的不重复加），
             // 于是「在 A 家行上删掉」不会顺手把 B 家的映射也弄丢
@@ -1061,10 +1079,11 @@ pub fn remove_mapping(
                         alias: alias.to_string(),
                         target: target.to_string(),
                         provider: Some(other.to_string()),
-                        reasoning: None,
+                        reasoning: global.reasoning.clone(),
+                        reasoning_override: global.reasoning_override.clone(),
                         // 展开补出来的条目继承「映射本来生效」的事实：
                         // 被删的那条是全局条目（对这家也是开着的）
-                        enabled: true,
+                        enabled: global.enabled,
                     });
                 }
             }
@@ -1183,6 +1202,7 @@ fn seed_extra_aliases(
             provider: Some(provider.to_string()),
             // 种子建的映射不绑思考等级（那是用户手动绑定的东西）
             reasoning: None,
+            reasoning_override: None,
             // 种子建的就是「生效」的映射；用户此后把它关掉是自己的决定，
             // seeded 只防「删掉后被重种」，关掉的不会被重开（exists 判重挡着）
             enabled: true,
@@ -1248,6 +1268,7 @@ pub fn seed_raccoon_defaults(ids: &[String]) -> Option<String> {
                 target: id.to_string(),
                 provider: Some("raccoon".to_string()),
                 reasoning: None,
+            reasoning_override: None,
                 enabled: true,
             });
             mappings_added.push(format!("{alias} → {id}"));

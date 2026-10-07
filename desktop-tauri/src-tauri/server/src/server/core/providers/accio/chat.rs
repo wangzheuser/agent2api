@@ -54,6 +54,8 @@ pub struct ChatPlan {
     pub upstream_key: String,
     /// 要不要下发思考内容（上游声明支持思考且档位不是「关」）
     pub thinking: bool,
+    /// 按模型声明归一后的实际档位。
+    pub reasoning: Option<String>,
     /// 本次请求 id（`sg_k` 由它算出来，日志里对得上）
     pub request_id: String,
 }
@@ -136,6 +138,7 @@ pub fn build_plan(
         model_name: model_name.to_string(),
         upstream_key,
         thinking: built.thinking,
+        reasoning: resolved_effort,
         request_id,
     })
 }
