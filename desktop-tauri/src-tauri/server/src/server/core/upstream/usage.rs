@@ -1430,7 +1430,7 @@ impl RequestTelemetry {
     pub fn report_usage(&self, usage: &Value) {
         if let Some(credit) = upstream_credits(usage) {
             let mut guard = self.lock();
-            if guard.provider.as_deref() == Some("workbuddy") { guard.upstream_credits = Some(credit); }
+            if matches!(guard.provider.as_deref(), Some("workbuddy" | "workbuddy-intl")) { guard.upstream_credits = Some(credit); }
         }
         let Some(tokens) = extract_usage(usage) else {
             return;
@@ -1444,9 +1444,9 @@ impl RequestTelemetry {
             return;
         }
         let mut guard = self.lock();
-        if guard.provider.as_deref() == Some("workbuddy") && tokens.total_present && tokens.total > 0 {
+        if matches!(guard.provider.as_deref(), Some("workbuddy" | "workbuddy-intl")) && tokens.total_present && tokens.total > 0 {
             guard.workbuddy_cost_tokens = Some(tokens.total);
-        } else if guard.provider.as_deref() == Some("workbuddy") && tokens.prompt_present && tokens.completion_present {
+        } else if matches!(guard.provider.as_deref(), Some("workbuddy" | "workbuddy-intl")) && tokens.prompt_present && tokens.completion_present {
             guard.workbuddy_cost_tokens = Some(tokens.prompt.saturating_add(tokens.completion));
         }
         if tokens.prompt_present && (tokens.prompt > 0 || guard.prompt_tokens == 0) {
@@ -1591,5 +1591,26 @@ impl RequestTelemetry {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
+    }
+}
+
+#[cfg(test)]
+mod intl_credit_restore_tests {
+    use super::*;
+    #[test]
+    fn international_receipts_keep_identity_cost_tokens_and_reset_on_rotation() {
+        let telemetry = RequestTelemetry::new();
+        telemetry.note_attempt(Some("intl"), "fixture", "workbuddy-intl");
+        telemetry.note_workbuddy_account(Some(&json!({"uid":"fixture","provider":"workbuddy-intl","edition":"intl"})));
+        telemetry.report_usage(&json!({"credit":0.125,"prompt_tokens":100,"completion_tokens":7,"total_tokens":107}));
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.upstream_credits, Some(0.125));
+        assert_eq!(snapshot.workbuddy_cost_tokens, Some(107));
+        assert!(snapshot.workbuddy_identity.is_some());
+        telemetry.note_attempt(Some("other"), "other", "zcode");
+        assert_eq!(telemetry.snapshot().workbuddy_identity, None);
+        assert_eq!(telemetry.snapshot().upstream_credits, None);
+        telemetry.report_usage(&json!({"credit":1.0}));
+        assert_eq!(telemetry.snapshot().upstream_credits, None);
     }
 }

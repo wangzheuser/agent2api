@@ -202,8 +202,10 @@ pub fn shim_js() -> &'static str {
       : provider.indexOf('accio') === 0 ? 'Accio'
       : provider === 'codearts' ? 'CodeArts'
       : provider === 'lobsterai' ? 'LobsterAI' : 'AutoClaw';
-    var callbackInstruction = '授权完成后，复制授权页浏览器地址栏中的<strong>完整地址</strong>，'
-        + '粘贴到下面提交。不要复制授权页原始地址，也不要改动参数。';
+    var callbackInstruction = provider === 'autoclaw-intl'
+        ? 'AutoClaw 国际版授权完成后，浏览器可能显示 localhost 无法访问，这是预期现象。请复制地址栏中的<strong>完整回调地址</strong>，粘贴到下面提交。不要复制授权页原始地址，也不要改动参数。'
+        : '授权完成后，复制授权页浏览器地址栏中的<strong>完整地址</strong>，'
+          + '粘贴到下面提交。不要复制授权页原始地址，也不要改动参数。';
     while (true) {
       var callbackUrl = await ensureOverlay(
         label + '需要粘贴回调地址',
@@ -652,6 +654,17 @@ pub fn shim_js() -> &'static str {
         captchaRegion: captchaRegion ? String(captchaRegion) : '',
       });
     },
+    // ── ZCode 活动套餐通道的验证码令牌池 ──
+    // 与桌面端 bridge.rs 保持同一契约：headless 面板里的令牌守卫需要
+    // 读取库存，并把 WebView 铸出的令牌推回网关。缺少这两个方法时，
+    // zcode-captcha-pool.js 会静默跳过整个铸造循环，账号设置也会一直显示
+    // 「验证码令牌：状态读取失败」。
+    zcodeCaptchaStats: function () { return call('GET', '/api/zcode/captcha'); },
+    pushZcodeCaptchaTokens: function (tokens) {
+      return call('POST', '/api/zcode/captcha', {
+        tokens: Array.isArray(tokens) ? tokens : [],
+      });
+    },
     onLoginState: function (callback) {
       loginListeners.add(callback);
       return function () { loginListeners.delete(callback); };
@@ -759,6 +772,13 @@ pub fn shim_js() -> &'static str {
       return call('GET', '/api/accounts/usage' + (id ? '?id=' + encodeURIComponent(id) : ''));
     },
     getBalancesSnapshot: function () { return call('GET', '/api/accounts/usage/snapshot'); },
+    getAutoClawTasks: function (id) {
+      return call('GET', '/api/accounts/autoclaw/tasks?id=' + encodeURIComponent(String(id || '')));
+    },
+    getWorkBuddyGrowth: function (id) { return call('GET', '/api/accounts/workbuddy/growth?id=' + encodeURIComponent(id)); },
+    workBuddyGrowthAction: function (input) { return call('POST', '/api/accounts/workbuddy/growth/action', input); },
+    getWorkBuddyPolicy: function (id) { return call('GET', '/api/accounts/workbuddy/policy?id=' + encodeURIComponent(id)); },
+    updateWorkBuddyPolicy: function (id, patch) { return call('PATCH', '/api/accounts/workbuddy/policy?id=' + encodeURIComponent(id), patch); },
     getAccountConnections: function () { return call('GET', '/api/accounts/connections'); },
     checkinAllAccounts: function (id) { return call('POST', '/api/accounts/checkin', id ? { id: id } : {}); },
 
@@ -935,6 +955,10 @@ pub fn shim_js() -> &'static str {
     // ── 排队等待（次数 / 单次秒数）──
     getQueue: function () { return call('GET', '/api/queue'); },
     saveQueue: function (patch) { return call('PUT', '/api/queue', patch); },
+
+    // ── 账号选路策略 ──
+    getAccountSelection: function () { return call('GET', '/api/account-selection'); },
+    saveAccountSelection: function (patch) { return call('PUT', '/api/account-selection', patch); },
 
     // ── 调试模式 ──
     getDebug: function () { return call('GET', '/api/debug'); },

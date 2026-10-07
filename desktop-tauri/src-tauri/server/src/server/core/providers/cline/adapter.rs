@@ -209,7 +209,7 @@ impl ProviderAdapter for ClineAdapter {
                 // 错误文案里带人话时长（"Try again in 17h 59m"）—— 解析成恢复
                 // 时间戳交给编排层（Some 且未过期时直接采用，跳过 10 分钟兜底）；
                 // 解析不出维持 None（下游文案解析 → 10 分钟兜底的既有链路不变）。
-                reset_at: parse_inference_cap_reset_at(error_body),
+                reset_at: cline_reset_at(error_body).or_else(|| parse_inference_cap_reset_at(error_body)),
                 message,
                 upstream_code: None,
                 status,
@@ -632,6 +632,69 @@ fn build_upstream_body(body: &Value, session_id: &str) -> Value {
 }
 
 // ─── 429 的人话时长解析（移植自 cline-proxy）─────────────────
+
+fn cline_reset_at(error_body: &Value) -> Option<i64> {
+    for key in ["resets_at", "reset_at", "resetAt"] {
+        if let Some(value) = error_body.get(key).and_then(absolute_timestamp) {
+            return Some(value);
+        }
+    }
+    error_body
+        .get("retry_after")
+        .and_then(relative_seconds)
+        .map(|seconds| crate::server::logging::now_ms().saturating_add(seconds.saturating_mul(1000)))
+}
+
+fn absolute_timestamp(value: &Value) -> Option<i64> {
+    if let Some(number) = value.as_i64() {
+        return timestamp_from_number(number);
+    }
+    let text = value.as_str()?.trim();
+    if let Ok(number) = text.parse::<i64>() {
+        return timestamp_from_number(number);
+    }
+    chrono::DateTime::parse_from_rfc3339(text)
+        .ok()
+        .map(|date| date.timestamp_millis())
+        .filter(|value| *value > crate::server::logging::now_ms())
+}
+
+fn timestamp_from_number(number: i64) -> Option<i64> {
+    let millis = if number < 100_000_000_000 {
+        number.saturating_mul(1000)
+    } else {
+        number
+    };
+    (millis > crate::server::logging::now_ms()).then_some(millis)
+}
+
+fn relative_seconds(value: &Value) -> Option<i64> {
+    let seconds = value.as_i64().or_else(|| value.as_str()?.trim().parse().ok())?;
+    (seconds > 0).then_some(seconds)
+}
+
+#[cfg(test)]
+mod reset_tests {
+    use super::*;
+
+    #[test]
+    fn parses_absolute_seconds_milliseconds_and_iso() {
+        let future_seconds = crate::server::logging::now_ms() / 1000 + 3600;
+        let seconds = cline_reset_at(&serde_json::json!({"resets_at": future_seconds})).expect("seconds");
+        assert!((seconds - future_seconds * 1000).abs() < 1000);
+        let future_ms = crate::server::logging::now_ms() + 7_200_000;
+        assert_eq!(Some(future_ms), cline_reset_at(&serde_json::json!({"resetAt": future_ms})));
+        assert!(cline_reset_at(&serde_json::json!({"reset_at": "2099-01-01T00:00:00Z"})).is_some());
+    }
+
+    #[test]
+    fn parses_relative_retry_after_and_ignores_expired_values() {
+        let before = crate::server::logging::now_ms();
+        let reset = cline_reset_at(&serde_json::json!({"retry_after": 90})).expect("retry_after");
+        assert!(reset >= before + 89_000);
+        assert_eq!(None, cline_reset_at(&serde_json::json!({"resets_at": 1})));
+    }
+}
 
 /// 从 Cline 429 错误体解析 `"Try again in 17h 59m"` 形式的等待时长，
 /// 返回**恢复时间戳**（毫秒；`now + 时长`）。解析不出返回 None。

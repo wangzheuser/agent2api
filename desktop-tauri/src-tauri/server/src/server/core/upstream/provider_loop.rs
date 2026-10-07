@@ -73,13 +73,15 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use bytes::Bytes;
+use futures::StreamExt;
 use serde_json::{json, Value};
 
 use crate::server::config;
 use crate::server::core::custom_providers;
 use crate::server::core::protocol::strip_internal_fields;
 use crate::server::core::providers::adapter::{
-    adapter_for, ProviderAdapter, RetryAdvice, UpstreamErrorClass,
+    adapter_for, ProviderAdapter, RetryAdvice, SuccessHead, UpstreamErrorClass,
 };
 use crate::server::core::providers::custom::forward as custom_forward;
 use crate::server::core::providers::router::route_for_forward;
@@ -101,6 +103,8 @@ mod tests;
 
 /// 上游一次请求的失败（已分类 + 已构好给客户端的错误）。
 struct OutboundFailure {
+    /// 已消耗重试预算，需要回到计划构造层换取一次性凭证。
+    rebuild: bool,
     /// 适配器给出的分类（决定编排动作）
     class: UpstreamErrorClass,
     /// 给客户端的网关错误（状态码 / 文案 / 上游码）。
@@ -109,6 +113,11 @@ struct OutboundFailure {
     /// 收的就是 `error.message`（`上游返回 429: {上游原文}`），
     /// accounts.json 里落的那段文案因此逐字不变。
     error: GatewayError,
+}
+
+struct PreparedResponse {
+    status: u16,
+    stream: futures::stream::BoxStream<'static, Result<Bytes, std::io::Error>>,
 }
 
 /// **原地重发**的退避预算（见 `send_with_retry` 的说明）。
@@ -763,6 +772,7 @@ async fn attempt_queue(
         // 放在这里而不是 send_with_retry 里：函数内那层退避重试（同账号重发）
         // **不算一次新尝试**（口径见 TelemetrySnapshot::attempts 的说明），
         // 若在循环里起头就会多出几条「同名同账号」的重复项。
+        if matches!(provider_id, "workbuddy" | "workbuddy-intl") { ctx.telemetry.note_workbuddy_account(Some(&session)); }
         ctx.telemetry.note_attempt_started(provider_id, &attempt_account);
         // 代理回退提示：选路时记下的「代理不可用、本次直连」跟着这一轮走
         // （改造前它是一行运行日志，见 `with_proxy_notice`）
@@ -825,7 +835,15 @@ async fn attempt_queue(
             // 会把它渲染成「无结果记录」）—— 明明有一个明确的失败原因。
             // 所以先给明细定稿，再把错误抛出：明细条数与 attempts 的一一对应
             // 在此也成立（那是本字段的全部前提，见模块头）。
-            let plan = match adapter.build_chat_request(&session, body, ctx.client_headers) {
+            let prepared = adapter.prepare_chat_request(&session, body, ctx.client_headers);
+            let result = match ctx.telemetry.cancel_token() {
+                Some(token) => tokio::select! {
+                    result = prepared => result,
+                    _ = token.cancelled() => Err(cancellation::cancelled_error()),
+                },
+                None => prepared.await,
+            };
+            let plan = match result {
                 Ok(plan) => plan,
                 Err(error) => {
                     ctx.telemetry.finish_last_attempt(
@@ -876,7 +894,11 @@ async fn attempt_queue(
                 url: plan.url,
                 headers: plan.headers,
                 payload,
-                proxy: target.proxy.clone(),
+                proxy: if adapter.chat_uses_direct_egress(&session) {
+                    None
+                } else {
+                    target.proxy.clone()
+                },
             };
             // ── 调试模式：抓一份即将发出去的原始报文 ──────────────────
             // 位置在 `build_chat_request` 之后（URL / 头 / body 都已定稿）。
@@ -891,9 +913,10 @@ async fn attempt_queue(
                 adapter,
                 &transport,
                 &mut budget,
-                capture.as_deref(),
+                capture.as_ref(),
                 ctx.telemetry,
                 degraded,
+                adapter.request_is_single_use(&session),
             )
             .await
             {
@@ -907,7 +930,7 @@ async fn attempt_queue(
                     // 发出去了，之后还可能断流失败 —— 那属于另一列（状态）的
                     // 口径，见 `RequestEntry::is_success` 的说明。
                     ctx.telemetry
-                        .finish_last_attempt(Some(i64::from(response.status().as_u16())), None);
+                        .finish_last_attempt(Some(i64::from(response.status)), None);
                     break (response, wire_model, plan.response);
                 }
                 Err(failure) => {
@@ -933,6 +956,9 @@ async fn attempt_queue(
                     // 一样按动作 1 / 动作 3 换号顺延：直接换下一个账号继续试，
                     // 换满或没有更多账号时错误才原样返回客户端。
                     let named_switch = direct_switch_status(i64::from(failure.error.status_code));
+                    if failure.rebuild {
+                        continue;
+                    }
                     // ── 动作 0：内容策略拦截 → 换中性提示词，同账号立即重试一次 ──
                     // 上游按逐字精确匹配审核，命中即整单拦截；这是**误报**而不是
                     // 账号问题（余额健康、未限流、session 未死），所以既不罚账号
@@ -1245,17 +1271,10 @@ async fn attempt_queue(
             "[Upstream]",
             &format!(
                 "上游响应 HTTP {}（{}ms）",
-                response.status().as_u16(),
+                response.status,
                 logging::now_ms() - started_at
             ),
         );
-
-        // ── 调试模式：响应头到手（必须在 consume response 之前）──────────
-        // 状态码与响应头在这里定稿；响应体由后续的流 / 聚合函数逐段补进同一个
-        // 采集器（见 `ForwardStream` / `aggregate_sse_completion`）。
-        if let Some(capture) = ctx.telemetry.capture() {
-            capture.attach_response(response.status().as_u16(), response.headers());
-        }
 
         // ── 上游响应协议（适配器在构造请求时一并给出）──────────────────
         // 绝大多数上游说 chat SSE（`ForwardStream` / 聚合器的默认输入）；
@@ -1267,15 +1286,11 @@ async fn attempt_queue(
             == crate::server::core::providers::adapter::UpstreamResponse::Anthropic
         {
             // 状态码要在 consume response 之前取（与 chat 路径同一时机）
-            let status = response.status().as_u16();
+            let status = response.status;
             let translated: futures::stream::BoxStream<
                 'static,
                 Result<bytes::Bytes, std::io::Error>,
-            > = Box::pin(super::translate::AnthropicToChatStream::new(
-                response,
-                &wire_model,
-                ctx.telemetry,
-            ));
+            > = Box::pin(super::translate::AnthropicToChatStream::from_stream(response.stream, &wire_model));
             if ctx.stream {
                 return Ok(ForwardOutcome::Stream {
                     status,
@@ -1300,14 +1315,14 @@ async fn attempt_queue(
         }
 
         if ctx.stream {
-            let status = response.status().as_u16();
+            let status = response.status;
             return Ok(ForwardOutcome::Stream {
                 status,
                 // 槽位交给流：流跑完 / 客户端断开 / 流被 drop 时才放行等待者；
                 // 连接计数同样移交（`handoff` 转移所有权，本栈帧的凭证随即失效，
                 // 避免同一账号被两份凭证各算一次）
-                stream: Box::new(super::ForwardStream::new(
-                    response,
+                stream: Box::new(super::ForwardStream::from_stream(
+                    response.stream,
                     slot.take(),
                     connections.handoff(),
                     ctx.telemetry.clone(),
@@ -1315,8 +1330,8 @@ async fn attempt_queue(
                 )),
             });
         }
-        let aggregated = super::aggregate::aggregate_sse_completion(
-            response,
+        let aggregated = super::aggregate::aggregate_frame_stream(
+            response.stream,
             ctx.telemetry.clone(),
             model_rewrite_of(adapter, &model),
         )
@@ -1768,6 +1783,7 @@ fn model_rewrite_of(adapter: &dyn ProviderAdapter, model: &str) -> Option<super:
 /// 调用方按令牌判定，不读这里的 `class`）。
 fn cancelled_failure() -> OutboundFailure {
     OutboundFailure {
+        rebuild: false,
         class: UpstreamErrorClass::Fatal {
             status: cancellation::MANUAL_TERMINATED_STATUS as u16,
             message: cancellation::MANUAL_TERMINATED.to_string(),
@@ -1816,6 +1832,94 @@ async fn sleep_or_cancel(
     }
 }
 
+fn gateway_error_from_class(class: &UpstreamErrorClass) -> GatewayError {
+    match class {
+        UpstreamErrorClass::QuotaLimited { status, message, upstream_code, .. }
+        | UpstreamErrorClass::ContentBlocked { status, message, upstream_code }
+        | UpstreamErrorClass::Fatal { status, message, upstream_code } => {
+            GatewayError::with_status(*status as i32, message.clone())
+                .with_optional_code(*upstream_code)
+        }
+        UpstreamErrorClass::TokenExpired { message } => {
+            GatewayError::with_status(401, message.clone())
+        }
+    }
+}
+
+/// 读取需要首包判定的提供商响应，并把已读前缀重新接回剩余流。
+///
+/// 适配器以 `Pending/Ready/Failure` 描述自己的 2xx 业务信封。只有明确要求
+/// 预读的适配器才会消费首段；其它提供商保持原有零拷贝响应路径。
+async fn prepare_success_response(
+    mut response: reqwest::Response,
+    adapter: &dyn ProviderAdapter,
+    capture: Option<&std::sync::Arc<crate::server::core::debug_traffic::TrafficCapture>>,
+) -> Result<PreparedResponse, OutboundFailure> {
+    let status = response.status().as_u16();
+    let headers = response.headers().clone();
+    let mut prefix = Vec::<Bytes>::new();
+    let mut head = Vec::<u8>::new();
+    let needs_head = matches!(adapter.inspect_success_head(&[]), SuccessHead::Pending);
+    if let Some(capture) = capture {
+        capture.attach_response(status, &headers);
+    }
+
+    if needs_head {
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    head.extend_from_slice(&chunk);
+                    if let Some(capture) = capture {
+                        capture.push(&chunk);
+                    }
+                    prefix.push(chunk);
+                    match adapter.inspect_success_head(&head) {
+                        SuccessHead::Pending => continue,
+                        SuccessHead::Ready => break,
+                        SuccessHead::Failure(class) => {
+                            let error = gateway_error_from_class(&class);
+                            return Err(OutboundFailure {
+                                rebuild: false,
+                                class,
+                                error,
+                            });
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    let message = format!(
+                        "上游流式传输中断：{}",
+                        crate::server::core::egress::describe_error_detail(&error)
+                    );
+                    let class = UpstreamErrorClass::Fatal {
+                        status: 502,
+                        message: message.clone(),
+                        upstream_code: None,
+                    };
+                    return Err(OutboundFailure {
+                        rebuild: false,
+                        class,
+                        error: GatewayError::with_status(502, message),
+                    });
+                }
+            }
+        }
+    }
+
+    let rest = response.bytes_stream().map(|item| {
+        item.map_err(|error| {
+            std::io::Error::other(crate::server::core::egress::describe_error_detail(&error))
+        })
+    });
+    let rest = super::capture_stream(Box::pin(rest), capture.cloned());
+    let stream = futures::stream::iter(prefix.into_iter().map(Ok)).chain(rest);
+    Ok(PreparedResponse {
+        status,
+        stream: Box::pin(stream),
+    })
+}
+
 /// 发一次上游请求，含「可退避重试」循环（次数 / 间隔来自设置页的全局重试设置）。
 ///
 /// 默认以 HTTP 2xx 判成功；适配器可按响应头识别伪装成 2xx 的业务错误。
@@ -1847,10 +1951,11 @@ async fn send_with_retry(
     adapter: &dyn ProviderAdapter,
     transport: &TransportRequest,
     budget: &mut RetryBudget,
-    capture: Option<&crate::server::core::debug_traffic::TrafficCapture>,
+    capture: Option<&std::sync::Arc<crate::server::core::debug_traffic::TrafficCapture>>,
     telemetry: &crate::server::core::upstream::usage::RequestTelemetry,
     degraded: bool,
-) -> Result<reqwest::Response, OutboundFailure> {
+    single_use: bool,
+) -> Result<PreparedResponse, OutboundFailure> {
     loop {
         // 手动终止：发送前先看令牌（退避睡眠 / 上一轮失败之后回到这里）。
         // 出口是 `cancelled_failure`，但调用方（attempt_queue）在分类动作之前
@@ -1873,6 +1978,7 @@ async fn send_with_retry(
                 }
                 // 传输层失败（DNS/代理/连接）：按设置退避重发，吸收链路抖动；
                 // 次数用完才收敛成 502，与改造前的兜底一致
+                let mut rebuild = false;
                 if let Some(advice) = transport_retry_advice(&error, budget.remaining) {
                     budget.remaining -= 1;
                     let used = budget.used();
@@ -1882,10 +1988,12 @@ async fn send_with_retry(
                         &retry_log_line(&advice.reason, advice.delay_ms, used, budget.total),
                     );
                     sleep_or_cancel(telemetry, advice.delay_ms).await;
-                    continue;
+                    if !single_use { continue; }
+                    rebuild = true;
                 }
                 let gateway = error.to_gateway_error();
                 return Err(OutboundFailure {
+                    rebuild,
                     class: UpstreamErrorClass::Fatal {
                         status: 502,
                         message: gateway.message.clone(),
@@ -1896,7 +2004,23 @@ async fn send_with_retry(
             }
         };
         if !adapter.is_error_response(response.status().as_u16(), response.headers()) {
-            return Ok(response);
+            let prepared = tokio::time::timeout(
+                Duration::from_millis(config::timeout_settings().body_ms()),
+                prepare_success_response(response, adapter, capture),
+            );
+            let result = match telemetry.cancel_token() {
+                Some(token) => tokio::select! {
+                    result = prepared => result,
+                    _ = token.cancelled() => return Err(cancelled_failure()),
+                },
+                None => prepared.await,
+            };
+            return result.unwrap_or_else(|_| {
+                let class = UpstreamErrorClass::Fatal {
+                    status: 504, message: "上游响应首包超时".into(), upstream_code: None,
+                };
+                Err(OutboundFailure { error: gateway_error_from_class(&class), class, rebuild: false })
+            });
         }
         let status = response.status().as_u16();
         // 错误响应体的读取同样受「非流式响应超时」管（对应 OmniProxy
@@ -1905,7 +2029,7 @@ async fn send_with_retry(
         // 分类仍按状态码走（classify_error 只看 status 也能给出结论）。
         let detail = {
             let budget = Duration::from_millis(config::timeout_settings().body_ms());
-            match tokio::time::timeout(budget, read_upstream_error(response, capture)).await {
+            match tokio::time::timeout(budget, read_upstream_error(response, capture.map(std::sync::Arc::as_ref))).await {
                 Ok(detail) => detail,
                 Err(_elapsed) => super::request::UpstreamErrorDetail {
                     code: None,
@@ -1942,6 +2066,7 @@ async fn send_with_retry(
                 .or_else(|| transient_retry_advice(status, budget.remaining))
                 .or_else(|| fallback_retry_advice(&class, budget.remaining, status))
         };
+        let mut rebuild = false;
         if let Some(advice) = advice {
             budget.remaining = budget.remaining.saturating_sub(1);
             let used = budget.used();
@@ -1951,14 +2076,17 @@ async fn send_with_retry(
                 &retry_log_line(&advice.reason, advice.delay_ms, used, budget.total),
             );
             sleep_or_cancel(telemetry, advice.delay_ms).await;
-            continue;
+            if !single_use { continue; }
+            rebuild = true;
         }
         // 定论的上游错误：这一行只在**终端**留痕。请求日志那侧由本轮明细的
         // `error`（同一个 message）回答，两处不再各写一份。
-        logging::console_line(
-            "[Upstream]",
-            &format!("上游错误 HTTP {status}: {}", detail.message),
-        );
+        if !rebuild {
+            logging::console_line(
+                "[Upstream]",
+                &format!("上游错误 HTTP {status}: {}", detail.message),
+            );
+        }
         // 文案由适配器给出（含 provider 提示），编排层原样组装成网关错误
         let error = match &class {
             UpstreamErrorClass::QuotaLimited { status, message, upstream_code, .. } => {
@@ -1980,6 +2108,6 @@ async fn send_with_retry(
                     .with_optional_code(detail.code)
             }
         };
-        return Err(OutboundFailure { class, error });
+        return Err(OutboundFailure { class, error, rebuild });
     }
 }

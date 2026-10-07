@@ -6,6 +6,7 @@ use super::{
     task_state::{self, Claim, ManualBackoff},
     usage_query, workbuddy_policy,
 };
+use super::providers::workbuddy::region::Region;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::future::Future;
@@ -28,11 +29,7 @@ pub fn target(store: &AccountStore, id: &str) -> Result<GrowthTarget, GrowthErro
         .and_then(|rows| rows.iter().find(|a| a["id"].as_str() == Some(id)))
         .cloned()
         .ok_or_else(|| GrowthError::new(404, "账号不存在"))?;
-    if account
-        .get("provider")
-        .and_then(Value::as_str)
-        .unwrap_or("workbuddy")
-        != "workbuddy"
+    if Region::from_provider_id(account.get("provider").and_then(Value::as_str).unwrap_or("workbuddy")).is_none()
     {
         return Err(GrowthError::new(400, "该账号不是 WorkBuddy 账号"));
     }
@@ -58,7 +55,8 @@ pub fn target(store: &AccountStore, id: &str) -> Result<GrowthTarget, GrowthErro
 fn personal_cn(value: &Value) -> bool {
     let account = value.get("account").unwrap_or(value);
     let edition = value.get("edition").and_then(Value::as_str).unwrap_or("cn");
-    edition == "cn"
+    value.get("provider").and_then(Value::as_str) != Some("workbuddy-intl")
+        && edition == "cn"
         && ["enterpriseId", "tenantId", "tenant_id", "tenant"]
             .iter()
             .all(|key| account.get(*key).map_or(true, |v| v.is_null() || v == ""))
@@ -465,11 +463,7 @@ pub async fn scheduled_run(store: &AccountStore) -> Result<String, String> {
     let mut total = 0;
     let mut failed = 0;
     for account in accounts {
-        if account
-            .get("provider")
-            .and_then(Value::as_str)
-            .unwrap_or("workbuddy")
-            != "workbuddy"
+        if Region::from_provider_id(account.get("provider").and_then(Value::as_str).unwrap_or("workbuddy")).is_none()
         {
             continue;
         }

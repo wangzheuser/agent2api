@@ -5,7 +5,7 @@ const test = require('node:test');
 const vm = require('node:vm');
 
 const ui = path.resolve(__dirname, '../desktop-tauri/ui');
-const source = fs.readFileSync(path.join(ui, 'aliyun-captcha.js'), 'utf8');
+const source = fs.readFileSync(process.env.CAPTCHA_UI_FILE || path.join(ui, 'aliyun-captcha.js'), 'utf8');
 const guardSource = fs.readFileSync(path.join(ui, 'zcode-captcha-pool.js'), 'utf8');
 const config = { region: 'fixture', prefix: 'fixture', sceneId: 'fixture' };
 
@@ -68,7 +68,7 @@ function mintHarness() {
   const h = harness();
   const instances = [];
   h.window.initAliyunCaptcha = options => {
-    const instance = { destroyed: false, destroy() { this.destroyed = true; }, startTracelessVerification() {} };
+    const instance = { destroyed: false, started: false, destroy() { this.destroyed = true; }, startTracelessVerification() { this.started = true; } };
     instances.push({ options, instance });
     options.getInstance(instance);
   };
@@ -80,16 +80,22 @@ function mintHarness() {
     );
     return result;
   };
-  return { ...h, instances, mint };
+  async function warmup() {
+    await h.flush();
+    // 上游新增 2.1 秒预热，回调必须在 SDK 真正启动后触发，不提前交付 proof。
+    if (!instances.at(-1).instance.started) await h.step();
+    assert.equal(instances.at(-1).instance.started, true);
+  }
+  return { ...h, instances, mint, warmup };
 }
 
 test('静默验证无效串立即拒绝并允许下一次生成', async () => {
   const h = mintHarness();
-  const old = h.mint(); await h.flush();
+  const old = h.mint(); await h.warmup();
   h.instances[0].options.success('invalid'); await h.flush();
   assert.equal(old.state, 'rejected');
   assert.equal(h.timers.size, 0);
-  const next = h.mint(); await h.flush();
+  const next = h.mint(); await h.warmup();
   const proof = Buffer.from(JSON.stringify({ securityToken: 'x'.repeat(220) })).toString('base64');
   h.instances[1].options.success(proof); await next.promise;
   assert.equal(next.value, proof);
@@ -97,9 +103,9 @@ test('静默验证无效串立即拒绝并允许下一次生成', async () => {
 
 test('旧实例 success/fail/onError 不改变新生成任务', async () => {
   const h = mintHarness();
-  const old = h.mint(); await h.flush(); await h.step();
+  const old = h.mint(); await h.warmup(); await h.step();
   assert.equal(old.state, 'rejected');
-  const next = h.mint(); await h.flush();
+  const next = h.mint(); await h.warmup();
   h.instances[0].options.success('invalid');
   h.instances[0].options.fail({}); h.instances[0].options.onError({});
   await h.flush();
@@ -110,7 +116,7 @@ test('旧实例 success/fail/onError 不改变新生成任务', async () => {
 
 test('静默生成并发调用不会覆盖第一个等待者', async () => {
   const h = mintHarness();
-  const first = h.mint(), second = h.mint(); await h.flush();
+  const first = h.mint(), second = h.mint(); await h.warmup();
   assert.equal(first.state, 'pending'); assert.equal(second.state, 'rejected');
   await h.step(); assert.equal(first.state, 'rejected');
 });
@@ -123,6 +129,19 @@ test('初始化错误立即结束，晚到的实例被销毁且不会污染重�
   let destroyed = false;
   options.getInstance({ destroy() { destroyed = true; } });
   assert.equal(destroyed, true);
+});
+
+test('预热期间仍保护并发，重置后拒绝启动过期实例', async () => {
+  const h = mintHarness();
+  const first = h.mint(); await h.flush();
+  assert.equal(h.instances[0].instance.started, false);
+  const second = h.mint(); await h.flush();
+  assert.equal(second.state, 'rejected');
+  h.captcha.resetMint();
+  await h.step();
+  assert.equal(first.state, 'rejected');
+  assert.equal(h.instances[0].instance.started, false);
+  assert.equal(h.instances[0].instance.destroyed, true);
 });
 
 for (const mode of ['success', 'business_false', 'request_reject', 'cancel', 'timeout', 'sdk_error', 'empty_param']) {

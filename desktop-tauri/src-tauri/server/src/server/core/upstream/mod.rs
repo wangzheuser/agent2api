@@ -527,6 +527,22 @@ impl ForwardStream {
         stream
     }
 
+    pub(super) fn from_stream(
+        inner: futures::stream::BoxStream<'static, Result<Bytes, std::io::Error>>,
+        slot: Option<InFlightGuard>,
+        connection: ConnectionGuard,
+        telemetry: Arc<usage::RequestTelemetry>,
+        model_rewrite: Option<ModelRewrite>,
+    ) -> Self {
+        let guarded = stall::idle_guard(
+            inner,
+            std::time::Duration::from_millis(
+                crate::server::config::timeout_settings().stream_idle_ms(),
+            ),
+        );
+        Self::from_translated(guarded, slot, connection, telemetry, model_rewrite)
+    }
+
     /// 翻译协议的构造入口：`inner` 已经是**标准 chat SSE** 帧流。
     ///
     /// 自定义家的 responses / anthropic 上游先过 `providers::custom` 的
