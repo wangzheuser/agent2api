@@ -44,7 +44,11 @@ async function run() {
   await page.locator('.credits-segment').nth(2).click();
   assert.equal(await page.locator('.credits-row').nth(2).getAttribute('aria-pressed'),'true');
   assert.equal(await page.locator('.credits-row').nth(2).evaluate(el=>el===document.activeElement),true);checks.push('segment click selects and focuses matching row');
-  for(let i=0;i<12;i++) await page.keyboard.press('Tab');
+  // Base UI 的边界 guard 在下一帧归还焦点；等待每次回环，不能抢跑下一次 Tab。
+  for(const key of ['Tab','Shift+Tab']) for(let i=0;i<12;i++) {
+   await page.keyboard.press(key);
+   await page.waitForFunction(()=>!!document.activeElement?.closest('[role=dialog]'),null,{timeout:2000});
+  }
   assert.equal(await page.evaluate(()=>!!document.activeElement?.closest('[role=dialog]')),true); checks.push('dialog traps keyboard focus');
   await page.getByRole('button',{name:'刷新当前账号',exact:true}).click();
   assert.equal(await page.locator('.credits-balance').innerText(),'580.50');

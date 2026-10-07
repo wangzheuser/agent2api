@@ -231,6 +231,56 @@ class FrozenGate(unittest.TestCase):
         self.assertIn('8 !== 7', report.with_name(report.name + '.adapted').read_text())
         self.assertEqual(json.loads(report.with_name(report.name + '.adapted.status.json').read_text())['exit'], 1)
 
+    def test_matching_scoped_patch_normalizes_ref_and_replays_original_then_adapted(self):
+        declaration = self.wiring_patch()
+        declaration['base_ref'] = self.base.upper()
+        self.write(replay.MANIFEST, json.dumps(self.manifest))
+        report = Path(self.temp.name) / 'scoped.txt'
+        replay.replay(self.root, self.base[:12], 'frontend', Path(self.temp.name) / 'scoped-candidate', report)
+        self.assertEqual(json.loads(report.with_name(report.name + '.original.status.json').read_text())['exit'], 1)
+        self.assertEqual(json.loads(report.with_name(report.name + '.adapted.status.json').read_text())['exit'], 0)
+
+    def test_old_scoped_patch_skips_patch_not_future_h_original_assertions(self):
+        declaration = self.wiring_patch()
+        declaration['base_ref'] = self.base
+        self.write('scripts/assert.test.cjs', (self.root / 'scripts/assert.test.cjs').read_text().replace("require('../impl.cjs')", "require('../new-api.cjs')"))
+        self.write(replay.MANIFEST, json.dumps(self.manifest))
+        self.git('add', '.')
+        self.git('commit', '-qm', 'future H includes API adaptation')
+        future = self.git('rev-parse', 'HEAD').strip()
+        (self.root / declaration['path']).unlink()
+        report = Path(self.temp.name) / 'future.txt'
+        target = Path(self.temp.name) / 'future-candidate'
+        with patch('builtins.print', wraps=print) as output:
+            replay.replay(self.root, future, 'frontend', target, report)
+        self.assertTrue(any('REPLAY_PATCH_SKIPPED' in str(call.args) for call in output.call_args_list))
+        self.assertEqual((target / 'scripts/assert.test.cjs').read_bytes(), replay.git(self.root, 'show', future + ':scripts/assert.test.cjs'))
+        self.assertEqual(json.loads(report.with_name(report.name + '.original.status.json').read_text())['exit'], 0)
+        self.assertIn('ok 1 - original assertion', report.read_text())
+        self.assertFalse(report.with_name(report.name + '.adapted').exists())
+        self.write('new-api.cjs', 'module.exports = 8;\n')
+        self.write('scripts/assert.test.cjs', "require('node:test')('original assertion',()=>{});\n")
+        wrong = Path(self.temp.name) / 'future-wrong.txt'
+        with self.assertRaises(subprocess.CalledProcessError):
+            replay.replay(self.root, future, 'frontend', Path(self.temp.name) / 'future-wrong', wrong)
+        self.assertIn('8 !== 7', wrong.read_text())
+        self.assertEqual(json.loads(wrong.with_name(wrong.name + '.original.status.json').read_text())['exit'], 1)
+
+    def test_patch_scope_invalid_or_matching_wrong_hash_fails_closed(self):
+        declaration = self.wiring_patch()
+        baseline = json.loads(replay.git(self.root, 'show', self.base + ':' + replay.MANIFEST))
+        for scope in (None, '', 'HEAD', self.base[:7], 'g' * 40, 'a' * 39, 'a' * 41, 'a' * 63, 'a' * 65, 12, []):
+            declaration['base_ref'] = scope
+            with self.subTest(scope=scope), self.assertRaisesRegex(ValueError, 'base_ref'):
+                replay.replay_patches(self.root, self.base, baseline, self.manifest, 'frontend')
+        declaration['base_ref'] = self.base
+        declaration['files'][0]['sha256'] = '0' * 64
+        with self.assertRaisesRegex(ValueError, 'SHA256'):
+            replay.replay_patches(self.root, self.base, baseline, self.manifest, 'frontend')
+        declaration['base_ref'] = 'f' * 64
+        declaration['path'] = 'retired/missing.patch'
+        self.assertEqual(replay.replay_patches(self.root, self.base, baseline, self.manifest, 'frontend'), [])
+
     def test_replay_patch_rejects_production_hash_and_undeclared_paths(self):
         declaration = self.wiring_patch()
         for invalid, message in [

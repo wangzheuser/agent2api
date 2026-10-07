@@ -1342,9 +1342,377 @@
           "id": "case-041aea87c3a8"
         }
       ]
+    },
+    {
+      "id": "session-affinity-allocation",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "健康旧会话复用账号；新会话按会话占用、并发、近期发送及容量权重分配；busy溢出不迁移，故障迁移成功才确认；并发预占、TTL、容量、generation与reset隔离有效。",
+      "source_commits": [
+        "8ca442f8985f3ed6176c0a6a27191fe64c407172"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/upstream/affinity.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/routing.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/upstream/rotate.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/affinity.rs",
+          "name": "server::core::upstream::affinity::tests::affinity_old_session_stays_and_new_sessions_balance",
+          "id": "case-d8eb71404606"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/affinity.rs",
+          "name": "server::core::upstream::affinity::tests::affinity_capacity_weights_and_parallel_reservations",
+          "id": "case-b86732db2608"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/affinity.rs",
+          "name": "server::core::upstream::affinity::tests::affinity_parallel_same_key_uses_one_pending_target",
+          "id": "case-acc23e8d7939"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/affinity.rs",
+          "name": "server::core::upstream::affinity::tests::affinity_failed_and_cancelled_leases_only_release_their_own_reservation",
+          "id": "case-cb326984aa50"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/affinity.rs",
+          "name": "server::core::upstream::affinity::tests::affinity_busy_overflow_never_rebinds_and_protects_owner",
+          "id": "case-04615a7f1779"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/affinity.rs",
+          "name": "server::core::upstream::affinity::tests::affinity_failover_is_pending_until_success_and_old_generation_cleans_up",
+          "id": "case-eb6adc5d6631"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/affinity.rs",
+          "name": "server::core::upstream::affinity::tests::affinity_replaced_pending_cannot_be_confirmed_by_stale_success",
+          "id": "case-2f0d0d978986"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/affinity.rs",
+          "name": "server::core::upstream::affinity::tests::affinity_identity_change_migrates_but_token_refresh_does_not",
+          "id": "case-81521a4ad35e"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/affinity.rs",
+          "name": "server::core::upstream::affinity::tests::affinity_no_session_does_not_persist_and_unknown_ids_are_ignored",
+          "id": "case-16771dfc627c"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/affinity.rs",
+          "name": "server::core::upstream::affinity::tests::affinity_recent_send_window_and_inflight_tie_break_are_exact",
+          "id": "case-70efac104701"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/affinity.rs",
+          "name": "server::core::upstream::affinity::tests::affinity_idle_ttl_and_capacity_never_evict_active_leases",
+          "id": "case-ffe5e5d3b36f"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/affinity.rs",
+          "name": "server::core::upstream::affinity::tests::affinity_reset_fences_old_leases_but_still_releases_them",
+          "id": "case-aa5bc34d23fb"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/affinity.rs",
+          "name": "server::core::upstream::affinity::tests::affinity_reset_rejects_old_request_reservations_and_send_counters",
+          "id": "case-a94ed4094342"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/affinity.rs",
+          "name": "server::core::upstream::affinity::tests::affinity_measure_10000_binding_selection_cost",
+          "id": "case-ae66369f6bfa"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/session_affinity.rs",
+          "name": "session_affinity_real_forward_protocols_lifecycle_and_strategy_rollback",
+          "id": "case-session-affinity-http"
+        }
+      ]
+    },
+    {
+      "id": "session-affinity-completion",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "仅原始上游真实终态、有效正文或完整工具及完整合法输入输出用量共同成立才确认绑定；缺失、非法用量、业务错误、工具残片、截断、取消及合成终态均不确认；重试证据不串轮。",
+      "source_commits": [
+        "8ca442f8985f3ed6176c0a6a27191fe64c407172"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/upstream/completion_evidence.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/upstream/usage.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/completion_evidence.rs",
+          "name": "server::core::upstream::completion_evidence::tests::late_usage_does_not_hold_text_and_split_utf8_remains_valid",
+          "id": "case-b503d55ec5c3"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/completion_evidence.rs",
+          "name": "server::core::upstream::completion_evidence::tests::finish_reason_or_empty_or_partial_usage_never_confirms",
+          "id": "case-d30dda2c229d"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/completion_evidence.rs",
+          "name": "server::core::upstream::completion_evidence::tests::error_followed_by_gateway_done_and_aborted_tail_never_confirms",
+          "id": "case-41910bac505c"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/completion_evidence.rs",
+          "name": "server::core::upstream::completion_evidence::tests::anthropic_requires_real_stop_reason_and_stop_with_split_usage",
+          "id": "case-bb9d0be383cc"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/completion_evidence.rs",
+          "name": "server::core::upstream::completion_evidence::tests::responses_completed_confirms_tools_but_incomplete_or_synthetic_done_does_not",
+          "id": "case-7dc3a37dc4e7"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/completion_evidence.rs",
+          "name": "server::core::upstream::completion_evidence::tests::malformed_or_oversized_lines_are_bounded_and_do_not_claim_completion",
+          "id": "case-2054d0a7d425"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/completion_evidence.rs",
+          "name": "server::core::upstream::completion_evidence::tests::observer_passes_first_bytes_without_waiting_for_usage_or_eof",
+          "id": "case-156fa912cb99"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/completion_evidence.rs",
+          "name": "server::core::upstream::completion_evidence::tests::qoder_original_done_survives_prefetch_and_business_error_rejects",
+          "id": "case-c04ca589647a"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/completion_evidence.rs",
+          "name": "server::core::upstream::completion_evidence::tests::accio_turn_complete_requires_original_usage_fields_not_translated_defaults",
+          "id": "case-2abac35459d7"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/completion_evidence.rs",
+          "name": "server::core::upstream::completion_evidence::tests::trae_original_done_is_distinct_from_error_and_eof_done",
+          "id": "case-c9dfc942239c"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/completion_evidence.rs",
+          "name": "server::core::upstream::completion_evidence::tests::codearts_stream_fault_after_content_cannot_be_confirmed_by_done",
+          "id": "case-29002bd82a62"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/completion_evidence.rs",
+          "name": "server::core::upstream::completion_evidence::tests::original_stream_evidence_confirms_only_after_final_settlement",
+          "id": "case-3c91754f042f"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/completion_evidence.rs",
+          "name": "server::core::upstream::completion_evidence::tests::initial_usage_cannot_replace_final_output_usage_after_payload",
+          "id": "case-afe5ca1df857"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/completion_evidence.rs",
+          "name": "server::core::upstream::completion_evidence::tests::chat_tool_fragments_need_identity_and_complete_object_even_with_text",
+          "id": "case-c0f8c93a0401"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/completion_evidence.rs",
+          "name": "server::core::upstream::completion_evidence::tests::anthropic_tool_arguments_must_close_and_parse_before_message_stop",
+          "id": "case-81fe2636cf23"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/completion_evidence.rs",
+          "name": "server::core::upstream::completion_evidence::tests::responses_tool_fragments_require_item_done_and_valid_object",
+          "id": "case-4d83af407604"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/completion_evidence.rs",
+          "name": "server::core::upstream::completion_evidence::tests::early_complete_placeholder_cannot_be_latched_in_telemetry",
+          "id": "case-93ca3657d85d"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/completion_evidence.rs",
+          "name": "server::core::upstream::completion_evidence::tests::accio_native_tools_allow_missing_id_and_distinguish_fragments_from_calls",
+          "id": "case-254fe1e417c1"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/completion_evidence.rs",
+          "name": "server::core::upstream::completion_evidence::tests::trae_native_single_object_function_call_is_normalized_and_validated",
+          "id": "case-ad6e6fbf667a"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/completion_evidence.rs",
+          "name": "server::core::upstream::completion_evidence::tests::accio_invalid_final_usage_overrides_earlier_valid_usage",
+          "id": "case-9c753c441e78"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/protocol/responses_outbound.rs",
+          "name": "server::core::protocol::responses_outbound::tool_identity_tests::item_id_joins_tool_arguments_without_replacing_call_id",
+          "id": "case-6cdeb58ed936"
+        }
+      ]
+    },
+    {
+      "id": "session-affinity-identity",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "会话按已认证客户端、设备、请求模型隔离；支持JSON metadata.user_id与严格legacy格式，无可靠ID不持久绑定；UID、地区、实际模型/思考和custom静态凭据变更失效，实际快照ABA不误确认，原生token刷新保留亲和；显式cache key优先。WorkBuddy会话头稳定且按UID/地区隔离，每次实际重试生成唯一请求ID。",
+      "source_commits": [
+        "8ca442f8985f3ed6176c0a6a27191fe64c407172"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/upstream/route_session.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/upstream/payload.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/upstream/usage.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/providers/workbuddy/adapter.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/route_session.rs",
+          "name": "server::core::upstream::route_session::tests::route_session_validates_legacy_suffix_and_device_partition",
+          "id": "case-f8b1d9012387"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/route_session.rs",
+          "name": "server::core::upstream::route_session::tests::route_session_configured_key_identity_is_not_permission_or_secret",
+          "id": "case-090c1204b5b5"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/route_session.rs",
+          "name": "server::core::upstream::route_session::tests::route_session_parses_real_encoded_identity_and_survives_content_changes",
+          "id": "case-d40a20e6cc5d"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/route_session.rs",
+          "name": "server::core::upstream::route_session::tests::route_session_partitions_client_device_model_and_explicit_provider",
+          "id": "case-d77ed351a8c4"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/route_session.rs",
+          "name": "server::core::upstream::route_session::tests::route_session_explicit_precedence_and_untrusted_identity_rejection",
+          "id": "case-972c509a54ac"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/payload.rs",
+          "name": "server::core::upstream::payload::affinity_identity_tests::affinity_identity_tracks_semantics_not_rotating_tokens",
+          "id": "case-4ceefa8398e7"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/usage.rs",
+          "name": "server::core::upstream::usage::affinity_snapshot_tests::actual_snapshot_rejects_identity_aba_and_ignores_refresh_tokens",
+          "id": "case-e8a225c4398a"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/protocol/anthropic.rs",
+          "name": "server::core::protocol::anthropic::tests::explicit_cache_key_survives_request_conversion",
+          "id": "case-cachekey-anthropic"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/protocol/responses.rs",
+          "name": "server::core::protocol::responses::tests::explicit_cache_key_survives_request_conversion",
+          "id": "case-cachekey-responses"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/workbuddy/adapter.rs",
+          "name": "server::core::providers::workbuddy::adapter::tests::route_session_stabilizes_only_conversation_headers_and_isolates_targets",
+          "id": "case-wb-route-session-stabilizes-only-conversation-headers-and-isolates-targets"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/workbuddy/adapter.rs",
+          "name": "server::core::providers::workbuddy::adapter::tests::route_request_retry_ids_are_unique_and_keep_stable_session_headers",
+          "id": "case-wb-route-request-retry-ids-are-unique-and-keep-stable-session-headers"
+        }
+      ]
+    },
+    {
+      "id": "session-affinity-settings",
+      "level": "P1",
+      "status": "必须保留",
+      "behavior": "设置第四种会话均衡亲和策略且保存生效；默认balanced及原三项保留，保存失败回到原生效值。",
+      "source_commits": [
+        "8ca442f8985f3ed6176c0a6a27191fe64c407172"
+      ],
+      "implementation": [
+        "desktop-tauri/ui-islands/src/islands/settings-model.ts",
+        "desktop-tauri/src-tauri/server/src/server/config/types.rs"
+      ],
+      "tests": [
+        {
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/settings-cache-affinity.test.mjs",
+          "name": "cacheAffinity settings retain all existing choices and explain session fallback",
+          "id": "case-session-affinity-settings"
+        },
+        {
+          "kind": "browser",
+          "path": "desktop-tauri/ui-islands/tests/settings-cache-affinity.browser.cjs",
+          "id": "case-session-affinity-settings-browser"
+        }
+      ]
     }
   ],
   "replay_patches": [
+    {
+      "base_ref": "46a37d63561b83a6319db5d45afeb7fd75addbf3",
+      "path": "scripts/replay-patches/46a37d6-credit-focus.patch",
+      "files": [
+        {
+          "path": "desktop-tauri/ui-islands/tests/accounts-credit-dialog.browser.cjs",
+          "sha256": "1faf2649ec4ff56c8926ccc645c1dee26fdda4ca2c266dbadb34649f54bf80d2"
+        }
+      ],
+      "reason": "Linux Chromium 可在 Base UI 的 sibling focus guard 过渡帧完成 Tab；仅等待原有焦点回环完成，保留原输入/期望，并增加反向回环，不改生产实现或跳过断言。",
+      "review": "behavior_review 独立核查 DialogPopup → FloatingFocusManager → enqueueFocus 的 rAF 路径；原最终断言保留，每步焦点须回到 dialog，永久逃逸仍超时失败。"
+    },
     {
       "path": "scripts/replay-patches/session-affinity-zcode-request.patch",
       "files": [
@@ -1354,7 +1722,20 @@
         }
       ],
       "reason": "ForwardRequest 新增可选会话上下文；原始指定账号测试仍传 None，不改变输入及断言。",
-      "review": "独立 architect_review 对照基线检查：补丁仅为 pinned 测试增加 route_session: None，保留原始断言。"
+      "review": "独立 architect_review 对照基线检查：补丁仅为 pinned 测试增加 route_session: None，保留原始断言。",
+      "base_ref": "46a37d63561b83a6319db5d45afeb7fd75addbf3"
+    },
+    {
+      "path": "scripts/replay-patches/session-affinity-zcode-request.patch",
+      "files": [
+        {
+          "path": "desktop-tauri/src-tauri/server/tests/zcode_restore.rs",
+          "sha256": "7464daff25b517d9e47faea366b43fed9ddd7ffe7fd65ab7c023c3fe507036e4"
+        }
+      ],
+      "reason": "ForwardRequest 新增可选会话上下文；原始指定账号测试仍传 None，不改变输入及断言。",
+      "review": "独立 architect_review 对照基线检查：补丁仅为 pinned 测试增加 route_session: None，保留原始断言。",
+      "base_ref": "b0ba9e04535a951f6acc804d4dd7b10627cc5b7b"
     }
   ]
 }
