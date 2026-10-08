@@ -500,6 +500,13 @@ impl Observer {
             }
         }
         if let Some(call) = delta.get("function_call") {
+            // WorkBuddy 会在正常终帧附带空的 function_call 占位对象；它不是工具调用，
+            // 只有非空 name 或 arguments 片段才创建工具证据。
+            let has_function_payload =
+                nonempty(call.get("name")) || nonempty(call.get("arguments"));
+            if !has_function_payload {
+                return;
+            }
             self.new_output();
             self.tool(
                 &format!("{prefix}:legacy"),
@@ -966,7 +973,7 @@ mod tests {
         let mut workbuddy = Observer::new(EvidenceProtocol::WorkBuddy);
         workbuddy.push(&frame(serde_json::json!({
             "choices": [{
-                "delta": {"content": "ok"},
+                "delta": {"content": "ok", "function_call": {"name": "", "arguments": ""}},
                 "finish_reason": "stop"
             }],
             "usage": {"prompt_tokens": 7, "completion_tokens": 2}
@@ -976,7 +983,7 @@ mod tests {
         let mut chat = Observer::new(EvidenceProtocol::Chat);
         chat.push(&frame(serde_json::json!({
             "choices": [{
-                "delta": {"content": "ok"},
+                "delta": {"content": "ok", "function_call": {"name": "", "arguments": ""}},
                 "finish_reason": "stop"
             }],
             "usage": {"prompt_tokens": 7, "completion_tokens": 2}
