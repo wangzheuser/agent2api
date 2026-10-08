@@ -14,6 +14,7 @@ const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Clone, Copy, Debug)]
 pub enum EvidenceProtocol {
     Chat,
+    WorkBuddy,
     Anthropic,
     Responses,
     Qoder,
@@ -26,6 +27,7 @@ impl From<UpstreamResponse> for EvidenceProtocol {
     fn from(protocol: UpstreamResponse) -> Self {
         match protocol {
             UpstreamResponse::Chat => Self::Chat,
+            UpstreamResponse::WorkBuddy => Self::WorkBuddy,
             UpstreamResponse::Anthropic => Self::Anthropic,
         }
     }
@@ -203,7 +205,9 @@ impl Observer {
         if data == "[DONE]" {
             if matches!(
                 self.protocol,
-                EvidenceProtocol::Chat | EvidenceProtocol::CodeArts
+                EvidenceProtocol::Chat
+                    | EvidenceProtocol::WorkBuddy
+                    | EvidenceProtocol::CodeArts
             ) {
                 self.end();
             }
@@ -224,7 +228,7 @@ impl Observer {
             .and_then(Value::as_str)
             .unwrap_or(event_type);
         match self.protocol {
-            EvidenceProtocol::Chat => {
+            EvidenceProtocol::Chat | EvidenceProtocol::WorkBuddy => {
                 self.chat(&event);
             }
             EvidenceProtocol::CodeArts => {
@@ -422,6 +426,7 @@ impl Observer {
     fn chat(&mut self, event: &Value) {
         self.failed |= event.get("error").is_some_and(|value| !value.is_null());
         if let Some(choices) = event.get("choices").and_then(Value::as_array) {
+            let mut finish_reason = false;
             for choice in choices {
                 let delta = choice.get("delta").or_else(|| choice.get("message"));
                 if let Some(delta) = delta {
@@ -429,9 +434,18 @@ impl Observer {
                         self.new_output();
                         self.payload = true;
                     }
-                    let choice = choice.get("index").and_then(Value::as_i64).unwrap_or(0);
-                    self.chat_tools(delta, &format!("chat:{choice}"));
+                    let index = choice.get("index").and_then(Value::as_i64).unwrap_or(0);
+                    self.chat_tools(delta, &format!("chat:{index}"));
                 }
+                finish_reason |= choice
+                    .get("finish_reason")
+                    .and_then(Value::as_str)
+                    .is_some_and(|reason| !reason.trim().is_empty());
+            }
+            if matches!(self.protocol, EvidenceProtocol::WorkBuddy) && finish_reason {
+                // WorkBuddy 的真实成功流可能以 finish_reason 收尾而省略 [DONE]。
+                // 只接受非空原因，工具调用仍由 end() 做完整性校验。
+                self.end();
             }
         }
         self.usage(event.get("usage"));
@@ -945,6 +959,58 @@ mod tests {
         ));
         anthropic.push(&frame(serde_json::json!({"type":"message_stop"})));
         assert!(!complete(&anthropic));
+    }
+
+    #[test]
+    fn workbuddy_finish_reason_is_real_terminal_without_synthetic_done() {
+        let mut workbuddy = Observer::new(EvidenceProtocol::WorkBuddy);
+        workbuddy.push(&frame(serde_json::json!({
+            "choices": [{
+                "delta": {"content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 2}
+        })));
+        assert!(complete(&workbuddy));
+
+        let mut chat = Observer::new(EvidenceProtocol::Chat);
+        chat.push(&frame(serde_json::json!({
+            "choices": [{
+                "delta": {"content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 2}
+        })));
+        assert!(!complete(&chat));
+    }
+
+    #[tokio::test]
+    async fn workbuddy_finish_reason_confirms_affinity_without_done() {
+        let (telemetry, affinity, pool) = active_telemetry();
+        let source = futures::stream::iter([Ok(Bytes::from(frame(serde_json::json!({
+            "choices": [{
+                "delta": {"content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 2}
+        }))))])
+        .boxed();
+        let mut observed = observe_stream(source, telemetry.clone(), EvidenceProtocol::WorkBuddy);
+        while observed.next().await.is_some() {}
+        drop(observed);
+        telemetry.settle_affinity(true);
+        assert_eq!(
+            affinity
+                .select(
+                    Some("session"),
+                    &pool,
+                    &pool,
+                    &std::collections::HashMap::new(),
+                )
+                .unwrap()
+                .reason,
+            "sticky"
+        );
     }
 
     #[test]

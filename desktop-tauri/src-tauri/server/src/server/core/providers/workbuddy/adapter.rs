@@ -186,7 +186,7 @@ impl ProviderAdapter for WorkBuddyAdapter {
             &crate::server::core::upstream::request::new_request_id(),
             Some("text/event-stream"),
         );
-        Ok(ChatRequestPlan::chat(url, headers, with_system))
+        Ok(ChatRequestPlan::workbuddy(url, headers, with_system))
     }
 
     fn apply_route_session(
@@ -816,6 +816,7 @@ fn value_text(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::core::providers::adapter::UpstreamResponse;
 
     fn header<'a>(plan: &'a ChatRequestPlan, name: &str) -> &'a str {
         plan.headers
@@ -840,6 +841,7 @@ mod tests {
         let mut second = WORKBUDDY_ADAPTER
             .build_chat_request(&account, &body, &HeaderMap::new())
             .unwrap();
+        assert_eq!(first.response, UpstreamResponse::WorkBuddy);
         // 旧策略/缺少上下文不调用钩子，保留逐请求会话头与原自动缓存键。
         assert_ne!(
             header(&first, "X-Session-ID"),

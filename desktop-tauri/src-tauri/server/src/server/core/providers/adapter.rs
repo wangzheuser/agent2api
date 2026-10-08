@@ -142,8 +142,9 @@ pub struct ChatRequestPlan {
 impl ChatRequestPlan {
     /// 标准形态：上游说 OpenAI Chat（请求体与响应帧都是 chat 形态）。
     ///
-    /// 七家内置上游里的六家（以及自定义家）都是这一种；只有 ZCode 的活动套餐
-    /// 通道说 Anthropic（见 [`UpstreamResponse::Anthropic`]）。写成构造器而不是
+    /// 七家内置上游里的大多数（以及自定义家）都是这一种；ZCode 的活动套餐
+    /// 通道说 Anthropic（见 [`UpstreamResponse::Anthropic`]），WorkBuddy 使用
+    /// [`Self::workbuddy`] 保留自己的终态证据规则。写成构造器而不是
     /// 让各家手写字段，是为了「响应协议」这一个新字段不给七处调用点各留一次
     /// 写错的机会。
     pub fn chat(url: String, headers: Vec<(String, String)>, body: Value) -> Self {
@@ -152,6 +153,17 @@ impl ChatRequestPlan {
             headers,
             body,
             response: UpstreamResponse::Chat,
+        }
+    }
+
+    /// WorkBuddy 的响应仍是 Chat SSE，但部分成功流以非空 `finish_reason`
+    /// 作为终态，可能不再追加 `[DONE]`；亲和证据需要按该协议单独判定。
+    pub fn workbuddy(url: String, headers: Vec<(String, String)>, body: Value) -> Self {
+        Self {
+            url,
+            headers,
+            body,
+            response: UpstreamResponse::WorkBuddy,
         }
     }
 }
@@ -163,15 +175,18 @@ impl ChatRequestPlan {
 /// 本项目的历史前提是「所有上游都说 Chat」（见 `protocol` 的模块头），于是
 /// 无状态转发路径的下行帧一律按 chat SSE 处理。ZCode 的活动套餐通道打破了这个
 /// 前提：它的推理端点是 Anthropic Messages（`stream:true` 时吐 Anthropic 事件
-/// 流）。与其为一家新写一条「适配器自己转发」的路（那会丢掉账号轮换、限额冷却、
-/// 退避重试、usage 与取消处理，见 `upstream::provider_loop` 的有状态路径说明），
-/// 不如把「响应要说另一种协议」做成计划里的一个字段 —— 编排层只多一次分支，
-/// 其余全都共用。
+/// 流）。WorkBuddy 仍是 Chat SSE，但部分成功流以 `finish_reason` 收尾而不附带
+/// `[DONE]`，因此需要单独的证据口径。与其为一家新写一条「适配器自己转发」的
+/// 路（那会丢掉账号轮换、限额冷却、退避重试、usage 与取消处理，见
+/// `upstream::provider_loop` 的有状态路径说明），不如把响应证据协议做成计划里的
+/// 一个字段 —— 编排层仍复用同一条转发链。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum UpstreamResponse {
     /// OpenAI Chat SSE（默认）
     #[default]
     Chat,
+    /// WorkBuddy Chat SSE：允许真实 `finish_reason` 作为上游终态。
+    WorkBuddy,
     /// Anthropic Messages SSE：下发前折回标准 chat SSE（见 `upstream::translate`）
     Anthropic,
 }
