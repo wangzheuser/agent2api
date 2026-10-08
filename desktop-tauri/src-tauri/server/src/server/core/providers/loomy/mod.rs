@@ -269,7 +269,11 @@ impl ProviderAdapter for LoomyAdapter {
                 Ok(credentials) => credentials,
                 Err(error) => return ModelRefreshOutcome::failed(error.message),
             };
-            models::refresh(&credentials.session, force).await
+            let proxy = match client::account_proxy(record.as_ref()) {
+                Ok(proxy) => proxy,
+                Err(error) => return ModelRefreshOutcome::failed(error.message),
+            };
+            models::refresh(&credentials.session, proxy.as_ref(), force).await
         })
     }
 

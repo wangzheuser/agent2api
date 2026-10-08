@@ -17,6 +17,7 @@
 use serde_json::Value;
 
 use crate::server::core::auth_http::send_raw;
+use crate::server::core::proxies::{resolve_account_proxy, ProxyResolution, ResolvedProxy};
 use crate::server::errors::GatewayError;
 
 use super::endpoints;
@@ -55,6 +56,22 @@ pub fn upstream_message(payload: &Value) -> String {
         .map(str::trim)
         .unwrap_or("")
         .to_string()
+}
+
+/// 解析账号绑定的出站代理。
+///
+/// Loomy 的模型请求走转发层时会带账号代理；积分、签到和模型目录请求也
+/// 必须使用同一出口，否则配置了代理的账号在服务器直连受限时会稳定超时。
+/// 没有账号记录时保留直连语义，凭证校验仍由调用方负责。
+pub fn account_proxy(record: Option<&Value>) -> Result<Option<ResolvedProxy>, GatewayError> {
+    let Some(record) = record else {
+        return Ok(None);
+    };
+    match resolve_account_proxy(record.get("proxy")) {
+        Some(ProxyResolution::Resolved(proxy)) => Ok(Some(proxy)),
+        Some(ProxyResolution::Failed(reason)) => Err(GatewayError::with_status(400, reason)),
+        None => Ok(None),
+    }
 }
 
 /// 向 CAccount 发一次**带签名**的 POST（登录链路，没有账号上下文，不走代理）。
@@ -100,6 +117,7 @@ pub async fn token_request(
     session: &str,
     body: Option<&Value>,
     what: &str,
+    proxy: Option<&ResolvedProxy>,
 ) -> Result<Value, GatewayError> {
     if session.trim().is_empty() {
         return Err(GatewayError::with_status(401, "Loomy 账号缺少 session"));
@@ -109,7 +127,7 @@ pub async fn token_request(
         ("token".to_string(), session.to_string()),
         ("Authorization".to_string(), format!("Bearer {session}")),
     ];
-    let response = send_raw(method, &url, body, &headers, None, Some(REQUEST_TIMEOUT_MS))
+    let response = send_raw(method, &url, body, &headers, proxy, Some(REQUEST_TIMEOUT_MS))
         .await
         .map_err(|error| {
             if error.is_timeout() {
@@ -131,4 +149,52 @@ pub async fn token_request(
         ));
     }
     Ok(response.payload.unwrap_or(Value::Null))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::account_proxy;
+
+    #[test]
+    fn account_proxy_resolves_custom_proxy() {
+        let record = json!({
+            "proxy": {
+                "source": "custom",
+                "protocol": "http",
+                "host": "127.0.0.1",
+                "port": 8080
+            }
+        });
+        let proxy = account_proxy(Some(&record)).expect("valid proxy should resolve");
+        let proxy = proxy.expect("custom proxy should be present");
+        assert_eq!(proxy.protocol, "http");
+        assert_eq!(proxy.host, "127.0.0.1");
+        assert_eq!(proxy.port, Some(8080));
+    }
+
+    #[test]
+    fn account_proxy_keeps_direct_connection_without_config() {
+        assert!(account_proxy(None).expect("missing record is direct").is_none());
+        assert!(account_proxy(Some(&json!({ "proxy": null })))
+            .expect("null proxy is direct")
+            .is_none());
+    }
+
+    #[test]
+    fn account_proxy_preserves_invalid_port_for_shared_egress_handling() {
+        let record = json!({
+            "proxy": {
+                "source": "custom",
+                "protocol": "http",
+                "host": "127.0.0.1",
+                "port": 0
+            }
+        });
+        let proxy = account_proxy(Some(&record))
+            .expect("proxy resolution should preserve the shared semantics")
+            .expect("configured proxy should remain visible to egress");
+        assert_eq!(proxy.port, None);
+    }
 }

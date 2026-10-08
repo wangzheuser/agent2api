@@ -51,6 +51,7 @@ pub async fn claim_daily_login(
             format!("Loomy 账号 {account_id} 不存在（请重新添加）"),
         ));
     }
+    let proxy = client::account_proxy(record.as_ref())?;
     let credentials = credentials::from_record(record.as_ref())?;
 
     let payload = client::token_request(
@@ -59,6 +60,7 @@ pub async fn claim_daily_login(
         &credentials.session,
         Some(&json!({})),
         "每日积分刷新",
+        proxy.as_ref(),
     )
     .await?;
 

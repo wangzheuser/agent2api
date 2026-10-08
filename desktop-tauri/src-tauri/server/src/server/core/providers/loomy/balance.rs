@@ -53,9 +53,18 @@ pub async fn query_usage(store: &AccountStore, account_id: &str) -> Result<Value
             format!("Loomy 账号 {account_id} 不存在（请重新添加）"),
         ));
     }
+    let proxy = client::account_proxy(record.as_ref())?;
     let credentials = credentials::from_record(record.as_ref())?;
 
-    let payload = client::token_request("GET", RECORDS_PATH, &credentials.session, None, "积分查询").await?;
+    let payload = client::token_request(
+        "GET",
+        RECORDS_PATH,
+        &credentials.session,
+        None,
+        "积分查询",
+        proxy.as_ref(),
+    )
+    .await?;
 
     let code = client::business_code(&payload);
     if client::is_auth_error_code(&code) {

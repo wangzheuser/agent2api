@@ -25,6 +25,7 @@ use std::sync::{Mutex, OnceLock};
 use serde_json::{json, Value};
 
 use crate::server::core::providers::catalog_cache;
+use crate::server::core::proxies::ResolvedProxy;
 use crate::server::errors::GatewayError;
 
 use super::client;
@@ -229,7 +230,11 @@ pub fn last_refreshed_at() -> i64 {
 ///
 /// `force = false`（自动路径）时 10 分钟 TTL 内早退为 `unchanged()`；
 /// `force = true`（用户手动刷新）真打上游。
-pub async fn refresh(session: &str, force: bool) -> ModelRefreshOutcome {
+pub async fn refresh(
+    session: &str,
+    proxy: Option<&ResolvedProxy>,
+    force: bool,
+) -> ModelRefreshOutcome {
     let now = crate::server::logging::now_ms();
     if !force {
         let fresh = with_state(|slot| {
@@ -241,7 +246,16 @@ pub async fn refresh(session: &str, force: bool) -> ModelRefreshOutcome {
             return ModelRefreshOutcome::unchanged();
         }
     }
-    let payload = match client::token_request("GET", MODELS_PATH, session, None, "模型目录查询").await {
+    let payload = match client::token_request(
+        "GET",
+        MODELS_PATH,
+        session,
+        None,
+        "模型目录查询",
+        proxy,
+    )
+    .await
+    {
         Ok(payload) => payload,
         Err(error) => return ModelRefreshOutcome::failed(error.message),
     };
