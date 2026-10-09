@@ -71,6 +71,7 @@ RUN mkdir -p src-tauri/server/src/bin src-tauri/src \
 RUN /build/cargo-build.sh
 
 COPY desktop-tauri/src-tauri/server/src src-tauri/server/src
+COPY desktop-tauri/src-tauri/server/tests src-tauri/server/tests
 RUN cd src-tauri \
     && find server/src -type f -exec touch {} + \
     && /build/cargo-build.sh

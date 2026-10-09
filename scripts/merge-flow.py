@@ -110,9 +110,11 @@ def candidate_tree(root):
               if row and (row[0].islower() or row[0] == 'S')]
     if hidden:
         raise ValueError('候选含 assume-unchanged/skip-worktree 文件；先显式核对并恢复索引标志: ' + ', '.join(hidden))
-    if git(root, 'diff', '--name-only', '--diff-filter=U').strip():
+    if git(root, 'diff-files', '--name-only', '--diff-filter=U').strip():
         raise ValueError('仍有未解决冲突')
-    if subprocess.run(['git', 'diff', '--quiet'], cwd=root).returncode != 0:
+    subprocess.run(['git', 'update-index', '--refresh'], cwd=root,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if subprocess.run(['git', 'diff-files', '--quiet', '--'], cwd=root).returncode != 0:
         raise ValueError('候选有未暂存修改；先生成产物并按范围暂存，或使用隔离候选')
     unknown = git(root, 'ls-files', '--others', '--exclude-standard', '-z').decode().split('\0')
     remaining = [name for name in unknown if name and not name.startswith(('diagnostic-artifacts/', '.verify/'))]
