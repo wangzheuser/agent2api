@@ -1,5 +1,6 @@
 import * as React from 'react'
 import { createRoot } from 'react-dom/client'
+import { amountText } from './accounts-growth-data'
 import {
   Badge, BadgeDot, Button, Dialog, DialogBody, DialogContent, DialogFooter,
   DialogHeader, DialogTitle, SegmentedControl, Spinner, Table, TableBody,
@@ -99,8 +100,8 @@ type RequestRow = {
   completionTokens?: unknown
   totalTokens?: unknown
   cacheReadTokens?: unknown
-  cacheCreationTokens?: number | null
-  upstreamCredits?: number | null
+  cacheCreationTokens?: unknown
+  upstreamCredits?: unknown
   /** 模型名与推理等级：下游 / 上游各一份 */
   model?: unknown
   clientModel?: unknown
@@ -110,6 +111,8 @@ type RequestRow = {
   accountName?: unknown
   attemptDetails?: AttemptDetail[]
   sensitiveHits?: SensitiveHit[]
+  /** 模型测试发起的请求（后端 `is_test` 透传到列表行；老行没有这个键） */
+  isTest?: boolean
 } & ProviderFields
 
 /** 下游原文响应（预览对话）与上游调试报文（四段 + meta）：字段都按 unknown 收，用前归一 */
@@ -471,15 +474,21 @@ function DetailPane({ row }: { row: RequestRow | null }) {
         <Field label='令牌'>
           输入 {fmtTokens(row.promptTokens)} · 输出 {fmtTokens(row.completionTokens)} · 总计{' '}
           {fmtTokens(row.totalTokens)} · 缓存读 {fmtTokens(row.cacheReadTokens)} · 缓存创建{' '}
-          <span title='创建量仅使用上游报告值；未上报或旧记录显示“未上报”，显式 0 表示上游报告为零'>
-            {row.cacheCreationTokens == null ? '未上报' : fmtTokens(row.cacheCreationTokens)}
-          </span>
+          {row.cacheCreationTokens == null ? '未上报' : fmtTokens(row.cacheCreationTokens)}
         </Field>
-        {(row.provider === 'workbuddy' || row.upstreamCredits != null) && <Field label='实扣积分'>
-          <span title='仅展示上游明确报告的扣费；缺失与显式 0 分开，不由 token 推算'>
-            {typeof row.upstreamCredits === 'number' && Number.isFinite(row.upstreamCredits) && row.upstreamCredits >= 0 ? row.upstreamCredits.toLocaleString('zh-CN', { maximumFractionDigits: 6 }) : '未上报'}
-          </span>
-        </Field>}
+        {(row.provider === 'workbuddy' || row.provider === 'workbuddy-intl' || row.upstreamCredits != null) && (
+          <Field label='实扣积分'>{amountText(row.upstreamCredits, '未上报')}</Field>
+        )}
+        {/* 测试发起的请求**按需多一行**：它是这一条明细的性质（走的是真实转发链路、但不进报表），
+            正常转发的行不必为此多读一行「正常转发」 —— 那种字段每个租户都有时等于没有 */}
+        {row.isTest ? (
+          <Field label='来源'>
+            <Badge variant='brand' shape='tag'
+              title='模型管理页操作列那颗「测试」发起的请求：与真实请求同一条转发链路，但不计入报表统计'>
+              模型测试
+            </Badge>
+          </Field>
+        ) : null}
         <Field label='错误'>
           {row.error ? <span className='text-destructive'>{String(row.error)}</span> : '—'}
         </Field>

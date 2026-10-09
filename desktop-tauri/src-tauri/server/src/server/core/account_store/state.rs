@@ -478,6 +478,30 @@ impl StoredAccount {
     }
 }
 
+/// 在记录上打「用户显式设置过备注名」标（`nameCustom`）。
+///
+/// 种子名（凭证账号名 / 昵称 / uid 兜底）与用户改的名落库后都是 `name`，无法
+/// 事后区分 —— 只能在**用户显式给名的时刻**打标：设置弹窗真正改到 name 时
+/// （`apply_patch`），以及添加表单显式填了备注名（各 provider 的添加路径）。
+/// 界面据此分流：有标记备注名恒为主名，无标记维持历史口径（邮箱 / 昵称优先，
+/// 见岛内 displayNameOf）—— 没有它，「备注名优先」会把未设备注账号的显示
+/// 顶成建号时的种子值。
+///
+/// 重加（同 id 再走一次添加）没给新名字时，旧记录的标记要**跟过来**：备注名
+/// 种子链会从旧记录把名字原样种回来，标记丢了它就又被默认口径压住。
+pub(crate) fn mark_name_custom(
+    record: &mut Map<String, Value>,
+    explicit_name: bool,
+    existing: Option<&StoredAccount>,
+) {
+    let carried = existing
+        .and_then(|item| item.get("nameCustom"))
+        .is_some_and(|value| matches!(value, Value::Bool(true)));
+    if explicit_name || carried {
+        record.insert("nameCustom".to_string(), Value::Bool(true));
+    }
+}
+
 // ─── 优先级判定的数据源（全局一条队列）────────────────────
 
 // 改造前这里有一个 `priority_peers(&[StoredAccount]) -> Vec<(id, name, priority)>`
@@ -583,4 +607,30 @@ pub struct SessionById {
     pub session: Value,
     pub proxy: Value,
     pub proxy_error: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_name_or_carried_flag_marks_the_record() {
+        // 添加表单显式给名：打标
+        let mut record = Map::new();
+        mark_name_custom(&mut record, true, None);
+        assert_eq!(record.get("nameCustom"), Some(&Value::Bool(true)));
+
+        // 种子名（非显式、旧记录无标）：不打 —— 未设备注的账号要维持原展示口径
+        let mut record = Map::new();
+        mark_name_custom(&mut record, false, None);
+        assert_eq!(record.get("nameCustom"), None);
+
+        // 重加没给新名字：旧记录已打的标要跟过来（备注名从旧记录种回来，标不能丢）
+        let mut previous = Map::new();
+        previous.insert("nameCustom".to_string(), Value::Bool(true));
+        let existing = StoredAccount::from_map(previous);
+        let mut record = Map::new();
+        mark_name_custom(&mut record, false, Some(&existing));
+        assert_eq!(record.get("nameCustom"), Some(&Value::Bool(true)));
+    }
 }

@@ -47,7 +47,7 @@ import {
 } from './accounts-shared'
 import { clampPriority, priorityOf, PRIORITY_MAX, PRIORITY_MIN } from './accounts-columns'
 import {
-  providerOf, supportsPlanChannel, zcodePlanLabel, zcodePlanOf,
+  displayNameOf, providerOf, supportsPlanChannel, zcodePlanLabel, zcodePlanOf,
   ZCODE_PLAN_CODING, ZCODE_PLAN_START,
 } from './accounts-domain'
 import {
@@ -66,7 +66,8 @@ function peersOf(account: AccountLike, all: AccountLike[]): AccountLike[] {
 }
 
 function labelOf(account: AccountLike | null | undefined): string {
-  return account?.nickname || account?.name || account?.id || ''
+  // 与账号列同一取名口径（displayNameOf 内含 nameCustom / emailAsName 分流）
+  return displayNameOf(account) || account?.id || ''
 }
 
 /* ─── 代理表单 ──────────────────────────────── */

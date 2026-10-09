@@ -113,6 +113,19 @@ mod cline;
 
 pub use cline::{migrate_cline_split, seed_cline_defaults};
 
+/// WorkBuddy 专用的规则件：默认启用白名单种子 + **拆家迁移**。
+///
+/// 与 `cline` 同一模式（那家是拆池、本家是拆地区，两次迁移的形态也接近）：
+/// 拆出去的理由见那个文件的模块头（拆家迁移与长期机制不该混在一起，
+/// 以及单文件体量约定）。`pub use` 让调用方仍写
+/// `model_rules::seed_workbuddy_defaults` / `model_rules::migrate_workbuddy_split`。
+mod workbuddy;
+
+pub use workbuddy::{
+    migrate_workbuddy_split, seed_workbuddy_defaults, SplitMigrationOutcome,
+    WORKBUDDY_DEFAULT_ENABLED,
+};
+
 /// 思考等级组件（候选表 + 归一规则 + 设计取舍说明）。
 ///
 /// 与 `cline` 同一模式：拆出去的理由见那个文件的模块头（长期机制与
@@ -124,7 +137,8 @@ mod reasoning;
 
 pub use reasoning::{
     effort_rank as reasoning_rank, is_thinking_off as reasoning_is_off,
-    normalize as normalize_reasoning, read_client_level, REASONING_LEVELS,
+    normalize as normalize_reasoning, read_client_level, clear_client_controls, override_error,
+    OVERRIDE_ERROR_CODE, REASONING_LEVELS,
 };
 
 /// 一条映射：把上游模型（`provider` × `target`）以对外名 `alias` 暴露给下游。
@@ -148,6 +162,7 @@ pub struct Mapping {
     pub target: String,
     pub provider: Option<String>,
     pub reasoning: Option<String>,
+    pub reasoning_override: Option<String>,
     pub enabled: bool,
 }
 
@@ -266,6 +281,9 @@ impl Mapping {
             "provider": self.provider,
             "reasoning": self.reasoning,
         });
+        if let Some(level) = &self.reasoning_override {
+            object["reasoningOverride"] = Value::String(level.clone());
+        }
         if !self.enabled {
             if let Some(map) = object.as_object_mut() {
                 map.insert("enabled".to_string(), Value::Bool(false));
@@ -440,6 +458,7 @@ impl ModelRules {
                             target: target.to_string(),
                             provider: provider.map(str::to_string),
                             reasoning,
+                            reasoning_override: item.get("reasoningOverride").and_then(Value::as_str).and_then(normalize_reasoning),
                             enabled,
                         })
                     })
@@ -586,6 +605,14 @@ impl ModelRules {
     /// 升级前的 `seeded` 存的是纯 id（旧版种子是全局动作），读取时对这两家
     /// 保留「纯 id 也算已种」的兼容：重种一遍只是把同样的默认值再写一次，
     /// 没必要。
+    ///
+    /// ── WorkBuddy 国际版**不继承**国内版的种子标记（2026-10 拆家）────
+    /// `migrate_workbuddy_split` 会把 `workbuddy:<id>` 的标记**复制**一份给
+    /// 国际版（那条迁移在拆家那一刻跑一次）。但读取层**不能**在这里把
+    /// 「`workbuddy:<id>` 存在」当成「`workbuddy-intl:<id>` 已种」：
+    /// 拆家之后新出现在国际版清单里的模型必须按正常种子路径判一次
+    /// （不在白名单里就默认禁用），而继承国内版的标记会让它们直接跳过种子、
+    /// 默认全开。两件事各归各处：迁移负责存量，读取层不猜。
     ///
     /// 但这个兼容**不能给所有 provider 开**：Qoder 的目录里有 `Auto` /
     /// `GLM-5.3` / `DeepSeek-V4-Pro` 这类与 workbuddy / raccoon 清单**同名**的
@@ -743,6 +770,7 @@ pub fn add_mapping(
     reasoning: Option<Option<&str>>,
     enabled: Option<bool>,
     other_providers: &[String],
+    reasoning_override: Option<Option<&str>>,
 ) -> Result<ModelRules, String> {
     let mut rules = current();
     let inherited = provider.and_then(|owner| rules.binding(owner, alias, target).cloned());
@@ -775,6 +803,13 @@ pub fn add_mapping(
                 touched = true;
             }
         }
+        if let Some(next) = reasoning_override {
+            let next = next.and_then(normalize_reasoning);
+            if existing.reasoning_override != next {
+                existing.reasoning_override = next;
+                touched = true;
+            }
+        }
         if let Some(next) = enabled {
             if existing.enabled != next {
                 existing.enabled = next;
@@ -789,6 +824,10 @@ pub fn add_mapping(
             reasoning: match reasoning {
                 Some(value) => value.and_then(normalize_reasoning),
                 None => inherited.as_ref().and_then(|mapping| mapping.reasoning.clone()),
+            },
+            reasoning_override: match reasoning_override {
+                Some(value) => value.and_then(normalize_reasoning),
+                None => inherited.as_ref().and_then(|mapping| mapping.reasoning_override.clone()),
             },
             enabled: enabled.unwrap_or_else(|| inherited.as_ref().map_or(true, |mapping| mapping.enabled)),
         });
@@ -1000,7 +1039,7 @@ pub fn remove_mapping(
 ) -> (ModelRules, bool) {
     let mut rules = current();
     let mut removed = false;
-    let mut global_hit = false;
+    let mut global_hit = None;
     rules.mappings.retain(|m| {
         if !(m.alias.eq_ignore_ascii_case(alias) && m.target.eq_ignore_ascii_case(target)) {
             return true;
@@ -1011,7 +1050,7 @@ pub fn remove_mapping(
             (Some(_), None) => true,
             // 旧版全局条目：对任何家都命中（与展示同口径）
             (None, _) => {
-                global_hit = true;
+                global_hit = Some(m.clone());
                 true
             }
         };
@@ -1020,7 +1059,7 @@ pub fn remove_mapping(
         }
         !hit
     });
-    if removed && global_hit {
+    if let Some(global) = global_hit.filter(|_| removed) {
         if let Some(owner) = provider {
             // 全局条目展开：其余承载 target 的家逐家补精确条目（已有的不重复加），
             // 于是「在 A 家行上删掉」不会顺手把 B 家的映射也弄丢
@@ -1040,10 +1079,11 @@ pub fn remove_mapping(
                         alias: alias.to_string(),
                         target: target.to_string(),
                         provider: Some(other.to_string()),
-                        reasoning: None,
+                        reasoning: global.reasoning.clone(),
+                        reasoning_override: global.reasoning_override.clone(),
                         // 展开补出来的条目继承「映射本来生效」的事实：
                         // 被删的那条是全局条目（对这家也是开着的）
-                        enabled: true,
+                        enabled: global.enabled,
                     });
                 }
             }
@@ -1162,6 +1202,7 @@ fn seed_extra_aliases(
             provider: Some(provider.to_string()),
             // 种子建的映射不绑思考等级（那是用户手动绑定的东西）
             reasoning: None,
+            reasoning_override: None,
             // 种子建的就是「生效」的映射；用户此后把它关掉是自己的决定，
             // seeded 只防「删掉后被重种」，关掉的不会被重开（exists 判重挡着）
             enabled: true,
@@ -1227,6 +1268,7 @@ pub fn seed_raccoon_defaults(ids: &[String]) -> Option<String> {
                 target: id.to_string(),
                 provider: Some("raccoon".to_string()),
                 reasoning: None,
+            reasoning_override: None,
                 enabled: true,
             });
             mappings_added.push(format!("{alias} → {id}"));
@@ -1252,11 +1294,6 @@ pub fn seed_raccoon_defaults(ids: &[String]) -> Option<String> {
 
 // ─── 各清单的「默认启用白名单」种子 ────────────────────
 
-/// WorkBuddy 清单的**默认启用白名单**：模型首次出现在清单里时，只有这里的
-/// 模型保持默认启用，其余一律默认**禁用**（管理页可见、开关关着，用户可手动
-/// 启用 —— 与小浣熊种子同一哲学：「默认值」只决定初始状态，不决定 forever）。
-pub const WORKBUDDY_DEFAULT_ENABLED: &[&str] = &["hy3", "hy4-preview-f", "deepseek-v4.1-flash"];
-
 /// Qoder 清单的**默认启用白名单**：同 WorkBuddy 种子的语义，只是白名单里
 /// 只留一个模型。
 ///
@@ -1270,20 +1307,6 @@ pub const WORKBUDDY_DEFAULT_ENABLED: &[&str] = &["hy3", "hy4-preview-f", "deepse
 /// 的两个 Qwen3.8 系模型之一，且面向日常对话），拿它当唯一默认项最贴近
 /// 「装上就能用」的预期。
 pub const QODER_DEFAULT_ENABLED: &[&str] = &["Qwen3.8-Flash"];
-
-/// WorkBuddy 清单的**默认规则种子**：对 `ids` 里每个还没种过的模型记入
-/// `seeded`，不在 [`WORKBUDDY_DEFAULT_ENABLED`] 里的同时默认禁用。
-///
-/// 调用点有两类：清单**首次落地**（`core::models` 的 `apply_remote`，覆盖
-/// /v3/config 与企业清单两条路径），以及编排入口对**当前缓存清单**的补种
-/// （见 `providers::adapter` 的 `seed_current_workbuddy_defaults` —— 覆盖启动时
-/// 只有内置清单、或刷新失败停留在旧清单的情形）。幂等：种过的 id 不再动，
-/// 用户事后在管理页的手动启用 / 禁用不会被清单刷新改回去。
-///
-/// 返回给日志的摘要；没有新种过的模型时返回 None（不落盘）。
-pub fn seed_workbuddy_defaults(ids: &[String]) -> Option<String> {
-    seed_default_enabled("workbuddy", "WorkBuddy", WORKBUDDY_DEFAULT_ENABLED, ids)
-}
 
 /// Qoder 清单的**默认规则种子**：语义与 [`seed_workbuddy_defaults`] 完全一致，
 /// 只是白名单是 [`QODER_DEFAULT_ENABLED`]。

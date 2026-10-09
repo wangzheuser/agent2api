@@ -20,8 +20,8 @@ pub async fn get_account_selection(State(_state): State<ServerState>) -> Respons
     ok_json(selection_json(config::account_selection()))
 }
 
-/// PUT /api/account-selection —— body `{accountSelection: "balanced"|"priority"|"roundRobin"}`
-pub async fn put_account_selection(State(_state): State<ServerState>, body: Bytes) -> Response {
+/// PUT /api/account-selection —— body `{accountSelection: "balanced"|"priority"|"roundRobin"|"cacheAffinity"}`
+pub async fn put_account_selection(State(state): State<ServerState>, body: Bytes) -> Response {
     let payload = match parse_body(&body) {
         Ok(value) => value,
         Err(error) => return errors::management_error(400, error.message),
@@ -39,20 +39,25 @@ pub async fn put_account_selection(State(_state): State<ServerState>, body: Byte
         "balanced" => AccountSelectionStrategy::Balanced,
         "priority" => AccountSelectionStrategy::Priority,
         "roundRobin" => AccountSelectionStrategy::RoundRobin,
+        "cacheAffinity" => AccountSelectionStrategy::CacheAffinity,
         _ => {
             return errors::management_error(
                 400,
                 format!(
-                    "{KEY_ACCOUNT_SELECTION} 必须是 balanced、priority 或 roundRobin（收到: {raw}）"
+                    "{KEY_ACCOUNT_SELECTION} 必须是 balanced、priority、roundRobin 或 cacheAffinity（收到: {raw}）"
                 ),
             )
         }
     };
+    let previous = config::account_selection();
     if !config::set_account_selection(strategy) {
         logging::log(
             "[Config]",
             "⚠️ 账号选路策略写入配置库失败，本次运行内仍立即生效",
         );
+    }
+    if previous != strategy {
+        state.upstream().reset_affinity();
     }
     logging::log(
         "[Config]",

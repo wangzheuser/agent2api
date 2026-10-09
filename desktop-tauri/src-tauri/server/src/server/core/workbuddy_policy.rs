@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 
 use super::upstream::usage::TelemetrySnapshot;
 use super::{endpoints, routing, task_state};
+use super::providers::workbuddy::region::Region;
 use crate::server::logging;
 
 pub const BALANCE_MAX_AGE_MS: i64 = 900_000;
@@ -24,20 +25,14 @@ fn string<'a>(value: &'a Value, key: &str) -> &'a str {
 
 /// 接受公开账号或会话形态；地区归一与既有登录/计费共用。
 pub fn identity(value: &Value) -> Option<String> {
-    if value
-        .get("provider")
-        .and_then(Value::as_str)
-        .unwrap_or("workbuddy")
-        != "workbuddy"
-    {
-        return None;
-    }
+    let provider = value.get("provider").and_then(Value::as_str).unwrap_or("workbuddy");
+    let region = Region::from_provider_id(provider)?;
     let account = value.get("account").unwrap_or(value);
     let uid = string(account, "uid");
     if uid.is_empty() {
         return None;
     }
-    let edition = endpoints::resolve_edition(value.get("edition").and_then(Value::as_str)).id;
+    let edition = if region == Region::Intl { region.id() } else { endpoints::resolve_edition(value.get("edition").and_then(Value::as_str)).id };
     let bytes =
         serde_json::to_vec(&["workbuddy", edition, uid, string(account, "enterpriseId")]).ok()?;
     Some(format!("{:x}", Sha256::digest(bytes)))
@@ -140,7 +135,7 @@ pub fn observe_usage(account: &Value, usage: &Value) {
 
 /// 单次最终尝试的上游实扣；不用余额差估算，也不累计重复 SSE usage 帧。
 pub fn observe_cost(snapshot: &TelemetrySnapshot, success: bool) {
-    if snapshot.provider.as_deref() != Some("workbuddy") {
+    if snapshot.provider.as_deref().and_then(Region::from_provider_id).is_none() {
         return;
     }
     let (Some(identity), Some(credits)) = (
@@ -341,7 +336,7 @@ impl RoutePolicy {
                 .iter()
                 .enumerate()
                 .filter_map(|(index, account)| {
-                    if routing::provider_of(account) != "workbuddy"
+                    if Region::from_provider_id(routing::provider_of(account)).is_none()
                         || string(account, "edition") != edition
                     {
                         return None;
@@ -490,5 +485,19 @@ mod tests {
             cost_summary(&samples(0.0), now)["models"][0]["creditsPer1kTokens"].as_f64(),
             Some(0.0)
         );
+    }
+}
+
+#[cfg(test)]
+mod region_restore_tests {
+    use super::*;
+    #[test]
+    fn migrated_international_identity_retains_policy_and_does_not_collide_with_cn() {
+        let legacy = json!({"uid":"fixture", "edition":"intl", "provider":"workbuddy"});
+        let migrated = json!({"uid":"fixture", "edition":"intl", "provider":"workbuddy-intl"});
+        assert_eq!(identity(&legacy), identity(&migrated));
+        assert_eq!(identity(&migrated), identity(&json!({"uid":"fixture","provider":"workbuddy-intl"})));
+        assert_ne!(identity(&migrated), identity(&json!({"uid":"fixture","provider":"workbuddy"})));
+        assert_eq!(identity(&json!({"uid":"fixture","provider":"zcode"})), None);
     }
 }

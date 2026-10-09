@@ -326,7 +326,10 @@ fn explicitly_inactive(value: &Value) -> bool {
         if path.ends_with("lifecycleState") {
             normalized != "active"
         } else {
-            matches!(normalized.as_str(), "false" | "0" | "inactive" | "ended" | "closed")
+            matches!(
+                normalized.as_str(),
+                "false" | "0" | "inactive" | "ended" | "closed"
+            )
         }
     })
 }
@@ -341,7 +344,8 @@ fn context_requires_login(context: &Value) -> bool {
                     .as_str()
                     .is_some_and(|text| text.trim().eq_ignore_ascii_case("false"))
         })
-        || ["/loginRequired", "/state/loginRequired"]
+        // loginRequired 是活动策略；已认证用户也会收到 true。
+        || (["/loginRequired", "/state/loginRequired"]
             .iter()
             .filter_map(|path| context.pointer(path))
             .any(|value| {
@@ -349,7 +353,7 @@ fn context_requires_login(context: &Value) -> bool {
                     || value
                         .as_str()
                         .is_some_and(|text| text.trim().eq_ignore_ascii_case("true"))
-            })
+            }) && !bool_at(context, &["/authenticated", "/state/authenticated"]))
 }
 
 fn has_checkin_action(context: &Value) -> bool {
@@ -465,6 +469,57 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[tokio::test]
+    async fn authenticated_activity_with_login_requirement_can_claim_once() {
+        use axum::{body::Bytes, extract::State, http::Uri, Json, Router};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        async fn handle(
+            State(claims): State<Arc<AtomicUsize>>,
+            uri: Uri,
+            body: Bytes,
+        ) -> Json<Value> {
+            let data = if uri.path().ends_with("/slot") {
+                json!({"slotState":"available","activity":{"activityCode":"live-fixture","configRevision":7}})
+            } else if uri.path().ends_with("/context") {
+                json!({"authenticated":true,"loginRequired":true,"lifecycleState":"active","state":{"claimedToday":claims.load(Ordering::SeqCst)>0,"completed":false},"actions":["check_in"]})
+            } else {
+                assert!(uri.path().ends_with("/actions/check_in"));
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(body["configRevision"], 7);
+                assert!(!body["idempotencyKey"].as_str().unwrap().is_empty());
+                assert_eq!(claims.fetch_add(1, Ordering::SeqCst), 0);
+                json!({"result":{"creditsGranted":100,"expiresAt":"2026-11-07T00:00:00Z"}})
+            };
+            Json(json!({"code":0,"data":data}))
+        }
+        let claims = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = Router::new().fallback(handle).with_state(claims.clone());
+        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        struct Restore(Option<String>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(old) => std::env::set_var("LOBSTERAI_SERVER_BASE", old),
+                    None => std::env::remove_var("LOBSTERAI_SERVER_BASE"),
+                }
+            }
+        }
+        let _restore = Restore(std::env::var("LOBSTERAI_SERVER_BASE").ok());
+        std::env::set_var("LOBSTERAI_SERVER_BASE", format!("http://{address}"));
+        let credentials = Credentials::from_payload(&json!({"accessToken":"fixture"})).unwrap();
+        let first = daily_checkin(&credentials, None).await;
+        assert!(first.success);
+        assert_eq!(first.reward_credits, Some(100.0));
+        assert!(daily_checkin(&credentials, None).await.already_completed);
+        assert_eq!(claims.load(Ordering::SeqCst), 1);
+        task.abort();
+    }
+
     #[test]
     fn slot_and_context_helpers_accept_dynamic_shapes() {
         let slot = json!({
@@ -490,15 +545,31 @@ mod tests {
     #[test]
     fn lifecycle_state_must_be_active() {
         assert!(explicitly_inactive(&json!({"lifecycleState":"ended"})));
-        assert!(explicitly_inactive(&json!({"state":{"lifecycleState":"paused"}})));
+        assert!(explicitly_inactive(
+            &json!({"state":{"lifecycleState":"paused"}})
+        ));
         assert!(!explicitly_inactive(&json!({"lifecycleState":"active"})));
     }
 
     #[test]
     fn unauthenticated_context_is_neutral() {
         assert!(context_requires_login(&json!({"authenticated":false})));
-        assert!(context_requires_login(&json!({"state":{"loginRequired":true}})));
-        assert!(!context_requires_login(&json!({"authenticated":true,"loginRequired":false})));
+        assert!(context_requires_login(
+            &json!({"state":{"loginRequired":true}})
+        ));
+        assert!(!context_requires_login(
+            &json!({"authenticated":true,"loginRequired":false})
+        ));
+        // 官方与实测活动都同时返回这两个 true：登录要求不是未登录状态。
+        assert!(!context_requires_login(
+            &json!({"authenticated":true,"loginRequired":true})
+        ));
+        assert!(!context_requires_login(
+            &json!({"state":{"authenticated":"true","loginRequired":"true"}})
+        ));
+        assert!(context_requires_login(
+            &json!({"authenticated":false,"loginRequired":true})
+        ));
     }
 
     #[test]

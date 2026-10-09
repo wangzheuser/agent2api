@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! 候选家 = 清单里有这个模型名的 provider（router::route_for_forward）
-//! 账号循环：在候选家的全部账号里按**当前选路策略**选一个
+//! 账号循环：在候选家的全部账号里按**全局优先级**选一个
 //!   └ 一次发送（该账号所属 provider 的适配器；含退避重试 + 401 刷新后重试一次）
 //!        └ 429 → 标记该账号对该模型冷却，回到账号循环选下一个（可能换了一家）
 //! ```
@@ -98,6 +98,9 @@ use super::{
     MAX_ROUTE_ATTEMPTS,
 };
 
+#[cfg(test)]
+mod tests;
+
 /// 上游一次请求的失败（已分类 + 已构好给客户端的错误）。
 struct OutboundFailure {
     /// 已消耗重试预算，需要回到计划构造层换取一次性凭证。
@@ -112,11 +115,6 @@ struct OutboundFailure {
     error: GatewayError,
 }
 
-/// 已通过 HTTP 状态与提供商首包业务判定的响应。
-///
-/// `reqwest::Response` 一旦预读了首段就不能把已消费的字节放回去，因此统一把
-/// 状态码和可继续消费的字节流交给下游。首包失败在构造这个结构之前返回，
-/// 所以不会有任何下游字节已经发出。
 struct PreparedResponse {
     status: u16,
     stream: futures::stream::BoxStream<'static, Result<Bytes, std::io::Error>>,
@@ -275,7 +273,7 @@ fn retry_log_line(reason: &str, delay_ms: u64, used: usize, total: usize) -> Str
     format!("⚠️ {reason}；{} 秒后重试（第 {used}/{total} 次）", delay_ms / 1000)
 }
 
-/// 转发入口：在候选家的全部账号里按当前选路策略逐个尝试。
+/// 转发入口：在候选家的全部账号里按全局优先级逐个尝试。
 ///
 /// `slot` 是在途槽位凭证（`&mut` 是因为它只在**成功转为流式**时才被取走，
 /// 失败重试时仍由本函数持有；见 `InFlightGuard` 的说明）。
@@ -291,7 +289,10 @@ pub(super) async fn forward_with_providers(
     // 候选家来自 `route_for_forward`（目录里没有这个模型名时会回落成默认
     // provider 一家；模型有家承载但全被禁用时**不回落**，见那个函数）——
     // 本函数是唯一消费方，日志也打在这里。
-    let candidates = route_for_forward(&model);
+    let candidates = match ctx.test_target {
+        Some(target) => crate::server::core::providers::catalog::providers_for_model(&target.model),
+        None => route_for_forward(&model),
+    };
     if crate::server::core::providers::catalog::providers_for_model(&model).is_empty() {
         logging::verbose(
             "[Upstream]",
@@ -333,7 +334,7 @@ pub(super) async fn forward_with_providers(
     logging::verbose(
         "[Upstream]",
         &format!(
-            "候选提供商 {}（按账号选路策略选路{}）",
+            "候选提供商 {}（按账号全局优先级选路{}）",
             provider_ids.join(" / "),
             if with_mapping { "，含映射" } else { "" },
         ),
@@ -397,7 +398,7 @@ fn filter_by_key_scope(
     .with_code("model_not_found"))
 }
 
-/// 账号循环：每一轮从候选池里按当前选路策略选一个账号，用它所属家的适配器发一次。
+/// 账号循环：每一轮从候选池里按全局优先级选一个账号，用它所属家的适配器发一次。
 ///
 /// 按 `is_stateful` 分流（架构文档 §4.2.1）：
 ///   - 无状态（workbuddy / 小浣熊 / AutoClaw）→ 下面这段「构造请求 → 发送 →
@@ -415,7 +416,10 @@ async fn attempt_queue(
     // 限额冷却键的解析器：把请求名解析成**各家上游真名**（见 `routing::CooldownKeys`）。
     // 建一次、整条请求共用 —— 选路、429 记账、成功清理三处读的必须是同一个键，
     // 否则冷却会写在一个名字上、查在另一个名字上。
-    let cooldown_keys = rotate::CooldownKeys::new(&model);
+    let cooldown_keys = match ctx.test_target {
+        Some(target) => rotate::CooldownKeys::for_wire_model(&target.model),
+        None => rotate::CooldownKeys::new(&model),
+    };
     let mut tried_ids: Vec<String> = Vec::new();
     // ── 两份独立的预算（见 config::RetrySettings）─────────────────────
     //   - `budget`：同一个账号上还能**原地重发**几次。整份请求共用一份，
@@ -473,8 +477,21 @@ async fn attempt_queue(
         if ctx.telemetry.is_cancelled() {
             return Err(cancellation::cancelled_error());
         }
-        let target =
-            rotate::select_target_account(service, provider_ids, &cooldown_keys, &tried_ids).await?;
+        let target = rotate::select_target_account(
+            service,
+            provider_ids,
+            &cooldown_keys,
+            &tried_ids,
+            ctx.pinned_account,
+            ctx.affinity_enabled.then_some(ctx),
+        )
+        .await?;
+        // 兜底路由仍计实际发送，但不建立亲和绑定。
+        if ctx.affinity_enabled {
+            if let Some(id) = target.account_id.as_deref() {
+                ctx.telemetry.set_affinity_sender(service.affinity.clone(), id, ctx.affinity_epoch);
+            }
+        }
         // 连接计数改绑到这一轮选中的账号：失败重试换账号时计数跟着走，
         // 于是「一个请求任意时刻只占一个账号」这条口径不需要每个分支各维护一次
         // （429 降级、401 刷新后换号、会话式失败顺延三条路径都经过这里）。
@@ -491,6 +508,9 @@ async fn attempt_queue(
             match attempt_custom(service, ctx, target, slot, connections, degraded).await {
                 Ok(outcome) => return Ok(outcome),
                 Err(error) => {
+                    if error.code.as_deref() == Some(crate::server::core::model_rules::OVERRIDE_ERROR_CODE) {
+                        return Err(error);
+                    }
                     // 手动终止优先（与无状态路径同一判定与理由）：不把已受理的
                     // 终止当成「这一轮失败」去顺延下一个账号
                     if ctx.telemetry.is_cancelled() {
@@ -516,10 +536,8 @@ async fn attempt_queue(
                             // 自定义家没有「同名多池」之类的键重排，冷却键
                             // 与发送名同源（`custom::forward::cooldown_model`）。
                             if error.is_quota_limit() {
-                                let wire_model = custom_forward::cooldown_model(
-                                    &custom_provider_id,
-                                    &model,
-                                );
+                                let wire_model = ctx.test_target.map(|target| target.model.clone())
+                                    .unwrap_or_else(|| custom_forward::cooldown_model(&custom_provider_id, &model));
                                 rotate::mark_account_limited(
                                     service,
                                     &account_id,
@@ -537,6 +555,7 @@ async fn attempt_queue(
                         provider_ids,
                         &cooldown_keys,
                         &tried_ids,
+                        ctx.pinned_account,
                     ) {
                         Some(next) => {
                             // 换号额度用尽 → 队列里即使还有人也不再顺延
@@ -592,6 +611,9 @@ async fn attempt_queue(
             {
                 Ok(outcome) => return Ok(outcome),
                 Err(error) => {
+                    if error.code.as_deref() == Some(crate::server::core::model_rules::OVERRIDE_ERROR_CODE) {
+                        return Err(error);
+                    }
                     // 手动终止优先（与无状态 / 自定义两条路径同一判定与理由）：
                     // 会话式这一轮已经结束，但用户要的是终止 —— 不把它当成
                     // 普通失败去顺延下一个账号（那会把终止拖成另一轮转发）
@@ -650,6 +672,7 @@ async fn attempt_queue(
                         provider_ids,
                         &cooldown_keys,
                         &tried_ids,
+                        ctx.pinned_account,
                     ) {
                         Some(next) => {
                             // 换号额度用尽 → 队列里即使还有人也不再顺延
@@ -760,13 +783,13 @@ async fn attempt_queue(
             &attempt_account,
             provider_id,
         );
-        if provider_id == "workbuddy" { ctx.telemetry.note_workbuddy_account(Some(&session)); }
         // 尝试明细的「起头」：本轮的承载者定了，结果稍后由下面两个出口补上
         // （成功出口 / 失败出口）。与 note_attempt 必须成对且在它之后 ——
         // 明细的条数因此恒等于 attempts，前端「共 N 次尝试」与链长对得上。
         // 放在这里而不是 send_with_retry 里：函数内那层退避重试（同账号重发）
         // **不算一次新尝试**（口径见 TelemetrySnapshot::attempts 的说明），
         // 若在循环里起头就会多出几条「同名同账号」的重复项。
+        if matches!(provider_id, "workbuddy" | "workbuddy-intl") { ctx.telemetry.note_workbuddy_account(Some(&session)); }
         ctx.telemetry.note_attempt_started(provider_id, &attempt_account);
         // 代理回退提示：选路时记下的「代理不可用、本次直连」跟着这一轮走
         // （改造前它是一行运行日志，见 `with_proxy_notice`）
@@ -809,19 +832,30 @@ async fn attempt_queue(
             // 发送体在这一轮发送前取一次（同一家同池同降级状态下复用缓存项）：
             // 借用在本次迭代内有效，`continue`（401 刷新 / 内容拦截补救）时
             // 重新取 —— 于是「换了 body 的那次重试」拿到的一定是新的一份。
-            let send = send_cache.entry((provider_id, account_pool.clone(), degraded)).or_insert_with(
-                || send_body(ctx, provider_id, target.account.as_ref(), degraded),
-            );
+            let send = match send_cache.entry((provider_id, account_pool.clone(), degraded)) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let send = send_body(ctx, provider_id, target.account.as_ref(), degraded).map_err(|error| {
+                        ctx.telemetry.finish_last_attempt(Some(i64::from(error.status_code)), Some(&error.message));
+                        error
+                    })?;
+                    entry.insert(send)
+                }
+            };
             // 内置家是「把 chat 体原样发给上游」的透传出口：入口翻译（Anthropic /
             // Responses）暂存的内部字段（_wb_*，见 protocol::mod 的说明）绝不能
             // 到这里 —— 严格校验的上游会拒绝消息上的未知字段整轮 400。没有暂存
             // 字段时零拷贝借出原体（绝大多数请求的形态）。
             let stripped = strip_internal_fields(&send.body);
             let body: &serde_json::Value = &stripped;
+            ctx.telemetry.validate_affinity_body(body);
             // 这一家实际收到的上游模型名 = 它的限额冷却键（与字节同源，见 `SendBody`）。
             // 随发送体一起取（发送体换了，真名也随之重算），成功时随返回值交给
             // 循环外（`cap_cleared` 要读它）—— 所以它是 break 的第二个元素。
             let wire_model = send.wire_model.clone();
+            if let Some(account) = target.account.as_ref().filter(|_| ctx.affinity_enabled) {
+                ctx.telemetry.validate_affinity_identity(&super::payload::affinity_identity(account, &session, ctx.body));
+            }
             // 构造请求计划**可能失败**（适配器自己的校验，例如小浣熊账号缺
             // accessToken → 401）。这里显式处理而不是用 `?` 直接抛出：
             // 上面的 `note_attempt_started` 已经为这一轮起了头，直接返回会让
@@ -837,7 +871,7 @@ async fn attempt_queue(
                 },
                 None => prepared.await,
             };
-            let plan = match result {
+            let mut plan = match result {
                 Ok(plan) => plan,
                 Err(error) => {
                     ctx.telemetry.finish_last_attempt(
@@ -847,6 +881,9 @@ async fn attempt_queue(
                     return Err(error);
                 }
             };
+            if let Some(session_context) = ctx.route_session {
+                adapter.apply_route_session(&mut plan, &session, ctx.body, session_context);
+            }
             // 序列化失败只可能是内部数据坏了（适配器给出的 body 里含不可序列化的
             // 值），按 500 收敛。同样要先给明细定稿（理由同上一条）。
             let payload = match serde_json::to_string(&plan.body) {
@@ -911,6 +948,7 @@ async fn attempt_queue(
                 ctx.telemetry,
                 degraded,
                 adapter.request_is_single_use(&session),
+                ctx.route_session.is_some(),
             )
             .await
             {
@@ -942,7 +980,7 @@ async fn attempt_queue(
                         return Err(cancellation::cancelled_error());
                     }
                     // ── 指定错误码直接换号 ──────────────────────────────
-                    // 用户点名的状态码（默认 402、405）不做「同一账号再看一眼」：
+                    // 用户点名的状态码（默认 402）不做「同一账号再看一眼」：
                     // 原地重发已在 `send_with_retry` 的第二道闸挡住，这里的
                     // 标记再把同账号的补救动作（动作 0 换提示词、动作 2 刷新
                     // 凭证）一并跳过 —— 点名的码没有任何例外。明细仍走下面
@@ -1106,6 +1144,7 @@ async fn attempt_queue(
                                 provider_ids,
                                 &cooldown_keys,
                                 &tried_ids,
+                                ctx.pinned_account,
                             ) {
                                 Some(next) => {
                                     let next_label = account_display(&next);
@@ -1207,6 +1246,7 @@ async fn attempt_queue(
                         provider_ids,
                         &cooldown_keys,
                         &tried_ids,
+                        ctx.pinned_account,
                     ) {
                         Some(next) => {
                             if !take_switch(&mut switches_left, switch_total) {
@@ -1274,6 +1314,12 @@ async fn attempt_queue(
         // （见 `upstream::translate` 与 `providers::zcode::plan`）。
         // 翻译在**两处出口之前**做，于是流式与非流式共用同一条下行语义：
         // reasoning 合并、usage 提取、model 回写、取消处理全都不需要第二套。
+        let mut response = response;
+        if ctx.telemetry.observes_affinity() {
+            response.stream = super::completion_evidence::observe_stream(
+                response.stream, ctx.telemetry.clone(), response_protocol,
+            );
+        }
         if response_protocol
             == crate::server::core::providers::adapter::UpstreamResponse::Anthropic
         {
@@ -1282,10 +1328,7 @@ async fn attempt_queue(
             let translated: futures::stream::BoxStream<
                 'static,
                 Result<bytes::Bytes, std::io::Error>,
-            > = Box::pin(super::translate::AnthropicToChatStream::from_stream(
-                response.stream,
-                &wire_model,
-            ));
+            > = Box::pin(super::translate::AnthropicToChatStream::from_stream(response.stream, &wire_model));
             if ctx.stream {
                 return Ok(ForwardOutcome::Stream {
                     status,
@@ -1398,7 +1441,6 @@ async fn attempt_custom(
     );
     ctx.telemetry
         .note_attempt(target.account_id.as_deref(), &attempt_account, &provider_id);
-    ctx.telemetry.note_workbuddy_account(target.account.as_ref());
     ctx.telemetry
         .note_attempt_started(&provider_id, &attempt_account);
     if let Some(notice) = target.proxy_notice.as_deref() {
@@ -1406,20 +1448,21 @@ async fn attempt_custom(
     }
     let started_at = logging::now_ms();
     // 内容处理（系统提示词 + 脱敏）与内置家同一时机：凭证已就绪、这一家
-    // **即将发送**。`send_body` 对自定义 id 是零改写（它的模型名改写只认
-    // modelRules），处理结果就是「提示词/脱敏后的客户端请求体」—— 自定义
-    // 语义的改写（映射 alias → 真名、思考等级）在 forward 里做。
-    let send = send_body(ctx, &provider_id, target.account.as_ref(), degraded);
-    // 「上游模型」列以**真名**为准：send_body 对自定义 id 是零改写（它记的
-    // 是请求名），真名的解析与改写发生在 forward 内部 —— 这里按同源解析
-    // 覆盖一次（note_upstream_model 是覆盖式，最后一次为准；空串被内部过滤）。
-    let wire_model = custom_forward::cooldown_model(&provider_id, &model_of(ctx.body));
+    // **即将发送**。自定义绑定（原始测试目标、默认和强制等级）由 forward 收口，
+    // 这里仍处理提示词与脱敏，不用原生适配器预检自定义档位。
+    let send = send_body(ctx, &provider_id, target.account.as_ref(), degraded).map_err(|error| {
+        ctx.telemetry.finish_last_attempt(Some(i64::from(error.status_code)), Some(&error.message));
+        error
+    })?;
+    // 测试沿用已校验目标；普通请求用自定义绑定解析。日志与冷却都取同一真名。
+    let wire_model = ctx.test_target.map(|target| target.model.clone())
+        .unwrap_or_else(|| custom_forward::cooldown_model(&provider_id, &model_of(ctx.body)));
     ctx.telemetry.note_upstream_model(&wire_model);
     logging::verbose(
         "[Upstream]",
         &format!(
             "自定义转发 model={} stream={} account={} priority={} 出口={} provider={provider_id}",
-            limit_model_label(&model_of(ctx.body), &custom_forward::cooldown_model(&provider_id, &model_of(ctx.body))),
+            limit_model_label(&model_of(ctx.body), &wire_model),
             ctx.stream,
             target.account_id.as_deref().unwrap_or("-"),
             target
@@ -1439,6 +1482,7 @@ async fn attempt_custom(
         ctx.telemetry,
         slot,
         connections,
+        ctx.test_target,
     )
     .await
     {
@@ -1454,10 +1498,10 @@ async fn attempt_custom(
             cap_cleared(
                 service,
                 &target,
-                &custom_forward::cooldown_model(&provider_id, &model_of(ctx.body)),
+                &wire_model,
                 &limit_model_label(
                     &model_of(ctx.body),
-                    &custom_forward::cooldown_model(&provider_id, &model_of(ctx.body)),
+                    &wire_model,
                 ),
                 &Value::Null,
                 &provider_id,
@@ -1556,10 +1600,11 @@ async fn attempt_stateful(
     // `degraded` 由调用方（账号循环）给出：本路径**没有**就地补救（有状态
     // provider 一次转发就是一个会话轮次，没有「换提示词重发」这一步），
     // 但降级期内（状态机已生效）首发的提示词也要跟着换。
-    let send = send_body(ctx, provider_id, target.account.as_ref(), degraded);
+    let send = send_body(ctx, provider_id, target.account.as_ref(), degraded)?;
     // 内置家透传出口的内部字段剥离：与无状态路径同一理由（见那里的说明）
     let stripped = strip_internal_fields(&send.body);
     let body: &serde_json::Value = &stripped;
+    ctx.telemetry.validate_affinity_body(body);
     // 这一家实际收到的上游模型名 = 限额冷却键（与字节同源，见 `SendBody`）
     let wire_model = &send.wire_model;
     // 旁路记账：本 provider + 本账号是这一轮的实际承载者（attempts +1）。
@@ -1573,7 +1618,6 @@ async fn attempt_stateful(
     );
     ctx.telemetry
         .note_attempt(target.account_id.as_deref(), &attempt_account, provider_id);
-    ctx.telemetry.note_workbuddy_account(target.account.as_ref());
     // 尝试明细的起头：与 note_attempt 配对（同上一条注释的说明）。
     // 本路径的定稿在下面 match 的两个分支里 —— 有状态 provider 没有账号轮换，
     // 所以一轮就是一条明细，链路至多一项（`provider_loop` 的 `'accounts` 循环
@@ -1799,6 +1843,9 @@ async fn send_or_cancel(
     transport: &TransportRequest,
     telemetry: &crate::server::core::upstream::usage::RequestTelemetry,
 ) -> Result<reqwest::Response, super::request::UpstreamRequestError> {
+    if !telemetry.is_cancelled() {
+        telemetry.record_affinity_send();
+    }
     let Some(token) = telemetry.cancel_token() else {
         return send_chat_request(transport).await;
     };
@@ -1919,7 +1966,7 @@ async fn prepare_success_response(
 
 /// 发一次上游请求，含「可退避重试」循环（次数 / 间隔来自设置页的全局重试设置）。
 ///
-/// 成功的定义是 HTTP 2xx —— 与改造前 `request_with_waf_retry` 一致。
+/// 默认以 HTTP 2xx 判成功；适配器可按响应头识别伪装成 2xx 的业务错误。
 ///
 /// 重试判定分两档：
 ///   - **适配器声明**（`retry_advice`）：provider 专属知识（workbuddy 的 11128），
@@ -1952,6 +1999,7 @@ async fn send_with_retry(
     telemetry: &crate::server::core::upstream::usage::RequestTelemetry,
     degraded: bool,
     single_use: bool,
+    refresh_route_ids: bool,
 ) -> Result<PreparedResponse, OutboundFailure> {
     loop {
         // 手动终止：发送前先看令牌（退避睡眠 / 上一轮失败之后回到这里）。
@@ -1966,7 +2014,21 @@ async fn send_with_retry(
         // 睡醒重发时必须推回去 —— 否则那一段等待首字节的时间会被显示成
         // 「重试中」，而它其实已经在等上游出字了。
         telemetry.note_phase(LogPhase::Waiting);
-        let response = match send_or_cancel(transport, telemetry).await {
+        let fresh_transport;
+        let outbound = if refresh_route_ids {
+            let mut headers = transport.headers.clone();
+            adapter.refresh_route_request_id(&mut headers);
+            fresh_transport = TransportRequest {
+                url: transport.url.clone(), headers, payload: transport.payload.clone(), proxy: transport.proxy.clone(),
+            };
+            if let Some(capture) = capture {
+                if let Ok(body) = serde_json::from_str(&fresh_transport.payload) {
+                    capture.reset_request(&fresh_transport.url, kind_id(adapter.kind()), &fresh_transport.headers, &body);
+                }
+            }
+            &fresh_transport
+        } else { transport };
+        let response = match send_or_cancel(outbound, telemetry).await {
             Ok(response) => response,
             Err(error) => {
                 // 手动终止：不把它当传输失败去退避重发（原因不是链路抖动）
@@ -2000,8 +2062,24 @@ async fn send_with_retry(
                 });
             }
         };
-        if response.status().is_success() {
-            return prepare_success_response(response, adapter, capture).await;
+        if !adapter.is_error_response(response.status().as_u16(), response.headers()) {
+            let prepared = tokio::time::timeout(
+                Duration::from_millis(config::timeout_settings().body_ms()),
+                prepare_success_response(response, adapter, capture),
+            );
+            let result = match telemetry.cancel_token() {
+                Some(token) => tokio::select! {
+                    result = prepared => result,
+                    _ = token.cancelled() => return Err(cancelled_failure()),
+                },
+                None => prepared.await,
+            };
+            return result.unwrap_or_else(|_| {
+                let class = UpstreamErrorClass::Fatal {
+                    status: 504, message: "上游响应首包超时".into(), upstream_code: None,
+                };
+                Err(OutboundFailure { error: gateway_error_from_class(&class), class, rebuild: false })
+            });
         }
         let status = response.status().as_u16();
         // 错误响应体的读取同样受「非流式响应超时」管（对应 OmniProxy
@@ -2010,7 +2088,7 @@ async fn send_with_retry(
         // 分类仍按状态码走（classify_error 只看 status 也能给出结论）。
         let detail = {
             let budget = Duration::from_millis(config::timeout_settings().body_ms());
-            match tokio::time::timeout(budget, read_upstream_error(response, capture.map(|value| value.as_ref()))).await {
+            match tokio::time::timeout(budget, read_upstream_error(response, capture.map(std::sync::Arc::as_ref))).await {
                 Ok(detail) => detail,
                 Err(_elapsed) => super::request::UpstreamErrorDetail {
                     code: None,
@@ -2031,7 +2109,7 @@ async fn send_with_retry(
         // 重试（11-128 的「拦截窗口会持续一小段时间」是实测结论），再不行才换账号。
         //
         // ── 「指定错误码直接换号」为什么是第二道闸 ────────────────────
-        // 用户点名的状态码（默认 402、405）连「再看一眼」都不值得：重发同一份 body
+        // 用户点名的状态码（默认 402）连「再看一眼」都不值得：重发同一份 body
         // 结论不变。这里返回 None 会让下面的终端错误路径立即收尾，不再消耗
         // 原地重发预算 —— 换号那条路由编排层接管：命中名单的失败不留在本账号
         // 上，直接换下一个账号继续试（见 `direct_switch_status` 与动作 3），
@@ -2063,285 +2141,32 @@ async fn send_with_retry(
         // 定论的上游错误：这一行只在**终端**留痕。请求日志那侧由本轮明细的
         // `error`（同一个 message）回答，两处不再各写一份。
         if !rebuild {
-            logging::console_line("[Upstream]", &format!("上游错误 HTTP {status}: {}", detail.message));
+            logging::console_line(
+                "[Upstream]",
+                &format!("上游错误 HTTP {status}: {}", detail.message),
+            );
         }
         // 文案由适配器给出（含 provider 提示），编排层原样组装成网关错误
         let error = match &class {
-            UpstreamErrorClass::TokenExpired { message } => GatewayError::with_status(
-                status as i32,
-                message.clone(),
-            )
-            .with_optional_code(detail.code),
-            _ => gateway_error_from_class(&class),
+            UpstreamErrorClass::QuotaLimited { status, message, upstream_code, .. } => {
+                GatewayError::with_status(*status as i32, message.clone())
+                    .with_optional_code(*upstream_code)
+            }
+            // 内容拦截与 Fatal 的客户端形态相同（状态码 + 上游原文 + 上游码）：
+            // 区别只在**编排动作**（前者不罚账号、先换提示词补救），不在文案。
+            UpstreamErrorClass::ContentBlocked { status, message, upstream_code } => {
+                GatewayError::with_status(*status as i32, message.clone())
+                    .with_optional_code(*upstream_code)
+            }
+            UpstreamErrorClass::Fatal { status, message, upstream_code } => {
+                GatewayError::with_status(*status as i32, message.clone())
+                    .with_optional_code(*upstream_code)
+            }
+            UpstreamErrorClass::TokenExpired { message } => {
+                GatewayError::with_status(status as i32, message.clone())
+                    .with_optional_code(detail.code)
+            }
         };
         return Err(OutboundFailure { class, error, rebuild });
-    }
-}
-
-#[cfg(test)]
-mod single_use_tests {
-    use super::*;
-    use futures::TryStreamExt;
-    use std::sync::{Arc, Mutex};
-    use axum::{routing::post, Router, Json, extract::State, http::HeaderMap};
-
-    #[tokio::test]
-    async fn cache_creation_raw_capture_is_exact_for_prefetched_and_translated_streams() {
-        use crate::server::core::{debug_traffic::TrafficCapture, upstream::{
-            aggregate::aggregate_frame_stream, connections::{ConnectionGuard, Connections},
-            translate::AnthropicToChatStream, usage::RequestTelemetry, ForwardStream,
-        }};
-        let native = concat!(
-            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"sample\",\"usage\":{\"input_tokens\":50,\"cache_read_input_tokens\":20,\"cache_creation_input_tokens\":30}}}\n\n",
-            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"样例\"}}\n\n",
-            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7}}\n\n",
-            "data: {\"type\":\"message_stop\"}\n\n",
-        );
-        let chat = concat!(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"样例\"}}]}\n\n",
-            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":7,\"prompt_tokens_details\":{\"cached_tokens\":20},\"cache_creation_input_tokens\":30}}\n\n",
-            "data: [DONE]\n\n",
-        );
-        for is_native in [false, true] {
-            for streaming in [false, true] {
-                let body = if is_native { native } else { chat };
-                let split = body.find("\n\n").unwrap() + 2;
-                let app = Router::new().route("/", post(move || async move {
-                    let first = futures::stream::once(async move {
-                        Ok::<_, std::io::Error>(Bytes::from_static(&body.as_bytes()[..split]))
-                    });
-                    let rest = futures::stream::once(async move {
-                        tokio::time::sleep(Duration::from_millis(20)).await;
-                        Ok::<_, std::io::Error>(Bytes::from_static(&body.as_bytes()[split..]))
-                    });
-                    axum::body::Body::from_stream(first.chain(rest))
-                }));
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let address = listener.local_addr().unwrap();
-                let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
-                let transport = TransportRequest {
-                    url: format!("http://{address}/"), headers: Vec::new(), payload: "{}".into(), proxy: None,
-                };
-                let telemetry = Arc::new(RequestTelemetry::new());
-                let capture = Arc::new(TrafficCapture::begin("sample"));
-                telemetry.set_capture(capture.clone());
-                let adapter = &crate::server::core::providers::zcode::adapter::ZCODE_ADAPTER;
-                let mut budget = RetryBudget::new(0);
-                let response = send_with_retry(adapter, &transport, &mut budget, Some(&capture), &telemetry, false, false)
-                    .await.ok().expect("本地 SSE 应通过首包检查");
-                let input = if is_native {
-                    Box::pin(AnthropicToChatStream::from_stream(response.stream, "sample")) as futures::stream::BoxStream<_>
-                } else { response.stream };
-                if streaming {
-                    let connection = ConnectionGuard::new(Connections::new());
-                    let stream = if is_native {
-                        ForwardStream::from_translated(input, None, connection, telemetry.clone(), None)
-                    } else {
-                        ForwardStream::from_stream(input, None, connection, telemetry.clone(), None)
-                    };
-                    let chunks = stream.try_collect::<Vec<_>>().await.unwrap();
-                    let output = chunks.iter().flat_map(|chunk| chunk.iter().copied()).collect::<Vec<_>>();
-                    assert!(String::from_utf8_lossy(&output).contains("样例"));
-                    assert!(output.ends_with(b"data: [DONE]\n\n"));
-                } else {
-                    let result = aggregate_frame_stream(input, telemetry.clone(), None).await.unwrap();
-                    assert_eq!(result.body["choices"][0]["message"]["content"], "样例");
-                    assert_eq!(result.body["usage"]["cache_creation_input_tokens"], 30);
-                }
-                assert_eq!(capture.captured_body(), body.as_bytes(), "native={is_native} streaming={streaming}");
-                assert_eq!(telemetry.snapshot().cache_creation_tokens, Some(30));
-                server.abort();
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn one_time_proof_retries_return_for_rebuild_while_normal_requests_reuse_transport() {
-        for single_use in [true, false] {
-            let seen = Arc::new(Mutex::new(Vec::<String>::new()));
-            let app = Router::new().route("/", post(|State(seen): State<Arc<Mutex<Vec<String>>>>, headers: HeaderMap| async move {
-                let mut seen = seen.lock().unwrap();
-                seen.push(headers.get("x-proof").unwrap().to_str().unwrap().to_string());
-                if seen.len() == 1 {
-                    (axum::http::StatusCode::BAD_GATEWAY, Json(serde_json::json!({"message":"temporary"})))
-                } else {
-                    (axum::http::StatusCode::OK, Json(serde_json::json!({"ok":true})))
-                }
-            })).with_state(seen.clone());
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let address = listener.local_addr().unwrap();
-            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
-            let mut transport = TransportRequest {
-                url: format!("http://{address}/"), headers: vec![("x-proof".into(), "first".into())],
-                payload: "{}".into(), proxy: None,
-            };
-            let adapter = &crate::server::core::providers::zcode::adapter::ZCODE_ADAPTER;
-            let telemetry = crate::server::core::upstream::usage::RequestTelemetry::new();
-            let mut budget = RetryBudget::new(1);
-            let result = send_with_retry(adapter, &transport, &mut budget, None, &telemetry, false, single_use).await;
-            assert_eq!(budget.remaining, 0);
-            if single_use {
-                assert!(result.err().unwrap().rebuild);
-                assert_eq!(seen.lock().unwrap().len(), 1, "禁止原样重发一次性 proof");
-                transport.headers[0].1 = "second".into();
-                assert!(send_with_retry(adapter, &transport, &mut budget, None, &telemetry, false, true).await.is_ok());
-                assert_eq!(*seen.lock().unwrap(), vec!["first", "second"]);
-            } else {
-                assert!(result.is_ok());
-                assert_eq!(*seen.lock().unwrap(), vec!["first", "first"]);
-            }
-            server.abort();
-        }
-    }
-
-    #[tokio::test]
-    async fn http_405_switches_accounts_without_same_account_retry() {
-        use axum::http::StatusCode;
-
-        let seen = Arc::new(Mutex::new(0usize));
-        let app = Router::new()
-            .route(
-                "/",
-                post(|State(seen): State<Arc<Mutex<usize>>>| async move {
-                    *seen.lock().unwrap() += 1;
-                    (
-                        StatusCode::METHOD_NOT_ALLOWED,
-                        Json(serde_json::json!({
-                            "message": "request has been blocked due to unusual activity"
-                        })),
-                    )
-                }),
-            )
-            .with_state(seen.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let transport = TransportRequest {
-            url: format!("http://{address}/"),
-            headers: Vec::new(),
-            payload: "{}".to_string(),
-            proxy: None,
-        };
-        let adapter = &crate::server::core::providers::zcode::adapter::ZCODE_ADAPTER;
-        let telemetry = crate::server::core::upstream::usage::RequestTelemetry::new();
-        let mut budget = RetryBudget::new(3);
-
-        let failure = match send_with_retry(
-            adapter,
-            &transport,
-            &mut budget,
-            None,
-            &telemetry,
-            false,
-            false,
-        )
-        .await
-        {
-            Ok(_) => panic!("HTTP 405 should finish this account attempt"),
-            Err(failure) => failure,
-        };
-
-        assert_eq!(failure.error.status_code, 405);
-        assert_eq!(*seen.lock().unwrap(), 1, "HTTP 405 must not be retried in place");
-        assert_eq!(budget.remaining, 3, "direct account switch must preserve resend budget");
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn zcode_http_200_quota_envelope_returns_a_rotatable_failure() {
-        use axum::http::StatusCode;
-
-        let app = Router::new().route(
-            "/",
-            post(|| async {
-                (
-                    StatusCode::OK,
-                    r#"{"code":1005,"msg":"exceed quota limit"}data: {"choices":[]}"#,
-                )
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
-        let transport = TransportRequest {
-            url: format!("http://{address}/"),
-            headers: Vec::new(),
-            payload: "{}".to_string(),
-            proxy: None,
-        };
-        let adapter = &crate::server::core::providers::zcode::adapter::ZCODE_ADAPTER;
-        let telemetry = crate::server::core::upstream::usage::RequestTelemetry::new();
-        let mut budget = RetryBudget::new(0);
-        let result = send_with_retry(
-            adapter,
-            &transport,
-            &mut budget,
-            None,
-            &telemetry,
-            false,
-            false,
-        )
-        .await;
-        let failure = match result {
-            Ok(_) => panic!("HTTP 200 的 ZCode 限额信封必须回到统一失败分支"),
-            Err(failure) => failure,
-        };
-        match failure.class {
-            UpstreamErrorClass::QuotaLimited {
-                status,
-                upstream_code,
-                ..
-            } => {
-                assert_eq!(status, 429);
-                assert_eq!(upstream_code, Some(1005));
-            }
-            other => panic!("期望 QuotaLimited，得到 {other:?}"),
-        }
-        assert_eq!(failure.error.status_code, 429);
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn zcode_success_head_keeps_every_prefetched_byte() {
-        use axum::http::StatusCode;
-
-        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n";
-        let app = Router::new().route(
-            "/",
-            post(move || async move { (StatusCode::OK, body) }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
-        let transport = TransportRequest {
-            url: format!("http://{address}/"),
-            headers: Vec::new(),
-            payload: "{}".to_string(),
-            proxy: None,
-        };
-        let adapter = &crate::server::core::providers::zcode::adapter::ZCODE_ADAPTER;
-        let telemetry = crate::server::core::upstream::usage::RequestTelemetry::new();
-        let mut budget = RetryBudget::new(0);
-        let response = match send_with_retry(
-            adapter,
-            &transport,
-            &mut budget,
-            None,
-            &telemetry,
-            false,
-            false,
-        )
-        .await
-        {
-            Ok(response) => response,
-            Err(_) => panic!("正常 ZCode 首包应当放行"),
-        };
-        let bytes = response.stream.try_collect::<Vec<_>>().await.unwrap();
-        let actual = bytes
-            .into_iter()
-            .flat_map(|chunk| chunk.to_vec())
-            .collect::<Vec<_>>();
-        assert_eq!(actual, body.as_bytes());
-        server.abort();
     }
 }

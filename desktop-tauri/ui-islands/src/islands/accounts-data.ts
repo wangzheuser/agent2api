@@ -79,6 +79,19 @@ type UsageRequest = { identity: string; sequence: number; promise: Promise<Balan
 const usageRequests = new Map<string, UsageRequest>()
 let usageBatch: Promise<BalancesResult> | null = null
 
+/**
+ * 失败结论的**取得时刻**（按账号 id，毫秒）。只有失败条目需要它：失败行是对
+ * 「当时那份凭证」的断言，账号记录一变（重新登录 / 重导入 / 刷过 token）就作废
+ * —— 判据与读入口见 `usageEntryOf`。成功读数不记时刻：「上次读数」本来就会旧，
+ * 界面按读数展示，不作废。
+ */
+const usageFailureAt = new Map<string, number>()
+
+/**
+ * **原始**缓存（含已过期的失败结论）：余额列的读入口是 [`usageEntryOf`]，它做
+ * 时效过滤（见那里的说明）。新加读取点请走 `usageEntryOf` —— 直接读这张表就会
+ * 把「重新登录前的旧失败结论」又显示出来，那正是这条过滤要挡的 bug。
+ */
 export const usageEntries = (): ReadonlyMap<string, UsageEntry> => usageMap
 
 /** 仅保存成功响应；当前错误仍由 usageEntries 提供，弹窗显式标注旧数据。 */
@@ -167,7 +180,7 @@ function serverTimestamp(at: unknown): number {
 }
 
 function writeUsage(id: string, entry: UsageEntry, at: number, receivedAt = Date.now()): void {
-  usageMap.set(id, entry)
+  putUsage(id, entry, at)
   usageAppliedAt.set(id, at)
   if (entry && typeof entry === 'object' && !usageFailureOf(entry)) {
     successfulUsage.set(id, entry)
@@ -176,7 +189,47 @@ function writeUsage(id: string, entry: UsageEntry, at: number, receivedAt = Date
 }
 
 /**
- * 上一次签到/日活任务的**失败原因**（按账号 id）。
+ * 写一条余额缓存（`at` = 这条结论的取得时刻：快照行用它自己的 `at`，手动查询
+ * 用当刻）。失败结论记时刻、其它形态清掉残留 —— 同一行「失败过、后来又成功了」
+ * 时必须把旧时刻删掉，否则下一次失败的判定会拿一个更早的戳去比。
+ */
+function putUsage(id: string, entry: UsageEntry, at: number): void {
+  usageMap.set(id, entry)
+  if (entry !== null && entry !== undefined && usageFailureOf(entry)) {
+    usageFailureAt.set(id, at)
+  } else {
+    usageFailureAt.delete(id)
+  }
+}
+
+/**
+ * 该账号**此刻可用**的余额缓存条目（余额列的唯一读入口）。
+ *
+ * ── 过期的失败结论在这里作废（返回 undefined = 界面显示「未查询」）──
+ * 失败行说的是「这个账号此刻查不到 / 续期不了」，而缓存按账号 id 存：账号重新
+ * 登录、重新导入、或 token 被刷新（记录的 `updatedAt` 往前走）之后，那条断言就
+ * 不再成立 —— 继续显示只会让人以为账号还是坏的。真实事故：两个小浣熊账号 12:39
+ * 重新登录成功、转发与余额都恢复正常，界面上却一直挂着上午的「小浣熊刷新接口
+ * 失败（HTTP 401）」。后端在快照出口做同一条判定
+ * （`core::usage_query::prune_stale_failures`）；这里管的是**本地缓存**，重新
+ * 登录后不必等下一轮查询才纠正。
+ *
+ * 成功读数不受影响：「可用 5147 积分」是一次读数的事实，凭证换了它也不会变成
+ * 假话，界面本来就按「上次读数」展示。
+ *
+ * 判据用「记录改动时间」而不是凭证指纹：与后端同一取舍 —— 改备注名这类改动也会
+ * 让旧失败作废，多作废一条提示比留着过期结论轻（手点一次查询就能拿到新的）。
+ */
+export function usageEntryOf(account: AccountRecord): UsageEntry {
+  const entry = usageMap.get(account.id)
+  if (entry === undefined) return undefined
+  if (!usageFailureOf(entry)) return entry
+  const changedAt = Math.max(Number(account.addedAt) || 0, Number(account.updatedAt) || 0)
+  return (usageFailureAt.get(account.id) || 0) >= changedAt ? entry : undefined
+}
+
+/**
+ * 上一次签到的**失败原因**（按账号 id）。
  *
  * 签到没有明细面板，结果只落在两处：成功/已领取由行上那颗按钮自己的状态表达
  * （`checkedInToday` → 「已签到」）＋ 一条 toast；失败则要留下可复看的原因 ——
@@ -394,6 +447,7 @@ export function refreshCaches(validIds: Set<string>): void {
     }
   }
   for (const account of allAccounts()) if (validIds.has(account.id)) ensureUsageIdentity(account.id)
+  for (const id of [...usageFailureAt.keys()]) if (!validIds.has(id)) usageFailureAt.delete(id)
   for (const id of [...checkinErrors.keys()]) if (!validIds.has(id)) { checkinErrors.delete(id); touched = true }
   const panels = new Map(getStore().panels)
   for (const id of [...panels.keys()]) if (!validIds.has(id)) { panels.delete(id); touched = true }
@@ -502,6 +556,7 @@ export function applyBalances(
   requestVersions?: ReadonlyMap<string, number>,
 ): number {
   const rows = Array.isArray(balances?.results) ? balances.results : []
+  const at = Number(balances?.at) || Date.now()
   let applied = 0
   for (const row of rows) {
     if (!row?.id) continue
@@ -542,7 +597,8 @@ export function applyBalances(
  * 那一次的旧余额，那正是「定时查询」最容易让人觉得「没生效」的地方。
  * `at` 是那一刻的毫秒时间戳，用它判断「这一轮我应用过了没」：时间戳没变就直接返回，
  * 不做无谓的重绘。**失败的行同样会被应用**（后端快照里就带着它们），于是账号页会
- * 明确显示「查询失败」而不是悄悄留着上一个成功的旧值。
+ * 明确显示「查询失败」而不是悄悄留着上一个成功的旧值 —— 但后端出口会先丢掉
+ * 「账号记录比快照还新」的失败行（见 `usageEntryOf` 的说明），那些行这里也就收不到。
  * 失败静默（不 toast）：它是 20 秒一次的轮询，网关长时间不可用会变成刷屏。
  */
 let lastSnapshotAt = 0
@@ -714,8 +770,9 @@ function checkinOutcomeOf(row: Record<string, unknown> | undefined): CheckinOutc
   if (row.error) return { kind: 'failed', reason: String(row.error) }
   const claim = row.claim as Record<string, unknown> | null | undefined
   if (!claim) return { kind: 'failed', reason: '签到响应为空' }
-  if (claim.success === true) return { kind: 'ok', reason: '' }
-  if (claim.alreadyCompleted === true || claim.status === 'already_claimed') return { kind: 'already', reason: '' }
+  const receiptMessage = claim.creditVerification ? String(claim.msg || '签到已确认，额度到账待核验') : ''
+  if (claim.success === true) return { kind: 'ok', reason: receiptMessage }
+  if (claim.alreadyCompleted === true || claim.status === 'already_claimed') return { kind: 'already', reason: receiptMessage }
   if (claim.status === 'auth_expired') return { kind: 'failed', reason: String(claim.msg || '登录态已过期') }
   if (claim.status === 'task_not_found') return { kind: 'failed', reason: String(claim.msg || '签到任务不存在') }
   if (claim.status === 'unsupported') return { kind: 'failed', reason: String(claim.msg || '签到任务暂不可用') }
@@ -750,8 +807,11 @@ export async function checkinAll(): Promise<void> {
     let ok = 0
     let already = 0
     let active = 0
+    let pendingCredits = 0
     const failed: string[] = []
     for (const account of targets) {
+      const verification = (byId.get(account.id)?.claim as Record<string, unknown> | undefined)?.creditVerification
+      if (verification === 'unverified' || verification === 'query_failed') pendingCredits += 1
       const outcome = checkinOutcomeOf(byId.get(account.id))
       if (outcome.kind === 'ok') {
         ok += 1
@@ -769,9 +829,10 @@ export async function checkinAll(): Promise<void> {
     }
     bump()
     // 失败详情：个数 + 第一条原因（各账号自己的原因记进按钮 title，可逐个悬停复看）
-    const parts = [`成功领取 ${ok} 个`]
+    const parts = [pendingCredits ? `签到确认 ${ok} 个` : `成功领取 ${ok} 个`]
     if (already) parts.push(`今日已领取 ${already} 个`)
     if (active) parts.push(`完成有效对话 ${active} 个（日活奖励尚未确认）`)
+    if (pendingCredits) parts.push(`其中 ${pendingCredits} 个额度到账待核验`)
     if (failed.length) parts.push(`未领取 ${failed.length} 个（首个：${failed[0]}）`)
     const skipped = Number(data?.skipped) || 0
     toast(`签到完成：${parts.join('，')}`
@@ -817,7 +878,7 @@ export async function runCheckin(id: string): Promise<void> {
       toast(`签到失败：${label}：${outcome.reason}`, 'err')
     } else {
       checkinErrors.delete(id)
-      toast(outcome.kind === 'already'
+      toast(outcome.reason ? `${label}：${outcome.reason}` : outcome.kind === 'already'
         ? `${label}：今日已领取`
         : outcome.kind === 'active' ? `${label}：网页会话完成，日活奖励尚未确认` : `✅ ${label} 签到成功`, 'ok')
     }
@@ -1090,7 +1151,9 @@ export type AccountsViewApi = {
   refreshCaches(validIds: Set<string>): void
   openPanels(ids: string[], kind: PanelKind): void
   syncConnections(): Promise<boolean>
-  applyBalances(balances: { results?: Array<Record<string, unknown>> } | null | undefined): number
+  applyBalances(
+    balances: { results?: Array<Record<string, unknown>>; at?: unknown } | null | undefined,
+  ): number
   syncBalancesSnapshot(): Promise<boolean>
   queryUsageFor(id?: string | null): Promise<unknown>
   queryAllUsage(): Promise<void>

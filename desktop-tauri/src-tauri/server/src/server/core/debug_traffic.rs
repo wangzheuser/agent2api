@@ -576,8 +576,8 @@ impl TrafficCapture {
     }
 
     #[cfg(test)]
-    pub(crate) fn captured_body(&self) -> Vec<u8> {
-        self.lock().body.clone()
+    pub(crate) fn captured_body(&self) -> String {
+        String::from_utf8_lossy(&self.lock().body).into_owned()
     }
 
     /// 落库（幂等：第二次调用什么都不做）。
@@ -621,7 +621,7 @@ mod capture_tests {
     fn raw_capture_keeps_utf8_fragments_and_reports_actual_truncation() {
         let capture = TrafficCapture::begin("sample");
         for byte in "缓存创建".as_bytes() { capture.push(&[*byte]); }
-        assert_eq!(String::from_utf8(capture.captured_body()).unwrap(), "缓存创建");
+        assert_eq!(capture.captured_body(), "缓存创建");
         capture.attach_response(200, &reqwest::header::HeaderMap::new());
         capture.push(&vec![b'a'; MAX_ENTRY_BYTES]);
         assert!(!capture.lock().entry.truncated);

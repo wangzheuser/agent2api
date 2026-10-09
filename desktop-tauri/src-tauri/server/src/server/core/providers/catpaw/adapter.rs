@@ -177,7 +177,7 @@ impl ProviderAdapter for CatPawAdapter {
     /// 变成成功，而他永远不知道自己传的值是无效的（也再没有别的地方会提示）。
     /// 所以「读得出值」与「读出来是错的」都归「客户端已指定」，绑定一律让位，
     /// 校验与报错交给原有那条路径。
-    fn reasoning_patch(&self, level: &str, _model: &str, body: &Value) -> ReasoningPatch {
+    fn reasoning_patch(&self, level: &str, _model: &str, body: &Value, force: bool) -> ReasoningPatch {
         let declared = match models::resolve_effort(body) {
             // 读出一个档位 = 客户端指定过
             Ok(Some(_)) => true,
@@ -186,7 +186,7 @@ impl ProviderAdapter for CatPawAdapter {
             // 指定了、但值非法 —— 见上方说明，同样让位
             Err(_) => true,
         };
-        if declared {
+        if !force && declared {
             return ReasoningPatch::Skip {
                 reason: "客户端请求体里已指定思考档位，绑定不覆盖",
             };
@@ -419,6 +419,7 @@ impl ProviderAdapter for CatPawAdapter {
     > {
         Box::pin(async move {
             let credentials = resolve_credentials(store, account_id)?;
+            telemetry.validate_affinity_session(&serde_json::json!({"uid": credentials.uid}));
             // ── 账号身份对账（转发选路时，见 registry 的 `AccountIdentity`）──
             // 必须在这里做，而不是只在导入/添加账号时：桌面端实时登录态
             // （`~/.meituan-catpaw/auth.json`）由 CatPaw 客户端自己维护，用户可以在

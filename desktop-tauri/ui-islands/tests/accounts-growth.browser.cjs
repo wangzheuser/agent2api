@@ -9,7 +9,7 @@ const evidence = path.join(root, '.verify/workbuddy-growth')
 fs.mkdirSync(evidence, { recursive: true })
 const href = file => pathToFileURL(path.join(root, 'desktop-tauri/ui', file)).href
 const accounts = Array.from({ length: 7 }, (_, i) => ({ id: `A${i}`, uid: `demo-${i}`, name: `国内示例账号 ${i + 1}`, provider: 'workbuddy', edition: 'cn', enabled: true, addedAt: 1, priority: i }))
-accounts.push({ ...accounts[0], id: 'intl', edition: 'intl', name: '国际示例账号' }, { ...accounts[0], id: 'duplicate', name: '重复身份示例' }, { ...accounts[0], id: 'enterprise', enterpriseId: 'demo-tenant', name: '企业示例' })
+accounts.push({ ...accounts[0], id: 'intl', provider: 'workbuddy-intl', edition: 'intl', name: '国际示例账号' }, { ...accounts[0], id: 'duplicate', name: '重复身份示例' }, { ...accounts[0], id: 'enterprise', enterpriseId: 'demo-tenant', name: '企业示例' })
 const rewards = { credits: 0, energy: 0, buddy: null, lotteryChances: null, makeupCards: null }
 const state = {
   schemaVersion: 1, id: 'A0', identity: 'identity-A0', fetchedAt: Date.now(), supported: true, reason: null, edition: 'cn', capabilities: ['tasks', 'travel', 'streak', 'lottery'],
@@ -37,7 +37,7 @@ const fixtureFile = path.join(evidence, 'growth-browser-fixture.html')
 fs.writeFileSync(fixtureFile, html)
 
 async function run() {
-  const browser = await chromium.launch({ channel: 'msedge', headless: true })
+  const browser = await chromium.launch({ ...(process.platform === 'win32' ? { channel: 'msedge' } : {}), headless: true })
   const checks = [], errors = []
   try {
     const page = await browser.newPage({ viewport: { width: 1120, height: 980 }, locale: 'zh-CN', timezoneId: 'Asia/Shanghai' })
@@ -163,21 +163,32 @@ async function run() {
     assert.equal(await page.evaluate(() => fixture.growthCalls.length), 6)
     checks.push('closing overview leaves dispatched reads to finish and starts no further account')
     const requestsFixture = path.join(evidence, 'growth-credits-requests-fixture.html')
-    const requestsScript = `<script>fixture.requests=[{id:'zero',status:200,provider:'workbuddy',upstreamCredits:0},{id:'missing',status:200,provider:'workbuddy',upstreamCredits:null},{id:'failed',status:502,error:'示例上游错误',provider:'workbuddy',upstreamCredits:1.25}];wbApp.currentPage='requests';Object.assign(workbuddyDesktop,{getStatsRequests:async()=>({entries:fixture.requests,total:3,matched:3,running:0}),getStatsRequestFilters:async()=>({providers:[],models:[]}),getScheduledTasks:async()=>({tasks:[]}),getStatsRequestRaw:async()=>({}),getDebugTraffic:async()=>({})});</script>`
+    const requestRows = [
+      { id: 'zero', status: 200, provider: 'workbuddy', upstreamCredits: 0, cacheCreationTokens: 0 },
+      { id: 'missing', status: 200, provider: 'workbuddy', upstreamCredits: null, cacheCreationTokens: null },
+      { id: 'omitted', status: 200, provider: 'workbuddy' },
+      { id: 'intl-missing', status: 200, provider: 'workbuddy-intl', upstreamCredits: null, cacheCreationTokens: null },
+      { id: 'intl-fractional', status: 200, provider: 'workbuddy-intl', upstreamCredits: 0.012345, cacheCreationTokens: 12 },
+      { id: 'fractional', status: 200, provider: 'workbuddy', upstreamCredits: 0.012345, cacheCreationTokens: 12 },
+      { id: 'failed', status: 502, error: '示例上游错误', provider: 'workbuddy', upstreamCredits: 1.25, cacheCreationTokens: 0 },
+    ]
+    const requestsScript = `<script>fixture.requests=${JSON.stringify(requestRows)};wbApp.currentPage='requests';Object.assign(workbuddyDesktop,{getStatsRequests:async()=>({entries:fixture.requests,total:fixture.requests.length,matched:fixture.requests.length,running:0}),getStatsRequestFilters:async()=>({providers:[],models:[]}),getScheduledTasks:async()=>({tasks:[]}),getStatsRequestRaw:async()=>({}),getDebugTraffic:async()=>({})});</script>`
     fs.writeFileSync(requestsFixture, html.replace('data-page="accounts"', 'data-page="requests"').replace('<script src=', `${requestsScript}<script src=`))
     await page.goto(pathToFileURL(requestsFixture).href)
     await page.locator('#req-list').waitFor()
     await page.evaluate(() => wbRequestsPanel.load())
-    for (const text of ['实扣积分: 0', '实扣积分: 未上报', '实扣积分: 1.25']) await page.getByText(text, { exact: true }).waitFor()
-    for (const [id, expected] of [['zero', '0'], ['missing', '未上报'], ['failed', '1.25']]) {
+    for (const text of ['实扣积分: 0', '实扣积分: 未上报', '实扣积分: 0.012345', '实扣积分: 1.25']) await page.getByText(text, { exact: true }).first().waitFor()
+    assert.equal(await page.getByText('实扣积分: 未上报', { exact: true }).count(), 3)
+    for (const [id, expected, creation] of [['zero', '0', '0'], ['missing', '未上报', '未上报'], ['omitted', '未上报', '未上报'], ['intl-missing', '未上报', '未上报'], ['intl-fractional', '0.012345', '12'], ['fractional', '0.012345', '12'], ['failed', '1.25', '0']]) {
       await page.evaluate(id => wbRequestDetail.open(id, fixture.requests.find(row => row.id === id)), id)
       const detail = page.getByRole('dialog', { name: '请求详情', exact: true })
       await detail.waitFor()
-      assert.match(await detail.innerText(), new RegExp('实扣积分\\s+' + expected.replace('.', '\\.')))
+      assert.equal(await detail.getByRole('rowheader', { name: '实扣积分', exact: true }).locator('..').getByRole('cell').innerText(), expected)
+      assert.ok((await detail.getByRole('rowheader', { name: '令牌', exact: true }).locator('..').getByRole('cell').innerText()).endsWith(`缓存创建 ${creation}`))
       await page.evaluate(() => wbRequestDetail.close())
       await detail.waitFor({ state: 'detached' })
     }
-    checks.push('request list and details display explicit zero, missing report and credits charged on a failed request')
+    checks.push('request list and details cover native international provider, distinguish zero/null/absent fields, preserve six-decimal credits and charges on failed requests')
     assert.deepEqual(errors, [])
     const result = { passed: checks.length, checks, pageErrors: errors }
     fs.writeFileSync(path.join(evidence, 'growth-browser-result.json'), JSON.stringify(result, null, 2))

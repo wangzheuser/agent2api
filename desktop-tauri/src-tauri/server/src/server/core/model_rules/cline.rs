@@ -111,6 +111,7 @@ pub fn seed_cline_defaults(provider: &str, ids: &[String]) -> Option<String> {
             provider: Some(provider.to_string()),
             // 种子建的映射不绑思考等级（那是用户手动绑定的东西，见 mod.rs 模块头）
             reasoning: None,
+            reasoning_override: None,
             enabled: true,
         });
         mappings_added.push(format!("{alias} → {id}"));

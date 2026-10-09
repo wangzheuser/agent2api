@@ -118,6 +118,7 @@ pub mod content_block;
 pub mod custom;
 /// LobsterAI 原生 Provider：OpenAI Chat Completions、OAuth、额度与活动奖励。
 pub mod lobsterai;
+pub mod loomy;
 /// MiniMax Code（mcode）原生 Provider：Anthropic Messages 反代、OAuth 续期、额度与签到。
 pub mod minimax_code;
 pub mod qoder;
@@ -142,8 +143,33 @@ use serde_json::{json, Value};
 /// 加新家请加在**末尾**并同步 `PROVIDERS`。
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum ProviderKind {
-    /// WorkBuddy（原唯一上游）
+    /// WorkBuddy **国内版**（原唯一上游；`copilot.tencent.com`）
     WorkBuddy,
+    /// WorkBuddy **国际版**（`www.workbuddy.ai`，`workbuddy-intl`）。
+    ///
+    /// ── 为什么两个地区是两家 provider（2026-10 拆分的由来）──────
+    /// 与 AutoClaw / Accio / ZCode 的两个地区、Cline 的两个额度池同一思路 ——
+    /// 本家是最后一个补齐的：早先「地区是账号上的 `edition` 字段」，
+    /// 后果是三处具体故障（完整论证见 `workbuddy::region` 的模块头）：
+    ///   1. 模型目录只有一份（单槽缓存 + 单条刷新排期），两个地区的清单
+    ///      互相覆盖，不可能同时存在（issue #74）；
+    ///   2. 模型规则只有一套 `(provider, id)` 命名空间，同名模型在两个地区
+    ///      无法区分、无法分别点名（issue #89）；
+    ///   3. 转发候选账号不含地区，请求可能落到另一个地区的账号上，而
+    ///      「模型不存在」的 400 是 `Fatal`、不会换账号，直接失败。
+    ///
+    /// ── provider id 为什么只有国际版是新 id ──────────────────────
+    /// 国内版保持 `"workbuddy"` 不动：它是存量账号的落盘契约（改名会让账号
+    /// 升级后变成「未知 provider」而静默消失）。国际版取 `"workbuddy-intl"`，
+    /// 存量国际版账号由 `account_store::migrate_startup` 原地归位。
+    ///
+    /// ── 实现是**一套**（与 AutoClaw 等各家同款）──────────────────
+    /// `workbuddy::adapter::WorkBuddyAdapter` 持有一个 `workbuddy::region::Region`，
+    /// 两个静态实例（`WORKBUDDY_ADAPTER` / `WORKBUDDY_INTL_ADAPTER`）由
+    /// `adapter_for` 按 kind 给出。地区 → provider 的互查在 `Region`
+    /// （`kind` / `provider_id` / `from_provider_id`），别处不要再写
+    /// `"workbuddy-intl"` 这类字面量。
+    WorkBuddyIntl,
     /// 小浣熊（适配实现在 `raccoon/`：JWT 凭证 + `/model_catalog` + SSE 回写）
     Raccoon,
     /// CatPaw（美团；架构文档 §9）。适配实现在 `catpaw/adapter.rs`
@@ -287,6 +313,8 @@ pub enum ProviderKind {
     /// `core::auto_checkin` 的提供商清单不含本家。每日签到存在，但要单独授权
     /// 才会接（见 cpa-deploy/notes/agent2api-trae-port-plan.md 的 §8 决策 3）。
     Trae,
+    /// Loomy（讯飞）OpenAI 兼容推理与每日首次登录积分刷新。
+    Loomy,
     /// MiniMax Code（mcode）。原生 Anthropic Messages 上游与 Code 专属额度池。
     MiniMaxCode,
     /// LobsterAI。原生 OpenAI Chat Completions、活动奖励与额度查询。
@@ -317,7 +345,11 @@ pub struct ProviderMeta {
 pub const PROVIDERS: &[ProviderMeta] = &[
     ProviderMeta {
         id: "workbuddy",
-        label: "WorkBuddy",
+        label: "WorkBuddy 国内版",
+    },
+    ProviderMeta {
+        id: "workbuddy-intl",
+        label: "WorkBuddy 国际版",
     },
     ProviderMeta {
         id: "raccoon",
@@ -388,6 +420,10 @@ pub const PROVIDERS: &[ProviderMeta] = &[
         id: "lobsterai",
         label: "LobsterAI",
     },
+    ProviderMeta {
+        id: "loomy",
+        label: "Loomy",
+    },
 ];
 
 /// provider id 在注册表里的下标（未知 id → None）。
@@ -449,6 +485,7 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
     }
     match id {
         "workbuddy" => Some(ProviderKind::WorkBuddy),
+        "workbuddy-intl" => Some(ProviderKind::WorkBuddyIntl),
         "raccoon" => Some(ProviderKind::Raccoon),
         "catpaw" => Some(ProviderKind::CatPaw),
         "autoclaw" => Some(ProviderKind::AutoClaw),
@@ -464,6 +501,7 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
         "trae" => Some(ProviderKind::Trae),
         "minimax-code" => Some(ProviderKind::MiniMaxCode),
         "lobsterai" => Some(ProviderKind::LobsterAI),
+        "loomy" => Some(ProviderKind::Loomy),
         // 走到这里 = 上面的注册表判定已放行、这个 match 却没有对应分支：
         // 只可能是有人给 `PROVIDERS` 加了条目忘了加这里。开发期喊出来；
         // release 返回 None（见上：宁可为「未知」，不可误认成别家）。
@@ -483,6 +521,7 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
 pub const fn kind_id(kind: ProviderKind) -> &'static str {
     match kind {
         ProviderKind::WorkBuddy => "workbuddy",
+        ProviderKind::WorkBuddyIntl => "workbuddy-intl",
         ProviderKind::Raccoon => "raccoon",
         ProviderKind::CatPaw => "catpaw",
         ProviderKind::AutoClaw => "autoclaw",
@@ -498,6 +537,7 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
         ProviderKind::Trae => "trae",
         ProviderKind::MiniMaxCode => "minimax-code",
         ProviderKind::LobsterAI => "lobsterai",
+        ProviderKind::Loomy => "loomy",
     }
 }
 

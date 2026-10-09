@@ -63,6 +63,7 @@ use axum::http::HeaderMap;
 use serde_json::Value;
 
 use crate::server::logging;
+use crate::server::errors::GatewayError;
 
 use super::usage::RequestTelemetry;
 
@@ -102,6 +103,16 @@ pub(super) struct ProviderContext<'a> {
     /// 语义不会中途漂移。传引用是因为它由 `upstream::forward` 的栈帧持有，
     /// 生命周期覆盖整条转发链。
     pub key_scope: Option<&'a crate::server::core::key_scope::KeyScope>,
+    /// 只准用这个账号（模型测试；`None` = 走全局优先级队列）。
+    ///
+    /// 与 `key_scope` 同一分工：它是「本次转发的收窄条件」，被选路与换号两处
+    /// 读同一份，语义不会中途漂移。收窄的语义见
+    /// [`super::ForwardRequest::pinned_account`] 与 `rotate::accounts_in_providers`。
+    pub pinned_account: Option<&'a str>,
+    pub route_session: Option<&'a super::route_session::RouteSession>,
+    pub affinity_enabled: bool,
+    pub affinity_epoch: u64,
+    pub test_target: Option<&'a crate::server::core::providers::catalog::WireTarget>,
 }
 
 /// 某一家 provider 实际要发送的请求体（**每次转发前**决定，不做跨家复用），
@@ -155,7 +166,7 @@ pub(super) fn send_body<'a>(
     provider_id: &str,
     account: Option<&Value>,
     degraded: bool,
-) -> SendBody<'a> {
+) -> Result<SendBody<'a>, GatewayError> {
     // ── ① 系统提示词层（网关自有提示词：透传 / 替换 / 追加）──────────────
     // 在脱敏**之前**：与参考项目同序（提示词改写 → 脱敏），于是网关提示词
     // 自己万一命中指纹也会被后一层清掉；反过来的话，「刚换上去的那段提示词」
@@ -244,24 +255,36 @@ pub(super) fn send_body<'a>(
         .to_string();
     if requested.is_empty() {
         // 没有 model 字段：不改写，也没有可用的冷却键（空串，与改造前一致）
-        return SendBody { body, wire_model: requested };
+        return Ok(SendBody { body, wire_model: requested });
     }
     // 一次解析出两个属性：该家要收的名字 + 跟着那条映射走的思考等级
     // （同源，见模块头「思考等级绑定为什么也在这一步」）
-    let wire = crate::server::core::providers::catalog::wire_target_for_provider(
+    // 自定义测试目标由 custom::rewrite_body 处理，强制档位不能交给原生适配器预检。
+    let wire = ctx.test_target.filter(|_| !crate::server::core::custom_providers::is_custom_provider_id(provider_id)).cloned().unwrap_or_else(|| crate::server::core::providers::catalog::wire_target_for_provider(
         &requested,
         provider_id,
         account,
-    );
+    ));
     ctx.telemetry.note_upstream_model(&wire.model);
     rewrite_model(&mut body, &requested, &wire.model, provider_id);
+    // Qoder 两地区共用一个适配器，但模型能力必须以本次账号地区为准。
+    if provider_id == "qoder" {
+        if let Some(level) = wire.reasoning_override.as_deref() {
+            use crate::server::core::providers::qoder::{endpoints::Region, supports_reasoning};
+            let region = account.map(Region::from_payload).transpose()?.unwrap_or(Region::Global);
+            if !supports_reasoning(&wire.model, level, region) {
+                return Err(crate::server::core::model_rules::override_error("该账号地区的 Qoder 模型不支持强制思考档位"));
+            }
+        }
+    }
     let injected = apply_reasoning(
         &mut body,
         provider_id,
         &requested,
         &wire.model,
         wire.reasoning.as_deref(),
-    );
+        wire.reasoning_override.as_deref(),
+    )?;
     // 采集「实际随上游请求发出的思考等级」（请求日志模型列的 `(等级)`）。
     // 注入值优先（映射绑定生效时的最终档位，CatPaw 已在 patch 内归并）；
     // 没注入时问承载家的 `outbound_reasoning` —— 客户端显式指定的档位走这条
@@ -270,7 +293,7 @@ pub(super) fn send_body<'a>(
     // 注入路径已经问过一次适配器，这里再查一次注册表是两次哈希查找，可忽略。
     let upstream_reasoning = injected.or_else(|| outbound_reasoning_of(provider_id, &body));
     ctx.telemetry.note_upstream_reasoning(upstream_reasoning);
-    SendBody { body, wire_model: wire.model }
+    Ok(SendBody { body, wire_model: wire.model })
 }
 
 /// 承载家的 [`ProviderAdapter::outbound_reasoning`]（读发送体里随行的等级）。
@@ -280,6 +303,144 @@ pub(super) fn send_body<'a>(
 fn outbound_reasoning_of(provider_id: &str, body: &Value) -> Option<String> {
     let kind = crate::server::core::providers::kind_from_id(provider_id)?;
     crate::server::core::providers::adapter::adapter_for(kind).outbound_reasoning(body)
+}
+
+/// 仅复制路由相关小字段，复用发送侧的档位解析；不复制长历史、不写旁路记账。
+pub(super) fn affinity_route_body(account: &Value, body: &Value) -> Value {
+    use crate::server::core::providers::catalog;
+    let provider = super::rotate::provider_of(account);
+    let requested = body.get("model").and_then(Value::as_str).unwrap_or_default();
+    let custom = crate::server::core::custom_providers::get(provider).is_some();
+    let (model, reasoning, forced) = if custom {
+        crate::server::core::custom_providers::wire_model_for(provider, requested)
+    } else {
+        let target = catalog::wire_target_for_provider(requested, provider, Some(account));
+        (target.model, target.reasoning, target.reasoning_override)
+    };
+    affinity_reasoning_body(provider, custom, &model, reasoning.as_deref(), forced.as_deref(), body)
+}
+
+/// 使用同一个适配器补丁和清除规则，但不执行发送侧的日志/记账及历史复制。
+/// 非法强制只保留客户端控制字段；发送侧仍返回原有错误，不确认亲和绑定。
+fn affinity_reasoning_body(
+    provider: &str,
+    custom: bool,
+    model: &str,
+    default: Option<&str>,
+    forced: Option<&str>,
+    body: &Value,
+) -> Value {
+    use crate::server::core::providers::adapter::{adapter_for, ReasoningPatch};
+    use crate::server::core::model_rules;
+    let mut reasoning_body = serde_json::json!({"model":model});
+    for field in ["reasoning_effort", "reasoningEffort", "effort", "reasoning", "thinking", "output_config", "properties"] {
+        if let Some(value) = body.get(field) {
+            reasoning_body[field] = value.clone();
+        }
+    }
+    if model.trim().is_empty() { return reasoning_body; }
+    let forced = forced.map(str::trim).filter(|level| !level.is_empty());
+    let force = forced.is_some();
+    let Some(level) = forced.or_else(|| default.map(str::trim).filter(|level| !level.is_empty())) else {
+        return reasoning_body;
+    };
+    if model_rules::reasoning_is_off(level) { return reasoning_body; }
+    if custom {
+        if force {
+            if model_rules::reasoning_rank(level).is_some() {
+                model_rules::clear_client_controls(&mut reasoning_body);
+                reasoning_body["reasoning_effort"] = Value::String(level.to_lowercase());
+            }
+        } else if reasoning_body.get("reasoning_effort").is_none() && reasoning_body.get("reasoning").is_none() {
+            reasoning_body["reasoning_effort"] = Value::String(level.to_string());
+        }
+    } else if let Some(kind) = crate::server::core::providers::kind_from_id(provider) {
+        if let ReasoningPatch::Set { field, value } = adapter_for(kind).reasoning_patch(level, model, &reasoning_body, force) {
+            if force { model_rules::clear_client_controls(&mut reasoning_body); }
+            reasoning_body[field] = value;
+        }
+    }
+    reasoning_body
+}
+
+pub(super) fn affinity_identity(account: &Value, session: &Value, body: &Value) -> Value {
+    use sha2::{Digest, Sha256};
+    let provider = super::rotate::provider_of(account);
+    let custom = crate::server::core::custom_providers::get(provider);
+    let reasoning_body = affinity_route_body(account, body);
+    let public_identity: Vec<Value> = [
+        "provider",
+        "uid",
+        "userId",
+        "region",
+        "edition",
+        "mode",
+        "variant",
+        "zcodePlan",
+        "baseUrl",
+    ]
+    .iter()
+    .map(|field| account.get(*field).cloned().unwrap_or(Value::Null))
+    .collect();
+    let identity = serde_json::json!([
+        public_identity,
+        session.pointer("/account/uid"),
+        session.get("userId"),
+        session.get("edition"),
+        session.get("mode"),
+        session.get("endpoint"),
+        session.get("zcodePlan"),
+        reasoning_body,
+        custom.as_ref().and_then(|item| item.get("baseUrl")),
+        custom.as_ref().and_then(|item| item.get("protocol")),
+    ]);
+    Value::String(format!(
+        "{:x}",
+        Sha256::digest(identity.to_string().as_bytes())
+    ))
+}
+
+/// 自定义静态凭据也是上游身份；原生可刷新 token 不参加该摘要。
+pub(super) fn affinity_custom_snapshot(
+    store: &crate::server::core::account_store::AccountStore,
+    account: &Value,
+) -> Option<Value> {
+    use sha2::{Digest, Sha256};
+    let definition =
+        crate::server::core::custom_providers::get(super::rotate::provider_of(account))?;
+    let credential =
+        store.custom_credential_by_id(crate::server::core::routing::account_id(account)?)?;
+    let base = credential
+        .base_url_override
+        .as_deref()
+        .or_else(|| definition.get("baseUrl").and_then(Value::as_str))
+        .unwrap_or_default();
+    let identity =
+        serde_json::json!({"apiKey":credential.api_key,"baseUrl":base,"noAuth":credential.no_auth});
+    Some(
+        serde_json::json!({"credential":format!("{:x}",Sha256::digest(identity.to_string().as_bytes())),"baseUrl":base,"protocol":definition.get("protocol")}),
+    )
+}
+
+pub(super) fn affinity_target_identity(
+    store: &crate::server::core::account_store::AccountStore,
+    account: &Value,
+    session: &Value,
+    body: &Value,
+) -> Value {
+    use sha2::{Digest, Sha256};
+    let identity = affinity_identity(account, session, body);
+    match affinity_custom_snapshot(store, account) {
+        Some(snapshot) => Value::String(format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::json!([identity, snapshot])
+                    .to_string()
+                    .as_bytes()
+            )
+        )),
+        None => identity,
+    }
 }
 
 /// 请求体里的消息条数（提示词层的详细日志用；没有 messages 数组时给 0）。
@@ -346,8 +507,8 @@ fn rewrite_model(body: &mut Cow<'_, Value>, requested: &str, wire: &str, provide
 /// 同名映射（对外名与上游 id 相同）时两者相同，用户仍能从这一行看出
 /// 「这条等级来自哪条映射」；不同名时它就是「这条映射做了什么改写」的完整记录。
 ///
-/// **不碰客户端自己传的思考字段**：覆盖与否是适配器的判断（它复用本家那个
-/// resolver 读的键名），这里只往它指定的 `field` 上写。
+/// 默认绑定不碰客户端字段；强制绑定在确认适配器支持后，清除冲突的控制字段，
+/// 再写入同一个适配器返回的字段。历史消息和非控制子字段不参与清除。
 ///
 /// 返回值是**注入成功时的档位字符串**（`Set` 分支里写进 body 的那个值；
 /// `value` 不是字符串形态时给 None）：调用方拿它当「上游等级」采集的第一优先
@@ -360,11 +521,15 @@ fn apply_reasoning(
     requested: &str,
     wire_model: &str,
     level: Option<&str>,
-) -> Option<String> {
-    let Some(level) = level.map(str::trim).filter(|text| !text.is_empty()) else {
-        return None;
+    override_level: Option<&str>,
+) -> Result<Option<String>, GatewayError> {
+    let forced = override_level.map(str::trim).filter(|text| !text.is_empty());
+    let force = forced.is_some();
+    let Some(level) = forced.or_else(|| level.map(str::trim).filter(|text| !text.is_empty())) else {
+        return Ok(None);
     };
     if crate::server::core::model_rules::reasoning_is_off(level) {
+        if force { return Err(crate::server::core::model_rules::override_error("强制覆盖思考不支持关闭思考；请清空强制配置或选择有效等级")); }
         logging::verbose(
             "[Upstream]",
             &format!(
@@ -372,22 +537,25 @@ fn apply_reasoning(
                  「{level}」（关闭思考），本网关不向任何上游发「关闭思考」字段，跳过注入"
             ),
         );
-        return None;
+        return Ok(None);
     }
     // 未知 provider id 直接返回：选路早已按注册表校验过（`provider_loop` 对未知
     // id 直接 503），走到这里说明调用链坏了 —— 什么都不做比 panic 安全
     // （release 是 panic=abort）。
     let Some(kind) = crate::server::core::providers::kind_from_id(provider_id) else {
-        return None;
+        if force { return Err(crate::server::core::model_rules::override_error("强制覆盖思考的提供商未注册")); }
+        return Ok(None);
     };
     let adapter = crate::server::core::providers::adapter::adapter_for(kind);
-    match adapter.reasoning_patch(level, wire_model, body.as_ref()) {
+    match adapter.reasoning_patch(level, wire_model, body.as_ref(), force) {
         crate::server::core::providers::adapter::ReasoningPatch::Set { field, value } => {
             // 先取可变对象再打日志：请求体不是 JSON 对象时写不进去（正常路径不会
             // 发生 —— chat 入口已校验过是对象），此时**不能**打「已注入」——
             // 「日志里说的就是字节里有的」是这一整段可观测性的全部价值，
             // 一句与字节不符的「已注入」比没有日志更坏。
+            if force { crate::server::core::model_rules::clear_client_controls(body.to_mut()); }
             let Some(object) = body.to_mut().as_object_mut() else {
+                if force { return Err(crate::server::core::model_rules::override_error("强制覆盖思考要求请求体为 JSON 对象")); }
                 logging::verbose(
                     "[Upstream]",
                     &format!(
@@ -395,20 +563,20 @@ fn apply_reasoning(
                          绑定的思考等级 {level} 未注入：请求体不是 JSON 对象"
                     ),
                 );
-                return None;
+                return Ok(None);
             };
             logging::verbose(
                 "[Upstream]",
                 &format!(
                     "provider={provider_id} 映射 {requested} → {wire_model} \
-                     注入思考等级 {level} → {field}={value}"
+                     注入思考等级 {level}（force={force}） → {field}={value}"
                 ),
             );
             // 采集用值在 move 前取出：字符串形态才是「档位」，其它形态（将来
             // 某家的开关 / 对象）交给调用方那侧的 outbound_reasoning 再读
             let injected = value.as_str().map(str::to_string);
             object.insert(field.to_string(), value);
-            injected
+            Ok(injected)
         }
         crate::server::core::providers::adapter::ReasoningPatch::Skip { reason } => {
             logging::verbose(
@@ -418,7 +586,177 @@ fn apply_reasoning(
                      绑定的思考等级 {level} 未注入：{reason}"
                 ),
             );
-            None
+            if force {
+                Err(crate::server::core::model_rules::override_error(format!("强制覆盖思考 {level} 不支持：{reason}")))
+            } else { Ok(None) }
         }
+    }
+}
+
+#[cfg(test)]
+mod force_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn all_supported_providers_force_without_changing_default_precedence() {
+        for (provider, model, expected) in [
+            ("zcode", "glm-5.3-flash", "max"),
+            ("zcode-intl", "glm-5.3-flash", "max"),
+            ("catpaw", "fixture", "max"),
+            ("qoder", "Qwen3.8-Flash", "max"),
+            ("accio", "claude-sonnet-4-6", "max"),
+            ("loomy", "spark-x", "high"),
+        ] {
+            for control in [json!("medium"), Value::Null, json!(false), json!(17), json!("off"), json!("unknown")] {
+                let original = json!({"model":model, "reasoning_effort":control,
+                    "reasoningEffort":"low", "effort":"low", "thinking":{"type":"disabled"},
+                    "reasoning":{"effort":"low","summary":"detailed"},
+                    "output_config":{"effort":"low","format":{"type":"json"}},
+                    "properties":{"reasoning_effort":"low","keep":true}, "max_tokens":48000,
+                    "messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"history","signature":"fixture"}]}]});
+                let mut body = Cow::Borrowed(&original);
+                let injected = apply_reasoning(&mut body, provider, model, model, Some("max"), None).unwrap();
+                if control.is_null() && provider.starts_with("qoder") {
+                    // Qoder 旧契约把第一个字段的 null 当未指定，不读取后面的冲突字段。
+                    assert_eq!(injected.as_deref(), Some("max"));
+                    let mut expected = original.clone(); expected["reasoning_effort"] = json!("max");
+                    assert_eq!(body.as_ref(), &expected);
+                } else {
+                    assert!(injected.is_none(), "{provider}");
+                    assert_eq!(body.as_ref(), &original, "默认绑定必须保持客户端优先 {provider}");
+                }
+                let mut body = Cow::Borrowed(&original);
+                assert_eq!(apply_reasoning(&mut body, provider, model, model, Some("low"), Some("max")).unwrap().as_deref(), Some(expected), "{provider}");
+                assert_eq!(body["reasoning_effort"], expected, "{provider}");
+                for key in ["reasoningEffort", "effort", "thinking"] { assert!(body.get(key).is_none(), "{provider} {key}"); }
+                assert_eq!(body["reasoning"], json!({"summary":"detailed"}));
+                assert_eq!(body["output_config"], json!({"format":{"type":"json"}}));
+                assert_eq!(body["properties"], json!({"keep":true}));
+                assert_eq!(body["max_tokens"], original["max_tokens"]);
+                assert_eq!(body["messages"], original["messages"]);
+                assert_eq!(original["thinking"]["type"], "disabled", "输入保持只读");
+            }
+        }
+    }
+
+    #[test]
+    fn unset_override_is_legacy_and_unsupported_force_is_an_error() {
+        let original = json!({"model":"glm-5.3-flash","messages":[]});
+        let mut body = Cow::Borrowed(&original);
+        assert_eq!(apply_reasoning(&mut body, "zcode", "alias", "glm-5.3-flash", Some("medium"), Some(" ")).unwrap().as_deref(), Some("high"));
+        assert_eq!(body["reasoning_effort"], "high");
+        for (provider, model, forced) in [("qoder", "not-a-model", "max"), ("accio", "glm-5", "max"), ("loomy", "other", "max"), ("zcode", "glm-4.7", "max"), ("workbuddy", "fixture", "max"), ("zcode", "glm-5.3-flash", "off"), ("zcode", "glm-5.3-flash", "unknown")] {
+            let mut body = Cow::Borrowed(&original);
+            let error = apply_reasoning(&mut body, provider, "alias", model, Some("medium"), Some(forced)).unwrap_err();
+            assert_eq!(error.status_code, 400);
+            assert_eq!(body.as_ref(), &original);
+        }
+    }
+}
+
+#[cfg(test)]
+mod affinity_identity_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn affinity_identity_tracks_semantics_not_rotating_tokens() {
+        let account =
+            json!({"provider":"workbuddy", "uid":"fixture", "userId":"user-a", "mode":"standard"});
+        let session = json!({"account":{"uid":"fixture"}, "accessToken":"one"});
+        let body = json!({"model":"fixture-model", "reasoning_effort":"low"});
+        let original = affinity_identity(&account, &session, &body);
+        assert_eq!(original.as_str().unwrap().len(), 64);
+        let mut refreshed = session.clone();
+        refreshed["accessToken"] = json!("two");
+        assert_eq!(original, affinity_identity(&account, &refreshed, &body));
+        for (field, value) in [
+            ("userId", "user-b"),
+            ("mode", "other"),
+            ("zcodePlan", "pro"),
+        ] {
+            let mut changed = account.clone();
+            changed[field] = json!(value);
+            assert_ne!(original, affinity_identity(&changed, &session, &body));
+        }
+        let mut changed = body.clone();
+        changed["reasoning_effort"] = json!("high");
+        assert_ne!(original, affinity_identity(&account, &session, &changed));
+        changed["thinking"] = json!({"budget_tokens":1024,"payload":"x".repeat(32_768)});
+        assert_eq!(
+            affinity_identity(&account, &session, &changed)
+                .as_str()
+                .unwrap()
+                .len(),
+            64
+        );
+        let prior = affinity_identity(&account, &session, &changed);
+        changed["thinking"]["budget_tokens"] = json!(2048);
+        assert_ne!(prior, affinity_identity(&account, &session, &changed));
+    }
+}
+
+#[cfg(test)]
+mod affinity_reasoning_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn affinity_force_fingerprint_matches_send_patch_and_keeps_default_precedence() {
+        for (provider, model) in [("zcode", "glm-5.3-flash"), ("zcode-intl", "glm-5.3-flash"),
+            ("catpaw", "fixture"), ("qoder", "Qwen3.8-Flash"),
+            ("accio", "claude-sonnet-4-6"), ("loomy", "spark-x")] {
+            for control in [json!("medium"), Value::Null, json!(false), json!(17), json!("off"), json!("unknown")] {
+                let original = json!({"model":model, "reasoning_effort":control,
+                    "reasoningEffort":"low", "effort":"low", "thinking":{"type":"disabled"},
+                    "reasoning":{"effort":"low","summary":"detailed"},
+                    "output_config":{"effort":"low","format":{"type":"json"}},
+                    "properties":{"reasoning_effort":"low","keep":true}, "max_tokens":48000,
+                    "messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"history","signature":"fixture"}]}]});
+                for forced in [None, Some("max")] {
+                    let mut outbound = Cow::Borrowed(&original);
+                    apply_reasoning(&mut outbound, provider, model, model, Some("low"), forced).unwrap();
+                    let fingerprint = affinity_reasoning_body(provider, false, model, Some("low"), forced, &original);
+                    let actual = affinity_reasoning_body(provider, false, model, None, None, outbound.as_ref());
+                    assert_eq!(fingerprint, actual, "{provider} force={forced:?}");
+                    assert!(fingerprint.get("messages").is_none());
+                    assert!(fingerprint.get("max_tokens").is_none());
+                    assert_eq!(original["thinking"]["type"], "disabled");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn affinity_invalid_force_does_not_inject_and_send_remains_an_error() {
+        let original = json!({"model":"fixture", "reasoning_effort":"medium", "messages":[]});
+        for (provider, model, forced) in [("workbuddy", "fixture", "max"),
+            ("zcode", "glm-5.3-flash", "off"), ("zcode", "glm-5.3-flash", "unknown")] {
+            let baseline = affinity_reasoning_body(provider, false, model, None, None, &original);
+            assert_eq!(affinity_reasoning_body(provider, false, model, Some("low"), Some(forced), &original), baseline);
+            let mut outbound = Cow::Borrowed(&original);
+            assert_eq!(apply_reasoning(&mut outbound, provider, "alias", model, Some("low"), Some(forced)).unwrap_err().status_code, 400);
+            assert_eq!(outbound.as_ref(), &original);
+        }
+    }
+
+    #[test]
+    fn affinity_custom_force_fingerprint_clears_controls_but_not_sibling_fields() {
+        let original = json!({"model":"alias","reasoning_effort":"medium", "thinking":false,
+            "reasoning":{"effort":"low","summary":"detailed"},
+            "output_config":{"effort":"low","format":{"type":"json"}},
+            "properties":{"reasoning_effort":"low","keep":true}, "messages":[{"role":"user","content":"history"}]});
+        let provider = "custom:fixture";
+        let default = affinity_reasoning_body(provider, true, "wire", Some("max"), None, &original);
+        assert_eq!(default["reasoning_effort"], "medium");
+        let forced = affinity_reasoning_body(provider, true, "wire", Some("low"), Some("HIGH"), &original);
+        assert_eq!(forced["reasoning_effort"], "high");
+        assert!(forced.get("thinking").is_none());
+        assert_eq!(forced["reasoning"], json!({"summary":"detailed"}));
+        assert_eq!(forced["output_config"], json!({"format":{"type":"json"}}));
+        assert_eq!(forced["properties"], json!({"keep":true}));
+        assert!(forced.get("messages").is_none());
+        assert_eq!(affinity_reasoning_body(provider, true, "wire", Some("low"), Some("unknown"), &original), affinity_reasoning_body(provider, true, "wire", None, None, &original));
     }
 }

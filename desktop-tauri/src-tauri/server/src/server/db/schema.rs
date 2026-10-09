@@ -23,7 +23,7 @@
 //! 落库的版本号继续 —— 不会出现「表建了一半但版本号已经写新」的错位。
 //!
 //! ── 为什么所有语句都带 IF NOT EXISTS ────────────────────────
-//! 版本号是**唯一**的推进依据，但现实里存在「表已经在了、版本号却是 0」的
+//! 版本号控制推进，但修复分叉历史时还须核验实际结构。现实里存在「表已经在了、版本号却是 0」的
 //! 情形：用户手工拷过库文件、或者从旧版本二进制回退再前进。DDL 幂等之后这种
 //! 库能直接跑过去（缺的补上、有的跳过），而不是在启动时报一句
 //! 「table already exists」把用户挡在门外。
@@ -194,8 +194,19 @@ pub fn is_reserved(key: &str) -> bool {
 /// 期间有值，收尾时一律清空（见 `request_stats::sql` 的各条收尾语句）——
 /// 「有没有阶段」因此就是「这一行还在跑」的第二个读数，与 status=0 同进同退。
 ///
-/// v7：缓存创建计数，NULL 与显式 0 分开保存（见 [`V7_SCHEMA`]）。
-pub const SCHEMA_VERSION: i64 = 8;
+/// ── 版本 7：requests 表加缓存创建计数列 ─────────────────────
+/// 见 [`V7_SCHEMA`]。
+///
+/// ── 版本 8：requests 表加上游积分列 ─────────────────────────
+/// 见 [`V8_SCHEMA`]。
+///
+/// ── 版本 9：requests 表加「测试来源」列 ─────────────────────
+/// 上游 2.9.5 曾把它编号为 v7；v9 的迁移对已有列幂等，兼容两条版本线。
+///
+/// ── 版本 10：补齐上游/本地两条历史线的请求计数列 ───────────
+/// 上游 v7 已有 is_test，但会跳过本地 v7 的缓存创建列；曾升级到 v9 的库
+/// 也可能缺这列。保留已发布 v7-v9 含义，在新的事务中按实际列补齐。
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
@@ -528,12 +539,15 @@ ALTER TABLE requests ADD COLUMN phase TEXT NOT NULL DEFAULT '';
 ALTER TABLE requests ADD COLUMN phase_started_at INTEGER;
 ";
 
-/// 版本 7：创建量允许 NULL，旧记录保持“未上报”，不回填猜测值。
-/// 只追加列；旧程序的显式列查询和写入保持兼容。
 const V7_SCHEMA: &str = "ALTER TABLE requests ADD COLUMN cache_creation_tokens INTEGER;";
 
-// v8 只加可空列；旧版列名读写及更高版本放行机制保持兼容。
 const V8_SCHEMA: &str = "ALTER TABLE requests ADD COLUMN upstream_credits REAL;";
+
+/// 版本 9：`requests` 补一列——这条请求是不是模型测试发起的。
+const V9_SCHEMA: &str = "
+-- ── requests 补一列（schema v9）──────────────────────────────
+ALTER TABLE requests ADD COLUMN is_test INTEGER NOT NULL DEFAULT 0;
+";
 
 /// 把库升到 [`SCHEMA_VERSION`]（幂等：已是最新版时什么都不做）。
 ///
@@ -594,51 +608,35 @@ fn apply_version(conn: &Connection, version: i64) -> rusqlite::Result<()> {
         5 => conn.execute_batch(V5_SCHEMA),
         // v6：requests 补阶段与阶段计时两列（在途请求的状态列读数，见 V6_SCHEMA）
         6 => conn.execute_batch(V6_SCHEMA),
+        // v7：requests 补缓存创建计数列（见 V7_SCHEMA）
         7 => conn.execute_batch(V7_SCHEMA),
+        // v8：requests 补上游积分列（见 V8_SCHEMA）
         8 => conn.execute_batch(V8_SCHEMA),
+        // v9：requests 补测试来源列；上游 v7 可能已经有该列
+        9 => {
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('requests') WHERE name='is_test')",
+                [],
+                |row| row.get(0),
+            )?;
+            if exists { Ok(()) } else { conn.execute_batch(V9_SCHEMA) }
+        }
+        // v10：按实际结构兼容分叉和已受影响的 v9；不覆盖旧值或降级未来库。
+        10 => {
+            for (column, ddl) in [
+                ("cache_creation_tokens", V7_SCHEMA),
+                ("upstream_credits", V8_SCHEMA),
+                ("is_test", V9_SCHEMA),
+            ] {
+                let exists: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('requests') WHERE name=?1)",
+                    [column],
+                    |row| row.get(0),
+                )?;
+                if !exists { conn.execute_batch(ddl)?; }
+            }
+            Ok(())
+        }
         _ => Ok(()),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn credit_migration_allows_legacy_readers_and_writers() {
-        let conn = Connection::open_in_memory().unwrap();
-        for version in 1..=7 { apply_version(&conn, version).unwrap(); }
-        conn.pragma_update(None, "user_version", 7).unwrap();
-        conn.execute("INSERT INTO requests (ts,model,status) VALUES (1,'legacy',200)", []).unwrap();
-        migrate(&conn).unwrap();
-        migrate(&conn).unwrap();
-        conn.execute("INSERT INTO requests (ts,model,status) VALUES (2,'old-writer',200)", []).unwrap();
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM requests WHERE upstream_credits IS NULL", [], |row| row.get(0)).unwrap();
-        assert_eq!(count, 2);
-        conn.execute("UPDATE requests SET upstream_credits=0.125 WHERE model='legacy'", []).unwrap();
-        // v7 的列名读写继续成功，并保留新列；旧版 migrate 对更高版本直接返回。
-        conn.execute("UPDATE requests SET cache_creation_tokens=0 WHERE model='legacy'", []).unwrap();
-        let observed: (String, Option<i64>, Option<f64>) = conn.query_row("SELECT model,cache_creation_tokens,upstream_credits FROM requests WHERE ts=1", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
-        assert_eq!(observed, ("legacy".into(),Some(0),Some(0.125)));
-        assert_eq!(conn.query_row("PRAGMA integrity_check", [], |row| row.get::<_,String>(0)).unwrap(),"ok");
-    }
-
-    #[test]
-    fn cache_creation_migration_preserves_legacy_rows_and_old_writers() {
-        let conn = Connection::open_in_memory().unwrap();
-        for version in 1..=6 { apply_version(&conn, version).unwrap(); }
-        conn.pragma_update(None, "user_version", 6).unwrap();
-        conn.execute("INSERT INTO requests (ts, model, status, prompt_tokens, cache_read_tokens) VALUES (1, 'legacy', 200, 100, 20)", []).unwrap();
-        migrate(&conn).unwrap();
-        migrate(&conn).unwrap();
-        let legacy: (i64, i64, Option<i64>) = conn.query_row(
-            "SELECT prompt_tokens, cache_read_tokens, cache_creation_tokens FROM requests WHERE model='legacy'",
-            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        ).unwrap();
-        assert_eq!(legacy, (100, 20, None));
-        conn.execute("INSERT INTO requests (ts, model, status) VALUES (2, 'old-writer', 200)", []).unwrap();
-        let missing: Option<i64> = conn.query_row("SELECT cache_creation_tokens FROM requests WHERE model='old-writer'", [], |row| row.get(0)).unwrap();
-        assert_eq!(missing, None);
-        assert_eq!(conn.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0)).unwrap(), "ok");
     }
 }

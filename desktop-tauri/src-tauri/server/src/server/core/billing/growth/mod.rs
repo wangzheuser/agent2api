@@ -10,7 +10,9 @@ use serde_json::{json, Value};
 pub const CHAT_CODES: &[&str] = &["chat_5", "Model_chat_GLM5.2"];
 
 pub fn chat_model(code: &str) -> Option<String> {
-    let catalog = crate::server::core::models::global_catalog();
+    let catalog = crate::server::core::models::global_catalog(
+        crate::server::core::providers::workbuddy::Region::Cn,
+    );
     if !catalog.remote_refreshed()
         || crate::server::logging::now_ms() - catalog.last_refreshed_at() > 86_400_000
     {

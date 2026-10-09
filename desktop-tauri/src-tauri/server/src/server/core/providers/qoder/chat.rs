@@ -56,6 +56,8 @@ pub struct ChatPlan {
     pub upstream_key: String,
     /// 是否要下发思考内容（决定要不要启用标签拆解器）
     pub thinking: bool,
+    /// 协议归一后真正发送的档位（日志与签名字节同源）。
+    pub reasoning: Option<String>,
 }
 
 /// 上游排队态（业务码 10605：「模型请求排队中」）。
@@ -276,6 +278,7 @@ pub fn build_plan_with_base(
         upstream_key,
         // 只有「模型支持思考」时才启用标签拆解（否则正文里的尖括号是用户内容）
         thinking: thinking.enable.is_some() || thinking.effort.is_some(),
+        reasoning: thinking.effort,
     })
 }
 

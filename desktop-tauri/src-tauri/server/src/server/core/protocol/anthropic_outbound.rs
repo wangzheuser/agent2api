@@ -33,7 +33,7 @@ use super::{
     chat_frame, content_parts, content_text, is_truthy, json_text, native_tool, random_id,
     string_field, string_value, SseLineBuffer, FIELD_CACHE_CONTROL, FIELD_IS_ERROR,
 };
-use super::anthropic::{parse_json_object, tool_result_text, DEFAULT_MAX_TOKENS};
+use super::anthropic::{parse_json_object, tool_result_parts, DEFAULT_MAX_TOKENS, ToolResultParts};
 use super::responses::ConvertError;
 use crate::server::core::model_rules;
 
@@ -201,6 +201,28 @@ pub fn anthropic_request_from_chat(chat: &Value, model: &str) -> Result<Value, C
     Ok(Value::Object(out))
 }
 
+/// 拆开的工具结果 → Anthropic 的 `tool_result.content`。
+///
+/// ── 与入站方向相反的取舍（不是笔误）──────────────────────────
+/// 入站（`anthropic.rs`）图片**必须**挪出 tool 消息：Chat 不许 `tool` 角色带
+/// 图片（OpenAI 直接 400，见 `responses::PendingImages`），所以那边图片落到
+/// 相邻的 user 消息上。出站这边不用搬 —— Anthropic 的 `tool_result.content`
+/// 本来就接受嵌套内容块（官方收 `text` / `image` / `document` / `search_result`），
+/// 图片留在结果里才是保真形态。
+///
+/// 没有图片时保持字符串形态：字符串对各家上游最友好，也是原来就在发的形状。
+fn tool_result_content(parts: ToolResultParts) -> Value {
+    if parts.images.is_empty() {
+        return Value::String(parts.text);
+    }
+    let mut blocks: Vec<Value> = Vec::new();
+    if !parts.text.is_empty() {
+        blocks.push(json!({ "type": "text", "text": parts.text }));
+    }
+    blocks.extend(parts.images);
+    Value::Array(blocks)
+}
+
 /// 一条非 system 的 chat 消息 → Anthropic 内容块数组。
 fn anthropic_blocks_of(message: &Value, role: &str) -> Vec<Value> {
     // tool 消息 → tool_result 块（挂在 user 消息上；Anthropic 要求
@@ -216,7 +238,10 @@ fn anthropic_blocks_of(message: &Value, role: &str) -> Vec<Value> {
         let mut block = json!({
             "type": "tool_result",
             "tool_use_id": string_field(message, "tool_call_id"),
-            "content": tool_result_text(message.get("content").unwrap_or(&Value::Null)),
+            "content": tool_result_content(tool_result_parts(
+                message.get("content").unwrap_or(&Value::Null),
+                image_to_anthropic,
+            )),
         });
         if let Some(object) = block.as_object_mut() {
             if is_error {
@@ -751,6 +776,10 @@ impl ChatFromAnthropicStream {
         if self.finished {
             return Vec::new();
         }
+        if !self.started {
+            // 心跳或无法识别的载荷不能在 EOF 时变成一次成功的空回答。
+            return self.fail_message("上游未返回有效 Anthropic 消息");
+        }
         self.finished = true;
         let mut out = self.start();
         let finish_reason = self.finish_reason.clone().unwrap_or_else(|| {
@@ -792,7 +821,6 @@ impl ChatFromAnthropicStream {
         if self.finished {
             return Vec::new();
         }
-        self.finished = true;
         let error = event.get("error").filter(|error| is_truthy(error));
         let message = match error {
             Some(error) => {
@@ -806,6 +834,15 @@ impl ChatFromAnthropicStream {
         } else {
             message
         };
+        self.fail_message(&message)
+    }
+
+    /// 将适配器检测到的协议错误转换为标准 chat 错误帧。
+    fn fail_message(&mut self, message: &str) -> Vec<bytes::Bytes> {
+        if self.finished {
+            return Vec::new();
+        }
+        self.finished = true;
         vec![
             chat_frame(&json!({
                 "error": { "message": message, "type": "upstream_error" },
@@ -869,6 +906,128 @@ mod tests {
             assert_eq!(restored["cache_read_input_tokens"], 20);
             assert_eq!(restored["output_tokens"], 7);
             assert_eq!(restored.get("cache_creation_input_tokens").and_then(Value::as_i64), creation);
+        }
+    }
+
+    fn output_text(frames: &[bytes::Bytes]) -> String {
+        frames
+            .iter()
+            .map(|frame| String::from_utf8_lossy(frame).into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn empty_upstream_stream_is_reported_as_an_error() {
+        for input in [
+            "",
+            ": keepalive\n\n",
+            "data: {\"type\":\"ping\"}\n\n",
+            "data: {\"type\":\"unknown\"}\n\n",
+            "data: {broken}\n\n",
+            "data: {\"type\":",
+            "<html>not an SSE response</html>",
+            "data: [DONE]\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        ] {
+            let mut stream = ChatFromAnthropicStream::new("glm-5.3");
+            let mut frames = stream.push(input.as_bytes());
+            frames.extend(stream.finish());
+            assert_eq!(frames.len(), 2, "input: {input}");
+            let text = std::str::from_utf8(&frames[0]).unwrap();
+            let error: Value = serde_json::from_str(text.strip_prefix("data: ").unwrap()).unwrap();
+            assert_eq!(error["error"]["type"], "upstream_error");
+            assert_eq!(error["error"]["message"], "上游未返回有效 Anthropic 消息");
+            assert!(error.get("choices").is_none());
+            assert_eq!(frames[1].as_ref(), b"data: [DONE]\n\n");
+            assert!(stream.finish().is_empty());
+            assert!(stream.push(b"data: [DONE]\n\n").is_empty());
+        }
+    }
+
+    #[test]
+    fn valid_message_stream_still_completes_normally() {
+        let mut stream = ChatFromAnthropicStream::new("glm-5.3");
+        let output = stream
+            .push(
+                b"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":3}}}\n\n",
+            )
+            .into_iter()
+            .chain(stream.push(b"data: {\"type\":\"message_stop\"}\n\n"))
+            .map(|frame| String::from_utf8_lossy(&frame).into_owned())
+            .collect::<String>();
+
+        assert!(!output.contains("\"error\""));
+        assert!(output.contains("\"finish_reason\":\"stop\""));
+        assert!(output.contains("data: [DONE]"));
+    }
+
+    #[test]
+    fn content_without_message_start_survives_fragmentation_and_eof() {
+        for (kind, field, chat_field) in [
+            ("text_delta", "text", "content"),
+            ("thinking_delta", "thinking", "reasoning_content"),
+        ] {
+            let input = format!(
+                "data: {{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"{kind}\",\"{field}\":\"你好\"}}}}"
+            );
+            let mut stream = ChatFromAnthropicStream::new("glm-5.3");
+            let mut frames = Vec::new();
+            for chunk in input.as_bytes().chunks(1) {
+                frames.extend(stream.push(chunk));
+            }
+            frames.extend(stream.finish());
+            let output = output_text(&frames);
+            assert!(output.contains(&format!("\"{chat_field}\":\"你好\"")));
+            assert!(output.contains("\"finish_reason\":\"stop\""));
+            assert!(!output.contains("\"error\""));
+        }
+    }
+
+    #[test]
+    fn tool_arguments_are_preserved_without_message_start() {
+        let mut stream = ChatFromAnthropicStream::new("glm-5.3");
+        let mut frames = stream.push(concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_1\",\"name\":\"lookup\",\"input\":{}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"key\\\":1}\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n"
+        ).as_bytes());
+        frames.extend(stream.finish());
+        let output = output_text(&frames);
+        assert!(output.contains("\"name\":\"lookup\""));
+        assert!(output.contains("\"arguments\":\"{\\\"key\\\":1}\""));
+        assert!(output.contains("\"finish_reason\":\"tool_calls\""));
+        assert!(!output.contains("\"error\""));
+    }
+
+    #[test]
+    fn upstream_error_is_preserved_and_terminated_once() {
+        let mut stream = ChatFromAnthropicStream::new("glm-5.3");
+        let frames = stream.push(
+            b"data: {\"type\":\"error\",\"error\":{\"message\":\"upstream unavailable\"}}\n\n",
+        );
+        assert_eq!(frames.len(), 2);
+        assert!(output_text(&frames).contains("upstream unavailable"));
+        assert!(stream.finish().is_empty());
+        assert!(stream.push(b"data: [DONE]\n\n").is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_stream_becomes_502_when_aggregated() {
+        use crate::server::core::upstream::{
+            aggregate::aggregate_frame_stream, usage::RequestTelemetry,
+        };
+        use std::sync::Arc;
+
+        let mut stream = ChatFromAnthropicStream::new("glm-5.3");
+        let frames = futures::stream::iter(stream.finish().into_iter().map(Ok));
+        let result =
+            aggregate_frame_stream(Box::pin(frames), Arc::new(RequestTelemetry::new()), None).await;
+        match result {
+            Err(error) => {
+                assert_eq!(error.status_code, 502);
+                assert_eq!(error.message, "上游未返回有效 Anthropic 消息");
+            }
+            Ok(_) => panic!("empty upstream must not aggregate to a successful completion"),
         }
     }
 }

@@ -63,6 +63,24 @@ impl KeyScope {
         }
     }
 
+    /// **只有这一家**（模型测试专用：测试要打在**这一行所属的家**上，
+    /// 而不是「别名碰巧命中的第一家」—— 同一对外名允许在多家各挂一条映射，
+    /// 不定家的话「测这一行」测出来的是别人，结论无法归因）。
+    ///
+    /// 模型维度不限制：测试的目标模型由请求体自己点名（那是这一行的默认绑定），
+    /// 再叠一道模型白名单只会多一处可能对不上的判定。
+    pub fn provider_only(provider: &str) -> Self {
+        let mut allowed_providers = HashSet::new();
+        let id = normalize_one(provider);
+        if !id.is_empty() {
+            allowed_providers.insert(id);
+        }
+        Self {
+            allowed_providers,
+            allowed_models: HashSet::new(),
+        }
+    }
+
     /// 是否限制提供商（界面上「有没有勾」的判据，也用于日志措辞）
     pub fn restricts_providers(&self) -> bool {
         !self.allowed_providers.is_empty()
@@ -144,4 +162,30 @@ pub fn allows_model(scope: Option<&KeyScope>, model: &str) -> bool {
 /// 同上，提供商维度
 pub fn allows_provider(scope: Option<&KeyScope>, provider: &str) -> bool {
     scope.map_or(true, |scope| scope.allows_provider(provider))
+}
+
+/// 已认证客户端的路由分区；与 KeyScope 权限无关，不保存明文凭证。
+#[derive(Clone)]
+pub struct RoutingPrincipal(String);
+
+impl RoutingPrincipal {
+    pub(crate) fn from_entry(entry: &ApiKeyEntry) -> Self {
+        Self(format!("entry:{}", entry.id))
+    }
+
+    /// 仅在环境 Key 已通过认证之后调用；进程重启后不复用指纹。
+    pub(crate) fn from_environment_key(key: &str) -> Self {
+        use sha2::{Digest, Sha256};
+        use std::sync::OnceLock;
+        static SALT: OnceLock<String> = OnceLock::new();
+        let salt = SALT.get_or_init(|| crate::server::access::random_hex(32));
+        let mut hash = Sha256::new();
+        hash.update(salt.as_bytes());
+        hash.update(key.as_bytes());
+        Self(format!("environment:{:x}", hash.finalize()))
+    }
+
+    pub(crate) fn partition(&self) -> &str {
+        &self.0
+    }
 }

@@ -58,8 +58,12 @@ pub(super) async fn prefetch_stream_head(
     let source = response.bytes_stream().map(|item| {
         item.map_err(|error| std::io::Error::other(egress::describe_error_detail(&error)))
     });
+    let source = crate::server::core::upstream::completion_evidence::observe_stream(
+        Box::pin(source), telemetry.clone(),
+        crate::server::core::upstream::completion_evidence::EvidenceProtocol::Qoder,
+    );
     let mut source = stall::idle_guard(
-        Box::pin(source),
+        source,
         std::time::Duration::from_millis(
             crate::server::config::timeout_settings().stream_idle_ms(),
         ),

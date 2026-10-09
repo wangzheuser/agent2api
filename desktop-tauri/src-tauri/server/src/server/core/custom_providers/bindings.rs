@@ -5,7 +5,15 @@ use serde_json::{json, Value};
 use crate::server::core::capability;
 use crate::server::core::models::model_id;
 
-pub fn resolve(provider: &Value, requested: &str) -> Option<(String, Option<String>)> {
+pub fn resolve(provider: &Value, requested: &str) -> Option<(String, Option<String>, Option<String>)> {
+    resolve_binding(provider, requested, false)
+}
+
+pub(super) fn resolve_test(provider: &Value, requested: &str) -> Option<(String, Option<String>, Option<String>)> {
+    resolve_binding(provider, requested, true)
+}
+
+fn resolve_binding(provider: &Value, requested: &str, testing: bool) -> Option<(String, Option<String>, Option<String>)> {
     if !provider.get("enabled").and_then(Value::as_bool).unwrap_or(false) {
         return None;
     }
@@ -13,17 +21,21 @@ pub fn resolve(provider: &Value, requested: &str) -> Option<(String, Option<Stri
     let mappings = provider.get("mappings").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
     let level = |entry: &Value| entry.get("reasoning").and_then(Value::as_str)
         .map(str::trim).filter(|text| !text.is_empty()).map(str::to_string);
+    let forced = |entry: &Value| entry.get("reasoningOverride").and_then(Value::as_str)
+        .map(str::trim).filter(|text| !text.is_empty()).map(str::to_string);
     if let Some(model) = models.iter().find(|model| model_id(model).eq_ignore_ascii_case(requested)) {
         let default = mappings.iter().find(|mapping| {
             mapping.get("alias").and_then(Value::as_str).is_some_and(|alias| alias.eq_ignore_ascii_case(requested))
                 && mapping.get("target").and_then(Value::as_str).is_some_and(|target| target.eq_ignore_ascii_case(requested))
         });
-        if model.get("enabled").and_then(Value::as_bool).unwrap_or(true)
-            && default.map_or(true, |mapping| mapping.get("enabled").and_then(Value::as_bool).unwrap_or(true))
+        if testing || (model.get("enabled").and_then(Value::as_bool).unwrap_or(true)
+            && default.map_or(true, |mapping| mapping.get("enabled").and_then(Value::as_bool).unwrap_or(true)))
         {
-            return Some((model_id(model), default.and_then(level).or_else(|| level(model))));
+            return Some((model_id(model), default.and_then(level).or_else(|| level(model)),
+                default.filter(|entry| entry.get("reasoningOverride").is_some()).map_or_else(|| forced(model), forced)));
         }
     }
+    if testing { return None; }
     mappings.iter().find_map(|mapping| {
         let alias = mapping.get("alias")?.as_str()?;
         let target = mapping.get("target")?.as_str()?;
@@ -34,7 +46,7 @@ pub fn resolve(provider: &Value, requested: &str) -> Option<(String, Option<Stri
         }
         // target 的 enabled 只控制原始 ID，不能阻止别名调用它。
         let model = models.iter().find(|model| model_id(model).eq_ignore_ascii_case(target))?;
-        Some((model_id(model), level(mapping)))
+        Some((model_id(model), level(mapping), forced(mapping)))
     })
 }
 
@@ -62,7 +74,7 @@ pub fn public_models(provider: &Value) -> Vec<Value> {
         {
             continue;
         }
-        let Some((target, _)) = resolve(provider, &name) else { continue };
+        let Some((target, _, _)) = resolve(provider, &name) else { continue };
         let mut item = json!({ "id": name });
         let capabilities = capability::normalize_object(
             models
@@ -74,4 +86,31 @@ pub fn public_models(provider: &Value) -> Vec<Value> {
         result.push(item);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolution_ignores_model_switches_but_not_provider_switch_or_raw_catalog() {
+        let mut provider = json!({"enabled":true,"models":[{"id":"Raw-A","enabled":false,"reasoning":"low"}],
+            "mappings":[{"alias":"Raw-A","target":"Raw-A","enabled":false,"reasoning":"high"},
+                        {"alias":"alias","target":"Raw-A","enabled":true}]});
+        let original = provider.clone();
+        assert!(resolve(&provider, "Raw-A").is_none());
+        assert_eq!(resolve_test(&provider, "raw-a"), Some(("Raw-A".into(), Some("high".into()), None)));
+        assert!(resolve_test(&provider, "alias").is_none());
+        assert!(resolve_test(&provider, "absent").is_none());
+        assert_eq!(resolve(&provider, "alias"), Some(("Raw-A".into(), None, None)));
+        assert_eq!(provider, original);
+        provider["enabled"] = json!(false);
+        assert!(resolve_test(&provider, "Raw-A").is_none());
+        provider["enabled"] = json!(true);
+        provider["models"][0]["reasoningOverride"] = json!("high");
+        provider["mappings"][0]["reasoningOverride"] = json!("max");
+        assert_eq!(resolve_test(&provider, "Raw-A").unwrap().2.as_deref(), Some("max"));
+        provider["mappings"][0]["reasoningOverride"] = json!("");
+        assert_eq!(resolve_test(&provider, "Raw-A").unwrap().2, None);
+    }
 }

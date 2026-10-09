@@ -167,7 +167,8 @@ pub fn shim_js() -> &'static str {
   function needsManualCallback(provider) {
     return provider === 'trae'
       || provider === 'accio' || provider === 'accio-cn'
-      || provider === 'codearts' || provider === 'autoclaw-intl';
+      || provider === 'codearts' || provider === 'autoclaw-intl'
+      || provider === 'lobsterai';
   }
 
   function escapeHtml(value) {
@@ -199,7 +200,8 @@ pub fn shim_js() -> &'static str {
     var label = provider === 'raccoon' ? '小浣熊'
       : provider === 'trae' ? 'Trae'
       : provider.indexOf('accio') === 0 ? 'Accio'
-      : provider === 'codearts' ? 'CodeArts' : 'AutoClaw';
+      : provider === 'codearts' ? 'CodeArts'
+      : provider === 'lobsterai' ? 'LobsterAI' : 'AutoClaw';
     var callbackInstruction = provider === 'autoclaw-intl'
         ? 'AutoClaw 国际版授权完成后，浏览器可能显示 localhost 无法访问，这是预期现象。请复制地址栏中的<strong>完整回调地址</strong>，粘贴到下面提交。不要复制授权页原始地址，也不要改动参数。'
         : '授权完成后，复制授权页浏览器地址栏中的<strong>完整地址</strong>，'
@@ -211,11 +213,7 @@ pub fn shim_js() -> &'static str {
         + '<div style="margin-bottom:10px;">如果授权页没有打开，请先点击：<a href="'
         + escapeHtml(authUrl) + '" target="_blank" rel="noopener" style="color:#7fa7ff;word-break:break-all;">'
         + escapeHtml(authUrl) + '</a></div>'
-        + '<input type="text" spellcheck="false" autocomplete="off" placeholder="'
-        + (provider === 'autoclaw-intl'
-          ? 'http://localhost:18432/auth/callback-zai?...'
-          : 'http://127.0.0.1:…/callback?...')
-        + '" '
+        + '<input type="text" spellcheck="false" autocomplete="off" placeholder="http://127.0.0.1:…/callback?..." '
         + 'style="width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #3a3b3f;'
         + 'border-radius:6px;background:#26272b;color:#e8e8e8;">',
         '提交回调地址'
@@ -337,21 +335,30 @@ pub fn shim_js() -> &'static str {
 
   // access 短效令牌过期后的静默续期。中转环境里 refresh cookie 到不了
   // 服务端，改为带 `x-panel-refresh` 头，并显式带 `x-panel-auth-mode: body`
-  // 要求新令牌进响应体（服务端只认这个标记，直连环境响应体与旧行为
-  // 逐字节一致）；响应体里的新令牌回写 PANEL_AUTH（轮换后旧 refresh 已
+  // 要求新令牌进响应体；响应体里的新令牌回写 PANEL_AUTH（轮换后旧 refresh 已
   // 作废，不回存下次必失败）。cookie 模式（本地没存过令牌，即不带
   // x-panel-refresh）下轮换随 Set-Cookie 完成，body 里没有令牌 ——
   // resp.ok 即续期成功，不能按失败处理。
+  //
+  // ⚠️ 标记**只在本地存过令牌时才发**（头与 query 两条通道一起，同一个条件）：
+  // 早先这里把 `?auth-mode=body` 写成了无条件，于是直连环境每两小时一次的静默
+  // 续期都会把裸令牌吐进响应体、并被 `storePanelAuth` 落进 localStorage ——
+  // 「直连环境令牌不 JS 可读」这条性质在一次续期之后就没了。服务端把标记当
+  // **显式覆盖**（见 `api::panel::tokens_in_body`），所以不发标记时它会自己按
+  // 探针 cookie 判：直连 → 仍走 cookie（响应体无令牌）；中转 → 探针判不通，
+  // 令牌照样进响应体。两侧行为都不比原来差，只有直连侧少暴露一份凭据。
   async function tryRefresh() {
     try {
       var headers = { 'Accept': 'application/json' };
       var refreshToken = storedPanelToken('refresh');
+      var url = '/api/panel/refresh';
       if (refreshToken) {
         headers['x-panel-refresh'] = refreshToken;
         headers['x-panel-auth-mode'] = 'body';
+        // 标记走两条通道（头 + query）：中转剥自定义请求头时 query 照常生效
+        url += '?auth-mode=body';
       }
-      // 标记走两条通道（头 + query）：中转剥自定义请求头时 query 照常生效
-      var resp = await fetch('/api/panel/refresh?auth-mode=body', { method: 'POST', headers: headers });
+      var resp = await fetch(url, { method: 'POST', headers: headers });
       if (!resp.ok) return false;
       var payload = await resp.json();
       var data = payload && payload.data;
@@ -651,7 +658,7 @@ pub fn shim_js() -> &'static str {
     // 与桌面端 bridge.rs 保持同一契约：headless 面板里的令牌守卫需要
     // 读取库存，并把 WebView 铸出的令牌推回网关。缺少这两个方法时，
     // zcode-captcha-pool.js 会静默跳过整个铸造循环，账号设置也会一直显示
-    // 「验证码令牌：读取中…」。
+    // 「验证码令牌：状态读取失败」。
     zcodeCaptchaStats: function () { return call('GET', '/api/zcode/captcha'); },
     pushZcodeCaptchaTokens: function (tokens) {
       return call('POST', '/api/zcode/captcha', {
@@ -685,10 +692,11 @@ pub fn shim_js() -> &'static str {
     setModelState: function (payload) { return call('POST', '/api/models/state', payload); },
     // 第 4 / 第 5 个参数（思考等级 / 映射开关）都按「有没有传」决定是否进请求体：
     // 后端按「请求体里有没有这个键」区分三态，undefined 的键不会进 JSON
-    addModelMapping: function (alias, target, provider, reasoning, enabled) {
+    addModelMapping: function (alias, target, provider, reasoning, enabled, reasoningOverride) {
       var payload = { alias: alias, target: target, provider: provider };
       if (reasoning !== undefined) payload.reasoning = reasoning;
       if (enabled !== undefined) payload.enabled = enabled;
+      if (reasoningOverride !== undefined) payload.reasoningOverride = reasoningOverride;
       return call('POST', '/api/models/mappings', payload);
     },
     removeModelMapping: function (alias, target, provider) {
@@ -702,6 +710,10 @@ pub fn shim_js() -> &'static str {
     setModelCapabilities: function (provider, id, capabilities) {
       return call('POST', '/api/models/capabilities', { provider: provider, id: id, capabilities: capabilities });
     },
+    // 模型测试：真打上游、会消耗额度；payload 原样透传（与桌面 bridge 对齐），
+    // 各键都可选（account_id / prompt / system_prompt / reasoning / stream / test_id）。
+    // 结论失败也返回 2xx —— 上游的错误在返回值的 status / error 里
+    testModel: function (payload) { return call('POST', '/api/models/test', payload || {}); },
 
     // ── 网关 API Key（多把）──
     getKeys: function () { return call('GET', '/api/keys'); },
@@ -771,26 +783,46 @@ pub fn shim_js() -> &'static str {
     getAccountConnections: function () { return call('GET', '/api/accounts/connections'); },
     checkinAllAccounts: function (id) { return call('POST', '/api/accounts/checkin', id ? { id: id } : {}); },
 
-    // ── 手机验证码登录（AutoClaw 国内版）──
+    // ── 手机验证码登录（AutoClaw 国内版 / Loomy）──
+    // 与桌面 `bridge.rs` 的同名方法**必须成对存在**（理由见下面 ZCode 那段的
+    // 说明）：界面只知道「手机号 + 中间态」，走哪个端点由两份桥各自决定。
+    //
+    // ── 为什么这里要按 provider 选端点（曾经漏过，issue #93）──────
+    // Loomy 是**另一条链路**（自己的签名算法与站点，中间态叫 msgid 而不是
+    // deviceId），端点在服务端就是分开挂的（`api::session::login_loomy_*`）。
+    // 只补了桌面那份桥、漏了这里时，浏览器面板发的 loomy 会落进 AutoClaw
+    // 端点：验证码由 AutoClaw 发出、账号也存成 AutoClaw，界面却因为文案取自
+    // 卡片 label 而显示「Loomy 账号已添加」—— 全程没有一条报错。
     sendSmsCode: function (input) {
       var isObject = input && typeof input === 'object';
       var phone = String((isObject ? input.phone : input) || '');
       var provider = isObject && input.provider ? String(input.provider) : '';
-      return call('POST', '/api/session/login/sms/send', {
+      var path = provider === 'loomy'
+        ? '/api/session/login/loomy/sms/send'
+        : '/api/session/login/sms/send';
+      return call('POST', path, {
         phone: phone,
         provider: provider || undefined,
       });
     },
     verifySmsLogin: function (payload) {
       payload = payload || {};
+      var provider = payload.provider ? String(payload.provider) : '';
+      var path = provider === 'loomy'
+        ? '/api/session/login/loomy/sms/verify'
+        : '/api/session/login/sms/verify';
       var body = {
         phone: String(payload.phone || ''),
         code: String(payload.code || ''),
       };
+      // deviceId（AutoClaw）/ msgid（Loomy）：两个中间态都按「有值才带」整形
+      // —— 空串会被后端当成一个真值带上去。字段名由界面按各自链路给（见
+      // ui/sms-login.js 的 SMS_PROFILES），这里只透传，不替它做归一。
       if (payload.deviceId) body.deviceId = String(payload.deviceId);
+      if (payload.msgid) body.msgid = String(payload.msgid);
       if (payload.name) body.name = String(payload.name);
-      if (payload.provider) body.provider = String(payload.provider);
-      return call('POST', '/api/session/login/sms/verify', body);
+      if (provider) body.provider = provider;
+      return call('POST', path, body);
     },
 
     // ── 定时签到 ──
@@ -828,6 +860,25 @@ pub fn shim_js() -> &'static str {
     getSanitize: function () { return call('GET', '/api/sanitize'); },
     saveSanitize: function (enabled) {
       return call('PUT', '/api/sanitize', { sanitizeBlacklistFingerprints: enabled === true });
+    },
+
+    // ── Cline 伪装头（转发头逐键覆盖）──
+    // 与桌面桥（src/bridge.rs 的 getClineHeaders / saveClineHeaders）同一映射。
+    // 这两个方法曾经漏在网页桥里：设置页调用 `getClineHeaders` 抛
+    // 「不是函数」，面板因此一直显示「不可用」——后端接口本身是好的，
+    // 缺的只是这座桥。
+    getClineHeaders: function () { return call('GET', '/api/cline/headers'); },
+    saveClineHeaders: function (overrides) {
+      // 整体替换覆盖表（非增量 merge），与后端 PUT 同语义；界面传的就是
+      // 「编辑后的整张表」。返回值与 GET 同形（后端 PUT 回的就是那份三表），
+      // 界面拿它直接重画。
+      return call('PUT', '/api/cline/headers', { overrides: overrides || {} });
+    },
+
+    // ── 网关面跨域访问（/v1/*，默认关）──
+    getCors: function () { return call('GET', '/api/cors'); },
+    saveCors: function (enabled) {
+      return call('PUT', '/api/cors', { corsEnabled: enabled === true });
     },
 
     // ── 系统提示词与内容拦截降级 ──
@@ -905,6 +956,7 @@ pub fn shim_js() -> &'static str {
     // ── 排队等待（次数 / 单次秒数）──
     getQueue: function () { return call('GET', '/api/queue'); },
     saveQueue: function (patch) { return call('PUT', '/api/queue', patch); },
+
     // ── 账号选路策略 ──
     getAccountSelection: function () { return call('GET', '/api/account-selection'); },
     saveAccountSelection: function (patch) { return call('PUT', '/api/account-selection', patch); },

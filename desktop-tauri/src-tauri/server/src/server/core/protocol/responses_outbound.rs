@@ -28,7 +28,7 @@ use super::{
     chat_frame, content_parts, content_text, is_truthy, json_number_of, json_text, native_tool,
     random_id, string_field, string_value, SseLineBuffer, FIELD_ENCRYPTED_CONTENT,
 };
-use super::responses::{image_url_of, tool_output_text, ConvertError};
+use super::responses::{image_url_of, tool_output_parts, ConvertError, ToolOutput};
 use super::tool_plan;
 
 // ─── 请求：Chat → Responses ─────────────────────────────────
@@ -83,7 +83,7 @@ pub fn responses_request_from_chat(chat: &Value, model: &str) -> Result<Value, C
                 items.push(json!({
                     "type": "function_call_output",
                     "call_id": string_field(message, "tool_call_id"),
-                    "output": tool_output_text(message.get("content")),
+                    "output": tool_output_to_responses(tool_output_parts(message.get("content"))),
                 }));
             }
             "assistant" => push_assistant_items(&mut items, message),
@@ -260,6 +260,38 @@ fn push_assistant_items(items: &mut Vec<Value>, message: &Value) {
             }));
         }
     }
+}
+
+/// 拆开的工具输出 → Responses 的 `function_call_output.output`。
+///
+/// ── 与入站方向相反的取舍（不是笔误）──────────────────────────
+/// 入站（`responses.rs`）图片**必须**挪出 tool 消息：Chat 不许 `tool` 角色带
+/// 图片（OpenAI 直接 400，见 `responses::PendingImages`）。出站这边不用 ——
+/// Responses 官方 schema 里 `output` 本来就是
+/// `String | Array[ResponseInputText | ResponseInputImage | …]`，图表留在工具结果
+/// 里才是保真形态（DeepSeek 的 Responses 文档同样声明 `input_image` 按真图片
+/// 处理）。所以这边只是「别把它拍平成 JSON 文本」，不搬消息。
+///
+/// 没有图片时保持字符串形态：字符串对各家上游最友好，也是原来就在发的形状。
+fn tool_output_to_responses(output: ToolOutput) -> Value {
+    if output.images.is_empty() {
+        return Value::String(output.text);
+    }
+    let mut parts: Vec<Value> = Vec::new();
+    if !output.text.is_empty() {
+        parts.push(json!({ "type": "input_text", "text": output.text }));
+    }
+    for image in &output.images {
+        let url = image_url_of(image);
+        if !url.is_empty() {
+            parts.push(json!({ "type": "input_image", "image_url": url }));
+        }
+    }
+    if parts.is_empty() {
+        // 图片块全都取不到 url（只剩 file_id 之类）：退回文本，别发空数组上去
+        return Value::String(output.text);
+    }
+    Value::Array(parts)
 }
 
 /// Chat content（字符串或块数组）→ Responses 的 input content。
@@ -797,15 +829,15 @@ impl ChatFromResponsesStream {
     }
 }
 
-/// 事件 / 项里的工具身份键：call_id 优先，退到 id / item_id / output_index。
+/// 事件 / 项里的工具身份键：item id 优先，退到 call_id / output_index。
 ///
 /// 同一次调用的各个事件（added / delta / done）必须映射到同一个键，
-/// 上游保证这几个字段在各事件里一致（官方与参考实现都按这个优先链取值）。
+/// 官方参数增量只带 item_id；call_id 是交给下游的调用标识，与 item id 不同。
 fn tool_key(event: &Value, item: &Value) -> String {
     for text in [
-        string_field(item, "call_id"),
         string_field(item, "id"),
         string_field(event, "item_id"),
+        string_field(item, "call_id"),
     ] {
         if !text.is_empty() {
             return text;
@@ -852,4 +884,21 @@ fn chat_usage_from_responses(usage: &Value) -> Value {
         Value::from(json_number_of(usage, &["total_tokens"]).max(input + output)),
     );
     Value::Object(out)
+}
+
+#[cfg(test)]
+mod tool_identity_tests {
+    use super::*;
+    #[test]
+    fn item_id_joins_tool_arguments_without_replacing_call_id() {
+        let item = json!({"id":"item-1", "call_id":"call-1", "name":"fixture_tool", "type":"function_call"});
+        let mut stream = ChatFromResponsesStream::new("fixture");
+        let opening = stream.consume(&json!({"type":"response.output_item.added", "output_index":0,"item":item}));
+        let delta = stream.consume(&json!({"type":"response.function_call_arguments.delta", "output_index":0,"item_id":"item-1","delta":"{}"}));
+        assert_eq!(stream.tools.len(), 1);
+        let frames: Vec<Value> = opening.iter().chain(delta.iter()).filter_map(|frame| std::str::from_utf8(frame).ok()?.strip_prefix("data: ").and_then(|s|serde_json::from_str(s.trim()).ok())).collect();
+        assert!(frames.iter().any(|frame| frame.pointer("/choices/0/delta/tool_calls/0/id")==Some(&json!("call-1"))));
+        assert!(frames.iter().any(|frame| frame.pointer("/choices/0/delta/tool_calls/0/function/arguments")==Some(&json!("{}"))));
+        assert!(frames.iter().filter_map(|frame|frame.pointer("/choices/0/delta/tool_calls/0/index")).all(|index|index==&json!(0)));
+    }
 }

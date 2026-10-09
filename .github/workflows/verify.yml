@@ -1,0 +1,136 @@
+name: verify
+
+on:
+  pull_request:
+  push:
+    branches: ['main', 'dev/pr-integration', 'codex/**']
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: '显式保护基线提交；留空使用候选 first-parent（实际合并 H 另行本地冻结）'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  contracts:
+    name: merge-contracts
+    runs-on: ubuntu-latest
+    outputs:
+      base: ${{ steps.baseline.outputs.base }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: 冻结本次事件的保护基线
+        id: baseline
+        env:
+          CONTRACT_BASE: ${{ inputs.base_ref || '' }}
+        run: python3 scripts/replay-merge-baseline.py resolve
+      - name: 检查清单及门禁自身
+        env:
+          CONTRACT_BASE: ${{ steps.baseline.outputs.base }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B -m unittest discover -s scripts -p 'test_*merge*.py' -v
+          python3 scripts/check-merge-contracts.py --base-ref "$CONTRACT_BASE"
+          python3 scripts/replay-merge-baseline.py gate
+
+  server:
+    name: server-tests
+    needs: contracts
+    runs-on: ubuntu-latest
+    env:
+      CONTRACT_BASE: ${{ needs.contracts.outputs.base }}
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop-tauri/src-tauri -> ../../target
+      - name: 编译与现有测试
+        working-directory: desktop-tauri/src-tauri
+        run: |
+          cargo check -p agent2api-server --locked
+          cargo test -p agent2api-server --locked
+      - name: 所有 target 编译列表及原始独立 Rust 断言
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml -p agent2api-server --locked -- --list > "$RUNNER_TEMP/rust-contract-tests.txt"
+          python3 scripts/check-merge-contracts.py --base-ref "$CONTRACT_BASE" --rust-list "$RUNNER_TEMP/rust-contract-tests.txt"
+          python3 scripts/replay-merge-baseline.py rust --report "$RUNNER_TEMP/baseline-rust-tests.txt" --candidate-rust-list "$RUNNER_TEMP/rust-contract-tests.txt"
+      - name: 保存候选及原样/适配 Rust 证据
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: merge-contract-rust-evidence
+          path: |
+            ${{ runner.temp }}/rust-contract-tests.txt
+            ${{ runner.temp }}/baseline-rust-tests.txt*
+          if-no-files-found: ignore
+
+  frontend:
+    name: frontend-tests
+    needs: contracts
+    runs-on: ubuntu-latest
+    env:
+      CONTRACT_BASE: ${{ needs.contracts.outputs.base }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            desktop-tauri/ui-kit/package-lock.json
+            desktop-tauri/ui-islands/package-lock.json
+      - name: 安装锁定前端与浏览器测试依赖
+        run: |
+          npm --prefix desktop-tauri/ui-kit ci
+          npm --prefix desktop-tauri/ui-islands ci
+          cd desktop-tauri/ui-islands
+          npx --no-install playwright install --with-deps chromium
+      - name: 前端业务及 headless bridge 测试
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/replay-merge-baseline.py candidate-node --report "$RUNNER_TEMP/node-contract-tests.txt"
+          python3 scripts/check-merge-contracts.py --base-ref "$CONTRACT_BASE" --node-report "$RUNNER_TEMP/node-contract-tests.txt"
+          npm --prefix desktop-tauri/ui-kit run typecheck
+          npm --prefix desktop-tauri/ui-islands run typecheck
+          npm --prefix desktop-tauri/ui-islands run build
+          git diff --exit-code -- desktop-tauri/ui/islands/ui.js desktop-tauri/ui/islands/ui.css
+      - name: 原始 Node 和浏览器断言重放
+        run: python3 scripts/replay-merge-baseline.py frontend --report "$RUNNER_TEMP/baseline-node-tests.txt"
+      - name: 真实构建产物浏览器回归
+        run: python3 scripts/replay-merge-baseline.py candidate-browser
+      - name: 保存浏览器验收证据
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: merge-contract-browser-evidence
+          path: |
+            .verify/
+            ${{ runner.temp }}/node-contract-tests.txt*
+            ${{ runner.temp }}/baseline-node-tests.txt*
+          include-hidden-files: true
+          if-no-files-found: ignore

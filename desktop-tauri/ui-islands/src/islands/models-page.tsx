@@ -9,7 +9,8 @@
  * 本文件只放**视图层**（页面骨架 + 左栏 + 模型表 + 映射 / 添加模型两个弹窗 + 挂载）；
  * 数据层（快照 store / 取数 / 写入 / 对外契约）在 models-panel-state.ts —— 那个文件不是岛
  * （.ts，不被 glob 加载）；「模型能力」弹窗自带一个文件（model-capability-dialog.tsx，它只
- * 依赖数据层，不依赖本文件）。
+ * 依赖数据层，不依赖本文件），操作列那颗「测试」的两层弹窗同样自带一个文件
+ * （model-test-dialog.tsx：门禁判定 `testBlockReason` 与弹窗本体都在那边，本页只挂载）。
  *
  * ── 一个页面，两种数据源 ──────────────────────────────
  * 左栏（`.prov-rail`）是提供商导航：**内置提供商**一组（「全部」= 各家的聚合视图，各家是
@@ -51,6 +52,7 @@
  * 2xs / icon-2xs 档）、「＋ 映射」（Button variant='dashed'）、模型 ID 的复制按钮、展开/收起、
  * 行内「移除」、来源徽标（Badge）、三个弹窗整块（Dialog 一族 + Input / Select / Label / Tooltip；
  * 「模型能力」在 model-capability-dialog.tsx，能力位两列的单元格样式在 page-gateway.css）。
+ * 操作列的「测试」也是组件库按钮，它的弹窗整块在 model-test-dialog.tsx（含那两条门禁）。
  * 保留旧实现的两处都不是控件本身：
  *   · 自定义家条目外层的 `.pv-row` 定位容器与那颗 `.pv-del` —— HTML 不允许 button 嵌套，
  *     删除 × 必须与 NavItem 做兄弟节点，靠 .pv-row 定位（见 rail 里的说明）；
@@ -97,13 +99,14 @@ import {
   exactTokens, formatTokens, normalizeOverrides,
 } from './model-capability'
 import { CapabilityDialog } from './model-capability-dialog'
+import { ModelTestDialog, testBlockReason, type ModelTestTarget } from './model-test-dialog'
 import { CUSTOM_LEVEL, levels as reasoningLevels } from './models-reasoning'
 import * as customSource from './models-custom-source'
 import type { ManageModel, ManageView } from './models-custom-source'
 import {
   GROUP_LIMIT, MODEL_STATE_OPTIONS, accept, bindingKeyOf, bindingsOf, builtinRailItems,
   closeCapability, closeCustomModel, closeMapping, collapseGroup, currentProvider, customProviderOptions,
-  directoryReady, esc, errorMessage, expandGroup, formatTime, getSnapshot, levelOf, load, models,
+  directoryReady, esc, errorMessage, expandGroup, formatTime, getSnapshot, levelOf, overrideLevelOf, load, models,
   openAddCustomProvider, openCapability, openCustomModel, openMapping, providerOptions, refreshAll,
   refreshModels, registerColumnSettings, removeCustomProvider, render, resolveProvider, restoreSavedFilters,
   rowEnabled, rowKeyOf, runRowAction, same, selectProvider, setSearch, setStateFilter, setTableEl,
@@ -147,6 +150,12 @@ function ModelsPage() {
   const state = React.useSyncExternalStore(subscribe, getSnapshot)
   const provider = resolveProvider(state)
   const custom = customSource.isCustom(provider)
+  /**
+   * 「测试」弹窗的目标行。这一份状态刻意**不放进模块级快照**（与三个弹窗的 context 不同）：
+   * 它只被本页用、也没有从 React 之外打开的调用点（入口就是表格里那颗按钮），
+   * 放在组件里就够了。值为 null = 弹窗关着。
+   */
+  const [testTarget, setTestTarget] = React.useState<ModelTestTarget | null>(null)
   /** 选中了一个已被删除的自定义家（目录缓存里确实没有这条记录，而不是「还没加载完」） */
   const customMissing = custom && directoryReady() && !customSource.record(provider)
 
@@ -232,15 +241,16 @@ function ModelsPage() {
   /** chip 上那枚等级标（未绑定时也渲染虚线样式，否则「怎么绑等级」会变成一个查不出的问题） */
   function levelBadge(alias: string, target: string, providerId: string, busy: boolean) {
     const level = levelOf(alias, target, providerId)
+    const forced = overrideLevelOf(alias, target, providerId)
     return (
       // 16px 小件（2xs 档）：原来那枚 mono 10px 的小药丸。已绑定走实心档、未绑定走虚线档，
       // 与旧 CSS 的 `.alias-level` / `.alias-level.unset` 同一套语义（mono 粗体也照旧）；
       // shadow-none 是清掉通用 button 规则的投影（旧 CSS 同样显式清过）
-      <Button variant={level ? 'secondary' : 'dashed'} size='2xs' disabled={busy}
+      <Button variant={level || forced ? 'secondary' : 'dashed'} size='2xs' disabled={busy}
         className='font-mono font-bold shadow-none'
-        title={level ? `思考等级 ${level}（点击修改）` : '设置思考等级（当前未绑定）'}
+        title={forced ? `默认 ${level || '未设置'} · 强制覆盖思考 ${forced}（点击修改）` : (level ? `思考等级 ${level}（点击修改）` : '设置思考等级（当前未绑定）')}
         onClick={() => openMapping({ alias, target, provider: providerId })}>
-        {level || '＋等级'}
+        {forced ? `强制 ${forced}` : (level || '＋等级')}
       </Button>
     )
   }
@@ -449,10 +459,18 @@ function ModelsPage() {
         return <td className={cellClass('cell-caps', column.align)}>{capsCell(model)}</td>
       case 'alias':
         return <td className={cellClass('cell-alias', column.align)}>{aliasCell(model)}</td>
-      case 'act':
+      case 'act': {
+        // 「测试」的账号可用性由 model-test-dialog 统一判定，绑定开关只控制对外请求。
+        // 这里只把理由挂到 title 上 —— 禁用而不说原因等于让用户猜
+        const blocked = testBlockReason(model.provider || '')
         return (
           <td className={cellClass('cell-act r', column.align)}>
             <div className='row-actions'>
+              <Button variant='ghost' size='sm' disabled={Boolean(blocked)}
+                title={blocked || '以这个上游模型发一次最小请求，走真实转发链路'}
+                onClick={() => setTestTarget({ provider: model.provider || '', id: model.id })}>
+                测试
+              </Button>
               {model.source === 'manual' || custom ? (
                 <Button variant='ghost' size='sm' className='text-destructive' disabled={busyRow}
                   onClick={() => void confirmRemoveModel()}>移除</Button>
@@ -460,6 +478,7 @@ function ModelsPage() {
             </div>
           </td>
         )
+      }
       default:
         return null
     }
@@ -643,6 +662,9 @@ function ModelsPage() {
       {state.capability
         ? <CapabilityDialog context={state.capability} onClose={closeCapability} />
         : null}
+      {testTarget
+        ? <ModelTestDialog target={testTarget} onClose={() => setTestTarget(null)} />
+        : null}
     </>
   )
 }
@@ -694,6 +716,11 @@ function MappingDialog({ context, onClose }: { context: MappingContext; onClose:
     return { select: current ? CUSTOM_LEVEL : '', custom: current }
   })
 
+  const [forcedReasoning, setForcedReasoning] = React.useState(() => {
+    const candidates = reasoningLevels(getSnapshot().data)
+    const current = editing ? overrideLevelOf(context.alias, context.target, context.provider) : ''
+    return { select: current && !candidates.includes(current) ? CUSTOM_LEVEL : current, custom: current }
+  })
   const candidates = reasoningLevels(getSnapshot().data)
   /** 提供商候选：表格里出现过的家，再补上上下文那一家（孤儿映射可能属于「整个没进表格」的家） */
   const providerChoices = (() => {
@@ -718,6 +745,7 @@ function MappingDialog({ context, onClose }: { context: MappingContext; onClose:
   const providerLabel = providerChoices.find(item => item.id === provider)?.label || provider || '(全局)'
   const level = reasoning.select === CUSTOM_LEVEL ? reasoning.custom.trim() : reasoning.select
   const showCustomLevel = reasoning.select === CUSTOM_LEVEL
+  const forcedLevel = forcedReasoning.select === CUSTOM_LEVEL ? forcedReasoning.custom.trim() : forcedReasoning.select
 
   /** 换了一家，上游候选整体换掉（保留同名项，切回来时不用重选） */
   function changeProvider(next: string): void {
@@ -744,7 +772,7 @@ function MappingDialog({ context, onClose }: { context: MappingContext; onClose:
       // `reasoning` **总是显式给出**（空串 = 清空绑定）：三元组相同走的也是这条接口，而用户
       // 在这个弹窗里看到的就是他要的结果 —— 传 undefined（= 不改）会让「从 high 改成不覆盖」
       // 这一步静默无效
-      accept(await writeBinding(provider, wanted, target, { reasoning: level }))
+      accept(await writeBinding(provider, wanted, target, { reasoning: level, reasoningOverride: forcedLevel }))
       setSaving(false)
       onClose()
       const suffix = level ? ` · 思考等级 ${level}` : ''
@@ -820,6 +848,7 @@ function MappingDialog({ context, onClose }: { context: MappingContext; onClose:
             下游请求 <b className='text-primary-fg'>{alias.trim() || '<对外名>'}</b> → 转发{' '}
             <b className='text-primary-fg'>{upstream || '<上游模型>'}</b>（{providerLabel}）
             {level ? <> · 思考等级 <b className='text-primary-fg'>{level}</b></> : null}
+            {forcedLevel ? <> · 强制覆盖思考 <b className='text-primary-fg'>{forcedLevel}</b></> : null}
           </div>
           <div className='flex flex-col gap-1.5'>
             <div className='flex items-center gap-[7px]'>
@@ -857,6 +886,23 @@ function MappingDialog({ context, onClose }: { context: MappingContext; onClose:
                 onChange={event => setReasoning(prev => ({ ...prev, custom: event.currentTarget.value }))}
                 onKeyDown={onEnter} />
             ) : null}
+          </div>
+          <div className='flex flex-col gap-1.5'>
+            <Label htmlFor='mapping-reasoning-override'>强制覆盖思考</Label>
+            <Select value={forcedReasoning.select} onValueChange={next => setForcedReasoning(prev => ({ ...prev, select: String(next) }))}>
+              <SelectTrigger id='mapping-reasoning-override' className='w-full' disabled={saving}>
+                <SelectValue>{forcedReasoning.select === CUSTOM_LEVEL ? '自定义等级…' : (forcedReasoning.select || '未设置')}</SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value=''>未设置</SelectItem>
+                {candidates.map(candidate => <SelectItem key={candidate} value={candidate}>{candidate}</SelectItem>)}
+                <SelectItem value={CUSTOM_LEVEL}>自定义等级…</SelectItem>
+              </SelectContent>
+            </Select>
+            {forcedReasoning.select === CUSTOM_LEVEL ? <Input id='mapping-reasoning-override-custom' maxLength={32}
+              placeholder='目标模型支持的等级' autoComplete='off' disabled={saving} value={forcedReasoning.custom}
+              onChange={event => setForcedReasoning(prev => ({ ...prev, custom: event.currentTarget.value }))} onKeyDown={onEnter} /> : null}
+            <p className='text-xs text-subtle'>未设置时保留默认思考等级规则；设置后忽略客户端思考参数，按目标模型支持的等级强制覆盖。</p>
           </div>
           <p className='text-xs leading-[1.65] text-subtle'>
             对外名可自由命名，允许与上游模型 ID 同名（同名时该上游的原生路由优先，映射作兜底）；

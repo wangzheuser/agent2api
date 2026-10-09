@@ -8,6 +8,23 @@ const bundled = await build({
   bundle: true, format: 'esm', platform: 'node', write: false,
 })
 const source = bundled.outputFiles[0].text
+
+test('check-in confirmation preserves pending-credit wording without changing other providers', async () => {
+  for (const claim of [
+    { success: true, creditVerification: 'unverified', msg: '签到已确认，额度到账待核验' },
+    { alreadyCompleted: true, creditVerification: 'query_failed', msg: '今天已签到，额度到账待核验' },
+    { success: true },
+  ]) {
+    const f = await fixture([{ id: 'A', provider: 'minimax-code', enabled: true }])
+    const messages = []
+    window.wbApp.toast = message => messages.push(message)
+    window.workbuddyDesktop.checkinAllAccounts = async () => ({ results: [{ id: 'A', claim }] })
+    await f.api.runCheckin('A')
+    assert.equal(messages.length, 1)
+    if (claim.creditVerification) assert.ok(messages[0].includes(claim.msg))
+    else assert.ok(messages[0].includes('签到成功'))
+  }
+})
 let moduleId = 0
 async function fixture(accounts = [{ id: 'A', uid: 'uA', provider: 'workbuddy', addedAt: 1 }]) {
   const state = { accounts: { accounts } }

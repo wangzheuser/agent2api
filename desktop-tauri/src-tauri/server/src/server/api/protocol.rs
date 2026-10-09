@@ -34,7 +34,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use serde_json::{json, Value};
 
-use crate::server::core::key_scope::KeyScope;
+use crate::server::core::key_scope::{KeyScope, RoutingPrincipal};
+use crate::server::core::upstream::route_session::RouteSession;
 use crate::server::core::protocol::{anthropic, responses};
 use crate::server::core::upstream::cancellation;
 use crate::server::core::upstream::usage::RequestTelemetry;
@@ -83,6 +84,7 @@ async fn forward_chat(
     stream: bool,
     dedupe_key: String,
     scope: Option<KeyScope>,
+    route_session: Option<RouteSession>,
     telemetry: Arc<RequestTelemetry>,
 ) -> Result<ForwardOutcome, GatewayError> {
     let outcome = state
@@ -94,6 +96,9 @@ async fn forward_chat(
             client_headers: client_headers.clone(),
             telemetry: telemetry.clone(),
             allowed_providers: scope,
+            // 两个协议入口都不是模型测试：不钉账号，走全局优先级队列
+            pinned_account: None,
+            route_session,
         })
         .await;
     outcome
@@ -109,15 +114,18 @@ pub async fn responses_endpoint(
     // `core::key_scope` 模块头）。用 `Option<Extension<_>>` 而不是裸
     // `Extension<_>` —— 后者在免鉴权模式下取不到会直接拒绝请求。
     key_scope: Option<Extension<KeyScope>>,
+    principal: Option<Extension<RoutingPrincipal>>,
     body: Bytes,
 ) -> Response {
     let scope = key_scope.map(|Extension(scope)| scope);
+    let principal = principal.map(|Extension(principal)| principal);
     let started_at = logging::now_ms();
     let path = "/v1/responses";
     let raw = match parse_object(&state, started_at, path, &body) {
         Ok(value) => value,
         Err(response) => return response,
     };
+    let route_session = RouteSession::from_body(&raw, principal.as_ref());
     // 原始请求体留一份：回程要用它回显请求侧字段（instructions / tools / …），
     // 而下面会把 payload 改写成 Chat 形态
     let original = raw.clone();
@@ -182,6 +190,8 @@ pub async fn responses_endpoint(
         &requested_model,
         &client_model,
         &client_reasoning,
+        // 真实流量：不是模型测试（见 `RecordContext::is_test`）
+        false,
     );
     // 在途回写（与 /v1/chat/completions 同一处时点与理由，见
     // `pipeline::live_row_sink`）
@@ -204,6 +214,7 @@ pub async fn responses_endpoint(
         stream,
         pipeline::sha256_hex(&body),
         scope,
+        route_session,
         telemetry.clone(),
     )
     .await;
@@ -220,6 +231,8 @@ pub async fn responses_endpoint(
         // 在聚合完成后补，流式由 RecordingStream 在流结束时定稿
         raw_request: pipeline::raw_body_text(&body),
         raw_response: None,
+        // 真实流量：不是模型测试（见 `RecordContext::is_test`）
+        is_test: false,
     };
 
     match outcome {
@@ -301,15 +314,18 @@ pub async fn messages_endpoint(
     headers: HeaderMap,
     // R9：同 responses_endpoint（`Option` + 取不到 = 不限制）
     key_scope: Option<Extension<KeyScope>>,
+    principal: Option<Extension<RoutingPrincipal>>,
     body: Bytes,
 ) -> Response {
     let scope = key_scope.map(|Extension(scope)| scope);
+    let principal = principal.map(|Extension(principal)| principal);
     let started_at = logging::now_ms();
     let path = "/v1/messages";
     let raw = match parse_object(&state, started_at, path, &body) {
         Ok(value) => value,
         Err(response) => return response,
     };
+    let route_session = RouteSession::from_body(&raw, principal.as_ref());
     let stream = raw.get("stream").and_then(Value::as_bool).unwrap_or(false);
 
     // 协议翻译
@@ -358,6 +374,8 @@ pub async fn messages_endpoint(
         &requested_model,
         &client_model,
         &client_reasoning,
+        // 真实流量：不是模型测试（见 `RecordContext::is_test`）
+        false,
     );
     // 在途回写（与 /v1/chat/completions 同一处时点与理由，见
     // `pipeline::live_row_sink`）
@@ -380,6 +398,7 @@ pub async fn messages_endpoint(
         stream,
         pipeline::sha256_hex(&body),
         scope,
+        route_session,
         telemetry.clone(),
     )
     .await;
@@ -396,6 +415,8 @@ pub async fn messages_endpoint(
         // 在聚合完成后补，流式由 RecordingStream 在流结束时定稿
         raw_request: pipeline::raw_body_text(&body),
         raw_response: None,
+        // 真实流量：不是模型测试（见 `RecordContext::is_test`）
+        is_test: false,
     };
 
     match outcome {

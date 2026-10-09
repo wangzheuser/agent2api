@@ -447,3 +447,21 @@ fn random_hex() -> Result<String, String> {
     getrandom::getrandom(&mut bytes).map_err(|_| "无法生成安全的登录随机串".to_string())?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
+
+#[cfg(test)]
+mod remote_restore_tests {
+    use super::*;
+    #[tokio::test]
+    async fn remote_zai_keeps_registered_redirect_without_binding_server_loopback() {
+        let store = crate::server::core::account_store::AccountStore::with_db(None);
+        let login = LoginService::new(crate::server::core::auth::AuthService::for_store(store.clone()), store);
+        let zai = login.callback_endpoint("http://fixture.invalid:3065", Vendor::Zai, false).await;
+        assert_eq!(zai.base, oauth::registered_callback_base());
+        assert!(zai.listener.is_none());
+        assert!(zai.notice.as_deref().unwrap().contains("完整回调地址"));
+        let google = login.callback_endpoint("http://fixture.invalid:3065/", Vendor::Google, false).await;
+        assert_eq!(google.base, "http://fixture.invalid:3065");
+        assert!(google.listener.is_none());
+        assert!(google.notice.is_none());
+    }
+}

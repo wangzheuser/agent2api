@@ -63,7 +63,7 @@ pub const DEFAULT_TIME: &str = "00:01";
 /// 这是「有签到或每日活跃任务」的清单，不是「有积分概念」的清单：CatPaw 有积分查询
 /// 但没有签到，因此不在此列 —— 它的账号在批量签到里被算作 `skipped`。
 /// 加一家之前先确认它的签到链路真的存在（一个点了必然报错的复选框比没有更糟）。
-pub const CHECKIN_PROVIDERS: [&str; 9] = [
+pub const CHECKIN_PROVIDERS: [&str; 10] = [
     "workbuddy",
     "raccoon",
     "autoclaw",
@@ -76,6 +76,7 @@ pub const CHECKIN_PROVIDERS: [&str; 9] = [
     // keeps the persisted scheduler setting independent from generated
     // `custom-*` provider ids.
     "reward-custom",
+    "loomy",
 ];
 
 /// 缺省的签到提供商集合（全选）
@@ -85,26 +86,27 @@ pub fn default_providers() -> Vec<String> {
 
 /// 提供商的展示名（从注册表查，查不到就原样回显 id）。
 ///
-/// ── 为什么 WorkBuddy 要带上「国内版」────────────────────────
 /// 这个标签只出现在**签到语境**（提供商复选框、配置错误提示、签到范围变更日志），
-/// 而签到对 WorkBuddy 按版本分流：国内版领取签到奖励，国际版完成每日活跃任务。
-/// 注册表里的 `label` 是这家在**所有语境**下的通用展示名
-/// （账号卡片、筛选、模型清单都用它），改成「WorkBuddy 国内版」会让那些地方
-/// 出现一个没头没尾的版本后缀。
+/// 而清单里有两家的签到是**有版本限定**的 —— 标签要在用户勾选时就把这件事讲清楚，
+/// 而不是让他签完发现被跳过了才回来查。两家的处理方式不同，原因也不同：
 ///
-/// 因此在这里覆盖而不是改注册表：标签替用户把国内版领取、国际版活跃的差异
-/// 讲清楚，而不是让国际版账号被静默跳过。
+/// ── WorkBuddy：注册表里就叫「WorkBuddy 国内版」，这里不用再覆盖 ──
+/// 拆家后国内版与国际版是两家独立提供商（见 `providers::workbuddy::region`），
+/// 注册表的展示名**必须**带版本，否则「WorkBuddy」读起来像「两地通吃的那一家」。
+/// 而它在 `CHECKIN_PROVIDERS` 里只列国内版 —— 签到只有国内站有（上游事实：
+/// 腾讯的每日签到接口），国际版账号则走每日活跃任务；两者复用同一调度入口。
+/// 因此这里保留「含国际版活跃」的签到语境说明。
 ///
-/// 另外几家没有这个后缀：小浣熊没有版本区分（`edition` 概念不适用于它），
-/// AutoClaw 两地的签到链路都存在且同形 —— 它的展示名已经带「国内版 / 国际版」
-/// 后缀（注册表里就是），因此不需要在这里再补。
+/// ── Qoder：注册表是通用名，这里补成「中国版」──────────────────
+/// 与 WorkBuddy 同理但方向相反：注册表里是通用的「Qoder」（它没有拆家，
+/// 一个 id 覆盖两个地区，展示名不该自带地区），而签到**只在中国版成立**
+/// （国际版没有签到计划，见 `providers::qoder::checkin`）。所以这里覆盖成
+/// 「Qoder 中国版」。
 ///
-/// **Qoder 要补**（与 WorkBuddy 同理）：注册表里的名字是通用的「Qoder」，
-/// 这里明确标出国内版与国际版都会参与，避免用户误以为国际版被排除。
 fn provider_label(id: &str) -> &str {
     match id {
         "workbuddy" => "WorkBuddy（含国际版活跃）",
-        "qoder" => "Qoder（国内版/国际版）",
+        "qoder" => "Qoder 中国版",
         "minimax-code" => "MiniMax Code（每日签到）",
         "lobsterai" => "LobsterAI（活动奖励）",
         "reward-custom" => "预置 API 奖励（AStudio / DuMate）",
@@ -870,7 +872,7 @@ mod tests {
     #[test]
     fn qoder_is_default_and_labeled_for_both_regions() {
         assert!(default_providers().iter().any(|id| id == "qoder"));
-        assert_eq!(provider_label("qoder"), "Qoder（国内版/国际版）");
+        assert_eq!(provider_label("qoder"), "Qoder 中国版");
         assert!(default_providers().iter().any(|id| id == "minimax-code"));
         assert_eq!(provider_label("minimax-code"), "MiniMax Code（每日签到）");
         assert!(default_providers().iter().any(|id| id == "lobsterai"));

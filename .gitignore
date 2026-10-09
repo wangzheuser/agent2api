@@ -12,6 +12,8 @@ desktop-tauri/src-tauri/gen/schemas/
 # 本地开发过程产物
 .zcode/
 .verify/
+diagnostic-artifacts/
+__pycache__/
 prototype/
 # ZCode 的忽略配置文件本身（本机工具配置，不入库）
 .zcodeignore
@@ -24,9 +26,10 @@ desktop-tauri/web
 logs/
 desktop-tauri/window-shot.png
 
-# 发布说明草稿（只用于发布 Release，不入库）
-.release-notes-*.md
-docs/
+# 本地文档目录（发布说明草稿等，只在本机留存，不入库）
+# 新增文档直接放进 docs/ 下的分类目录即可，无需再加忽略规则
+/docs/*
+!/docs/local-contracts.json
 
 # 发版脚本下载的 CI 构建产物（scripts/release.sh）
 dist/

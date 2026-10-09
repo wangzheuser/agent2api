@@ -534,6 +534,35 @@ const LOBSTERAI: ProviderConfig = {
   ],
 }
 
+/**
+ * Loomy（讯飞）：短信登录 + 粘贴 session。
+ *
+ * ── 三处与别家不同（都有上游依据，别照抄别家）────────────────
+ *   1. 短信链路是**另一套**（端点 `/api/session/login/loomy/sms/*`、中间态字段
+ *      叫 `msgid` 而不是 `deviceId`、请求带 HMAC-SHA1 签名头）——
+ *      由 `ui/sms-login.js` 的 SMS_PROFILES 与壳侧桥接按 provider 分派；
+ *   2. 粘贴的是**登录 session**（它同时是模型网关的 token，不是 JWT）；
+ *   3. **没有续期**：session 约 14 天，过期只能重新登录（所以不渲染
+ *      「刷新 Token」那一类控件）。
+ */
+const LOOMY: ProviderConfig = {
+  provider: 'loomy',
+  label: 'Loomy',
+  smsLogin: {
+    noteHtml: '用 Loomy 账号绑定的手机号登录：点「获取验证码」后填入即可。这是本家最省事的入口。',
+  },
+  manualNote: '粘贴的是登录 session（同时是模型网关的 token）。Loomy 没有续期接口，session 有效期约 14 天，过期后重新登录即可。',
+  fields: [
+    { key: 'session', label: 'session', rows: 3, placeholder: '登录 session（一长串）' },
+    { key: 'userId', label: 'userId', optional: true, placeholder: '可选，讯飞侧 userid' },
+    { key: 'phone', label: '手机号', optional: true, placeholder: '可选，展示用' },
+    { key: 'name', label: '备注名', optional: true, placeholder: '可选，留空则用脱敏手机号或 userId' },
+  ],
+  // 登录态在客户端自己的加密存储里（没有 auth.json 那种稳定可读的文件形态），
+  // 不提供「导入桌面端登录态」（与 Accio / ZCode 同一处境，理由见各自配置注释）。
+  desktop: false,
+}
+
 /** 内置家的表单块，顺序与旧 ADD_FORMS 一致（只影响 DOM 里的块顺序，不影响界面） */
 export const BUILTIN_CONFIGS: ProviderConfig[] = [
   RACCOON,
@@ -557,12 +586,32 @@ export const BUILTIN_CONFIGS: ProviderConfig[] = [
   TRAE,
   MINIMAX_CODE,
   LOBSTERAI,
+  LOOMY,
 ]
 
 /** WorkBuddy 的块 id（结构特殊，单独一个组件） */
 export const WORKBUDDY_PROVIDER = 'workbuddy'
 /** 自定义提供商的块 id（后注册块的 provider 取值） */
 export const CUSTOM_PROVIDER = 'custom'
+
+/**
+ * WorkBuddy 在**添加账号入口**上的展示名：中性品牌名，不带地区。
+ *
+ * ── 为什么不用注册表里的名字（拆家后是「WorkBuddy 国内版」）──────
+ * 这个入口是**两版共用**的：第 1 步只有一张卡，卡片里的「账号版本」分段负责
+ * 切国内版 / 国际版（同一个 `WorkBuddyBlock` 的两个选项，见 add-provider-pick
+ * 的说明）。名字带「国内版」而用户当场就能切到国际版，读起来就是自相矛盾 ——
+ * 卡片与弹窗标题都因此用品牌名。
+ *
+ * 两处**都**走这个常量而不是各写一份：卡片与标题是同一个入口的两个步骤，
+ * 名字不一致时用户会以为点了别的东西。
+ *
+ * ── 别处仍用注册表名 ────────────────────────────────────────
+ * 账号页徽章、模型页、Key 页用的是注册表名（带地区）：那些地方要能分清两家，
+ * 而这里一家代表两版。别家不需要这一层 —— AutoClaw / Accio / ZCode 的两版
+ * 是**两张卡**，各自的注册名就是各自的身份。
+ */
+export const WORKBUDDY_ENTRY_LABEL = 'WorkBuddy'
 
 export function configOf(providerId: string): ProviderConfig | undefined {
   return BUILTIN_CONFIGS.find(item => item.provider === providerId)

@@ -80,13 +80,19 @@ static ROUTE_CURSOR: AtomicUsize = AtomicUsize::new(0);
 pub struct CooldownKeys<'a> {
     /// 客户端请求名（原始形态，未解析）
     requested: &'a str,
+    /// 管理模型测试已校验的上游真名，跳过普通绑定解析。
+    wire_model: Option<&'a str>,
     /// provider id → 该家收到的上游真名
     resolved: Mutex<HashMap<String, String>>,
 }
 
 impl<'a> CooldownKeys<'a> {
     pub fn new(requested: &'a str) -> Self {
-        Self { requested, resolved: Mutex::new(HashMap::new()) }
+        Self { requested, wire_model: None, resolved: Mutex::new(HashMap::new()) }
+    }
+
+    pub fn for_wire_model(wire_model: &'a str) -> Self {
+        Self { wire_model: Some(wire_model), ..Self::new(wire_model) }
     }
 
     /// 该家实际收到的上游模型名 —— 也就是它的冷却键。
@@ -98,6 +104,9 @@ impl<'a> CooldownKeys<'a> {
     /// 锁中毒（别的线程 panic 过）时**不做缓存**、直接现算 —— 缓存只是加速，
     /// 选路结果不该因为一个内部加速器而失败。
     pub fn for_provider(&self, provider_id: &str) -> String {
+        if let Some(wire_model) = self.wire_model {
+            return wire_model.to_string();
+        }
         if self.requested.is_empty() || provider_id.is_empty() {
             return self.requested.to_string();
         }
@@ -291,6 +300,48 @@ fn pick_account_with_strategy(
     strategy: crate::server::config::AccountSelectionStrategy,
     advance_cursor: bool,
 ) -> Option<Value> {
+    let mut candidates = eligible_accounts(accounts, keys, counts, exclude_ids, now, true);
+    if candidates.is_empty() {
+        return None;
+    }
+
+    match strategy {
+        crate::server::config::AccountSelectionStrategy::CacheAffinity => {
+            // 无会话上下文的预览只读：不建立绑定、不推进原策略游标。
+            candidates.sort_by(|left, right| load_score(left, counts)
+                .partial_cmp(&load_score(right, counts)).unwrap_or(std::cmp::Ordering::Equal));
+            candidates.into_iter().next()
+        }
+        crate::server::config::AccountSelectionStrategy::Priority => {
+            candidates.into_iter().next()
+        }
+        crate::server::config::AccountSelectionStrategy::RoundRobin => {
+            let len = candidates.len();
+            choose_by_cursor(candidates, advance_cursor, len)
+        }
+        crate::server::config::AccountSelectionStrategy::Balanced => {
+            candidates.sort_by(|left, right| {
+                load_score(left, counts)
+                    .partial_cmp(&load_score(right, counts))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let best = load_score(&candidates[0], counts);
+            let tie_len = candidates.iter().take_while(|account|
+                (load_score(account, counts) - best).abs() < f64::EPSILON).count();
+            choose_by_cursor(candidates, advance_cursor, tie_len)
+        }
+    }
+}
+
+/// 实际亲和分配和旧策略共用资格判定；仅调用方选择是否排除忙账号。
+pub(crate) fn eligible_accounts(
+    accounts: &[Value],
+    keys: &CooldownKeys<'_>,
+    counts: &HashMap<String, usize>,
+    exclude_ids: &[String],
+    now: i64,
+    check_capacity: bool,
+) -> Vec<Value> {
     let policy = super::workbuddy_policy::RoutePolicy::load();
     let mut candidates: Vec<Value> = accounts
         .iter()
@@ -304,49 +355,13 @@ fn pick_account_with_strategy(
             usability_with_policy(account, keys, now, &policy).usable
                 // 并发过滤放在 usability 之后：先答「这个账号让不让你用」，
                 // 再答「它忙不忙」—— 禁用 / 限流的原因不变，这里只追加一条。
-                && !at_concurrency_limit(account, id, counts)
+                && (!check_capacity || !at_concurrency_limit(account, id, counts))
         })
         .cloned()
         .collect();
-    if candidates.is_empty() {
-        return None;
-    }
-
-    match strategy {
-        crate::server::config::AccountSelectionStrategy::Priority => {
-            candidates.sort_by(compare_by_priority);
-            policy.reorder(&mut candidates, &keys.for_provider("workbuddy"), now);
-            candidates.into_iter().next()
-        }
-        crate::server::config::AccountSelectionStrategy::RoundRobin => {
-            // 保留账号页的主备排序作为轮询的稳定基准；WorkBuddy 的福利策略
-            // 仍作为同一候选池的次级顺序，不会绕过余额保底过滤。
-            candidates.sort_by(compare_by_priority);
-            policy.reorder(&mut candidates, &keys.for_provider("workbuddy"), now);
-            let len = candidates.len();
-            choose_by_cursor(candidates, advance_cursor, len)
-        }
-        crate::server::config::AccountSelectionStrategy::Balanced => {
-            // 福利/到期/成本策略先形成稳定的次级顺序，再由负载作为主排序键；
-            // `sort_by` 是稳定排序，负载相同时仍保留该次级顺序，最后由游标
-            // 轮换同负载账号，避免空闲时永远命中同一优先级账号。
-            candidates.sort_by(compare_by_priority);
-            policy.reorder(&mut candidates, &keys.for_provider("workbuddy"), now);
-            candidates.sort_by(|left, right| {
-                load_score(left, counts)
-                    .partial_cmp(&load_score(right, counts))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            let best = load_score(&candidates[0], counts);
-            let tie_len = candidates
-                .iter()
-                .take_while(|account| {
-                    (load_score(account, counts) - best).abs() < f64::EPSILON
-                })
-                .count();
-            choose_by_cursor(candidates, advance_cursor, tie_len)
-        }
-    }
+    candidates.sort_by(compare_by_priority);
+    policy.reorder(&mut candidates, &keys.for_provider("workbuddy"), now);
+    candidates
 }
 
 /// 以「有效并发容量」归一化在途负载：有限上限使用 `count / limit`，不限上限
@@ -584,6 +599,32 @@ mod selection_tests {
             "enabled": true,
             "maxConcurrent": max_concurrent,
         })
+    }
+
+    #[test]
+    fn model_test_raw_wire_key_ignores_same_name_alias_cooldown() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        // 模拟已解析的同名 alias Raw -> Other；不改全局模型配置。
+        let ordinary = CooldownKeys::new("Raw");
+        ordinary.resolved.lock().unwrap().insert("raccoon".into(), "Other".into());
+        let tested = CooldownKeys::for_wire_model("Raw");
+        tested.resolved.lock().unwrap().insert("raccoon".into(), "Other".into());
+        let mut raw_cooled = account("raw-cooled", 1, 0);
+        raw_cooled["rateLimits"] = json!({"Raw":{"resetAt":100}});
+        let mut alias_cooled = account("alias-cooled", 2, 0);
+        alias_cooled["rateLimits"] = json!({"Other":{"resetAt":100}});
+        let accounts = vec![raw_cooled, alias_cooled];
+        assert!(is_rate_limited(&accounts[0], &tested, 0));
+        assert!(!is_rate_limited(&accounts[1], &tested, 0));
+        for (keys, expected) in [(&ordinary, "raw-cooled"), (&tested, "alias-cooled")] {
+            let picked = pick_account_with_strategy(
+                &accounts, keys, &HashMap::new(), &[], 0,
+                crate::server::config::AccountSelectionStrategy::Priority, false,
+            ).expect("应有未冷却账号");
+            assert_eq!(picked["id"], expected);
+        }
+        // 成本排序与积分资格判定同样使用该解析器，不再读取普通映射名。
+        assert_eq!(tested.for_provider("workbuddy"), "Raw");
     }
 
     #[test]

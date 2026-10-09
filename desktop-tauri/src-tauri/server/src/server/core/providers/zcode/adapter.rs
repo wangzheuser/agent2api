@@ -96,63 +96,48 @@ impl ProviderAdapter for ZcodeAdapter {
     }
 
     /// 两地共用的默认等级绑定；客户端显式字段优先，能力按上游模型判定。
-    fn reasoning_patch(&self, level: &str, model: &str, body: &Value) -> ReasoningPatch {
-        if body.get(REASONING_FIELD).is_some()
+    fn reasoning_patch(&self, level: &str, model: &str, body: &Value, force: bool) -> ReasoningPatch {
+        if !force && (body.get(REASONING_FIELD).is_some()
             || body
                 .pointer("/thinking/type")
                 .and_then(Value::as_str)
-                .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("disabled"))
+                .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("disabled")))
         {
             return ReasoningPatch::Skip {
                 reason: "客户端请求体里已指定思考参数，绑定不覆盖",
             };
         }
-        if super::reasoning::is_glm53(model) {
-            if crate::server::core::model_rules::reasoning_rank(level).is_none() {
-                return ReasoningPatch::Skip {
-                    reason: "该等级不在通用档位表内（自定义等级不参与转发）",
-                };
-            }
-            return match super::reasoning::normalize(Some(level)) {
-                Some(effort) => ReasoningPatch::Set {
-                    field: super::reasoning::EFFORT_FIELD,
-                    value: Value::String(effort.as_str().to_string()),
-                },
-                None => ReasoningPatch::Skip {
-                    reason: "该等级没有可翻译的 ZCode 目标值",
-                },
+        if !super::reasoning::is_glm53(model) && !super::reasoning::is_glm52(model) {
+            return ReasoningPatch::Skip {
+                reason: "该模型没有已确认的 ZCode 思考档位（目前只有 GLM-5.2 / 5.3 家族）",
             };
         }
-        let Some(effort) = normalize_effort(model, level) else {
+        if crate::server::core::model_rules::reasoning_rank(level).is_none() {
             return ReasoningPatch::Skip {
-                reason: "模型或绑定等级没有已确认的 ZCode 思考等级映射",
+                reason: "该等级不在通用档位表内（自定义等级不参与转发）",
             };
-        };
-        ReasoningPatch::Set {
-            field: REASONING_FIELD,
-            value: Value::String(effort.to_string()),
+        }
+        match super::reasoning::target_effort(model, Some(level)) {
+            Some(value) => ReasoningPatch::Set {
+                field: super::reasoning::EFFORT_FIELD,
+                value: Value::String(value.to_string()),
+            },
+            None => ReasoningPatch::Skip {
+                reason: "该等级没有可翻译的 ZCode 目标值",
+            },
         }
     }
 
     /// 随请求上行的思考等级（请求日志「上游等级」列的采集口）。
     fn outbound_reasoning(&self, body: &Value) -> Option<String> {
         let model = body.get("model").and_then(Value::as_str).unwrap_or("");
-        if let Some(level) = body
+        let declared = body
             .get(super::reasoning::EFFORT_FIELD)
-            .and_then(Value::as_str)
-            .filter(|_| super::reasoning::is_glm53(model))
-            .and_then(|level| super::reasoning::normalize(Some(level)))
-        {
-            return Some(level.as_str().to_string());
-        }
-        if let Some(level) = body
-            .get(REASONING_FIELD)
-            .and_then(Value::as_str)
-            .and_then(|level| normalize_effort(model, level))
-        {
+            .and_then(Value::as_str);
+        if let Some(level) = super::reasoning::target_effort(model, declared) {
             return Some(level.to_string());
         }
-        if let Some(level) = body.get(REASONING_FIELD).and_then(Value::as_str) {
+        if let Some(level) = declared {
             return Some(level.to_string());
         }
         crate::server::core::model_rules::read_client_level(body)
@@ -262,6 +247,19 @@ impl ProviderAdapter for ZcodeAdapter {
         ))
     }
 
+    /// 推理请求恒为 stream:true；ZCode 的 JSON 响应是业务拒绝，HTTP 200
+    /// 也要先读错误体（实测 1005 / exceed quota limit），不能当 SSE 消费。
+    fn is_error_response(&self, status: u16, headers: &HeaderMap) -> bool {
+        if !(200..300).contains(&status) {
+            return true;
+        }
+        headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+    }
+
     /// 上游错误分类。
     ///
     ///   - `401` → TokenExpired（编排层会刷新后同账号重试一次；本家当前的
@@ -270,6 +268,8 @@ impl ProviderAdapter for ZcodeAdapter {
     ///     上游不给结构化的恢复时间，`reset_at` 给 None 让冷却走兜底时长。
     ///     「套餐已到期」也是这条 —— 上游用 429 表达它，而**换通道**
     ///     （账号设置里的「使用套餐」）才是出路，见 `plan` 的模块头）
+    ///   - 业务码 `1005` → QuotaLimited / 429（活动套餐可用 HTTP 200 返回
+    ///     exceed quota limit；不猜测额度恢复时间）
     ///   - 其余 → 交给共用的内容拦截判定（`content_block`），
     ///     与其余各家同一口径 —— 编码套餐同样会有内容策略拦截
     ///
@@ -317,14 +317,17 @@ impl ProviderAdapter for ZcodeAdapter {
         if status == 401 {
             return UpstreamErrorClass::TokenExpired { message };
         }
-        if status == 429 {
+        if status == 429 || code == Some(1005) {
             return UpstreamErrorClass::QuotaLimited {
                 reset_at: None,
                 message,
                 upstream_code: code,
-                status,
+                status: 429,
             };
         }
+        // 被响应头检查拒绝的 2xx JSON 必须产生失败状态；保留原始 HTTP
+        // 状态在 message 中，未知业务码不猜测为凭证失效或额度用尽。
+        let status = if (200..300).contains(&status) { 502 } else { status };
         content_block::classify_or_fatal(status, error_body, message, code)
     }
 

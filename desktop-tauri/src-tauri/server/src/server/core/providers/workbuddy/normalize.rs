@@ -361,6 +361,41 @@ fn inject_prompt_cache_key(
     );
 }
 
+/// 会话亲和策略覆盖自动键；显式非空键继续原样保留。
+pub(crate) fn apply_route_cache_key(
+    body: &mut Value,
+    account: &Value,
+    original: &Value,
+    context: &crate::server::core::upstream::route_session::RouteSession,
+    provider: &str,
+) {
+    if original
+        .get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .is_some_and(|key| !key.trim().is_empty())
+    {
+        return;
+    }
+    let uid = account_uid(account);
+    let target = context.for_target(provider, &uid);
+    if let Some(object) = body.as_object_mut() {
+        object.insert(
+            "prompt_cache_key".into(),
+            Value::String(build_cache_key(&uid, &target)),
+        );
+    }
+}
+
+pub(crate) fn route_session_id(
+    account: &Value,
+    context: &crate::server::core::upstream::route_session::RouteSession,
+    provider: &str,
+) -> Option<String> {
+    let uid = account_uid(account);
+    // 没有可靠账号身份时保留原逐请求头，不建立跨账号共享稳定标识。
+    (!uid.is_empty()).then(|| context.for_target(provider, &uid))
+}
+
 /// 生成 `wb2a-<uid8>-<convHex>` 形态的稳定缓存键。
 ///
 /// `uid8` 提供账号隔离段；`convHex = sha256(uid + "|" + conversation)` 前 16 字节

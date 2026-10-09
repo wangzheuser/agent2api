@@ -1,4 +1,6 @@
 //! 思考等级绑定（`mappings[].reasoning`）—— R7，照抄 OmniProxy 的**手动绑定**形态。
+//! `reasoning` 保持客户端优先的默认语义；独立 `reasoningOverride` 配置优先于客户端。
+//! 强制等级仍复用提供商的档位翻译；不支持时明确报错，不降级为默认绑定。
 //!
 //! ── 为什么单独一个文件 ──────────────────────────────────────
 //! 与 `cline.rs` 拆出去的同一理由（见那里的模块头）：这一段有自己的候选表、
@@ -210,4 +212,27 @@ pub fn read_client_level(body: &Value) -> Option<String> {
         }
     }
     None
+}
+
+/// 仅在强制等级成功翻译后清除冲突的请求控制；不碰消息里的思考内容。
+pub fn clear_client_controls(body: &mut Value) {
+    let Some(object) = body.as_object_mut() else { return; };
+    for key in ["reasoning_effort", "reasoningEffort", "effort", "thinking"] {
+        object.remove(key);
+    }
+    if object.get("reasoning").is_some_and(|value| !value.is_object()) {
+        object.remove("reasoning");
+    }
+    for (parent, field) in [("reasoning", "effort"), ("output_config", "effort"), ("properties", "reasoning_effort")] {
+        if let Some(value) = object.get_mut(parent).and_then(Value::as_object_mut) {
+            value.remove(field);
+            if value.is_empty() { object.remove(parent); }
+        }
+    }
+}
+
+/// 强制配置错误不应被当作上游故障，换到另一家后悄悄恢复默认。
+pub const OVERRIDE_ERROR_CODE: &str = "reasoning_override_unsupported";
+pub fn override_error(message: impl Into<String>) -> crate::server::errors::GatewayError {
+    crate::server::errors::GatewayError::bad_request(message).with_code(OVERRIDE_ERROR_CODE)
 }

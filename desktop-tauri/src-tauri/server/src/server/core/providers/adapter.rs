@@ -142,8 +142,9 @@ pub struct ChatRequestPlan {
 impl ChatRequestPlan {
     /// 标准形态：上游说 OpenAI Chat（请求体与响应帧都是 chat 形态）。
     ///
-    /// 七家内置上游里的六家（以及自定义家）都是这一种；只有 ZCode 的活动套餐
-    /// 通道说 Anthropic（见 [`UpstreamResponse::Anthropic`]）。写成构造器而不是
+    /// 七家内置上游里的大多数（以及自定义家）都是这一种；ZCode 的活动套餐
+    /// 通道说 Anthropic（见 [`UpstreamResponse::Anthropic`]），WorkBuddy 使用
+    /// [`Self::workbuddy`] 保留自己的终态证据规则。写成构造器而不是
     /// 让各家手写字段，是为了「响应协议」这一个新字段不给七处调用点各留一次
     /// 写错的机会。
     pub fn chat(url: String, headers: Vec<(String, String)>, body: Value) -> Self {
@@ -152,6 +153,17 @@ impl ChatRequestPlan {
             headers,
             body,
             response: UpstreamResponse::Chat,
+        }
+    }
+
+    /// WorkBuddy 的响应仍是 Chat SSE，但部分成功流以非空 `finish_reason`
+    /// 作为终态，可能不再追加 `[DONE]`；亲和证据需要按该协议单独判定。
+    pub fn workbuddy(url: String, headers: Vec<(String, String)>, body: Value) -> Self {
+        Self {
+            url,
+            headers,
+            body,
+            response: UpstreamResponse::WorkBuddy,
         }
     }
 }
@@ -163,15 +175,18 @@ impl ChatRequestPlan {
 /// 本项目的历史前提是「所有上游都说 Chat」（见 `protocol` 的模块头），于是
 /// 无状态转发路径的下行帧一律按 chat SSE 处理。ZCode 的活动套餐通道打破了这个
 /// 前提：它的推理端点是 Anthropic Messages（`stream:true` 时吐 Anthropic 事件
-/// 流）。与其为一家新写一条「适配器自己转发」的路（那会丢掉账号轮换、限额冷却、
-/// 退避重试、usage 与取消处理，见 `upstream::provider_loop` 的有状态路径说明），
-/// 不如把「响应要说另一种协议」做成计划里的一个字段 —— 编排层只多一次分支，
-/// 其余全都共用。
+/// 流）。WorkBuddy 仍是 Chat SSE，但部分成功流以 `finish_reason` 收尾而不附带
+/// `[DONE]`，因此需要单独的证据口径。与其为一家新写一条「适配器自己转发」的
+/// 路（那会丢掉账号轮换、限额冷却、退避重试、usage 与取消处理，见
+/// `upstream::provider_loop` 的有状态路径说明），不如把响应证据协议做成计划里的
+/// 一个字段 —— 编排层仍复用同一条转发链。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum UpstreamResponse {
     /// OpenAI Chat SSE（默认）
     #[default]
     Chat,
+    /// WorkBuddy Chat SSE：允许真实 `finish_reason` 作为上游终态。
+    WorkBuddy,
     /// Anthropic Messages SSE：下发前折回标准 chat SSE（见 `upstream::translate`）
     Anthropic,
 }
@@ -379,6 +394,19 @@ pub trait ProviderAdapter: Send + Sync {
         client_headers: &HeaderMap,
     ) -> Result<ChatRequestPlan, GatewayError>;
 
+    /// 可靠会话的发送前装饰；仅会话亲和策略调用，其他提供商保持原计划。
+    fn apply_route_session(
+        &self,
+        _plan: &mut ChatRequestPlan,
+        _account: &Value,
+        _original_body: &Value,
+        _context: &crate::server::core::upstream::route_session::RouteSession,
+    ) {
+    }
+
+    /// 可靠会话亲和请求的每次实际发送刷新；默认不修改其他提供商的头。
+    fn refresh_route_request_id(&self, _headers: &mut Vec<(String, String)>) {}
+
     /// 一次性请求凭证的提供商：重试须重新构造计划，禁止复用旧请求头。
     fn request_is_single_use(&self, _account: &Value) -> bool {
         false
@@ -451,7 +479,8 @@ pub trait ProviderAdapter: Send + Sync {
     /// `model` 是**即将发给上游的那个名字**（已按家改写，见 `WireTarget.model`）：
     /// 需要按模型判断档位的家（Qoder 要拿它去查模型的 `efforts`）用它，
     /// 不看模型的家忽略它。
-    fn reasoning_patch(&self, _level: &str, _model: &str, _body: &Value) -> ReasoningPatch {
+    /// `force` 只绕过客户端优先判定，不绕过提供商/模型的能力和等级校验。
+    fn reasoning_patch(&self, _level: &str, _model: &str, _body: &Value, _force: bool) -> ReasoningPatch {
         ReasoningPatch::Skip {
             reason: "该提供商不支持思考等级绑定（上游无对应字段）",
         }
@@ -485,6 +514,14 @@ pub trait ProviderAdapter: Send + Sync {
     fn outbound_reasoning(&self, body: &Value) -> Option<String> {
         crate::server::core::model_rules::read_client_level(body)
             .filter(|level| !crate::server::core::model_rules::reasoning_is_off(level))
+    }
+
+    /// 响应头是否表明上游错误；默认沿用 HTTP 非 2xx 的判定。
+    ///
+    /// 部分流式上游用 HTTP 200 + application/json 返回业务错误，适配器可
+    /// 在成功流交给客户端之前将它送入既有错误读取、分类与账号轮换流程。
+    fn is_error_response(&self, status: u16, _headers: &HeaderMap) -> bool {
+        !(200..300).contains(&status)
     }
 
     /// 判定上游错误类型（status + 已解析的错误体）。
@@ -994,6 +1031,9 @@ pub fn usage_not_configured(provider_label: &str, field_hint: &str) -> GatewayEr
 pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
     match kind {
         ProviderKind::WorkBuddy => &super::workbuddy::WORKBUDDY_ADAPTER,
+        // WorkBuddy 的两个地区是两个 provider、两个实例（同一份实现的按地区
+        // 参数化，见 `workbuddy::region` 与 `workbuddy::adapter` 的模块头）
+        ProviderKind::WorkBuddyIntl => &super::workbuddy::WORKBUDDY_INTL_ADAPTER,
         ProviderKind::Raccoon => &super::raccoon::RACCOON_ADAPTER,
         ProviderKind::CatPaw => &super::catpaw::adapter::CATPAW_ADAPTER,
         ProviderKind::AutoClaw => &super::autoclaw::AUTOCLAW_ADAPTER,
@@ -1017,6 +1057,7 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         ProviderKind::Trae => &super::trae::adapter::TRAE_ADAPTER,
         ProviderKind::MiniMaxCode => &super::minimax_code::MINIMAX_CODE_ADAPTER,
         ProviderKind::LobsterAI => &super::lobsterai::adapter::LOBSTERAI_ADAPTER,
+        ProviderKind::Loomy => &super::loomy::LOOMY_ADAPTER,
     }
 }
 
@@ -1053,6 +1094,11 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
 pub fn implemented_kinds() -> Vec<ProviderKind> {
     vec![
         ProviderKind::WorkBuddy,
+        // WorkBuddy 国际版算一家：与国内版各自一份模型清单（`/v3/config` 打
+        // 各自的站点）、各自的缓存槽与刷新排期 —— 两家都必须在本列表里，
+        // 否则国际版的目录刷新永远不会被调度（症状是「国际版账号加了、
+        // 模型列表一直是内置兜底」）。
+        ProviderKind::WorkBuddyIntl,
         ProviderKind::Raccoon,
         ProviderKind::CatPaw,
         ProviderKind::AutoClaw,
@@ -1080,6 +1126,7 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         ProviderKind::Trae,
         ProviderKind::MiniMaxCode,
         ProviderKind::LobsterAI,
+        ProviderKind::Loomy,
     ]
 }
 
@@ -1160,14 +1207,23 @@ fn seed_current_raccoon_defaults() {
 /// 与 `seed_current_raccoon_defaults` 同理：刷新可能因失败 / 无登录态而不落地
 /// 新清单 —— 那条路径上没有种子可挂，启动后手里的这份清单（内置或旧缓存）
 /// 也要有同样的默认值。幂等：种过的 id 不会再动。
+///
+/// **两个地区各跑一遍**（拆家后各有各的清单与 provider 键）：种子按
+/// `(provider, id)` 记账，只种国内版会让国际版的新模型停在全开状态，
+/// 而两家的模型名很可能同名。
 fn seed_current_workbuddy_defaults() {
-    let ids: Vec<String> = crate::server::core::models::global_catalog()
-        .list()
-        .iter()
-        .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_string))
-        .collect();
-    if let Some(summary) = crate::server::core::model_rules::seed_workbuddy_defaults(&ids) {
-        crate::server::logging::log("[Models]", &summary);
+    for region in super::workbuddy::Region::ALL {
+        let ids: Vec<String> = crate::server::core::models::global_catalog(region)
+            .list()
+            .iter()
+            .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        if let Some(summary) = crate::server::core::model_rules::seed_workbuddy_defaults(
+            region.provider_id(),
+            &ids,
+        ) {
+            crate::server::logging::log("[Models]", &summary);
+        }
     }
 }
 

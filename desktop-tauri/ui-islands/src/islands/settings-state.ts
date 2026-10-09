@@ -52,6 +52,7 @@ import {
   toast,
   type AppSettings,
   type AccountSelection,
+  type ClineHeadersData,
   type GatewayBlocks,
   type NumberField,
   type PromptPatch,
@@ -77,6 +78,8 @@ export type BusyScope =
   | 'accountSelection'
   | 'debug'
   | 'sanitize'
+  | 'clineHeaders'
+  | 'cors'
   | 'prompt'
   | 'captcha'
   | 'export'
@@ -119,6 +122,17 @@ export type DebugState = {
 }
 
 export type SanitizeState = { status: LoadStatus; on: boolean }
+
+/** Cline 伪装头：三份表（默认 / 覆盖 / 生效）都来自后端，界面据此渲染与判断改动 */
+export type ClineHeadersState = {
+  status: LoadStatus
+  defaults: Record<string, string>
+  overrides: Record<string, string>
+  effective: Record<string, string>
+}
+
+/** 网关面（/v1/*）跨域访问开关；与 SanitizeState 同形 */
+export type CorsState = { status: LoadStatus; on: boolean }
 
 export type PromptState = {
   status: LoadStatus
@@ -211,6 +225,8 @@ export type SettingsSnapshot = {
   accountSelection: { status: LoadStatus; value: AccountSelection }
   debug: DebugState
   sanitize: SanitizeState
+  clineHeaders: ClineHeadersState
+  cors: CorsState
   prompt: PromptState
   storage: StorageState
   captcha: { available: boolean; enabled: boolean }
@@ -264,6 +280,8 @@ const INITIAL: SettingsSnapshot = {
   accountSelection: { status: 'loading', value: 'balanced' },
   debug: { status: 'loading', on: false, count: null, limit: null },
   sanitize: { status: 'loading', on: false },
+  clineHeaders: { status: 'loading', defaults: {}, overrides: {}, effective: {} },
+  cors: { status: 'loading', on: false },
   prompt: {
     status: 'loading',
     mode: 'passthrough',
@@ -927,7 +945,7 @@ export function renderAccountSelection(data?: unknown): void {
   })
 }
 
-export async function loadAccountSelection(): Promise<void> {
+async function loadAccountSelection(): Promise<void> {
   try {
     renderAccountSelection(await shared().workbuddyDesktop?.getAccountSelection())
   } catch (error) {
@@ -1145,6 +1163,106 @@ export async function saveSanitize(next: boolean): Promise<void> {
   } catch (error) {
     toast(`保存失败: ${errorMessage(error)}`, 'err')
     await loadSanitize() // 回滚到后端的真实值
+  } finally {
+    endBusy()
+  }
+}
+
+/* ─── Cline 伪装头（转发头的逐键覆盖）── */
+
+/** 非字符串值一律丢弃（后端只会给字符串，这里是给「形状不对的响应」兜底） */
+function asStringTable(value: unknown): Record<string, string> {
+  if (!value || typeof value !== 'object') return {}
+  const out: Record<string, string> = {}
+  for (const [key, text] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof text === 'string') out[key] = text
+  }
+  return out
+}
+
+export function renderClineHeaders(data?: unknown): void {
+  if (data === undefined) return
+  if (!data || typeof data !== 'object') {
+    publish({ clineHeaders: { status: 'unavailable', defaults: {}, overrides: {}, effective: {} } })
+    return
+  }
+  const record = data as ClineHeadersData
+  publish({
+    clineHeaders: {
+      status: 'ready',
+      defaults: asStringTable(record.defaults),
+      overrides: asStringTable(record.overrides),
+      effective: asStringTable(record.effective),
+    },
+  })
+}
+
+async function loadClineHeaders(): Promise<void> {
+  try {
+    renderClineHeaders(await shared().workbuddyDesktop?.getClineHeaders())
+  } catch (error) {
+    console.warn('读取 Cline 伪装头失败:', errorMessage(error))
+    renderClineHeaders(null)
+  }
+}
+
+export async function refreshClineHeaders(): Promise<void> {
+  await loadClineHeaders()
+  toast('Cline 伪装头已刷新')
+}
+
+/**
+ * 整体替换覆盖表（与后端 PUT 同语义）：伪装头面板把编辑后的整张表提交 ——
+ * 默认行「值改回了默认」就不进表、值留空 = 该头不发、删掉的行 = 回落默认。
+ * 空表 = 全部回落默认（「恢复默认」按钮就是存一份空表）。
+ */
+export async function saveClineHeaders(overrides: Record<string, string>): Promise<void> {
+  if (busyScope) { repaint(); return }
+  beginBusy('clineHeaders')
+  try {
+    const saved = await shared().workbuddyDesktop?.saveClineHeaders(overrides)
+    renderClineHeaders(saved)
+    toast('✅ Cline 伪装头已保存')
+  } catch (error) {
+    toast(`保存失败: ${errorMessage(error)}`, 'err')
+    await loadClineHeaders() // 回滚到后端的真实值
+  } finally {
+    endBusy()
+  }
+}
+
+/* ─── 网关面跨域访问（/v1/* 的 CORS，默认关）── */
+
+export function renderCors(data?: unknown): void {
+  if (data === undefined) return
+  if (!data || typeof data !== 'object') {
+    publish({ cors: { status: 'unavailable', on: false } })
+    return
+  }
+  const record = data as Record<string, unknown>
+  publish({ cors: { status: 'ready', on: record.corsEnabled === true } })
+}
+
+async function loadCors(): Promise<void> {
+  try {
+    renderCors(await shared().workbuddyDesktop?.getCors())
+  } catch (error) {
+    console.warn('读取网关跨域访问设置失败:', errorMessage(error))
+    renderCors(null)
+  }
+}
+
+export async function saveCors(next: boolean): Promise<void> {
+  if (busyScope) { repaint(); return }
+  beginBusy('cors')
+  publish({ cors: { status: 'ready', on: next } })
+  try {
+    const saved = await shared().workbuddyDesktop?.saveCors(next)
+    renderCors(saved)
+    toast(next ? '网关跨域访问已开启' : '已关闭网关跨域访问')
+  } catch (error) {
+    toast(`保存失败: ${errorMessage(error)}`, 'err')
+    await loadCors() // 回滚到后端的真实值
   } finally {
     endBusy()
   }
@@ -1677,6 +1795,8 @@ export async function load(): Promise<void> {
     loadAccountSelection(),
     loadDebug(),
     loadSanitize(),
+    loadClineHeaders(),
+    loadCors(),
     loadPrompt(),
     loadStorage(),
     loadCaptcha(),
@@ -1720,6 +1840,11 @@ export async function refreshDebug(): Promise<void> {
 export async function refreshSanitize(): Promise<void> {
   await loadSanitize()
   toast('指纹脱敏设置已刷新')
+}
+
+export async function refreshCors(): Promise<void> {
+  await loadCors()
+  toast('网关跨域访问设置已刷新')
 }
 
 export async function refreshPrompt(): Promise<void> {

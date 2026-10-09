@@ -106,13 +106,20 @@ pub(super) async fn session_for(
 /// `keys` 是请求名到各家上游真名的解析器：限额冷却按**真名**判定（理由见
 /// `routing::CooldownKeys`）—— 传请求名会让别名请求的冷却查不到、已限额的
 /// 账号被反复选中。第三级「恢复最早的那个」同样按真名读 `resetAt`。
+///
+/// `pinned` 是「这一轮只准用这个账号」（模型测试专用，见
+/// [`super::ForwardRequest::pinned_account`]）：候选池先被它收窄成一个账号，
+/// 上面那三级顺序对**那一个账号**照常生效 —— 它在限额冷却期时仍会被选中发一次，
+/// 这正是测试要的（把上游真实的 429 与恢复时间带回来，而不是换别人跑一遍）。
 pub(super) async fn select_target_account(
     service: &UpstreamService,
     providers: &[&str],
     keys: &routing::CooldownKeys<'_>,
     tried_ids: &[String],
+    pinned: Option<&str>,
+    affinity: Option<&super::payload::ProviderContext<'_>>,
 ) -> Result<RouteTarget, GatewayError> {
-    let accounts = accounts_in_providers(service, providers);
+    let accounts = accounts_in_providers(service, providers, pinned);
     // 这些家都没有账号记录 → 用第一家的默认登录态（环境变量旁路等）
     if accounts.is_empty() {
         return Ok(RouteTarget {
@@ -130,6 +137,46 @@ pub(super) async fn select_target_account(
     let counts = connection_counts(service);
     let mut excluded: Vec<String> = tried_ids.to_vec();
     let now = logging::now_ms();
+    if let Some(context) = affinity {
+        let session_key = context.route_session.map(|session| session.key.as_str());
+        let telemetry = context.telemetry;
+        let epoch = context.affinity_epoch;
+        telemetry.begin_affinity_attempt(service.affinity.clone(), "", None, epoch);
+        // 凭证和模型解析均在亲和锁外；只把身份摘要带入内存候选。
+        let healthy = routing::eligible_accounts(&accounts, keys, &counts, &excluded, now, false);
+        let mut reusable = Vec::with_capacity(healthy.len());
+        for mut account in healthy {
+            let Some(id) = routing::account_id(&account) else { continue; };
+            let Some(entry) = service.store.get_session_by_id(id) else { continue; };
+            let session = entry.session;
+            let identity = super::payload::affinity_target_identity(&service.store, &account, &session, context.body);
+            account["_affinityIdentity"] = identity;
+            reusable.push(account);
+        }
+        let normal: Vec<Value> = reusable.iter().filter(|account| {
+            let cap = routing::max_concurrent_of(account);
+            let count = routing::account_id(account).and_then(|id| counts.get(id)).copied().unwrap_or(0);
+            cap == 0 || (count as u64) < cap
+        }).cloned().collect();
+        if let Some(selection) = service.affinity.select_in_epoch(session_key, &normal, &reusable, &counts, epoch) {
+            let picked = selection.account;
+            if let Some(id) = routing::account_id(&picked).map(str::to_string) {
+                if let Some(entry) = service.store.get_session_by_id(&id) {
+                    let identity = super::payload::affinity_target_identity(&service.store, &picked, &entry.session, context.body);
+                    telemetry.begin_affinity_attempt(service.affinity.clone(), &id, selection.lease, epoch);
+                    telemetry.validate_affinity_identity(&identity);
+                    telemetry.guard_affinity_identity(service.store.clone(), &picked, context.body, &identity);
+                    let mut target = with_proxy_notice(picked, entry.proxy, entry.proxy_error, id);
+                    let notice = format!("会话均衡亲和: {}", selection.reason);
+                    target.proxy_notice = Some(match target.proxy_notice {
+                        Some(existing) => format!("{existing}；{notice}"),
+                        None => notice,
+                    });
+                    return Ok(target);
+                }
+            }
+        }
+    }
     loop {
         let picked = routing::pick_account_by_priority(&accounts, keys, &counts, &excluded, now);
         let Some(picked) = picked else {
@@ -239,16 +286,30 @@ pub(super) use crate::server::core::routing::provider_of;
 /// 只会让签名更长；而它是**冷却键口径**的单一事实来源，不该在别处再写一遍。
 pub(super) use crate::server::core::routing::CooldownKeys;
 
-/// 候选账号池：`providers` 里各家的全部账号（公开形态，文件顺序）。
+/// 候选账号池：`providers` 里各家的全部账号（公开形态，文件顺序）；
+/// `pinned` 非空时再收窄成**那一个账号**（模型测试，见
+/// [`select_target_account`] 对该参数的说明）。
 ///
 /// 为什么在公开快照上过滤而不是用 `store.accounts_for_provider`：后者按
 /// 「启用且有凭证」过滤掉了禁用账号，而本模块的第三级选路（全禁用 → 503）
 /// 必须**看见**禁用账号才能给出准确文案。两者口径不同、各有用途。
-pub(super) fn accounts_in_providers(service: &UpstreamService, providers: &[&str]) -> Vec<Value> {
+///
+/// 收窄只做「过滤」，不报错也不回退：钉住的账号不在这几家（账号被删了、
+/// 或认错了家）时得到的是空池 —— 上游那条路径会照常给出「这些家都没有账号」
+/// 的既有语义，不会静默换一个账号去跑。
+pub(super) fn accounts_in_providers(
+    service: &UpstreamService,
+    providers: &[&str],
+    pinned: Option<&str>,
+) -> Vec<Value> {
     let snapshot = service.store.list_accounts();
     routing::accounts_of(&snapshot)
         .into_iter()
         .filter(|account| providers.contains(&provider_of(account)))
+        .filter(|account| match pinned {
+            Some(id) => routing::account_id(account) == Some(id),
+            None => true,
+        })
         .collect()
 }
 
@@ -426,13 +487,18 @@ pub(super) fn connection_counts(service: &UpstreamService) -> HashMap<String, us
 /// `keys` 见 [`select_target_account`]：冷却按各家真名判定。
 /// 走与第一级选路同一个 `pick_account_by_priority`，因此沿用当前策略和并发上限过滤
 /// （与软上限口径）由此自动获得 —— 换号顺延不会把请求塞回一个已达上限的账号。
+///
+/// `pinned` 见 [`select_target_account`]：钉住账号时，候选池里只有那一个账号、
+/// 它已经在 `tried_ids` 里 —— 本函数因此必然返回 None，也就是「不顺延」。
+/// 这条是刻意的：模型测试问的是「这个账号行不行」，换个人跑通只会把结论搅浑。
 pub(super) fn pick_next_account(
     service: &UpstreamService,
     providers: &[&str],
     keys: &routing::CooldownKeys<'_>,
     tried_ids: &[String],
+    pinned: Option<&str>,
 ) -> Option<Value> {
-    let accounts = accounts_in_providers(service, providers);
+    let accounts = accounts_in_providers(service, providers, pinned);
     let counts = connection_counts(service);
     routing::pick_account_peek(&accounts, keys, &counts, tried_ids, logging::now_ms())
 }
@@ -448,38 +514,38 @@ mod policy_tests {
         let (db, _temp) = crate::server::db::test_temp::TempDb::open("workbuddy-policy-routing");
         task_state::install(Some(db.clone()));
         let store = AccountStore::with_db(Some(db));
-        let add = |uid: &str| store.add_account(&json!({"account":{"uid":uid},"auth":{"accessToken":"fixture-token"},"edition":"cn"}),Some(uid)).unwrap();
+        let add = |uid: &str| store.add_account(&json!({"account":{"uid":uid},"auth":{"accessToken":"fixture-token"},"edition":"cn"}),Some(uid),Some("workbuddy")).unwrap();
         let a = add("policy-route-a"); let b = add("policy-route-b");
         let a_id = a["id"].as_str().unwrap(); let b_id = b["id"].as_str().unwrap();
         let identity_a = workbuddy_policy::identity(&a).unwrap();
         let identity_b = workbuddy_policy::identity(&b).unwrap();
         let service = UpstreamService::new(store.clone(),AuthService::for_store(store.clone()));
         let keys = routing::CooldownKeys::new("fixture-model");
-        let initial = select_target_account(&service,&["workbuddy"],&keys,&[]).await.unwrap();
+        let initial = select_target_account(&service,&["workbuddy"],&keys,&[],None,None).await.unwrap();
         assert_eq!(initial.account_id.as_deref(),Some(a_id));
         workbuddy_policy::patch_policy(a_id,&identity_a,&json!({"creditFloor":10})).unwrap();
         let now = logging::now_ms();
         let usage = json!({"creditDetails":{"kind":"personal","complete":true,"remaining":10,"fetchedAt":now,"segments":[]}});
         workbuddy_policy::observe_usage(&a,&usage);
         assert!(matches!(session_for(&service,"workbuddy",Some(a_id)).await,Err(error) if error.status_code==503));
-        let normal = select_target_account(&service,&["workbuddy"],&keys,&[]).await.unwrap();
+        let normal = select_target_account(&service,&["workbuddy"],&keys,&[],None,None).await.unwrap();
         assert_eq!(normal.account_id.as_deref(),Some(b_id));
         store.mark_rate_limited(b_id,"fixture-model",429,None,Some((now+60_000) as f64),"fixture cooldown");
-        let cooling = select_target_account(&service,&["workbuddy"],&keys,&[]).await.unwrap();
+        let cooling = select_target_account(&service,&["workbuddy"],&keys,&[],None,None).await.unwrap();
         assert_eq!(cooling.account_id.as_deref(),Some(b_id));
         store.update_account(b_id,&json!({"maxConcurrent":1})).unwrap();
         let mut connection = super::super::connections::ConnectionGuard::new(service.connections());
         connection.rebind(Some(b_id.to_string()));
-        let squeezed = select_target_account(&service,&["workbuddy"],&keys,&[]).await.unwrap();
+        let squeezed = select_target_account(&service,&["workbuddy"],&keys,&[],None,None).await.unwrap();
         assert_eq!(squeezed.account_id.as_deref(),Some(b_id));
         // 唯一未受保护的账号已经试过时，旧逻辑会返回默认会话，借回 A。
-        let failed = select_target_account(&service,&["workbuddy"],&keys,&[b_id.to_string()]).await;
+        let failed = select_target_account(&service,&["workbuddy"],&keys,&[b_id.to_string()],None,None).await;
         assert!(matches!(failed,Err(error) if error.status_code==503));
         workbuddy_policy::patch_policy(b_id,&identity_b,&json!({"creditFloor":0})).unwrap();
-        let all_blocked = select_target_account(&service,&["workbuddy"],&keys,&[]).await;
+        let all_blocked = select_target_account(&service,&["workbuddy"],&keys,&[],None,None).await;
         assert!(matches!(all_blocked,Err(error) if error.status_code==503));
         workbuddy_policy::patch_policy(a_id,&identity_a,&json!({"creditFloor":null})).unwrap();
-        let restored = select_target_account(&service,&["workbuddy"],&keys,&[]).await.unwrap();
+        let restored = select_target_account(&service,&["workbuddy"],&keys,&[],None,None).await.unwrap();
         assert_eq!(restored.account_id.as_deref(),Some(a_id));
     }
 }

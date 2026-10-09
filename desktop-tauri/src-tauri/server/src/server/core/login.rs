@@ -47,9 +47,11 @@ use crate::server::core::auth::{
     urlencoding, with_expires_at, AuthService, WorkBuddyAuthError, SERVER_CODE_RETRY_FETCH_TOKEN,
 };
 use crate::server::core::endpoints::{resolve_edition, Context, DEFAULT_EDITION};
+use crate::server::core::providers::workbuddy::Region;
 use crate::server::core::providers::adapter::adapter_for;
+use crate::server::core::providers::minimax_code::oauth as minimax_oauth;
 use crate::server::core::providers::raccoon::oauth;
-use crate::server::core::providers::{kind_from_id, kind_id, ProviderKind, DEFAULT_PROVIDER_ID};
+use crate::server::core::providers::{kind_from_id, kind_id, ProviderKind};
 use crate::server::errors::GatewayError;
 use crate::server::logging;
 
@@ -82,6 +84,7 @@ pub struct LoginTaskState {
     /// 空串在回调侧按「不认识」拒绝，不会静默落到某一家。
     pub provider: String,
     pub canceled: bool,
+    callback_claimed: bool,
     finished_at: Option<i64>,
 }
 
@@ -339,20 +342,22 @@ impl LoginService {
     ///
     /// 立刻返回任务句柄，登录流程在后台任务里跑 —— authUrl 与 state 由
     /// 回调写进句柄，调用方（`/api/session/login/start`）负责等它出现。
-    pub fn start(&self, edition: Option<&str>) -> LoginTaskHandle {
-        let info = resolve_edition(edition.or(Some(DEFAULT_EDITION)));
-        let handle = self.new_handle(info);
-        self.spawn_login(handle.clone(), info.id.to_string());
+    /// `region` 由**调用方按 provider id 反查**给出（国内版 / 国际版）。
+    ///
+    /// 拆家后不读 body 里的 `edition`：界面上两个地区是两个条目，点哪个就发
+    /// 哪个 provider id —— 那是权威。拿一个回显字段定地区，会出现「点了国际版
+    /// 却落了国内版账号」，而账号一旦落错家，转发会稳定打错域名
+    /// （与 `api::session` 里 ZCode 那段注释同一条理由）。
+    pub fn start(&self, region: Region) -> LoginTaskHandle {
+        let handle = self.new_handle_for_provider(region.edition(), region.provider_id());
+        self.spawn_login(handle.clone(), region);
         handle
     }
 
     /// 建一个任务句柄但不启动后台任务（`/auth/login` 的同步登录用它 ——
     /// 那条路径自己 await 登录流程，不能再起一个后台任务重复登录）
-    fn new_handle(
-        &self,
-        info: &'static crate::server::core::endpoints::EditionInfo,
-    ) -> LoginTaskHandle {
-        self.new_handle_for_provider(info, DEFAULT_PROVIDER_ID)
+    fn new_handle(&self, region: Region) -> LoginTaskHandle {
+        self.new_handle_for_provider(region.edition(), region.provider_id())
     }
 
     /// 同上，但显式指定 provider（网页登录的任务表要记住它，见 `LoginTaskState::provider`）。
@@ -375,6 +380,7 @@ impl LoginService {
                 edition: info.id.to_string(),
                 provider: provider.to_string(),
                 canceled: false,
+                callback_claimed: false,
                 finished_at: None,
             })),
             ticket,
@@ -414,6 +420,91 @@ impl LoginService {
             "[Login]",
             &format!("发起{label}网页登录（等待浏览器回调…）"),
         );
+        Ok(handle)
+    }
+
+    /// MiniMax Code 使用带 PKCE 的设备授权，不走网页登录回调。
+    pub async fn start_minimax_code_login(
+        &self,
+        name: Option<String>,
+    ) -> Result<LoginTaskHandle, String> {
+        let start = minimax_oauth::start_device_authorization()
+            .await
+            .map_err(|error| error.message)?;
+        let state = format!(
+            "minimax-code-{}",
+            crate::server::core::upstream::request::new_request_id()
+        );
+        let auth_url = start
+            .verification_uri_complete
+            .clone()
+            .unwrap_or_else(|| start.verification_uri.clone());
+        let handle = self.new_handle_for_provider(
+            resolve_edition(Some(DEFAULT_EDITION)),
+            "minimax-code",
+        );
+        handle.update(|task| {
+            task.state = Some(state.clone());
+            task.auth_url = Some(auth_url.clone());
+        });
+        self.tasks.register(&state, handle.clone());
+        let service = self.clone();
+        tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now()
+                + Duration::from_secs(start.expires_in_seconds.max(1));
+            let mut interval = start.interval_seconds.max(1);
+            loop {
+                let Some(task) = service.tasks.get(&state) else { return };
+                if task.snapshot().canceled {
+                    return;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    finish_task_error(&task, "MiniMax Code 登录超时，请重新发起登录");
+                    return;
+                }
+                tokio::time::sleep(Duration::from_secs(interval)).await;
+                let Some(task) = service.tasks.get(&state) else { return };
+                if task.snapshot().canceled {
+                    return;
+                }
+                match minimax_oauth::poll_device_token(&start.device_code, &start.code_verifier).await {
+                    Ok(minimax_oauth::DevicePoll::Pending { slow_down }) => {
+                        if slow_down {
+                            interval = interval.saturating_add(5);
+                        }
+                    }
+                    Ok(minimax_oauth::DevicePoll::Authorized(credentials)) => {
+                        let Some(task) = service.tasks.get(&state) else { return };
+                        if task.snapshot().canceled {
+                            return;
+                        }
+                        match service.store.add_minimax_code_account(
+                            &credentials,
+                            name.as_deref(),
+                            "web",
+                        ) {
+                            Ok(account) => {
+                                let account_id = account
+                                    .get("id")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string();
+                                finish_task(
+                                    &task,
+                                    &json!({"account": {"uid": account_id}, "edition": ""}),
+                                );
+                            }
+                            Err(error) => finish_task_error(&task, &error.message),
+                        }
+                        return;
+                    }
+                    Err(error) => {
+                        finish_task_error(&task, &error.message);
+                        return;
+                    }
+                }
+            }
+        });
         Ok(handle)
     }
 
@@ -557,15 +648,15 @@ impl LoginService {
     /// 命令行入口要的就是「等登录完成才响应」。任务句柄仍然建一个，
     /// 这样 authUrl 能被回调写进去（日志用它打印链接），登录结果也能
     /// 被 `/api/session/login/wait` 查到（与 Node 版共用 loginTasks 一致）。
-    pub async fn run_login(&self, edition: Option<&str>) -> Result<Value, WorkBuddyAuthError> {
-        let info = resolve_edition(edition.or(Some(DEFAULT_EDITION)));
+    pub async fn run_login(&self, region: Region) -> Result<Value, WorkBuddyAuthError> {
+        let info = region.edition();
         logging::log(
             "[Login]",
             &format!("发起{}登录（{}）…", info.label, info.endpoint),
         );
-        let handle = self.new_handle(info);
+        let handle = self.new_handle(region);
         let session = self
-            .login_interactive(Some(info.id), &handle, |url, _state| {
+            .login_interactive(region, &handle, |url, _state| {
                 logging::log("[Login]", "请在浏览器中打开以下链接并完成登录：");
                 logging::console_line("[Login]", &format!("  {url}"));
                 logging::log("[Login]", "登录完成后本网关将自动获取并保存 token…");
@@ -644,6 +735,9 @@ impl LoginService {
             return Err(GatewayError::with_status(400, "登录已取消，请重新发起"));
         }
         if task.done {
+            if let Some(error) = task.error.as_deref() {
+                return Err(GatewayError::with_status(400, error));
+            }
             // 幂等：同一个回调被送来两次（深链 + 导航各触发一次）不是错误
             return Ok(LoginCallbackSubmission::Completed(String::new()));
         }
@@ -654,6 +748,16 @@ impl LoginService {
                 format!("登录任务记录的提供商「{}」无法识别", task.provider),
             ));
         };
+        if matches!(kind, ProviderKind::Raccoon | ProviderKind::LobsterAI) {
+            let mut already_claimed = false;
+            handle.update(|task| {
+                already_claimed = task.callback_claimed;
+                task.callback_claimed = true;
+            });
+            if already_claimed {
+                return Ok(LoginCallbackSubmission::Completed(String::new()));
+            }
+        }
         // CodeArts：粘贴回来的整条回调 URL 在这里收尾。
         // 为什么不是「按 state 取 code」那套：portal 的回调**可能只带一个 code**、
         // 不带我们的配对信息，收尾要「逐个候选试 verifier」，还要认第一次回调下发的
@@ -819,12 +923,6 @@ impl LoginService {
         } else {
             let code_result = match kind {
                 ProviderKind::Raccoon => oauth::parse_callback_code(callback_url, state),
-                ProviderKind::MiniMaxCode => {
-                    crate::server::core::providers::minimax_code::oauth::parse_callback_code(
-                        callback_url,
-                        state,
-                    )
-                }
                 ProviderKind::LobsterAI => {
                     crate::server::core::providers::lobsterai::oauth::parse_callback_code(
                         callback_url,
@@ -876,12 +974,12 @@ impl LoginService {
     }
 
     /// 后台起一个登录任务，并把「失败/完成」写回任务句柄。
-    fn spawn_login(&self, handle: LoginTaskHandle, edition: String) {
+    fn spawn_login(&self, handle: LoginTaskHandle, region: Region) {
         let this = self.clone();
         crate::spawn_task(async move {
             let handle_for_callback = handle.clone();
             let result = this
-                .login_interactive(Some(edition.as_str()), &handle, move |url, state| {
+                .login_interactive(region, &handle, move |url, state| {
                     // 回调发生在轮询任务内：把 authUrl/state 落进句柄，
                     // 让 /start 的等待与 /wait 的轮询都能看到
                     let state = state.map(str::to_string);
@@ -905,7 +1003,10 @@ impl LoginService {
                     finish_task(&handle, &session);
                     logging::log(
                         "[Login]",
-                        &format!("✅ 登录任务完成（{edition}，账号 {account_uid}）"),
+                        &format!(
+                            "✅ 登录任务完成（{}，账号 {account_uid}）",
+                            crate::server::core::providers::label_of(region.provider_id())
+                        ),
                     );
                 }
                 Err(error) => {
@@ -927,11 +1028,16 @@ impl LoginService {
     /// 每拍轮询前检查任务的 `canceled` 标记 —— 等价 Node 的 `signal.aborted`。
     async fn login_interactive(
         &self,
-        edition: Option<&str>,
+        region: Region,
         handle: &LoginTaskHandle,
         on_auth_url: impl Fn(&str, Option<&str>),
     ) -> Result<Value, WorkBuddyAuthError> {
-        let context: Context = context_for_edition(edition, None);
+        // 端点覆盖按本地区取（staging / 自建反向代理用户的落点，见
+        // `Region::env_endpoint_override`）
+        let context: Context = context_for_edition(
+            Some(region.id()),
+            region.env_endpoint_override().as_deref(),
+        );
         let headers = anonymous_headers();
         let url = context.auth_url(&format!(
             "/auth/state?platform={}",
@@ -1006,7 +1112,10 @@ impl LoginService {
                         "登录成功但获取账号信息失败（缺少 uid），请重试",
                     ));
                 }
-                let saved = self.store.add_account(&session, None).map_err(|error| {
+                let saved = self
+                    .store
+                    .add_account(&session, None, Some(region.provider_id()))
+                    .map_err(|error| {
                         WorkBuddyAuthError::with_status(error.status_code, error.message)
                     })?;
                 let name = saved
@@ -1069,6 +1178,10 @@ impl LoginService {
                 &format!("拉取账号列表失败（不影响登录）: {}", error.message),
             ),
         }
+        // ── 身份的三步兜底（后一步只在前一步没给出 uid 时生效）──────
+        //   ① `login/account`（上面那次调用）
+        //   ② `/accounts` 列表里「最近登录过的那条」，退而求其次取第一条
+        //   ③ access token 自己的 JWT 声明（见 `account_from_token_claims`）
         let account_uid = account.get("uid").and_then(Value::as_str).unwrap_or("");
         if account_uid.is_empty() {
             let fallback = accounts
@@ -1083,6 +1196,29 @@ impl LoginService {
                 .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
             account = fallback;
         }
+        // ③ 最后一步是**网络之外**的来源，这一层不能少：
+        //
+        // 前两步都是网络调用，任何一条卡住就把整轮登录作废。2026-10-03 实测
+        // （国际版，用户现场）：Chrome 里授权已经成功、token 也拿到了，只因
+        // 紧接着的 `login/account` 连了 30 秒没连上（日志「连接上游超时」），
+        // 用户看到的就是「登录成功但获取账号信息失败（缺少 uid），请重试」——
+        // 而 uid 本来就在 token 里。资料接口的职责是把昵称等资料带得更全，
+        // 身份不必依赖它们；补上这一层之后，「浏览器授权成功」在 token 可解
+        // （上游常态）时就等于「账号一定落库」，资料接口全挂也只会少一个昵称。
+        if account
+            .get("uid")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .is_empty()
+        {
+            if let Some(from_token) = account_from_token_claims(&enriched) {
+                logging::log(
+                    "[Auth]",
+                    "资料接口未给出 uid，已回退用 access token 的 JWT 声明（sub）",
+                );
+                account = from_token;
+            }
+        }
 
         Ok(json!({
             "endpoint": context.base_url,
@@ -1095,6 +1231,55 @@ impl LoginService {
             "lastRefreshTime": logging::now_ms(),
         }))
     }
+}
+
+/// 从 access token 的 JWT 声明里取账号身份（`uid` + 昵称）。
+///
+/// ── 为什么 token 里就有（2026-10-03 实测）────────────────────
+/// 上游签发的是 Keycloak 风格 JWT，`sub` **就是账号主键**：实测 CN 账号的
+/// `sub` 与库里既有记录的 uid 逐字相同（记录 id 形如 `user-<uid>`），
+/// `nickname` 是上游给的用户名（账号页显示的就是它），更次一档的展示名来源是
+/// `preferred_username` 与 `email`。国际版是同一套结构（`iss` 换成它自己的
+/// realm），`sub` 同样是上游主键。
+///
+/// 这一路只在**两条资料接口都没给出 uid** 时才走（见
+/// `build_session_from_token` 的第三步兜底），正常路径行为一字不变。
+///
+/// 只解 payload、不验签：网关不做鉴权判定，token 能不能用由上游说了算
+/// —— 与 `raccoon::jwt` 同一纪律（那份解码是与 provider 无关的纯函数，
+/// 本文件的登录流程本来也已经 import 了 `raccoon::oauth`）。
+fn account_from_token_claims(auth: &Value) -> Option<Value> {
+    let token = auth.get("accessToken").and_then(Value::as_str)?;
+    let claims = crate::server::core::providers::raccoon::jwt::decode_jwt_claims(token)?;
+    let uid = text_of(&claims, &["sub", "userId", "uid"]);
+    if uid.is_empty() {
+        return None;
+    }
+    let mut account = serde_json::Map::new();
+    account.insert("uid".to_string(), Value::String(uid));
+    // 昵称：`nickname` 优先（CN 是真实姓名），退到用户名 / 邮箱；
+    // 都没有就不出这个键 —— 账号存储会按 uid 生成「账号 xxxxxxxx」的兜底名
+    let name = text_of(
+        &claims,
+        &["nickname", "name", "preferred_username", "email"],
+    );
+    if !name.is_empty() {
+        account.insert("nickname".to_string(), Value::String(name));
+    }
+    Some(Value::Object(account))
+}
+
+/// 取候选键里第一个非空字符串（去空白）
+fn text_of(object: &Value, keys: &[&str]) -> String {
+    for key in keys {
+        if let Some(text) = object.get(*key).and_then(Value::as_str) {
+            let text = text.trim();
+            if !text.is_empty() {
+                return text.to_string();
+            }
+        }
+    }
+    String::new()
 }
 
 /// 标记任务完成并写入会话摘要
@@ -1130,4 +1315,91 @@ fn finish_task_error(handle: &LoginTaskHandle, message: &str) {
         task.error = Some(message.clone());
         task.finished_at = Some(logging::now_ms());
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 造一个 `header.payload.签名` 形态的 token（只用于本地解析，不验签）。
+    fn fake_token(claims: Value) -> String {
+        use base64::Engine;
+        let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let header = engine.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+        let payload = engine.encode(serde_json::to_vec(&claims).expect("声明可序列化"));
+        format!("{header}.{payload}.signature")
+    }
+
+    /// 与线上同构的 token 声明。**值全是构造出来的示例** —— 真实账号的
+    /// 姓名 / 手机号 / uid 一律不进仓库（测试要的是字段名与层级，不是谁的数据）。
+    fn sample_claims() -> Value {
+        json!({
+            "sub": "11111111-2222-4333-8444-555555555555",
+            "nickname": "示例用户",
+            "preferred_username": "sample-user",
+            "iss": "https://idp.invalid/auth/realms/copilot",
+            "aud": "account",
+            "typ": "Bearer"
+        })
+    }
+
+    /// uid 就写在 token 里 —— 这就是「资料接口两条都挂时登录不该失败」的依据。
+    ///
+    /// 2026-10-03 实测：国际版登录在浏览器里已经授权成功、token 也拿到了，
+    /// 只因为紧接着的 `login/account` 连了 30 秒没连上（连接上游超时），
+    /// 整轮登录被判死。而 `sub` 与账号存储里的 uid 逐字相同
+    /// （记录 id 形如 `user-<uid>`）。
+    #[test]
+    fn uid_comes_from_token_subject() {
+        let account =
+            account_from_token_claims(&json!({ "accessToken": fake_token(sample_claims()) }))
+                .expect("应当能从 token 里解出身份");
+        assert_eq!(account["uid"], "11111111-2222-4333-8444-555555555555");
+        // 昵称是账号页显示的那个名字（账号存储按 `account.nickname` 取）
+        assert_eq!(account["nickname"], "示例用户");
+    }
+
+    /// 昵称的退档顺序：没有 `nickname` 就退到用户名 / 邮箱；都没有就不出这个键
+    /// （账号存储会按 uid 生成「账号 xxxxxxxx」的兜底名）。
+    #[test]
+    fn nickname_falls_back_then_may_be_absent() {
+        let username = account_from_token_claims(&json!({
+            "accessToken": fake_token(json!({ "sub": "u-1", "preferred_username": "sample-user" }))
+        }))
+        .expect("有 sub 就应当能解出身份");
+        assert_eq!(username["nickname"], "sample-user");
+
+        let email = account_from_token_claims(&json!({
+            "accessToken": fake_token(json!({ "sub": "u-2", "email": "user@example.invalid" }))
+        }))
+        .expect("有 sub 就应当能解出身份");
+        assert_eq!(email["nickname"], "user@example.invalid");
+
+        let bare = account_from_token_claims(&json!({
+            "accessToken": fake_token(json!({ "sub": "u-3" }))
+        }))
+        .expect("有 sub 就应当能解出身份");
+        assert_eq!(bare["uid"], "u-3");
+        assert!(
+            bare.get("nickname").is_none(),
+            "没有可用展示名时不该出这个键"
+        );
+    }
+
+    /// 不是 JWT（上游换成不透明 token）／没有 sub／没有 accessToken：
+    /// 一律返回 None，让调用方维持原来的报错 —— 不能凭一个空对象伪造身份。
+    #[test]
+    fn opaque_or_subjectless_token_yields_none() {
+        assert!(
+            account_from_token_claims(&json!({ "accessToken": "opaque-token-not-a-jwt" }))
+                .is_none()
+        );
+        assert!(account_from_token_claims(&json!({
+            "accessToken": fake_token(json!({ "nickname": "无 sub" }))
+        }))
+        .is_none());
+        assert!(account_from_token_claims(&json!({})).is_none());
+        // 手改/截断的 token 不能 panic（release 是 panic=abort）
+        assert!(account_from_token_claims(&json!({ "accessToken": "a.!!!.c" })).is_none());
+    }
 }
