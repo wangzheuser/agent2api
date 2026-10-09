@@ -68,7 +68,7 @@ async fn dispatch(state: &ServerState, method: Method, path: &str, body: &Bytes)
 
     if rest.is_empty() {
         if method == Method::GET {
-            return ok_json(scheduled_tasks::list());
+            return ok_json(scheduled_tasks::list(state.store()));
         }
         return not_found(method.as_str(), path);
     }
@@ -82,14 +82,14 @@ async fn dispatch(state: &ServerState, method: Method, path: &str, body: &Bytes)
         // PATCH 是规范写法；POST 是别名 —— CORS 的允许方法里没有 PATCH
         // （沿袭 Node 版，见 http.rs 的 CORS_METHODS），浏览器直连时预检会拦下
         // PATCH，走 Tauri 桥的正式前端两种都能用。
-        (Method::PATCH, None) | (Method::POST, None) => configure(id, body),
+        (Method::PATCH, None) | (Method::POST, None) => configure(state, id, body),
         (Method::POST, Some("run")) => run_now(state, id).await,
         _ => not_found(method.as_str(), path),
     }
 }
 
 /// 改一条任务（`{enabled?}` / `{interval?}`，只改传进来的字段）
-fn configure(id: &str, body: &Bytes) -> Response {
+fn configure(state: &ServerState, id: &str, body: &Bytes) -> Response {
     // 空 body 视为 `{}` → 「没有需要更新的字段」的 400（与 auto-checkin 一致）
     let payload = match parse_body(body) {
         Ok(value) => value,
@@ -117,7 +117,7 @@ fn configure(id: &str, body: &Bytes) -> Response {
             }
         }
     }
-    match scheduled_tasks::configure(id, patch) {
+    match scheduled_tasks::configure(state.store(), id, patch) {
         Ok(task) => ok_json(task),
         Err(message) => bad_request(message),
     }
@@ -136,7 +136,7 @@ async fn run_now(state: &ServerState, id: &str) -> Response {
     match scheduled_tasks::run_now(&store, state.update(), id).await {
         Ok(summary) => ok_json(json!({
             "summary": summary,
-            "task": scheduled_tasks::task_by_id(id),
+            "task": scheduled_tasks::task_by_id(state.store(), id),
         })),
         Err(message) => bad_request(message),
     }

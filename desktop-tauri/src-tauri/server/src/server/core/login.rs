@@ -508,6 +508,70 @@ impl LoginService {
         Ok(handle)
     }
 
+    /// KukuAI 网页登录收尾：校验任务 → 从登录态 Cookie 提取凭证 → 落账号。
+    ///
+    /// ── 与其它网页登录回调的差别（为什么单独一个入口）────────────
+    /// 百度通行证登录成功后的跳转**不携带授权码**（凭证在 `.baidu.com` 域的
+    /// Cookie 里，跨域跳转不会带过去），因此无法走「回调 URL 里解析 code」的
+    /// 通用链路。本家由壳侧登录窗口的注入脚本把 Cookie 直接 POST 到
+    /// `POST /api/session/login/kuku/complete`，这里完成「任务校验 → 提取 →
+    /// 落账号 → 写任务状态」四步。任务状态的写回与 raccoon 分支同款
+    /// （`finish_task`），前端 `/wait` 轮询拿到的结果与其它家一致。
+    pub async fn finish_kuku_login(
+        &self,
+        state: &str,
+        cookie: &str,
+    ) -> Result<String, GatewayError> {
+        let state = state.trim();
+        if state.is_empty() {
+            return Err(GatewayError::with_status(400, "缺少 state，无法确认这次回调归属"));
+        }
+        let Some(handle) = self.tasks.get(state) else {
+            return Err(GatewayError::with_status(
+                404,
+                "登录任务不存在或已过期，请重新发起网页登录",
+            ));
+        };
+        let task = handle.snapshot();
+        if task.canceled {
+            return Err(GatewayError::with_status(400, "登录已取消，请重新发起"));
+        }
+        if task.done {
+            // 幂等：同一个回调被送来两次（脚本重入 + 页面重载各触发一次）不是错误
+            return Ok(String::new());
+        }
+        if task.provider != crate::server::core::providers::kind_id(crate::server::core::providers::ProviderKind::Kuku) {
+            return Err(GatewayError::with_status(
+                400,
+                "该登录任务不属于 KukuAI，请重新发起",
+            ));
+        }
+        let (credentials, warning) =
+            crate::server::core::providers::kuku::login::complete_login(cookie).await?;
+        let store = self.store.clone();
+        let account = store
+            .add_kuku_account(&credentials, None, "web")
+            .map_err(|error| GatewayError::with_status(error.status_code, error.message))?;
+        let account_id = account
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let label = account
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("KukuAI 账号")
+            .to_string();
+        let mut payload = json!({ "account": account, "edition": task.edition });
+        // 复核未通过的警告随任务载荷透传前端（账号已落库；提示换正确账号）
+        if let Some(warning) = warning {
+            payload["warning"] = Value::String(warning);
+        }
+        finish_task(&handle, &payload);
+        logging::log("[Login]", &format!("✅ KukuAI 网页登录成功: {label}"));
+        Ok(account_id)
+    }
+
     /// 发起一次 **Cline 设备授权登录**（WorkOS RFC 8628）。
     ///
     /// ── 与前两条链路的区别（为什么是第三种形态）─────────────────
@@ -1284,7 +1348,7 @@ fn text_of(object: &Value, keys: &[&str]) -> String {
 
 /// 标记任务完成并写入会话摘要
 fn finish_task(handle: &LoginTaskHandle, session: &Value) {
-    let summary = json!({
+    let mut summary = json!({
         "accountUid": session
             .get("account")
             .and_then(|account| account.get("uid"))
@@ -1300,6 +1364,10 @@ fn finish_task(handle: &LoginTaskHandle, session: &Value) {
             .and_then(Value::as_str)
             .unwrap_or_default(),
     });
+    // 复核警告属于公开摘要；账号对象和令牌仍不得透传到登录轮询响应。
+    if let Some(warning) = session.get("warning").and_then(Value::as_str).filter(|text| !text.trim().is_empty()) {
+        summary["warning"] = Value::String(warning.to_string());
+    }
     handle.update(|task| {
         task.done = true;
         task.session = Some(summary);
@@ -1320,6 +1388,50 @@ fn finish_task_error(handle: &LoginTaskHandle, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completed_login_exposes_warning_but_never_account_credentials() {
+        for (warning, expected_warning) in [
+            (json!("业务会话复核未通过"), Some("业务会话复核未通过")),
+            (Value::Null, None),
+            (json!("  "), None),
+            (json!({"accessToken": "fixture-secret"}), None),
+        ] {
+            let handle = LoginTaskHandle {
+                inner: Arc::new(Mutex::new(LoginTaskState {
+                    state: Some("fixture-state".to_string()),
+                    auth_url: None,
+                    done: false,
+                    error: None,
+                    session: None,
+                    edition: "cn".to_string(),
+                    provider: "kuku".to_string(),
+                    canceled: false,
+                    callback_claimed: false,
+                    finished_at: None,
+                })),
+                ticket: 1,
+            };
+            let mut session = json!({
+                "account": {"uid": "fixture-uid", "nickname": "示例", "cookie": "BDUSS=fixture-secret"},
+                "accessToken": "fixture-access",
+                "refreshToken": "fixture-refresh",
+                "credentials": {"STOKEN": "fixture-stoken"},
+                "edition": "cn",
+                "warning": warning,
+            });
+            let mut expected = json!({"accountUid": "fixture-uid", "nickname": "示例", "edition": "cn"});
+            if let Some(warning) = expected_warning {
+                expected["warning"] = json!(warning);
+            }
+            finish_task(&handle, &session);
+            assert_eq!(handle.snapshot().to_wait_response(), json!({"done": true, "session": expected}));
+            assert!(handle.snapshot().finished_at.is_some());
+            session.as_object_mut().unwrap().remove("warning");
+            finish_task(&handle, &session);
+            assert!(handle.snapshot().to_wait_response()["session"].get("warning").is_none());
+        }
+    }
 
     /// 造一个 `header.payload.签名` 形态的 token（只用于本地解析，不验签）。
     fn fake_token(claims: Value) -> String {

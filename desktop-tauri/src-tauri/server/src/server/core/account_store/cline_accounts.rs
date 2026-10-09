@@ -617,6 +617,7 @@ impl AccountStore {
     /// 只影响展示，不改盘 —— 写入仍只发生在添加 / 续期那两条既有路径上。
     pub fn to_cline_public_account(&self, record: &StoredAccount) -> Value {
         let value = record.to_value();
+        let live = record.is_desktop().then(|| credentials::read_desktop_credentials().ok().flatten()).flatten();
         let mut out = Map::new();
         out.insert("id".to_string(), Value::String(record.id().to_string()));
         // provider 取**记录自己的**（不是某个写死的值）：两个池共用这一份
@@ -625,12 +626,13 @@ impl AccountStore {
             "provider".to_string(),
             Value::String(record.provider()),
         );
-        let account = value
-            .get("account")
-            .and_then(Value::as_str)
+        let account = value.get("account").and_then(Value::as_str)
             .unwrap_or("")
             .trim()
             .to_string();
+        let token = live.as_ref().map(|credentials| credentials.access_token.as_str())
+            .unwrap_or_else(|| value.get("accessToken").and_then(Value::as_str).unwrap_or(""));
+        out.insert("usageIdentity".to_string(), Value::String(credentials::usage_identity(token)));
         // 展示名：token 能现解就现解（email 优先），解不出再回落到存的
         // （老记录 / 手填 token 的账号 / 桌面端账号）
         let stored_display = value
@@ -729,13 +731,7 @@ impl AccountStore {
         //
         // 读不到实时值（客户端没登录 / 文件损坏）时**回落到记录里的快照**：
         // 这是展示路径，不该因为客户端文件的问题而让整张账号表读不出来。
-        let live_expires = if record.is_desktop() {
-            crate::server::core::account_store::store::live_desktop_credentials(record)
-                .map(|(_, _, expires_at)| expires_at)
-                .filter(|expires_at| *expires_at > 0.0)
-        } else {
-            None
-        };
+        let live_expires = live.as_ref().and_then(|credentials| credentials.expires_at).filter(|expires_at| *expires_at > 0.0);
         let expires = live_expires
             .map(Value::from)
             .or_else(|| value.get("expiresAt").filter(|value| !value.is_null()).cloned());
@@ -832,6 +828,25 @@ mod tests {
             .cloned()
             .unwrap_or_default(),
         )
+    }
+
+    #[test]
+    fn usage_identity_tracks_jwt_account_not_manual_alias_or_rotation() {
+        let (store, _db) = store("usage-identity");
+        let mut row = record(Value::Null);
+        row.fields_mut().insert("account".into(), json!("fixed-alias"));
+        row.fields_mut().insert("accessToken".into(), json!("workos:e30.eyJleHRlcm5hbF9pZCI6InVzci1vbmUifQ.old"));
+        let before = store.to_cline_public_account(&row);
+        row.fields_mut().insert("accessToken".into(), json!("workos:e30.eyJleHRlcm5hbF9pZCI6InVzci1vbmUifQ.new"));
+        let refreshed = store.to_cline_public_account(&row);
+        assert_eq!(before["usageIdentity"], refreshed["usageIdentity"]);
+        assert_eq!(refreshed["account"], "fixed-alias");
+        row.fields_mut().insert("accessToken".into(), json!("workos:e30.eyJleHRlcm5hbF9pZCI6InVzci10d28ifQ.new"));
+        let changed = store.to_cline_public_account(&row);
+        assert_ne!(before["usageIdentity"], changed["usageIdentity"]);
+        assert_ne!(crate::server::core::usage_records::identity(&before), crate::server::core::usage_records::identity(&changed));
+        assert_eq!(changed["account"], "fixed-alias");
+        assert!(!changed.to_string().contains("workos:"));
     }
 
     /// 公开形态必须带上账号级代理配置 —— 前端代理列据此回显「直连 / 代理池某条」。

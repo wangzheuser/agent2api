@@ -469,8 +469,8 @@ pub fn shim_js() -> &'static str {
     },
     port_occupant: function () { return Promise.resolve(null); },
     get_app_settings: function () {
-      // 桌面设置（关窗到托盘 / 开机自启）在网页端没有宿主，固定默认值
-      return Promise.resolve({ closeToTray: false, autostart: false, proxyPort: 0 });
+      // 桌面设置（关窗到托盘 / 开机自启 / 轻量模式）在网页端没有宿主，固定默认值
+      return Promise.resolve({ closeToTray: false, autostart: false, proxyPort: 0, lightweightMode: false });
     },
     open_release_page: function (args) {
       if (args && args.url) { try { window.open(args.url, '_blank'); } catch (e) { /* 无害 */ } }
@@ -782,6 +782,15 @@ pub fn shim_js() -> &'static str {
     updateWorkBuddyPolicy: function (id, patch) { return call('PATCH', '/api/accounts/workbuddy/policy?id=' + encodeURIComponent(id), patch); },
     getAccountConnections: function () { return call('GET', '/api/accounts/connections'); },
     checkinAllAccounts: function (id) { return call('POST', '/api/accounts/checkin', id ? { id: id } : {}); },
+    // ── Loomy 新手任务（查询 / 一键领取）──
+    // 与桌面 `bridge.rs` 的同名方法成对维护：签到后界面查询任务状态、有未领取才
+    // 弹窗领取（accounts-dialog-onboarding）。
+    getOnboardingTasks: function (id) {
+      return call('GET', '/api/accounts/' + encodeURIComponent(String(id || '')) + '/onboarding');
+    },
+    claimOnboardingTasks: function (id) {
+      return call('POST', '/api/accounts/' + encodeURIComponent(String(id || '')) + '/onboarding/claim', {});
+    },
 
     // ── 手机验证码登录（AutoClaw 国内版 / Loomy）──
     // 与桌面 `bridge.rs` 的同名方法**必须成对存在**（理由见下面 ZCode 那段的
@@ -829,6 +838,13 @@ pub fn shim_js() -> &'static str {
     getAutoCheckin: function () { return call('GET', '/api/auto-checkin'); },
     saveAutoCheckin: function (patch) { return call('POST', '/api/auto-checkin', patch); },
     runAutoCheckinNow: function () { return call('POST', '/api/auto-checkin/run', {}); },
+    // WorkBuddy 国际版日活保活的模型链（与 bridge.rs 的同名方法成对维护）
+    getCheckinKeepalive: function () { return call('GET', '/api/checkin-keepalive'); },
+    saveCheckinKeepalive: function (models) { return call('POST', '/api/checkin-keepalive', { models: models }); },
+    // WorkBuddy 国际版日活任务的手动粒度入口（mode: full | claim | keepalive）
+    runCheckinActivity: function (id, mode) { return call('POST', '/api/checkin-activity', { id: id, mode: mode }); },
+    // 签到中心的聚合快照（与 bridge.rs 的同名方法同一路径）
+    getCheckinCenter: function () { return call('GET', '/api/checkin-center'); },
 
     // ── 间隔型定时任务 ──
     getScheduledTasks: function () { return call('GET', '/api/scheduled-tasks'); },
@@ -1020,7 +1036,7 @@ pub fn shim_js() -> &'static str {
     getAppSettings: function () { return invokeShell('get_app_settings'); },
     saveAppSettings: function (patch) {
       // 无处持久化也不该报错：界面保存成功即可（本次会话内忽略）
-      return Promise.resolve(Object.assign({ closeToTray: false, autostart: false, proxyPort: 0 }, patch));
+      return Promise.resolve(Object.assign({ closeToTray: false, autostart: false, proxyPort: 0, lightweightMode: false }, patch));
     },
     exportAccounts: function () { return invokeShell('export_accounts'); },
     importAccounts: function () { return invokeShell('import_accounts'); },

@@ -41,7 +41,7 @@ export const PRESET_CARD_PREFIX = 'preset:'
 /** 「新建自定义提供商」那张卡片的取值（不是 provider id，只是卡片自己的标记） */
 export const NEW_PROVIDER_CARD_ID = '__new__'
 
-/** 分段值归一：四个取值之外的一律按「反代」处理（DOM 被人改坏时的保守落点） */
+/** 分段值归一：四个取值之外的一律按「Agent」处理（DOM 被人改坏时的保守落点） */
 export function typeValueOf(value: string): AccountType {
   if (value === TYPE_PRESET || value === TYPE_CUSTOM) return value
   if (IMPORT_SEGMENT_ENABLED && value === TYPE_IMPORT) return TYPE_IMPORT
@@ -53,8 +53,9 @@ export function typeValueOf(value: string): AccountType {
  * 内嵌的图标（与系统里显示的为同一张；AutoClaw 国内 / 国际版、Cline 两种账号、
  * Accio / ZCode 两地各自共用一张 —— 它们本来就是同一个客户端）。
  * 自定义家与没收录图标的家回落到首字母徽章。
+ * 导出共用：签到中心的提供商行用同一份映射（checkin-page.tsx），别处不要照抄。
  */
-const PROVIDER_ICONS: Record<string, string> = {
+export const PROVIDER_ICONS: Record<string, string> = {
   workbuddy: 'assets/providers/workbuddy.png',
   raccoon: 'assets/providers/raccoon.png',
   catpaw: 'assets/providers/catpaw.png',
@@ -72,6 +73,9 @@ const PROVIDER_ICONS: Record<string, string> = {
   'minimax-code': 'assets/providers/minimax-cn.png',
   // Loomy：取自安装包 `resources/app.asar` 的 Windows 图标集。
   loomy: 'assets/providers/loomy.png',
+  // KukuAI：取自客户端 `GenFlowPro.exe` 的 RT_ICON 资源（256×256 那张，
+  // 与系统里显示的应用图标为同一张）
+  kuku: 'assets/providers/kuku.png',
 }
 
 type CardItem = {
@@ -84,7 +88,7 @@ type CardItem = {
 
 /**
  * 第 1 步的卡片列表数据，按账号类型分三段：
- *   · 反代 —— 内置家来自 providers 摘要（现有八家）；
+ *   · Agent —— 内置家来自 providers 摘要（现有八家）；
  *   · 预置 API —— 预置目录的官方与托管端点，点一张卡 = 创建这一家并预填；
  *     **已建过同名家的预置卡不再出现**（那张已建卡就在「自定义」段里）；
  *   · 自定义 —— 已建的自定义家（customList），每张卡是「给这家加账号」的对象。
@@ -258,7 +262,7 @@ export function PickStep({
           aria-label='账号类型'
           className={ADD_SEG_CLASS}
           options={[
-            { value: TYPE_PROXY, label: '反代' },
+            { value: TYPE_PROXY, label: 'Agent' },
             { value: TYPE_PRESET, label: '预置 API' },
             { value: TYPE_CUSTOM, label: '自定义' },
             // 「导入」分段暂时收起（见 IMPORT_SEGMENT_ENABLED）：整段不生成

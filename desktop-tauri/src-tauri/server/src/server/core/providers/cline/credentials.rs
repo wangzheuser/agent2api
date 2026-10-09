@@ -272,6 +272,13 @@ pub fn identity_from_jwt(token: &str) -> (String, String) {
     (display, account)
 }
 
+/// 余额绑定真实 JWT 身份；不透明凭证换值时保守失效，避免手填别名复用旧余额。
+pub(crate) fn usage_identity(token: &str) -> String {
+    let account = identity_from_jwt(token).1;
+    let source = if account.is_empty() { format!("token:{token}") } else { format!("account:{account}") };
+    super::super::refresh_flight::fingerprint(&source)
+}
+
 /// 拼姓名（按语种决定排列顺序）。
 ///
 /// ── 为什么要分语种 ──────────────────────────────────────────

@@ -44,10 +44,10 @@ import {
 import { formatTime, poolItemLabel, POOL_VALUE_PREFIX, shared, type AccountRecord, type UsageEntry } from './accounts-shared'
 import {
   accountTags, activeLimits, checkedInToday, checkinDoneTitle, claimDoneTitle, claimedToday,
-  isWorkBuddyInternational,
+  isWorkBuddyInternational, supportsCheckin,
   displayNameOf, editionSuffix, expiryMillis, formatResetText, identifierOf, isDesktopAccount, isEnabled,
-  providerFeatures, providerOf, RESET_UNKNOWN, supportsCheckin, supportsClaim, supportsUsage,
-  supportsWelfare, welfareDoneTitle, welfareStateOf, welfareTodoTitle,
+  lowBalanceBlockedOf, lowBalanceOf, providerFeatures, providerOf, RESET_UNKNOWN,
+  supportsClaim, supportsUsage, supportsWelfare, welfareDoneTitle, welfareStateOf, welfareTodoTitle,
 } from './accounts-domain'
 import { PRIORITY_MAX, PRIORITY_MIN, priorityOf } from './accounts-columns'
 import { creditDetailsOf, formatCreditAmount } from './accounts-credit-details'
@@ -439,7 +439,15 @@ export function UsageCell({ account }: { account: AccountRecord }) {
   // 所有已接入余额的 provider 都可双击打开统一余额弹窗；有结构化钱包时，
   // 余额列继续保留原来的主额度进度条作为快速读数。
   const pool = summary.kind === 'ok' || summary.kind === 'warn' ? usagePool(entry) : null
+  const blocked = lowBalanceBlockedOf(account, entry)
+  const blockedBadge = blocked ? (
+    <Badge variant='warning' shape='tag'
+      title={`余额低于阈值 ${lowBalanceOf(account).threshold}，转发时会跳过该账号（余额回升自动恢复）`}>
+      余额不足 · 已跳过
+    </Badge>
+  ) : null
   return (
+    <span className='usage-sum-wrap'>
     <button type='button' className={`usage-sum credit-balance-trigger ${summary.kind}`}
       title={`${summary.title}；双击查看余额明细（Enter / Space 打开）`}
       aria-label={`${summary.text}，查看余额明细`} aria-haspopup='dialog'
@@ -462,6 +470,8 @@ export function UsageCell({ account }: { account: AccountRecord }) {
         </span>
       </span> : summary.text}
     </button>
+    {blockedBadge}
+    </span>
   )
 }
 
@@ -648,21 +658,20 @@ export function ProxyCell({ account }: { account: AccountRecord }) {
 /* ─── 操作列 ────────────────────────────────── */
 
 /**
- * 操作：签到 / 领套餐 / 领福利 / 余额 / 设置 / ⋯，顺序固定。
+ * 操作：领套餐 / 领福利 / 余额 / 设置 / ⋯，顺序固定。
  *
- * 顺序按「点的频次」排，签到排头：它是这张表里唯一**每天都会做一次**的动作，
- * 排在第一位让手指有固定的落点 —— 按钮的显隐会随账号状态变，但**顺序不跟着变**。
+ * 顺序按「点的频次」排，按钮的显隐会随账号状态变，但**顺序不跟着变**。
  * 「设为首选」不在这里：它在 ⋯ 菜单的第二项（行上留一颗按钮去重复隔壁优先级列的
  * 信息，代价是操作列多留 50px，而那 50px 全是从账号列挤出来的）。
  *
- * 签到今天已签过时显示为**「已签到」并置灰**（这天再点也只能拿到上游「今天已签到」）。
- * `disabled` 是真的禁用属性：这才同时挡住点击与键盘操作，也让读屏念出「不可用」。
- * **禁用账号也渲染签到按钮**：签到与转发是两件事，后端单账号签到路径同样不看 enabled。
+ * （签到曾是这排的第一颗按钮，已随签到功能整体迁到「签到中心」——
+ * checkin-page.tsx 的每日签到卡承接了它的职责，含单账号签到与重签。）
  */
 export function ActionsCell({ account, atFront }: { account: AccountRecord; atFront: boolean }) {
   const [claimBusy, setClaimBusy] = React.useState(false)
   const [welfareBusy, setWelfareBusy] = React.useState(false)
   const [usageBusy, setUsageBusy] = React.useState(false)
+  const checkinFailed = checkinErrorOf(account.id)
   const checkedIn = checkedInToday(account)
   const canCheckin = supportsCheckin(account)
   const activeOnly = isWorkBuddyInternational(account)
@@ -670,7 +679,6 @@ export function ActionsCell({ account, atFront }: { account: AccountRecord; atFr
   const canClaim = supportsClaim(account)
   const canWelfare = supportsWelfare(account)
   const welfareTaken = welfareStateOf(account)
-  const checkinFailed = checkinErrorOf(account.id)
 
   async function claim(): Promise<void> {
     // 一次领取要拖一次滑块，重复点击会开出第二个验证码流程（共用的求解器一次只允许
@@ -811,7 +819,7 @@ export function MoreMenu({ account, atFront }: { account: AccountRecord; atFront
   )
 }
 
-/* ─── 展开的明细行（限流 / 签到）───────────────── */
+/* ─── 展开的明细行（限流）──────────────────── */
 
 /**
  * 限流明细面板：这个账号**当前限流中的模型**逐行列出 —— 模型名、恢复时间、上游给的

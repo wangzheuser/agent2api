@@ -780,7 +780,8 @@
         "0da274a"
       ],
       "implementation": [
-        "desktop-tauri/ui-islands/src/islands/accounts-data.ts"
+        "desktop-tauri/ui-islands/src/islands/accounts-data.ts",
+        "desktop-tauri/ui-islands/src/islands/accounts-domain.ts"
       ],
       "tests": [
         {
@@ -807,7 +808,21 @@
           "name": "check-in confirmation preserves pending-credit wording without changing other providers",
           "id": "case-df5ca7fa2615"
         }
-      ]
+      ],
+      "evolution": {
+        "baseline_sha256": "842a7c3a6b6743a014166048cf372776e8290360767629ddd09fc7b65a87f475",
+        "reason": "共享签到结果分类从账号数据模块移至账号领域模块，账号页与签到中心共用；原输入和断言保持。",
+        "review": "独立审阅 Hegel 01a11fa8-63b4-7700-a45e-45b815628b3d 已核对分类函数体与 H 相同；本轮候选差异、测试回执和最终tree见 diagnostic-artifacts/upstream-merge-analysis-20261009/run.json。",
+        "implementation_moves": [
+          {
+            "from": "desktop-tauri/ui-islands/src/islands/accounts-data.ts",
+            "to": [
+              "desktop-tauri/ui-islands/src/islands/accounts-data.ts",
+              "desktop-tauri/ui-islands/src/islands/accounts-domain.ts"
+            ]
+          }
+        ]
+      }
     },
     {
       "id": "workbuddy-credit-policy",
@@ -1836,6 +1851,511 @@
           "kind": "browser",
           "path": "desktop-tauri/ui-islands/tests/settings-cache-affinity.browser.cjs",
           "id": "case-session-affinity-settings-browser"
+        }
+      ]
+    },
+    {
+      "id": "usage-identity-and-account-scheduling",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "余额记录按身份与发起时序保存，未知不当零；查询继承全局总开关与间隔，保留持久化占位、退避；显式低余额策略与结果原子提交。",
+      "source_commits": [
+        "f82308a9549ee4760f27e393058c3482056ec514",
+        "94c674e7e3267bf1837afc44dc1860fe2dc6dc6c"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/usage_query.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/usage_records.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/account_store/store_crud.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/task_state.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/scheduled_tasks.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/providers/cline/balance.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/account_store/cline_accounts.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/upstream_usage_policy.rs",
+          "name": "upstream_usage_identity_and_unknown_balance_do_not_block_unrelated_accounts",
+          "id": "case-29bdc02f82b1"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/upstream_usage_policy.rs",
+          "name": "upstream_usage_records_and_schedule_preserve_local_controls",
+          "id": "case-42f93a31d09b"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/account_store/store_crud.rs",
+          "name": "server::core::account_store::store_crud::usage_commit_tests::usage_commit_is_atomic_and_rejects_replaced_identity",
+          "id": "case-4bb233f3889f"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/cline/balance.rs",
+          "name": "server::core::providers::cline::balance::usage_identity_tests::cline_usage_binds_live_account_but_allows_same_account_token_refresh",
+          "id": "case-f1cacec0d76d"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/task_state.rs",
+          "name": "server::core::task_state::tests::finish_success_after_clock_rollback_preserves_interval",
+          "id": "case-bca286d626eb"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/task_state.rs",
+          "name": "server::core::task_state::tests::finish_failure_after_clock_rollback_preserves_backoff",
+          "id": "case-1b05898fadb2"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/task_state.rs",
+          "name": "server::core::task_state::tests::heartbeat_after_clock_rollback_preserves_active_lease",
+          "id": "case-0949887a8cad"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/account_store/cline_accounts.rs",
+          "name": "server::core::account_store::cline_accounts::tests::usage_identity_tracks_jwt_account_not_manual_alias_or_rotation",
+          "id": "case-81837c652a0f"
+        }
+      ]
+    },
+    {
+      "id": "schema-upstream-usage-v11",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "上游 v7/v8 与本地 v7-v10 均升级到v11，保留字段、索引、精度和逐行时间；两份旧余额快照原子迁移，失败保留成功读数和可重试来源。",
+      "source_commits": [
+        "f82308a9549ee4760f27e393058c3482056ec514",
+        "94c674e7e3267bf1837afc44dc1860fe2dc6dc6c"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/db/schema.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/usage_records.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/upstream_sync_migrations.rs",
+          "name": "upstream_sync_new_database_has_usage_identity_and_queried_at_defaults",
+          "id": "case-8e5a2abdb8c5"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/upstream_sync_migrations.rs",
+          "name": "upstream_sync_local_v7_to_v10_preserve_request_history",
+          "id": "case-f5c8dab65c03"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/upstream_sync_migrations.rs",
+          "name": "upstream_sync_upstream_v7_v8_preserve_requests_and_usage_history",
+          "id": "case-349639635548"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/upstream_sync_migrations.rs",
+          "name": "upstream_sync_v11_repairs_partial_usage_columns_without_overwriting_values",
+          "id": "case-bcbbab7b5c32"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/upstream_sync_migrations.rs",
+          "name": "upstream_sync_v11_backfills_latest_time_without_changing_old_fields",
+          "id": "case-0792543e7ea8"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/upstream_sync_migrations.rs",
+          "name": "upstream_sync_v11_failure_rolls_back_columns_and_version_then_retries",
+          "id": "case-210d46741132"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/upstream_sync_migrations.rs",
+          "name": "upstream_sync_nested_snapshot_keeps_other_tasks_and_each_rows_time",
+          "id": "case-25708ebd58ea"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/upstream_sync_migrations.rs",
+          "name": "upstream_sync_snapshot_sources_keep_newer_rows_and_bound_identities",
+          "id": "case-dcced3780898"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/upstream_sync_migrations.rs",
+          "name": "upstream_sync_snapshot_row_failure_rolls_back_both_sources_and_retries",
+          "id": "case-97417715c21e"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/upstream_sync_migrations.rs",
+          "name": "upstream_sync_snapshot_cleanup_failure_rolls_back_imports_and_nested_removal",
+          "id": "case-9d7d2ba2b765"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/upstream_sync_migrations.rs",
+          "name": "upstream_sync_snapshot_new_failure_keeps_last_successful_balance",
+          "id": "case-8df233ff7ce6"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/upstream_sync_migrations.rs",
+          "name": "upstream_sync_snapshot_invalid_row_times_fall_back_to_valid_evidence",
+          "id": "case-83964a5bb831"
+        }
+      ]
+    },
+    {
+      "id": "checkin-center-provider-boundaries",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "签到中心保留本地已领取、失败、活跃和待到账口径；旧地区选择兼容、新保存精确；新手任务只跟进实际完成的账号；Trae保留稳定设备与刷新、增加同设备回查。",
+      "source_commits": [
+        "f82308a9549ee4760f27e393058c3482056ec514",
+        "94c674e7e3267bf1837afc44dc1860fe2dc6dc6c"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/auto_checkin.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/checkin_history.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/billing/activity.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/billing/checkin.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/providers/trae/checkin.rs",
+        "desktop-tauri/ui-islands/src/islands/checkin-state.ts",
+        "desktop-tauri/ui-islands/src/islands/checkin-page.tsx"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/upstream_checkin_merge.rs",
+          "name": "trae_status_preserves_h_aliases_and_reads_upstream_award_fields",
+          "id": "case-1de4baa15626"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/upstream_checkin_merge.rs",
+          "name": "trae_failed_or_missing_business_code_never_confirms_completion",
+          "id": "case-c04918dfb2f0"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/upstream_checkin_merge.rs",
+          "name": "trae_decide_requires_successful_confirmation_and_uses_its_award",
+          "id": "case-b0eb7769b5e1"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/upstream_checkin_merge.rs",
+          "name": "trae_decide_preserves_already_completed_and_rejection_precedence",
+          "id": "case-3b1b22cee8d2"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/upstream_checkin_merge.rs",
+          "name": "trae_auth_expiry_and_device_backoff_remain_distinct",
+          "id": "case-05b7c74b3fa2"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/upstream_checkin_merge.rs",
+          "name": "workbuddy_activity_modes_round_trip_and_unknown_values_default_to_full",
+          "id": "case-3c8cb963dbd8"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/upstream_checkin_merge.rs",
+          "name": "checkin_provider_union_retains_all_twelve_options",
+          "id": "case-e296d3b20e30"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/upstream_checkin_merge.rs",
+          "name": "checkin_eligibility_preserves_native_rewards_and_region_boundaries",
+          "id": "case-60a1d099ed03"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/upstream_checkin_merge.rs",
+          "name": "workbuddy_keepalive_preserves_h_region_headers_proxy_and_minimal_body",
+          "id": "case-77f3d7f3aa37"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/upstream_checkin_merge.rs",
+          "name": "completed_account_ids_only_include_confirmed_rows_from_this_run",
+          "id": "case-d595c1b73f2f"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/upstream_checkin_merge.rs",
+          "name": "authentication_failures_remain_visible_after_successful_keepalive",
+          "id": "case-b61633b95220"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/upstream_checkin_merge.rs",
+          "name": "keepalive_persistence_and_reward_eligibility_use_isolated_sqlite",
+          "id": "case-fb0d76fdcb6c"
+        },
+        {
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/upstream-checkin-merge.test.cjs",
+          "name": "ordinary successful checkin still reports success and refreshes account usage",
+          "id": "case-41a7b12ba39e"
+        },
+        {
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/upstream-checkin-merge.test.cjs",
+          "name": "keepalive-only success does not claim that a reward was received",
+          "id": "case-4320d66679c4"
+        },
+        {
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/upstream-checkin-merge.test.cjs",
+          "name": "explicit onboarding query and claim remain available",
+          "id": "case-b093f2903606"
+        },
+        {
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/upstream-checkin-merge.test.cjs",
+          "name": "explicitly disabled low-balance protection preserves zero-balance availability",
+          "id": "case-734af6d104b5"
+        },
+        {
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/upstream-checkin-merge.test.cjs",
+          "name": "WorkBuddy international page retains all three explicit activity modes",
+          "id": "case-474c3c72d80c"
+        },
+        {
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/upstream-checkin-merge.test.cjs",
+          "name": "successful single checkin follows up only its own onboarding tasks",
+          "id": "case-939fcdffe04b"
+        },
+        {
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/upstream-checkin-merge.test.cjs",
+          "name": "successful batch follows up only completed IDs, not selected neutral or unexecuted accounts",
+          "id": "case-5ddc8d4e4563"
+        },
+        {
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/upstream-checkin-merge.test.cjs",
+          "name": "already received IDs can follow up even without a new successful claim",
+          "id": "case-83e7293a4853"
+        },
+        {
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/upstream-checkin-merge.test.cjs",
+          "name": "a failed snapshot refresh cannot reuse stale onboarding eligibility",
+          "id": "case-98c2321b419d"
+        },
+        {
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/upstream-checkin-merge.test.cjs",
+          "name": "Kuku platform gating does not remove remote login from other providers",
+          "id": "case-31e4e5691949"
+        },
+        {
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/upstream-checkin-merge.test.cjs",
+          "name": "single result remains visible after toast and snapshot refresh: authentication failure",
+          "id": "case-0eb475ab4ff0"
+        },
+        {
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/upstream-checkin-merge.test.cjs",
+          "name": "single result remains visible after toast and snapshot refresh: already received",
+          "id": "case-e8fe54526d62"
+        },
+        {
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/upstream-checkin-merge.test.cjs",
+          "name": "single result remains visible after toast and snapshot refresh: pending credit",
+          "id": "case-62be10abbe2e"
+        },
+        {
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/upstream-checkin-merge.test.cjs",
+          "name": "single result remains visible after toast and snapshot refresh: keepalive only",
+          "id": "case-dfa5ab98f419"
+        },
+        {
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/upstream-checkin-merge.test.cjs",
+          "name": "single request rejection stays visible until the next result replaces it",
+          "id": "case-e0044a01a729"
+        },
+        {
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/upstream-checkin-merge.test.cjs",
+          "name": "single result renders upstream text without treating it as HTML",
+          "id": "case-bf64c7b751c3"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/trae/checkin_merge_tests.rs",
+          "name": "server::core::providers::trae::checkin::merge_tests::trae_driver_stops_on_any_completed_flag_without_claim_or_refresh",
+          "id": "case-fcae3b908340"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/trae/checkin_merge_tests.rs",
+          "name": "server::core::providers::trae::checkin::merge_tests::trae_driver_refreshes_only_confirmation_on_the_claim_device",
+          "id": "case-084ae1b5a4e8"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/trae/checkin_merge_tests.rs",
+          "name": "server::core::providers::trae::checkin::merge_tests::trae_driver_repeated_confirmation_auth_stops_after_one_refresh",
+          "id": "case-24a6e2737b99"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/trae/checkin_merge_tests.rs",
+          "name": "server::core::providers::trae::checkin::merge_tests::trae_driver_preclaim_auth_refreshes_once_and_shares_the_budget",
+          "id": "case-8cb2b869e24e"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/trae/checkin_merge_tests.rs",
+          "name": "server::core::providers::trae::checkin::merge_tests::trae_driver_failed_refresh_after_claim_never_reclaims",
+          "id": "case-03e003d13e20"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/upstream_checkin_dispatch.rs",
+          "name": "loomy_and_workbuddy_dispatch_preserve_completion_and_failures",
+          "id": "case-bf144a916b92"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/upstream_checkin_merge.rs",
+          "name": "provider_business_code_1001_preserves_completion_without_hiding_trae_auth",
+          "id": "case-7598a07cc830"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/trae/checkin_merge_tests.rs",
+          "name": "server::core::providers::trae::checkin::merge_tests::trae_driver_no_activity_is_neutral_without_claim_or_refresh",
+          "id": "case-800b6ec6aed8"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/trae/checkin_merge_tests.rs",
+          "name": "server::core::providers::trae::checkin::merge_tests::trae_driver_already_completed_preserves_h_and_upstream_reward_fields",
+          "id": "case-e3f434510d37"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/trae/checkin_merge_tests.rs",
+          "name": "server::core::providers::trae::checkin::merge_tests::trae_driver_backoff_keeps_h_status_and_upstream_device_diagnostics",
+          "id": "case-85d9cad9bd46"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/trae/checkin_merge_tests.rs",
+          "name": "server::core::providers::trae::checkin::merge_tests::trae_driver_unconfirmed_does_not_export_claim_rewards_as_completion",
+          "id": "case-80b8564e27af"
+        },
+        {
+          "kind": "browser",
+          "path": "desktop-tauri/ui-islands/tests/upstream-checkin-merge.browser.cjs",
+          "id": "case-upstream-checkin-browser"
+        }
+      ]
+    },
+    {
+      "id": "kuku-provider-integration",
+      "level": "P1",
+      "status": "必须保留",
+      "behavior": "Kuku凭证多形态解析保留业务换票Cookie，注册表进入会话式转发，桌面网页登录与远程手动凭证入口区分，保留本地原生提供商。",
+      "source_commits": [
+        "f82308a9549ee4760f27e393058c3482056ec514",
+        "94c674e7e3267bf1837afc44dc1860fe2dc6dc6c"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/providers/kuku/credentials.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/providers/kuku/adapter.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/providers/mod.rs",
+        "desktop-tauri/ui-islands/src/islands/add-account-configs.ts",
+        "desktop-tauri/src-tauri/server/src/server/core/providers/kuku/http.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/providers/kuku/models.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/providers/kuku/checkin.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/login.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/upstream_provider_wiring.rs",
+          "name": "kuku_cookie_shapes_preserve_business_exchange_credentials",
+          "id": "case-3d538734dc73"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/upstream_provider_wiring.rs",
+          "name": "kuku_registration_selects_stateful_forwarding_without_losing_native_providers",
+          "id": "case-f48262030106"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/kuku/http.rs",
+          "name": "server::core::providers::kuku::http::tests::json_http_errors_preserve_status_and_path_without_secrets",
+          "id": "case-ac405613cb7e"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/kuku/http.rs",
+          "name": "server::core::providers::kuku::http::tests::transport_errors_do_not_expose_reqwest_urls_or_header_values",
+          "id": "case-c29e13bbe871"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/kuku/http.rs",
+          "name": "server::core::providers::kuku::http::tests::form_and_stream_failures_never_echo_response_bodies",
+          "id": "case-7037dad25818"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/kuku/models.rs",
+          "name": "server::core::providers::kuku::models::tests::empty_or_unrecognized_remote_catalog_is_a_failure_not_a_fallback",
+          "id": "case-8b593df0ad3e"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/kuku/models.rs",
+          "name": "server::core::providers::kuku::models::tests::remote_catalog_requires_business_success_and_keeps_real_model_names",
+          "id": "case-77842e579c81"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/login.rs",
+          "name": "server::core::login::tests::completed_login_exposes_warning_but_never_account_credentials",
+          "id": "case-5a3d7fed63a9"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/kuku/checkin_merge_tests.rs",
+          "name": "server::core::providers::kuku::checkin::merge_tests::kuku_driver_rejects_failed_unknown_and_partial_task_results",
+          "id": "case-494516ed4f13"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/kuku/checkin_merge_tests.rs",
+          "name": "server::core::providers::kuku::checkin::merge_tests::kuku_driver_accepts_only_explicit_success_or_already_completed",
+          "id": "case-ad4577edbec8"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/kuku/checkin_merge_tests.rs",
+          "name": "server::core::providers::kuku::checkin::merge_tests::kuku_driver_panel_errors_do_not_claim_or_misclassify_business_failures",
+          "id": "case-1b87d3dd48fb"
         }
       ]
     }

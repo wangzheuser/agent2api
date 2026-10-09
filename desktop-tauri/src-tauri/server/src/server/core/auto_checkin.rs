@@ -47,8 +47,15 @@ pub const DEFAULT_TIME: &str = "00:01";
 
 /// 可勾选的签到提供商（界面上的复选框）。默认全选。
 ///
-///   - **WorkBuddy**：国内版走腾讯每日签到，国际版走活跃探测与免费模型保活；
+///   - **WorkBuddy 国内版**：腾讯的每日签到接口；
+///   - **WorkBuddy 国际版**：每日活跃任务（活动探测 + 条件领取 + 免费模型保活，
+///     `billing::activity` 的 `workbuddy_daily_activity`）。国际版没有国内版的
+///     普通签到接口，但上游客户端把这条活跃链接在同一个每日调度上 —— 保活的
+///     成功不落 `checkinAt`、单独统计在 `active`；免费模型链可在签到中心自定义
+///     （`billing::keepalive`）。
 ///   - **小浣熊**：「桌面登录积分」链路（`providers::raccoon` 的每日积分发放）；
+///     首次登录奖励（电脑端 / 手机端各一条端点）是一次性新手福利，不在这条
+///     每日链路里（见 `providers::raccoon::onboarding`，挂新手任务分组）；
 ///   - **AutoClaw 国内版 / 国际版**：通用任务接口的 `daily_signin` 任务
 ///     （`providers::autoclaw::checkin`）。两个地区**都支持** —— 任务接口在
 ///     两地是同一套路径、同一套任务 id，只是站点不同（已实测），因此两家
@@ -63,8 +70,9 @@ pub const DEFAULT_TIME: &str = "00:01";
 /// 这是「有签到或每日活跃任务」的清单，不是「有积分概念」的清单：CatPaw 有积分查询
 /// 但没有签到，因此不在此列 —— 它的账号在批量签到里被算作 `skipped`。
 /// 加一家之前先确认它的签到链路真的存在（一个点了必然报错的复选框比没有更糟）。
-pub const CHECKIN_PROVIDERS: [&str; 10] = [
+pub const CHECKIN_PROVIDERS: [&str; 12] = [
     "workbuddy",
+    "workbuddy-intl",
     "raccoon",
     "autoclaw",
     "autoclaw-intl",
@@ -77,6 +85,7 @@ pub const CHECKIN_PROVIDERS: [&str; 10] = [
     // `custom-*` provider ids.
     "reward-custom",
     "loomy",
+    "kuku",
 ];
 
 /// 缺省的签到提供商集合（全选）
@@ -86,26 +95,10 @@ pub fn default_providers() -> Vec<String> {
 
 /// 提供商的展示名（从注册表查，查不到就原样回显 id）。
 ///
-/// 这个标签只出现在**签到语境**（提供商复选框、配置错误提示、签到范围变更日志），
-/// 而清单里有两家的签到是**有版本限定**的 —— 标签要在用户勾选时就把这件事讲清楚，
-/// 而不是让他签完发现被跳过了才回来查。两家的处理方式不同，原因也不同：
-///
-/// ── WorkBuddy：注册表里就叫「WorkBuddy 国内版」，这里不用再覆盖 ──
-/// 拆家后国内版与国际版是两家独立提供商（见 `providers::workbuddy::region`），
-/// 注册表的展示名**必须**带版本，否则「WorkBuddy」读起来像「两地通吃的那一家」。
-/// 而它在 `CHECKIN_PROVIDERS` 里只列国内版 —— 签到只有国内站有（上游事实：
-/// 腾讯的每日签到接口），国际版账号则走每日活跃任务；两者复用同一调度入口。
-/// 因此这里保留「含国际版活跃」的签到语境说明。
-///
-/// ── Qoder：注册表是通用名，这里补成「中国版」──────────────────
-/// 与 WorkBuddy 同理但方向相反：注册表里是通用的「Qoder」（它没有拆家，
-/// 一个 id 覆盖两个地区，展示名不该自带地区），而签到**只在中国版成立**
-/// （国际版没有签到计划，见 `providers::qoder::checkin`）。所以这里覆盖成
-/// 「Qoder 中国版」。
-///
-fn provider_label(id: &str) -> &str {
+/// 签到语境展示名；国内外能力由提供商实时活动判定。
+pub fn provider_label(id: &str) -> &str {
     match id {
-        "workbuddy" => "WorkBuddy（含国际版活跃）",
+        "workbuddy" => "WorkBuddy（国内版）",
         "qoder" => "Qoder 中国版",
         "minimax-code" => "MiniMax Code（每日签到）",
         "lobsterai" => "LobsterAI（活动奖励）",
@@ -302,6 +295,19 @@ fn raw_object() -> Map<String, Value> {
 /// 读状态。time 被手工改坏时回落到 DEFAULT_TIME，不让调度起不来（Node 同）。
 fn read_state() -> CheckinState {
     let raw = raw_object();
+    let mut providers = normalize_providers(raw.get("providers"));
+    // H 的 workbuddy 选项包含国际版；新版显式保存的选择按独立 provider 解释。
+    if raw
+        .get("providersVersion")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        < 2
+        && providers.iter().any(|id| id == "workbuddy")
+        && !providers.iter().any(|id| id == "workbuddy-intl")
+    {
+        providers.push("workbuddy-intl".to_string());
+        providers = normalize_providers(Some(&json!(providers)));
+    }
     let enabled = raw.get("enabled").and_then(Value::as_bool) == Some(true);
     let time = raw
         .get("time")
@@ -319,7 +325,7 @@ fn read_state() -> CheckinState {
     CheckinState {
         enabled,
         time,
-        providers: normalize_providers(raw.get("providers")),
+        providers,
         last_fired_date,
         last_result,
     }
@@ -461,6 +467,7 @@ impl AutoCheckin {
             &self.billing,
             read_state().providers.as_slice(),
             None,
+            reason,
         )
         .await
         {
@@ -475,6 +482,7 @@ impl AutoCheckin {
                         "date": today,
                         "reason": reason,
                         "succeeded": 0,
+                        "completedAccountIds": [],
                         "active": 0,
                         "total": 0,
                         "skipped": 0,
@@ -502,64 +510,13 @@ impl AutoCheckin {
             .and_then(Value::as_u64)
             .unwrap_or(total.saturating_add(skipped));
         // 失败明细：`名字（错误）`，名字缺失时退到 id，再退到「未知账号」
-        let failures: Vec<String> = result
-            .get("results")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| {
-                        let error = item
-                            .get("error")
-                            .and_then(Value::as_str)
-                            .filter(|message| !is_benign_completion_message(message));
-                        let activity_succeeded = activity_keepalive_succeeded(item);
-                        let claim_message = item
-                            .get("claim")
-                            .filter(|value| {
-                                !activity_succeeded
-                                    && value.get("success").and_then(Value::as_bool) == Some(false)
-                                    && value.get("alreadyCompleted").and_then(Value::as_bool)
-                                        != Some(true)
-                                    && !value
-                                        .get("msg")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("")
-                                        .contains("当前没有可领取的签到活动")
-                                    && !value
-                                        .get("msg")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("")
-                                        .contains("无每日签到活动")
-                                    && !value
-                                        .get("msg")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("")
-                                        .contains("已签到")
-                                    && !value
-                                        .get("msg")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("")
-                                        .contains("已领取")
-                            })
-                            .and_then(|value| value.get("msg").and_then(Value::as_str));
-                        let error = error.or(claim_message)?;
-                        let name = item
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .filter(|text| !text.is_empty())
-                            .or_else(|| item.get("id").and_then(Value::as_str))
-                            .unwrap_or("未知账号");
-                        Some(format!("{name}（{error}）"))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let failures = failed_account_labels(result);
         let summary = json!({
             "at": logging::now_ms(),
             "date": today,
             "reason": reason,
             "succeeded": succeeded,
+            "completedAccountIds": completed_account_ids(result),
             "active": active,
             "total": total,
             "eligible": total,
@@ -583,7 +540,7 @@ impl AutoCheckin {
                     format!("，活跃保活 {active} 个")
                 } else {
                     String::new()
-                }
+                },
             ),
         );
         summary
@@ -734,6 +691,7 @@ impl AutoCheckin {
                 )));
             }
             patch.insert("providers".to_string(), Value::Array(picked));
+            patch.insert("providersVersion".to_string(), json!(2));
         }
         if patch.is_empty() {
             return Err(AutoCheckinConfigError::new("没有需要更新的字段"));
@@ -794,6 +752,107 @@ impl AutoCheckin {
     }
 }
 
+/// 只从本轮实际执行且无错误的领取结果提取账号，不从选中范围或成功总数推断。
+pub fn completed_account_ids(result: &Value) -> Vec<String> {
+    let mut ids = Vec::new();
+    for item in result
+        .get("results")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if item.get("error").is_some_and(|error| !error.is_null())
+            || item.get("skipped").and_then(Value::as_bool) == Some(true)
+            || item.get("status").and_then(Value::as_str) == Some("skipped")
+        {
+            continue;
+        }
+        let Some(claim) = item.get("claim") else {
+            continue;
+        };
+        if claim.get("error").is_some_and(|error| !error.is_null())
+            || claim.get("skipped").and_then(Value::as_bool) == Some(true)
+            || claim.get("status").and_then(Value::as_str) == Some("skipped")
+            || claim.get("claimUnconfirmed").and_then(Value::as_bool) == Some(true)
+            || claim_auth_failed(item, claim)
+        {
+            continue;
+        }
+        let completed = claim.get("success").and_then(Value::as_bool) == Some(true)
+            || claim.get("alreadyCompleted").and_then(Value::as_bool) == Some(true)
+            || claim.get("alreadyClaimed").and_then(Value::as_bool) == Some(true)
+            || matches!(
+                claim.get("status").and_then(Value::as_str),
+                Some("claimed" | "already_claimed")
+            );
+        if completed {
+            if let Some(id) = item
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+            {
+                if !ids.iter().any(|existing| existing == id) {
+                    ids.push(id.to_string());
+                }
+            }
+        }
+    }
+    ids
+}
+
+/// 调度摘要与签到历史共用失败口径；保活只能中和“奖励尚未确认”，不能隐藏领取错误。
+pub fn failed_account_labels(result: &Value) -> Vec<String> {
+    result
+        .get("results")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let error = item
+                .get("error")
+                .and_then(Value::as_str)
+                .filter(|message| !is_benign_completion_message(message));
+            let claim_message = item
+                .get("claim")
+                .filter(|value| value.get("success").and_then(Value::as_bool) == Some(false))
+                .and_then(|value| {
+                    let message = value
+                        .get("msg")
+                        .and_then(Value::as_str)
+                        .unwrap_or("签到领取失败");
+                    let auth_failed = claim_auth_failed(item, value);
+                    let rejected = value
+                        .get("code")
+                        .and_then(Value::as_i64)
+                        .is_some_and(|code| code != 0);
+                    let neutral_keepalive = activity_keepalive_succeeded(item)
+                        && !rejected
+                        && matches!(
+                            message,
+                            "日活奖励尚未确认"
+                                | "有效对话完成，日活奖励尚未确认"
+                                | "网页会话完成，日活奖励尚未确认"
+                                | "仅执行保活，未领取奖励"
+                        );
+                    let benign = value.get("alreadyCompleted").and_then(Value::as_bool)
+                        == Some(true)
+                        || is_benign_completion_message(message)
+                        || (!rejected && message == "活动未开启")
+                        || neutral_keepalive;
+                    (auth_failed || !benign).then_some(message)
+                });
+            let error = error.or(claim_message)?;
+            let name = item
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .or_else(|| item.get("id").and_then(Value::as_str))
+                .unwrap_or("未知账号");
+            Some(format!("{name}（{error}）"))
+        })
+        .collect()
+}
+
 /// 计费签到接口把「今天已经完成」作为 HTTP 错误返回；这类结果不会阻塞
 /// 下一次活动窗口，也不应让定时任务进入高频重试。
 fn is_benign_completion_message(message: &str) -> bool {
@@ -809,6 +868,14 @@ fn is_benign_completion_message(message: &str) -> bool {
     ]
     .iter()
     .any(|marker| message.contains(marker))
+}
+
+fn claim_auth_failed(item: &Value, claim: &Value) -> bool {
+    match claim.get("code").and_then(Value::as_i64) {
+        Some(401 | 403) => true,
+        Some(1001) => item.get("provider").and_then(Value::as_str) == Some("trae"),
+        _ => false,
+    }
 }
 
 fn activity_keepalive_succeeded(item: &Value) -> bool {

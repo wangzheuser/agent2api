@@ -69,10 +69,8 @@ const CREDITS_PER_MICRO: f64 = 1_000_000.0;
 /// ── 用户 id 从哪来（三级，尽量省掉那个往返）──────────────────
 /// 余额路径是 `/users/{userId}/balance`，`userId` 是 `usr-...` 形态的
 /// **Cline 账号 id**（不是 WorkOS 的 `user_...`）。来源顺序：
-///   1. 凭证记录里的 `account`（若已是 `usr-` 形态，通常来自 JWT 的
-///      `external_id` 声明 —— 见 `credentials::account_id_from_jwt`）；
-///   2. 现场从 access token 的 JWT 里解 `external_id`（手填 token 时记录里
-///      可能没有 account，但 JWT 里有）；
+///   1. access token 的 JWT `external_id`（真实身份优先于手填别名）；
+///   2. 凭证记录里的 `account`（若已是 `usr-` 形态）；
 ///   3. 兜底打一次 `/users/me`，用它的 `data.id`。
 ///
 /// 第 3 条是最后手段：它多一个往返、多一处失败面，但必须留着 ——
@@ -80,10 +78,10 @@ const CREDITS_PER_MICRO: f64 = 1_000_000.0;
 pub async fn query_usage(store: &AccountStore, account_id: &str) -> Result<Value, GatewayError> {
     let credentials = refresh::ensure_fresh(store, account_id, false).await?;
     let token = credentials.bearer_token();
-    let user_id = if credentials.account.starts_with("usr-") {
-        credentials.account.clone()
-    } else if let Some(from_jwt) = credentials::account_id_from_jwt(&credentials.access_token) {
+    let user_id = if let Some(from_jwt) = credentials::account_id_from_jwt(&credentials.access_token) {
         from_jwt
+    } else if credentials.account.starts_with("usr-") {
+        credentials.account.clone()
     } else {
         // 前两条都取不到 → 问上游要一个
         fetch_me(&token).await?
@@ -96,7 +94,39 @@ pub async fn query_usage(store: &AccountStore, account_id: &str) -> Result<Value
     }
     let balance_raw = fetch_balance(&token, &user_id).await?;
     let plan = fetch_plan(&token).await;
+    if !same_usage_account(&credentials, &refresh::snapshot(store, account_id)?) {
+        return Err(GatewayError::with_status(409, "Cline 查询期间账号已改变，请重新查询余额"));
+    }
     Ok(normalize(&balance_raw, plan.as_ref(), &user_id))
+}
+
+fn same_usage_account(expected: &credentials::ClineCredentials, current: &credentials::ClineCredentials) -> bool {
+    credentials::usage_identity(&expected.access_token) == credentials::usage_identity(&current.access_token)
+}
+
+#[cfg(test)]
+mod usage_identity_tests {
+    use super::*;
+
+    #[test]
+    fn cline_usage_binds_live_account_but_allows_same_account_token_refresh() {
+        let credentials = credentials::ClineCredentials {
+            id: "cline-free-desktop".into(), access_token: "workos:e30.eyJleHRlcm5hbF9pZCI6InVzci1vbmUifQ.old".into(), refresh_token: String::new(),
+            expires_at: None, account: " usr-one ".into(), name: String::new(), cache_key: None,
+        };
+        let mut changed = credentials.clone();
+        changed.access_token = "workos:e30.eyJleHRlcm5hbF9pZCI6InVzci1vbmUifQ.new".into();
+        changed.account = "email@example.invalid".into();
+        assert!(same_usage_account(&credentials, &changed));
+        changed.account = "usr-two".into();
+        changed.access_token = "workos:e30.eyJleHRlcm5hbF9pZCI6InVzci10d28ifQ.new".into();
+        assert!(!same_usage_account(&credentials, &changed));
+        changed.account.clear();
+        changed.access_token = "fixture-opaque".into();
+        let mut unknown = changed.clone(); unknown.access_token = "fixture-other".into();
+        assert!(!same_usage_account(&changed, &unknown));
+        assert!(same_usage_account(&changed, &changed));
+    }
 }
 
 /// `GET /users/me` → `data.id`（`usr-...`）

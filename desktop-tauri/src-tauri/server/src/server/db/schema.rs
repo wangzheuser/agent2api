@@ -136,10 +136,10 @@ pub const RESERVED_KV_KEYS: &[&str] = &[
     // GitHub 检查、余额查询、模型刷新、凭证维护各多打一轮上游请求。
     // 属于「其它零散状态」：配置写入绝不能动它（否则排期归零、重启又立刻重跑）。
     "backgroundTaskState",
-    // 最近一次「定时查询积分」的结果快照（core::usage_query）：整份
-    // `{at, results, skipped}` 一个键，让界面在重启后仍能看到上次结果与查询时刻。
-    // 与上面的排期分开存：一个是「下次什么时候跑」，一个是「上次跑出了什么」，
-    // 生命周期不同（快照会被手动查询覆盖，排期不会）。同样不归配置管。
+    // 旧「定时查询积分」的结果快照（全局任务已退役）：键保留在保留清单里是
+    // 刻意的 —— `core::usage_records` 启动时把它的行导入 account_usage_records
+    // 表后删除本键；若那次迁移失败，这里不让配置写入把唯一的迁移来源误清掉。
+    // 迁移成功后这个键不再出现，条目留在清单里只是防御。
     "usageQuerySnapshot",
     // 出网代理池（core::proxy_pool）：整份 `{items: [...]}` 一个键 ——
     // 「网络代理」页维护的命名代理，账号可按 id 引用。属于「其它零散状态」：
@@ -206,7 +206,8 @@ pub fn is_reserved(key: &str) -> bool {
 /// ── 版本 10：补齐上游/本地两条历史线的请求计数列 ───────────
 /// 上游 v7 已有 is_test，但会跳过本地 v7 的缓存创建列；曾升级到 v9 的库
 /// 也可能缺这列。保留已发布 v7-v9 含义，在新的事务中按实际列补齐。
-pub const SCHEMA_VERSION: i64 = 10;
+/// 版本 11：逐账号余额记录；兼容上游 v8 已建的同名表。
+pub const SCHEMA_VERSION: i64 = 11;
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
@@ -549,6 +550,38 @@ const V9_SCHEMA: &str = "
 ALTER TABLE requests ADD COLUMN is_test INTEGER NOT NULL DEFAULT 0;
 ";
 
+/// 版本 11：account_usage_records 表 —— 每账号一条余额查询记录（一账号一行，
+/// 主键即账号 id，重复写入天然是 UPSERT）。
+///
+/// 存什么：`usage` 是适配器返回的**归一化余额 JSON 原文**（与 `/api/accounts/usage`
+/// 行里的 `usage` 同一份形状，前端按它渲染余额列），`error` / `code` 是失败行的
+/// 原因与机器标记（与快照行同语义）。`remaining` 是从 usage 里提出的**数字**投影
+/// （归一化家 = `available`，workbuddy 既有形状 = `totalLeft`）：转发选路的
+/// 「余额不足跳过」每条请求都要比一次，从 JSON 里现场解析太奢侈，主键查一列即可；
+/// `unlimited` 单独一列，workbuddy 的 ∞ 账号不参与阈值判定。
+///
+/// ── 为什么 `remaining` 只在成功时覆写 ────────────────────────
+/// 失败行保留上次成功的数值：欠费判定不因「这次查询失败」而放行（避免
+/// 「查询失败 → 放行 → 402」的窗口期），恢复需要查询成功且数值回到阈值之上。
+/// 失败本身的展示信息在 `error` / `code` 里，二者互不覆盖。
+///
+/// 为什么时间是 INTEGER 毫秒而不是 DATETIME：调度判定（到期 = 上次尝试 +
+/// 间隔）要的是可直接比较的毫秒数，与 `logging::now_ms` 同一口径，读出来即用。
+const V11_SCHEMA: &str = "
+-- ── account_usage_records：每账号的余额查询记录（schema v11）──
+CREATE TABLE IF NOT EXISTS account_usage_records (
+  account_id      TEXT PRIMARY KEY,
+  usage           TEXT,
+  error           TEXT,
+  code            TEXT,
+  remaining       REAL,
+  unlimited       INTEGER NOT NULL DEFAULT 0 CHECK (unlimited IN (0, 1)),
+  last_success_at INTEGER NOT NULL DEFAULT 0,
+  last_attempt_at INTEGER NOT NULL DEFAULT 0,
+  updated_at      INTEGER NOT NULL DEFAULT 0
+);
+";
+
 /// 把库升到 [`SCHEMA_VERSION`]（幂等：已是最新版时什么都不做）。
 ///
 /// 返回 `rusqlite::Result` 而不是本模块自造的字符串错误：调用方 `Db::open`
@@ -637,6 +670,18 @@ fn apply_version(conn: &Connection, version: i64) -> rusqlite::Result<()> {
             }
             Ok(())
         }
+        11 => {
+            conn.execute_batch(V11_SCHEMA)?;
+            for (column, ddl) in [
+                ("identity", "ALTER TABLE account_usage_records ADD COLUMN identity TEXT NOT NULL DEFAULT '';"),
+                ("queried_at", "ALTER TABLE account_usage_records ADD COLUMN queried_at INTEGER NOT NULL DEFAULT 0;"),
+            ] {
+                let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('account_usage_records') WHERE name=?1)", [column], |row| row.get(0))?;
+                if !exists { conn.execute_batch(ddl)?; }
+            }
+            conn.execute("UPDATE account_usage_records SET queried_at=MAX(last_success_at,last_attempt_at) WHERE queried_at=0", [])?;
+            Ok(())
+        },
         _ => Ok(()),
     }
 }

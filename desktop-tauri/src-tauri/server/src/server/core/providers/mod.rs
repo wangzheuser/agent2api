@@ -118,6 +118,7 @@ pub mod content_block;
 pub mod custom;
 /// LobsterAI 原生 Provider：OpenAI Chat Completions、OAuth、额度与活动奖励。
 pub mod lobsterai;
+pub mod kuku;
 pub mod loomy;
 /// MiniMax Code（mcode）原生 Provider：Anthropic Messages 反代、OAuth 续期、额度与签到。
 pub mod minimax_code;
@@ -319,6 +320,23 @@ pub enum ProviderKind {
     MiniMaxCode,
     /// LobsterAI。原生 OpenAI Chat Completions、活动奖励与额度查询。
     LobsterAI,
+    /// KukuAI（百度文库「库库 AI / GenFlowPro」，`kuku.baidu.com`）。适配实现
+    /// 在 `kuku/`：账号管理（粘贴 Cookie / 导入本机客户端登录态）**加推理转发**
+    /// （建会话 → 分配算力 → SSE 的自有三步时序，`is_stateful()` 为 true，
+    /// 会话是**请求内**的、不跨请求保持状态）。
+    ///
+    /// ── 上游长什么样（从客户端 app.asar 逆向 + 参考实现实测，见模块头）──
+    /// 认证是三个 Cookie（`BDUSS` / `STOKEN` / `gfprotpl=genflowpro`），
+    /// **没有刷新接口**（`supports_refresh = false`，过期只能重新登录/重新导入，
+    /// 与 CatPaw 同一处境）；模型是 `/wenchain/genflowpro/model_list` 的
+    /// `model_name`（静态兜底 + 远程刷新）；余额是
+    /// `/bizapi/gfpro/getgfvipremain`（`data.list[0].totalPoint`）。
+    ///
+    /// ── 签到形态 ────────────────────────────────────────────
+    /// 「免费领积分」活动的每日任务（每日登录 / 完成一次对话），已接进
+    /// `core::auto_checkin`（清单里列 `kuku`），claim 见 `kuku::checkin`。
+    /// 业务会话靠换发的 genflowpro STOKEN（`kuku::engine`）。
+    Kuku,
 }
 
 /// 一个提供商的静态元数据。
@@ -424,6 +442,7 @@ pub const PROVIDERS: &[ProviderMeta] = &[
         id: "loomy",
         label: "Loomy",
     },
+    ProviderMeta { id: "kuku", label: "KukuAI" },
 ];
 
 /// provider id 在注册表里的下标（未知 id → None）。
@@ -502,6 +521,7 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
         "minimax-code" => Some(ProviderKind::MiniMaxCode),
         "lobsterai" => Some(ProviderKind::LobsterAI),
         "loomy" => Some(ProviderKind::Loomy),
+        "kuku" => Some(ProviderKind::Kuku),
         // 走到这里 = 上面的注册表判定已放行、这个 match 却没有对应分支：
         // 只可能是有人给 `PROVIDERS` 加了条目忘了加这里。开发期喊出来；
         // release 返回 None（见上：宁可为「未知」，不可误认成别家）。
@@ -538,6 +558,7 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
         ProviderKind::MiniMaxCode => "minimax-code",
         ProviderKind::LobsterAI => "lobsterai",
         ProviderKind::Loomy => "loomy",
+        ProviderKind::Kuku => "kuku",
     }
 }
 

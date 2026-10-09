@@ -1,14 +1,15 @@
-//! 查询结果和每个账号的请求排期持久化，首屏读取快照不会触发上游请求。
+//! 余额查询共用逐账号持久化占位、失败退避及身份校验。
+//! 全局配置保留为总开关和继承间隔，自动查询由单一心跳执行。
+//! 手动单查/批量与心跳逐条保存结果；显式低余额策略在写入与选路时生效。
 
-use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::server::config;
-use crate::server::core::task_state;
-
 use crate::server::core::account_store::AccountStore;
 use crate::server::core::providers::adapter::adapter_for;
+use crate::server::core::{usage_records, task_state};
+
 use crate::server::logging;
 
 /// 余额查询失败的原因：区分「没有凭证」（Node 的早退分支，少 name 键）与
@@ -103,9 +104,18 @@ pub fn resolve_batch_targets(
 
 /// 单账号余额查询：任何失败都收敛为 `{error}` 而不是抛出（批量查询不被单账号
 /// 拖垮），刷新重试在 `query_usage_inner` 里。
-async fn query_usage_for(store: &AccountStore, account: &Value) -> Value {
+async fn query_usage_for(store: &AccountStore, account: &Value, manual: bool) -> Value {
     let id = account.get("id").and_then(Value::as_str).unwrap_or("").to_string();
     let name = account.get("name").cloned().unwrap_or(Value::Null);
+    let interval = usage_records::query_settings(account.get("usageQuery"))["interval"].as_i64().unwrap_or(600).max(30) * 1000;
+    let key = format!("account-usage:{}", usage_records::identity(account));
+    let guard = match task_state::claim(&key, interval, manual, task_state::ManualBackoff::Bypass, 1000) {
+        Ok(task_state::Claim::Acquired(guard)) => guard,
+        Ok(task_state::Claim::Deferred(state)) => return json!({"id":id,"usage":null,"error":state.waiting_message(),"code":"usage_deferred"}),
+        Err(error) => return json!({"id":id,"usage":null,"error":error,"code":"usage_state_error"}),
+    };
+    // 保存请求时间；提交时另验 claim 所有权，拒绝旧租约的迟到响应。
+    let attempted_at = logging::now_ms();
     // 凭证与 provider 都从目标集合里的账号对象读，**不回读账号文件**：
     // 20 个账号并发时那次回读会变成 20 次整库读盘，而答案已在手上。
     // `hasCredentials` 是 store 逐条给出的统一判据（缺省视为有）。
@@ -130,17 +140,24 @@ async fn query_usage_for(store: &AccountStore, account: &Value) -> Value {
             json!({ "id": id, "name": name, "usage": Value::Null, "error": message, "code": code })
         }
     };
-    // 批量快照可能等待其他慢账号；按本账号完成时间排序，避免旧失败覆盖新余额。
-    if account.get("provider").and_then(Value::as_str).unwrap_or("workbuddy") == "workbuddy" {
-        row["queriedAt"] = Value::from(logging::now_ms());
+    let queried_at = logging::now_ms();
+    row["queriedAt"] = json!(queried_at);
+    let outcome = usage_records::UsageOutcome {
+        usage: row.get("usage").filter(|value| !value.is_null()).cloned(),
+        error: row.get("error").and_then(Value::as_str).map(str::to_string),
+        code: row.get("code").and_then(Value::as_str).map(str::to_string),
+    };
+    let written = store.commit_usage_result(account, &outcome, queried_at, attempted_at, guard.ownership());
+    if written {
+        super::workbuddy_policy::observe_usage(account, &row["usage"]);
+    } else {
+        row["usage"] = Value::Null;
+        row["error"] = json!("账号已改变或结果保存失败，请重新查询");
     }
-    // 身份在请求期间可能被替换；旧响应不写入新账号的保底/临期快照。
-    if let Some(before) = super::workbuddy_policy::identity(account) {
-        let current = store.list_accounts();
-        if current["accounts"].as_array().is_some_and(|accounts| accounts.iter().any(|item|
-            item["id"].as_str() == Some(id.as_str()) && super::workbuddy_policy::identity(item).as_ref() == Some(&before))) {
-            super::workbuddy_policy::observe_usage(account, &row["usage"]);
-        }
+    let success = written && outcome.usage.is_some();
+    let summary = if success { "余额查询完成".to_string() } else { row["error"].as_str().unwrap_or("查询失败").to_string() };
+    if let Err(error) = guard.finish(success, summary, None, 0, interval) {
+        logging::verbose("[Usage]", &format!("查询排期保存失败：{error}"));
     }
     row
 }
@@ -225,8 +242,10 @@ fn supports_usage(account: &Value) -> bool {
 ///
 /// 目标集合是**全部可用账号**（`resolve_batch_targets(provider = None)`，
 /// 不看启用状态，见那里的说明），逐账号按 `provider` 分流到
-/// `ProviderAdapter::query_usage`。改造前这条路径只查 workbuddy ——
-/// 三家账号被静默跳过，前端连按钮都不给。
+/// `ProviderAdapter::query_usage`。手动批量与手动单查走这里，自动查询的
+/// 心跳循环复用同一套单账号编排（`query_usage_for`）—— 三条入口的结果
+/// 都**落记录表**（见模块头），余额不足的跳过 / 禁用判定因此拿到的一直是
+/// 最新读数，手动查询也天然顺延该账号的下一轮自动排期。
 ///
 /// **并发**是关键：Node 版用 `Promise.all`，20 个账号串行会让前端转圈 20 次
 /// 往返。这里用 `join_all` 在同一个任务里并发轮询（每个 future 都是网络等待，
@@ -249,151 +268,178 @@ pub async fn query_all(store: &AccountStore, id: Option<&str>) -> Result<Value, 
     let single = id.filter(|value| !value.is_empty());
     // `provider = None`：跨四家取目标（签到那条仍按 provider 过滤）
     let (targets, skipped) = resolve_batch_targets(store, None, single)?;
-    // 用户手动批量查询也是一次真实的上游轮询：把定时那轮的排期顺延一个间隔，
-    // 免得「刚点完查询、到点或重启后又立刻全量再查一遍」（单账号查询不动它 ——
-    // 那是针对某一行的问题，不代表整批刚查过）。
-    if single.is_none() {
-        note_external_run();
-    }
-    let futures: Vec<_> = targets
+    let queried: Vec<&Value> = targets
         .iter()
         .filter(|account| single.is_some() || supports_usage(account))
-        .map(|account| query_usage_for(store, account))
+        .collect();
+    let futures: Vec<_> = queried
+        .iter()
+        .map(|account| query_usage_for(store, account, true))
         .collect();
     let results = futures::future::join_all(futures).await;
     Ok(json!({ "results": results, "skipped": skipped }))
 }
 
-// ─── 定时查询的结果快照 ──────────────────────────────────────
+// ─── 每账号自动查询的心跳调度 ────────────────────────────────
 
-/// 快照的持久化键（`kv` 的保留键，见 `task_state`）。
-const SNAPSHOT_KEY: &str = "usageQuerySnapshot";
+/// 心跳判定间隔：10 秒（与 `scheduled_tasks` 的 tick 同一量级）。
+/// 账号间隔下限是 30 秒，这个粒度意味着「到点后最多晚 10 秒查询」——
+/// 用户感知不到，空转代价只是每 10 秒一次读库（到期判定全部在内存与
+/// 记录表的小查询里）。
+pub const SWEEP_TICK_MS: u64 = 10_000;
 
-/// 进程内副本：快照是 20 秒一次的前端轮询读点，不必每次都读库。
-/// 未命中时从库里读回（重启后界面仍能看到上次结果与它的查询时刻）。
-static SNAPSHOT: OnceLock<Mutex<Option<Value>>> = OnceLock::new();
-
-fn snapshot_slot() -> &'static Mutex<Option<Value>> {
-    SNAPSHOT.get_or_init(|| Mutex::new(None))
+/// 起动每账号自动查询的心跳循环（`ServerState::bootstrap` 调一次，进程内
+/// 只有这一个循环）。循环体：扫到期账号 → 占位 → 并发查询 → 落记录 → 钩子。
+pub fn spawn_sweeper(store: AccountStore) {
+    crate::spawn_task(async move {
+        loop {
+            sweep_due(&store).await;
+            tokio::time::sleep(Duration::from_millis(SWEEP_TICK_MS)).await;
+        }
+    });
 }
 
-/// 手动那一轮把定时排期顺延一个间隔（口径与「立即执行」一致）。
-fn note_external_run() {
-    let interval = config::scheduled_settings().usage_query.interval * 60_000;
-    if let Err(error) = task_state::note_external_run("usageQuery", interval) {
-        logging::verbose("[Usage]", &format!("余额查询排期顺延失败：{error}"));
+/// 一轮清扫：查一遍「配置了自动查询且到期」的账号。
+///
+/// 到期判定使用 task_state 中的逐账号持久排期，保留失败退避与在途占位。
+/// 批量查询排除 `supports_usage == false` 的家（避免一整片 501，与手动批量
+/// 同口径）；没凭证的账号**不排除**：那是本地就能给出的失败结论，写进记录
+/// 让界面如实显示「没有可用凭证」，与手动批量同一行为。
+async fn sweep_due(store: &AccountStore) {
+    usage_records::sync_facts();
+    if !crate::server::config::scheduled_settings().usage_query.enabled { return; }
+    usage_records::prune_orphans();
+    let Ok(states) = account_schedules(store) else { return };
+    let now = logging::now_ms();
+    let due: Vec<_> = states.into_iter().filter(|(_, _, state)| state.due_at() <= now).collect();
+    if due.is_empty() {
+        return;
     }
-}
-
-/// 存下定时那一轮的查询结果，返回 `(成功数, 失败数)`。
-///
-/// **失败的行照样进快照**：定时查询的价值就在于「不点按钮也知道现在是好是坏」，
-/// 把失败悄悄丢掉会让界面永远停在上一轮的旧余额上（那是比显示失败更糟的误导）。
-/// （失败行的**时效**由出口把关：账号记录在快照之后变过就丢掉，见
-/// `prune_stale_failures` —— 进快照与端出去是两件事。）
-///
-/// 成功 / 失败的判据是 `usage` 键是否为 null —— 与前端 `cacheEntryOf` 同源
-/// （它也是「有 usage 就是结果，否则是失败行」）。
-///
-/// 快照落盘（`usageQuerySnapshot`）：重启后界面先展示上次结果与查询时刻，
-/// 而不是一片空白 —— 它同时是「重启后不必马上再查一遍」的另一半依据。
-pub fn store_snapshot(report: Value) -> (usize, usize) {
-    let results = report
-        .get("results")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let ok = results
+    let futures: Vec<_> = due
         .iter()
-        .filter(|row| row.get("usage").is_some_and(|usage| !usage.is_null()))
-        .count();
-    let failed = results.len().saturating_sub(ok);
-    let snapshot = json!({
-        "at": logging::now_ms(),
-        "results": results,
-        "skipped": report.get("skipped").cloned().unwrap_or(Value::from(0)),
-    });
-    // 锁中毒时沿用「不写内存」而不是 panic：少一次快照更新远比整个应用退出轻
-    if let Ok(mut slot) = snapshot_slot().lock() {
-        *slot = Some(snapshot.clone());
-    }
-    if let Err(error) = task_state::store_value(SNAPSHOT_KEY, snapshot) {
-        logging::verbose("[Usage]", &format!("余额快照保存失败（下次启动看不到本次结果）：{error}"));
-    }
-    (ok, failed)
+        .map(|(account, _, _)| query_usage_for(store, account, false))
+        .collect();
+    futures::future::join_all(futures).await;
 }
 
-/// 最近一次定时查询的快照（**出口已按账号记录做过时效过滤**）。从未查过时给
-/// `{at: 0, results: [], skipped: 0}` —— 界面据此显示「还没有定时查询结果」，
+/// 调度与任务面板使用同一组当前账号，避免展示已删除账号的旧状态。
+fn account_schedules(store: &AccountStore) -> Result<Vec<(Value, String, task_state::TaskState)>, String> {
+    let states = task_state::read_all()?;
+    let records = usage_records::load_all();
+    let legacy = states.get("usageQuery").cloned().unwrap_or_default();
+    let (targets, _) = resolve_batch_targets(store, None, None).map_err(|error| error.message)?;
+    let mut result = Vec::new();
+    for account in targets.into_iter().filter(supports_usage) {
+        let Some(interval) = usage_records::query_interval_of(&account) else { continue };
+        let identity = usage_records::identity(&account);
+        let key = format!("account-usage:{identity}");
+        let mut state = states.get(&key).cloned().unwrap_or_default();
+        if state.interval_ms() != interval * 1000 || state.clock_needs_adjustment() {
+            let mut initial = legacy.clone();
+            if let Some(record) = account["id"].as_str().and_then(|id| records.get(id))
+                .filter(|record| record.identity.is_empty() || record.identity == identity) {
+                initial.last_attempt_at = initial.last_attempt_at.max(record.last_attempt_at);
+                initial.last_run_at = initial.last_run_at.max(record.queried_at);
+            }
+            task_state::initialize_schedule(&key, &initial, interval * 1000)?;
+            state = task_state::read(&key)?;
+        }
+        result.push((account, key, state));
+    }
+    Ok(result)
+}
+
+pub fn reschedule(store: &AccountStore, enabled_now: bool) -> Result<(), String> {
+    for (_, key, _) in account_schedules(store)? {
+        if enabled_now { task_state::schedule_now(&key)?; }
+    }
+    Ok(())
+}
+
+pub fn scheduled_status(store: &AccountStore, task: &mut Value) {
+    match account_schedules(store) {
+        Ok(states) => {
+            task["retryAt"] = states.iter().map(|(_, _, state)| state.retry_at).filter(|at| *at > logging::now_ms()).min().map(|at| json!(at)).unwrap_or(Value::Null);
+            task["running"] = json!(states.iter().any(|(_, _, state)| state.running()));
+            task["nextRunAt"] = states.iter().map(|(_, _, state)| state.due_at().max(logging::now_ms())).min().map(|at| json!(at)).unwrap_or(Value::Null);
+            for (field, get) in [
+                ("lastRunAt", (|state: &task_state::TaskState| state.last_run_at) as fn(&task_state::TaskState) -> i64),
+                ("lastAttemptAt", |state: &task_state::TaskState| state.last_attempt_at),
+                ("lastSuccessAt", |state: &task_state::TaskState| state.last_success_at),
+            ] {
+                let at = states.iter().map(|(_, _, state)| get(state)).max().unwrap_or(0);
+                if at > task[field].as_i64().unwrap_or(0) { task[field] = json!(at); }
+            }
+            if let Some((_, _, state)) = states.iter().max_by_key(|(_, _, state)| state.last_run_at).filter(|(_, _, state)| state.last_run_at > 0) {
+                task["lastResult"] = json!(state.last_result);
+                task["lastError"] = json!(state.last_error);
+            }
+        }
+        Err(error) => { task["lastError"] = json!(error); task["nextRunAt"] = Value::Null; }
+    }
+}
+
+// ─── 快照（前端 20 秒轮询的读点）─────────────────────────────
+
+/// 各账号最近一次的查询结论（**出口已做两类过滤**）。从未查过时给
+/// `{at: 0, results: [], skipped: 0}` —— 界面据此显示「还没有查询结果」，
 /// 而不是把空数组当成「一个账号都没有」。
+///
+/// 形状与手动查询响应兼容（前端 `applyBalances` 同一份解析），每行多带自己的
+/// `at`（这一行的结论时刻）：按账号到期的写法下各行时刻天然不同，失败行的
+/// 时效判定必须按行算，不能再拿一个整轮的 `at` 盖所有人（前端 `applyBalances`
+/// 因此优先取行级 `at`）。
+///
+/// 出口过滤的两条（与旧 kv 快照的 `prune_stale_failures` 同语义）：
+///   - 账号已删除的行不端出（界面上没有那一行，留着只会对不上）；
+///   - 失败行只在「这次尝试不早于账号记录的最后改动」时端出 —— 重新登录 /
+///     重导入 / 刷过 token 之后，「当时查不到」那条断言就不再成立。成功读数
+///     不受影响：「可用 5147 积分」是一次读数的事实，凭证换了也不会变假话。
 pub fn snapshot(store: &AccountStore) -> Value {
-    let raw = raw_snapshot();
-    prune_stale_failures(store, raw)
-}
-
-/// 快照的原始副本（内存命中 → 库里的持久化副本 → 空快照），不含时效过滤。
-fn raw_snapshot() -> Value {
-    if let Ok(slot) = snapshot_slot().lock() {
-        if let Some(value) = slot.as_ref() {
-            let mut response = value.clone();
-            response["serverNow"] = Value::from(logging::now_ms());
-            return response;
+    let records = usage_records::load_all();
+    let accounts = store.list_accounts();
+    let list = accounts.get("accounts").and_then(Value::as_array);
+    let mut rows = Vec::new();
+    let mut at = 0i64;
+    for (id, record) in &records {
+        let account = list.and_then(|list| {
+            list.iter().find(|account| {
+                account.get("id").and_then(Value::as_str) == Some(id.as_str())
+            })
+        });
+        let Some(account) = account else { continue };
+        if !record.identity.is_empty() && record.identity != usage_records::identity(account) { continue; }
+        at = at.max(record.queried_at);
+        let name = account.get("name").cloned().unwrap_or(Value::Null);
+        match record.usage.as_ref().filter(|_| record.error.is_none()) {
+            Some(usage) => rows.push(json!({
+                "id": id,
+                "name": name,
+                "usage": usage,
+                "error": Value::Null,
+                "at": record.last_success_at,
+                "queriedAt": record.last_success_at,
+            })),
+            None => {
+                let Some(error) = record.error.as_deref() else { continue };
+                let changed = account
+                    .get("updatedAt")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0)
+                    .max(account.get("addedAt").and_then(Value::as_i64).unwrap_or(0));
+                if record.queried_at >= changed {
+                    rows.push(json!({
+                        "id": id,
+                        "name": name,
+                        "usage": Value::Null,
+                        "error": error,
+                        "code": record.code,
+                        "at": record.queried_at,
+                        "queriedAt": record.queried_at,
+                    }));
+                }
+            }
         }
     }
-    let mut restored = task_state::read(SNAPSHOT_KEY)
-        .ok()
-        .and_then(|state| state.value)
-        .unwrap_or_else(|| json!({ "at": 0, "results": [], "skipped": 0 }));
-    if let Ok(mut slot) = snapshot_slot().lock() {
-        *slot = Some(restored.clone());
-    }
-    // 当前服务端时刻只用于计算快照年龄，不持久化，也不与浏览器时钟比较。
-    restored["serverNow"] = Value::from(logging::now_ms());
-    restored
-}
-
-/// 快照出口的**时效过滤**：丢掉「比账号记录还旧」的失败行，也丢掉账号已被删除的行。
-///
-/// ── 为什么只丢失败行、不丢成功读数 ──────────────────────────
-/// 失败行是对**当时那份凭证**的断言（「这个账号此刻查不到 / 续期不了」），而快照
-/// 是按账号 id 存的：账号删掉重新登录、重新导入、或 token 被刷新（记录的
-/// `updatedAt` 往前走）之后，那条断言就不再成立 —— 继续端出去只会让人以为账号
-/// 还是坏的。真实事故（2026-10-06）：两个小浣熊账号 12:39 重新登录成功、之后
-/// 转发与余额都正常，界面上却一直挂着上午 10:12 那一轮的「刷新接口失败
-/// （HTTP 401）」—— 重建的记录复用了同一个 `user-<userId>` id，旧结论被继承了。
-///
-/// 成功读数不受这条规则影响：「可用 5147 积分」是一次读数的事实，凭证换了它
-/// 也不会变成假话，界面本来就按「上次读数」展示（重启后先给上次结果，见
-/// `store_snapshot`）。若一并丢掉，重新登录后的账号会连余额一起变空白 ——
-/// 那是比「读数旧」更糟的结果。
-///
-/// 前端缓存里还有一份（`accounts-data.ts` 的 `usageEntryOf`，同一条判据）：本地
-/// 缓存不经过这个出口，重新登录后不必等下一轮查询才纠正。两边都要改。
-fn prune_stale_failures(store: &AccountStore, mut snapshot: Value) -> Value {
-    let at = snapshot.get("at").and_then(Value::as_i64).unwrap_or(0);
-    // at = 0：本进程还没查过（空快照），没有行可过滤
-    if at <= 0 {
-        return snapshot;
-    }
-    let changed = store.account_change_times();
-    let Some(results) = snapshot.get_mut("results").and_then(Value::as_array_mut) else {
-        return snapshot;
-    };
-    results.retain(|row| {
-        // 读不出 id 的行看不懂，原样留着（宁可不动它，也不猜着删）
-        let Some(id) = row.get("id").and_then(Value::as_str) else {
-            return true;
-        };
-        // 有读数的行不是失败结论，见函数头
-        if row.get("usage").is_some_and(|usage| !usage.is_null()) {
-            return true;
-        }
-        match changed.get(id) {
-            // 记录在快照之后被改过（重新登录 / 重导入 / 刷过 token）→ 旧结论作废
-            Some(changed_at) => *changed_at <= at,
-            // 账号已不在列表里：界面上没有那一行，留着只会让响应与账号列表对不上
-            None => false,
-        }
-    });
-    snapshot
+    json!({ "at": at, "serverNow": logging::now_ms(), "results": rows, "skipped": 0 })
 }

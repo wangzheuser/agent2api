@@ -27,6 +27,8 @@
 //! 时间**而不是一个布尔：进程崩溃 / 强杀后没有人来清标志，只有租约到期才
 //! 会释放 —— 布尔形态会让任务永远卡在「执行中」。心跳任务随 `RunGuard` 一起
 //! 结束，正常收尾（`finish`）与中途取消（`Drop`）都会释放占位。
+//! 余额查询循环完成整轮后再等待 10 秒，跨实例余额缓存同步会随慢查询延迟；
+//! 本模块的租约心跳独立续租，不依赖余额查询循环完成。
 //!
 //! ── 为什么键名不带任务前缀、值整份存一个对象 ────────────────
 //! `kv` 的固定键必须登记进 `db::schema::RESERVED_KV_KEYS`（配置写入靠它排除
@@ -101,6 +103,10 @@ impl TaskState {
         self.next_run_at.max(self.retry_at).max(self.lease_until)
     }
 
+    pub fn interval_ms(&self) -> i64 { self.interval_ms }
+
+    pub fn clock_needs_adjustment(&self) -> bool { self.last_attempt_at > logging::now_ms() + 60_000 }
+
     pub fn waiting_message(&self) -> String {
         if self.running() {
             return "任务正在执行中，请稍候".to_string();
@@ -126,6 +132,46 @@ impl TaskState {
         self.retry_at = (self.retry_at - shift).max(0);
         self.lease_until = (self.lease_until - shift).max(0);
     }
+
+    fn renew_lease_at(&mut self, now: i64) {
+        // 先把旧排期移到当前时钟，再写新租约，避免后续校时再次平移。
+        self.adjust_clock(now);
+        self.lease_until = now.saturating_add(LEASE_MS);
+    }
+
+    fn finish_at(
+        &mut self,
+        now: i64,
+        success: bool,
+        summary: String,
+        value: Option<Value>,
+        retry_at: i64,
+        interval_ms: i64,
+    ) {
+        // 查询期间也可能回拨；旧时间必须在写入本次完成时间前一起校正。
+        self.adjust_clock(now);
+        self.last_run_at = now;
+        self.last_result = Some(summary.clone());
+        self.interval_ms = interval_ms;
+        if success {
+            self.last_success_at = now;
+            self.last_error = None;
+            self.failures = 0;
+            self.retry_at = retry_at;
+        } else {
+            self.last_error = Some(summary);
+            self.failures = self.failures.saturating_add(1);
+            let multiplier = 1_i64 << self.failures.saturating_sub(1).min(10);
+            let delay = interval_ms.max(60_000).saturating_mul(multiplier).min(MAX_BACKOFF_MS);
+            self.retry_at = retry_at.max(now.saturating_add(delay));
+        }
+        if let Some(value) = value {
+            self.value = Some(value);
+        }
+        self.next_run_at = now.saturating_add(interval_ms).max(self.retry_at);
+        self.owner.clear();
+        self.lease_until = 0;
+    }
 }
 
 pub fn install(db: Option<Db>) {
@@ -148,6 +194,11 @@ fn read_states(conn: &rusqlite::Connection) -> Result<HashMap<String, TaskState>
             .map_err(|error| format!("任务状态格式错误: {error}")),
         None => Ok(HashMap::new()),
     }
+}
+
+/// 在调用方的写事务中核对执行所有权，拒绝租约替换后的迟到结果。
+pub(crate) fn owns_run(conn: &rusqlite::Connection, key: &str, owner: &str) -> bool {
+    !owner.is_empty() && read_states(conn).ok().and_then(|states| states.get(key).cloned()).is_some_and(|state| state.owner == owner)
 }
 
 pub fn read(key: &str) -> Result<TaskState, String> {
@@ -254,6 +305,25 @@ pub fn reschedule(key: &str, interval_ms: i64) -> Result<(), String> {
     .map(|_| ())
 }
 
+/// 逐账号排期首次继承旧全局/余额记录；改间隔仍保留失败冷却与在途租约。
+pub fn initialize_schedule(key: &str, initial: &TaskState, interval_ms: i64) -> Result<(), String> {
+    change(key, |state| {
+        if state.interval_ms == 0 && state.last_attempt_at == 0 {
+            state.last_attempt_at = initial.last_attempt_at;
+            state.last_run_at = initial.last_run_at;
+            state.last_success_at = initial.last_success_at;
+            state.retry_at = initial.retry_at;
+            state.failures = initial.failures;
+        }
+        state.adjust_clock(logging::now_ms());
+        if state.interval_ms != interval_ms && !state.running() {
+            state.interval_ms = interval_ms;
+            let anchor = state.last_run_at.max(state.last_attempt_at);
+            state.next_run_at = anchor.saturating_add(interval_ms).max(state.retry_at);
+        }
+    }).map(|_| ())
+}
+
 pub enum Claim {
     Acquired(RunGuard),
     Deferred(TaskState),
@@ -266,7 +336,7 @@ pub enum Claim {
 ///     （检查更新的 GitHub 限额匿名按出口 IP 计、带令牌按用户计）。提前打一次
 ///     只会再吃一次 403，还把恢复时刻重新顶到未来，不如如实告诉用户还要等多久；
 ///   - [`ManualBackoff::Bypass`]：冷却记的是**上一轮为什么没成功**（模型目录按
-///     上游逐个 401 / 5xx 退避；定时查询积分与凭证维护按账号失败退避）。用户按下
+///     上游逐个 401 / 5xx 退避；凭证维护按账号失败退避）。用户按下
 ///     「获取模型」/「立即执行」的预期就是「现在真打一次」，而且按按钮往往正是
 ///     因为刚把那个原因修好（重新导入登录态、换账号、把坏账号删了）—— 继续拿旧
 ///     结论挡着，界面上只会留着上一次的错误文案，看起来就是按钮坏了。
@@ -322,7 +392,7 @@ pub fn claim(
             tokio::time::sleep(Duration::from_secs(30)).await;
             let result = change(&heartbeat_key, |state| {
                 if state.owner == heartbeat_owner {
-                    state.lease_until = logging::now_ms().saturating_add(LEASE_MS);
+                    state.renew_lease_at(logging::now_ms());
                 }
             });
             if !matches!(result, Ok(state) if state.owner == heartbeat_owner) {
@@ -346,6 +416,8 @@ pub struct RunGuard {
 }
 
 impl RunGuard {
+    pub(crate) fn ownership(&self) -> (&str, &str) { (&self.key, &self.owner) }
+
     pub fn finish(
         mut self,
         success: bool,
@@ -359,28 +431,7 @@ impl RunGuard {
             if state.owner != self.owner {
                 return;
             }
-            let now = logging::now_ms();
-            state.last_run_at = now;
-            state.last_result = Some(summary.clone());
-            state.interval_ms = interval_ms;
-            if success {
-                state.last_success_at = now;
-                state.last_error = None;
-                state.failures = 0;
-                state.retry_at = retry_at;
-            } else {
-                state.last_error = Some(summary);
-                state.failures = state.failures.saturating_add(1);
-                let multiplier = 1_i64 << state.failures.saturating_sub(1).min(10);
-                let delay = interval_ms.max(60_000).saturating_mul(multiplier).min(MAX_BACKOFF_MS);
-                state.retry_at = retry_at.max(now.saturating_add(delay));
-            }
-            if let Some(value) = value {
-                state.value = Some(value);
-            }
-            state.next_run_at = now.saturating_add(interval_ms).max(state.retry_at);
-            state.owner.clear();
-            state.lease_until = 0;
+            state.finish_at(logging::now_ms(), success, summary, value, retry_at, interval_ms);
         });
         self.finished = result.is_ok();
         result
@@ -400,5 +451,104 @@ impl Drop for RunGuard {
                 state.last_result = Some("上次执行中断，保留原有排期".to_string());
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    const OLD_NOW: i64 = 4_000_000;
+    const ROLLED_BACK_NOW: i64 = 405_000;
+    const INTERVAL_MS: i64 = 600_000;
+
+    fn active_run() -> TaskState {
+        TaskState {
+            last_attempt_at: OLD_NOW,
+            last_run_at: OLD_NOW - 10_000,
+            last_success_at: OLD_NOW - 20_000,
+            last_result: Some("旧结果".into()),
+            last_error: Some("旧失败".into()),
+            next_run_at: OLD_NOW + INTERVAL_MS,
+            retry_at: OLD_NOW + 500_000,
+            failures: 2,
+            value: Some(json!({"saved": true})),
+            interval_ms: INTERVAL_MS,
+            lease_until: OLD_NOW + LEASE_MS,
+            owner: "fixture-owner".into(),
+        }
+    }
+
+    fn assert_next_tick_preserves_state(state: &mut TaskState, now: i64) {
+        let before = serde_json::to_value(&*state).unwrap();
+        state.adjust_clock(now + 10_000);
+        assert_eq!(serde_json::to_value(&*state).unwrap(), before);
+    }
+
+    #[test]
+    fn finish_success_after_clock_rollback_preserves_interval() {
+        for now in [ROLLED_BACK_NOW, OLD_NOW + 5_000] {
+            let mut state = active_run();
+            state.finish_at(now, true, "查询完成".into(), Some(json!({"saved": "new"})), 0, INTERVAL_MS);
+            assert_eq!(state.last_attempt_at, now.min(OLD_NOW));
+            assert_eq!(state.last_run_at, now);
+            assert_eq!(state.last_success_at, now);
+            assert_eq!(state.last_result.as_deref(), Some("查询完成"));
+            assert_eq!(state.last_error, None);
+            assert_eq!(state.failures, 0);
+            assert_eq!(state.retry_at, 0);
+            assert_eq!(state.next_run_at, now + INTERVAL_MS);
+            assert_eq!(state.value, Some(json!({"saved": "new"})));
+            assert!(state.owner.is_empty());
+            assert_eq!(state.lease_until, 0);
+            assert_next_tick_preserves_state(&mut state, now);
+            assert_eq!(state.due_at(), now + INTERVAL_MS);
+        }
+    }
+
+    #[test]
+    fn finish_failure_after_clock_rollback_preserves_backoff() {
+        for now in [ROLLED_BACK_NOW, OLD_NOW + 5_000] {
+            let mut state = active_run();
+            state.finish_at(now, false, "查询失败".into(), None, 0, INTERVAL_MS);
+            assert_eq!(state.last_attempt_at, now.min(OLD_NOW));
+            assert_eq!(state.last_run_at, now);
+            assert_eq!(state.last_success_at, now.min(OLD_NOW) - 20_000);
+            assert_eq!(state.last_result.as_deref(), Some("查询失败"));
+            assert_eq!(state.last_error.as_deref(), Some("查询失败"));
+            assert_eq!(state.failures, 3);
+            assert_eq!(state.retry_at, now + 4 * INTERVAL_MS);
+            assert_eq!(state.next_run_at, state.retry_at);
+            assert_eq!(state.value, Some(json!({"saved": true})));
+            assert!(state.owner.is_empty());
+            assert_eq!(state.lease_until, 0);
+            assert_next_tick_preserves_state(&mut state, now);
+            assert_eq!(state.due_at(), now + 4 * INTERVAL_MS);
+        }
+    }
+
+    #[test]
+    fn heartbeat_after_clock_rollback_preserves_active_lease() {
+        for now in [ROLLED_BACK_NOW, OLD_NOW + 5_000] {
+            let mut state = active_run();
+            state.renew_lease_at(now);
+            assert_eq!(state.last_attempt_at, now.min(OLD_NOW));
+            assert_eq!(state.last_run_at, now.min(OLD_NOW) - 10_000);
+            assert_eq!(state.last_success_at, now.min(OLD_NOW) - 20_000);
+            assert_eq!(state.next_run_at, now.min(OLD_NOW) + INTERVAL_MS);
+            assert_eq!(state.retry_at, now.min(OLD_NOW) + 500_000);
+            assert_eq!(state.lease_until, now + LEASE_MS);
+            assert_eq!(state.owner, "fixture-owner");
+            assert_eq!(state.failures, 2);
+            assert_eq!(state.last_result.as_deref(), Some("旧结果"));
+            assert_eq!(state.last_error.as_deref(), Some("旧失败"));
+            assert_eq!(state.value, Some(json!({"saved": true})));
+            assert_next_tick_preserves_state(&mut state, now);
+            assert!(state.lease_until > now + 10_000);
+            state.renew_lease_at(now + 30_000);
+            assert_eq!(state.lease_until, now + 30_000 + LEASE_MS);
+            assert_eq!(state.last_attempt_at, now.min(OLD_NOW));
+        }
     }
 }

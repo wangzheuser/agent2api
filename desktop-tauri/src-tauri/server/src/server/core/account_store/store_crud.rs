@@ -43,8 +43,8 @@ use crate::server::core::account_store::sql;
 use crate::server::core::account_store::state::{mark_name_custom, StoredAccount};
 use crate::server::core::account_store::store::{AccountStore, AccountStoreError};
 use crate::server::core::account_store::store_util::{
-    js_string, number_or, object_or_empty, optional_text, pick_token, token_tail_of, truncate_chars,
-    value_or, value_or_nullish,
+    js_string, number_or, object_or_empty, optional_text, pick_token, token_tail_of,
+    truncate_chars, value_or, value_or_nullish,
 };
 use crate::server::core::account_store::MAX_TOKEN_LENGTH;
 use crate::server::core::endpoints::resolve_edition;
@@ -582,6 +582,48 @@ impl AccountStore {
         Ok((account, changes))
     }
 
+    /// 账号身份、最新策略、余额和自动禁用在同一事务核对，跨实例迟到结果也不污染重建账号。
+    pub(crate) fn commit_usage_result(&self, expected: &Value, outcome: &super::super::usage_records::UsageOutcome, queried_at: i64, attempted_at: i64, ownership: (&str, &str)) -> bool {
+        use super::super::usage_records;
+        let Some(id) = expected.get("id").and_then(Value::as_str) else { return false };
+        let guard = self.guard();
+        let Some(snapshot) = self.record_by_id(&guard, id) else { return false };
+        // 公开视图会解析代理池，必须在连接锁外计算；事务内再确认原始记录完全一致。
+        let current = self.public_account(&snapshot);
+        if usage_records::identity(expected) != usage_records::identity(&current) { return false; }
+        let result = self.with_conn_mut(&guard, |conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let Some(mut record) = sql::load_by_id(&tx, id)? else { return Ok((false, None)) };
+            if record.fields() != snapshot.fields() || !super::super::task_state::owns_run(&tx, ownership.0, ownership.1) { return Ok((false, None)); }
+            if !usage_records::write_result_in(&tx, &current, outcome, queried_at, attempted_at, true)? { return Ok((false, None)); }
+            let remaining = outcome.usage.as_ref().and_then(|usage| usage_records::extract_remaining(usage).0);
+            let disable = record.enabled() && remaining.zip(usage_records::low_balance_disable_threshold(&current)).is_some_and(|(value, threshold)| value < threshold);
+            if disable {
+                record.set_enabled(false);
+                record.set_updated_at(logging::now_ms());
+                sql::update_in_place(&tx, &record)?;
+            }
+            tx.commit()?;
+            Ok((true, disable.then(|| record.provider())))
+        });
+        drop(guard);
+        match result {
+            Ok((true, disabled_provider)) => {
+                usage_records::refresh_fact(id);
+                if let Some(provider) = disabled_provider {
+                    self.invalidate_catpaw_sessions(id, &provider);
+                    logging::log_with_level("[Usage]", &format!("账号 {id} 余额低于所设阈值，已自动禁用"), "warn");
+                }
+                true
+            }
+            Ok((false, _)) => false,
+            Err(error) => {
+                logging::verbose("[Usage]", &format!("账号 {id} 余额结果未保存：{}", error.message));
+                false
+            }
+        }
+    }
+
     /// 把 patch 应用到**单条记录**（纯内存操作：不落库、不动记录之外的东西）。
     ///
     /// `update_account` 与 `batch_update` 共用这里，保证单账号与批量的语义完全
@@ -707,7 +749,131 @@ impl AccountStore {
             }
         }
 
+        if let Some(value) = patch.get("usageQuery") {
+            // 每账号自动余额查询（enabled + interval 秒）：界面的设置段每次保存
+            // 都整块发回，与 name / proxy 同一形态。归一化后恒存显式对象
+            // （关闭 = {enabled:false, interval:0}），读侧（公开形态 / 调度）
+            // 不必判「键缺失」。边界常量与读取侧同源（usage_records），
+            // 否则「接口拒绝 29 秒而手改记录接受它」。
+            let next = Self::normalize_usage_query(value)?;
+            let current = Self::normalize_usage_query_lenient(record.get("usageQuery"));
+            if next != current || record.get("usageQuery").is_none() {
+                record.set("usageQuery", next.clone());
+                changes.push(Self::describe_usage_query(&next));
+            }
+        }
+
+        if let Some(value) = patch.get("lowBalance") {
+            // 每账号的「余额不足处理」（mode + threshold）：同一形态。
+            // off 档把阈值归零存放，不留「关了开关还挂着旧阈值」的脏数据。
+            // 缺省档按 provider 区分（Cline 免费池不处理，其余跳过阈值 1，
+            // 见 usage_records::default_low_balance_mode），比较基准同源 ——
+            // 对着缺省值保存不会凭空多一条变更日志、不会物化进记录。
+            let provider = record.provider();
+            let next = Self::normalize_low_balance(value, &provider)?;
+            let current = Self::normalize_low_balance_lenient(record.get("lowBalance"), &provider);
+            if next != current {
+                record.set("lowBalance", next.clone());
+                changes.push(Self::describe_low_balance(&next));
+            }
+        }
+
         Ok(changes)
+    }
+
+    /// `usageQuery` 的写入侧归一化（校验即权威：读侧只做容错展开，见 store_view）。
+    ///
+    /// 开关严格校验布尔值；关闭时忽略残留间隔，缺省继承全局配置。
+    fn normalize_usage_query(value: &Value) -> Result<Value, AccountStoreError> {
+        use crate::server::core::usage_records::{query_settings, MIN_QUERY_INTERVAL_SECONDS, MAX_QUERY_INTERVAL_SECONDS};
+        if let Some(enabled) = value.get("enabled") {
+            if !enabled.is_boolean() { return Err(AccountStoreError::bad_request("自动查询开关必须是布尔值")); }
+        }
+        if value.get("enabled").and_then(Value::as_bool) == Some(false) {
+            return Ok(json!({"enabled": false, "interval": 0}));
+        }
+        if let Some(interval) = value.get("interval") {
+            if !interval.as_i64().is_some_and(|number| (MIN_QUERY_INTERVAL_SECONDS..=MAX_QUERY_INTERVAL_SECONDS).contains(&number)) {
+                return Err(AccountStoreError::bad_request("查询间隔必须是 30~86400 秒的整数"));
+            }
+        }
+        Ok(query_settings(Some(value)))
+    }
+
+    fn normalize_usage_query_lenient(value: Option<&Value>) -> Value {
+        Self::normalize_usage_query(value.unwrap_or(&Value::Null)).unwrap_or_else(|_| {
+            crate::server::core::usage_records::query_settings(None)
+        })
+    }
+
+    /// `lowBalance` 的写入侧归一化：mode 三选一；非 off 档要求阈值有限且 > 0；
+    /// off 档阈值归零。非对象（null / 脏值）一律视为「恢复缺省」= 按 provider
+    /// 区分的缺省档（与读侧 `balance_blocked` 的缺省同一口径，见
+    /// `usage_records::default_low_balance_mode`）；对象里缺 mode 是不完整的
+    /// 表达，按校验失败处理而不是猜。
+    fn normalize_low_balance(value: &Value, provider: &str) -> Result<Value, AccountStoreError> {
+        let Some(fields) = value.as_object() else {
+            return Ok(Self::low_balance_default(provider));
+        };
+        let mode = fields.get("mode").and_then(Value::as_str).unwrap_or("");
+        if !matches!(mode, "off" | "skip" | "disable") {
+            return Err(AccountStoreError::bad_request(
+                "余额不足的处理方式必须是「不处理 / 跳过 / 禁用」之一",
+            ));
+        }
+        if mode == "off" {
+            return Ok(json!({ "mode": "off", "threshold": 0.0 }));
+        }
+        let threshold = fields
+            .get("threshold")
+            .and_then(Value::as_f64)
+            .ok_or_else(|| AccountStoreError::bad_request("余额阈值必须是大于 0 的数字"))?;
+        if !threshold.is_finite() || threshold <= 0.0 {
+            return Err(AccountStoreError::bad_request("余额阈值必须是大于 0 的数字"));
+        }
+        Ok(json!({ "mode": mode, "threshold": threshold }))
+    }
+
+    /// `lowBalance` 的缺省形状（无配置 / 无法解析时的口径）：委托
+    /// `usage_records::default_low_balance`（按 provider 区分，缺省值与读侧
+    /// `balance_blocked` 同源）。
+    fn low_balance_default(provider: &str) -> Value {
+        crate::server::core::usage_records::default_low_balance(provider)
+    }
+
+    /// `lowBalance` 的比较基准（容错，同上）。
+    fn normalize_low_balance_lenient(value: Option<&Value>, provider: &str) -> Value {
+        Self::normalize_low_balance(value.unwrap_or(&Value::Null), provider)
+            .unwrap_or_else(|_| Self::low_balance_default(provider))
+    }
+
+    /// 变更提示文案：`每 90 分钟` 这类人能读的间隔。
+    fn describe_usage_query(next: &Value) -> String {
+        let enabled = next.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+        if !enabled {
+            return "自动查询余额 → 关闭".to_string();
+        }
+        let seconds = next.get("interval").and_then(Value::as_i64).unwrap_or(0);
+        let span = if seconds > 0 && seconds % 3600 == 0 {
+            format!("{} 小时", seconds / 3600)
+        } else if seconds > 0 && seconds % 60 == 0 {
+            format!("{} 分钟", seconds / 60)
+        } else {
+            format!("{seconds} 秒")
+        };
+        format!("自动查询余额 → 开启（每 {span}）")
+    }
+
+    /// 变更提示文案：低于阈值跳过 / 禁用。f64 的 Display 打整数不带小数点
+    /// （`100.0` → `100`），与余额列的数字口径一致。
+    fn describe_low_balance(next: &Value) -> String {
+        let mode = next.get("mode").and_then(Value::as_str).unwrap_or("off");
+        let threshold = next.get("threshold").and_then(Value::as_f64).unwrap_or(0.0);
+        match mode {
+            "skip" => format!("余额不足处理 → 低于 {threshold} 时跳过"),
+            "disable" => format!("余额不足处理 → 低于 {threshold} 时禁用"),
+            _ => "余额不足处理 → 不处理".to_string(),
+        }
     }
 
     /// 沿优先级顺序把账号上移/下移一位（与相邻账号交换优先级数值）。
@@ -839,5 +1005,86 @@ mod tests {
         let patch = json!({ "priority": 5 }).as_object().unwrap().clone();
         AccountStore::apply_patch(&mut record, &patch, no_holder).unwrap();
         assert_eq!(record.get("nameCustom"), None);
+    }
+}
+
+#[cfg(test)]
+mod usage_commit_tests {
+    use super::*;
+    use crate::server::core::usage_records::UsageOutcome;
+
+    #[test]
+    fn usage_commit_is_atomic_and_rejects_replaced_identity() {
+        let (db, _temp) = crate::server::db::test_temp::TempDb::open("usage-commit");
+        let store = AccountStore::with_db(Some(db.clone()));
+        let account = store.add_account(&json!({"account":{"uid":"atomic-fixture"},"auth":{"accessToken":"fixture"},"edition":"cn"}),Some("fixture"),Some("workbuddy")).unwrap();
+        let id = account["id"].as_str().unwrap();
+        db.with(|conn| conn.execute("INSERT INTO kv(key,value) VALUES ('backgroundTaskState',?1)",[json!({"fixture-query":{"owner":"owner-a"}}).to_string()]).unwrap()).unwrap();
+        store.update_account(id,&json!({"lowBalance":{"mode":"disable","threshold":1}})).unwrap();
+        let outcome = UsageOutcome { usage:Some(json!({"totalLeft":0})),error:None,code:None };
+        let mut stale = account.clone(); stale["uid"] = json!("old-user");
+        assert!(!store.commit_usage_result(&stale,&outcome,100,100,("fixture-query","owner-a")));
+        db.with(|conn| {
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM account_usage_records",[],|row| row.get::<_,i64>(0)).unwrap(),0);
+            conn.execute_batch("CREATE TRIGGER fail_usage_disable BEFORE UPDATE ON accounts BEGIN SELECT RAISE(ABORT,'fixture disable failed'); END;").unwrap();
+        }).unwrap();
+        assert!(!store.commit_usage_result(&account,&outcome,200,200,("fixture-query","owner-a")));
+        db.with(|conn| {
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM account_usage_records",[],|row| row.get::<_,i64>(0)).unwrap(),0);
+            assert!(sql::load_by_id(conn,id).unwrap().unwrap().enabled());
+            conn.execute_batch("DROP TRIGGER fail_usage_disable;").unwrap();
+        }).unwrap();
+        assert!(store.commit_usage_result(&account,&outcome,300,300,("fixture-query","owner-a")));
+        db.with(|conn| {
+            assert!(!sql::load_by_id(conn,id).unwrap().unwrap().enabled());
+            assert_eq!(conn.query_row("SELECT remaining FROM account_usage_records WHERE account_id=?1",[id],|row| row.get::<_,f64>(0)).unwrap(),0.0);
+        }).unwrap();
+        // 当前 claim 允许墙钟回拨；更早租约的响应即使完成时间更晚也拒绝。
+        db.with(|conn| conn.execute("UPDATE kv SET value=?1 WHERE key='backgroundTaskState'",[json!({"fixture-query":{"owner":"owner-b"}}).to_string()]).unwrap()).unwrap();
+        assert!(!store.commit_usage_result(&account,&outcome,400,350,("fixture-query","owner-a")));
+        assert!(store.commit_usage_result(&account,&outcome,250,250,("fixture-query","owner-b")));
+        crate::server::core::proxy_pool::install(Some(db.clone()));
+        db.with(|conn| conn.execute("INSERT INTO kv(key,value) VALUES ('proxyPool',?1)",[json!({"items":[{"id":"fixture-proxy","source":"custom","protocol":"http","host":"127.0.0.1","port":8080,"enabled":true}]}).to_string()]).unwrap()).unwrap();
+        for proxy_id in ["fixture-proxy", "deleted-proxy"] {
+            store.update_account(id,&json!({"proxy":{"source":"pool","proxyId":proxy_id}})).unwrap();
+            let worker = store.clone(); let expected = account.clone();
+            let (send, receive) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let outcome = UsageOutcome { usage:Some(json!({"totalLeft":2})),error:None,code:None };
+                send.send(worker.commit_usage_result(&expected,&outcome,500,500,("fixture-query","owner-b"))).unwrap();
+            });
+            assert!(receive.recv_timeout(std::time::Duration::from_secs(2)).expect("代理池视图不得重入连接锁"));
+        }
+        let cline = store.add_cline_account("cline-free", &json!({"account":"usr-old","accessToken":"workos:e30.eyJleHRlcm5hbF9pZCI6InVzci1vbGQifQ.old"}), None).unwrap();
+        let cline_id = cline["id"].as_str().unwrap();
+        store.update_account(cline_id, &json!({"lowBalance":{"mode":"disable","threshold":1}})).unwrap();
+        db.with(|conn| {
+            let mut row = sql::load_by_id(conn, cline_id).unwrap().unwrap();
+            row.fields_mut().insert("account".into(), json!("usr-new"));
+            row.fields_mut().insert("accessToken".into(), json!("workos:e30.eyJleHRlcm5hbF9pZCI6InVzci1uZXcifQ.new"));
+            sql::update_in_place(conn, &row).unwrap();
+        }).unwrap();
+        assert!(!store.commit_usage_result(&cline, &outcome, 600, 600, ("fixture-query", "owner-b")));
+        let current = db.with(|conn| {
+            let row = sql::load_by_id(conn, cline_id).unwrap().unwrap();
+            assert!(row.enabled(), "旧余额不得禁用换号后的账号");
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM account_usage_records WHERE account_id=?1", [cline_id], |row| row.get::<_,i64>(0)).unwrap(), 0);
+            row
+        }).unwrap();
+        let expected = store.public_account(&current);
+        db.with(|conn| {
+            let mut row = current;
+            row.fields_mut().insert("accessToken".into(), json!("workos:e30.eyJleHRlcm5hbF9pZCI6InVzci1uZXcifQ.rotated"));
+            sql::update_in_place(conn, &row).unwrap();
+        }).unwrap();
+        assert!(store.commit_usage_result(&expected, &outcome, 700, 700, ("fixture-query", "owner-b")));
+        db.with(|conn| {
+            let mut row = sql::load_by_id(conn, cline_id).unwrap().unwrap();
+            row.set_enabled(true);
+            row.fields_mut().insert("accessToken".into(), json!("workos:e30.eyJleHRlcm5hbF9pZCI6InVzci10aGlyZCJ9.new"));
+            sql::update_in_place(conn, &row).unwrap();
+        }).unwrap();
+        assert!(!store.commit_usage_result(&expected, &outcome, 800, 800, ("fixture-query", "owner-b")));
+        assert!(db.with(|conn| sql::load_by_id(conn, cline_id).unwrap().unwrap().enabled()).unwrap(), "同一别名换 JWT 身份也不得被旧余额禁用");
     }
 }

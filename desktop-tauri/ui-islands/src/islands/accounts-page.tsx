@@ -61,7 +61,8 @@ import {
 } from '@ui'
 import { TableFooter, useClientPaging } from './table-shell'
 import { shared, type AccountRecord, type ColSettingsHandle } from './accounts-shared'
-import { checkinableAccounts, isDesktopAccount, isEnabled, supportsUsage } from './accounts-domain'
+import { isDesktopAccount, isEnabled, supportsUsage, checkinableAccounts,
+} from './accounts-domain'
 import { ACCOUNT_COLUMNS, bindColumnGrips, columnWidths, tableMinWidth } from './accounts-columns'
 import {
   allAccounts, checkinAll, clearLimits, clearSelection, ensureProxyPoolOptions,

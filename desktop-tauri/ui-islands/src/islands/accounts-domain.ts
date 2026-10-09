@@ -21,7 +21,7 @@
  * 所以筛选与计数都按这一条队列算，positionMap 的序号就是整张表的行序。
  */
 
-import { shared, formatTime, type AccountRecord, type AccountsSnapshot, type RateLimitInfo } from './accounts-shared'
+import { shared, formatTime, type AccountRecord, type AccountsSnapshot, type RateLimitInfo, type UsageEntry } from './accounts-shared'
 
 /** 缺省 provider id（后端注册表的默认项；旧账号记录没有该字段时的兜底） */
 export const DEFAULT_PROVIDER_ID = 'workbuddy'
@@ -29,10 +29,9 @@ export const DEFAULT_PROVIDER_ID = 'workbuddy'
 export const RACCOON_PROVIDER_ID = 'raccoon'
 
 type ProviderFeatures = {
+  checkin?: boolean
   /** 这一家有没有余额 / 积分查询概念 */
   usage: boolean
-  /** 这一家有没有签到活动 */
-  checkin: boolean
   /** 有没有国内 / 国际版概念（决定提供商徽章是否拼版本后缀、有效期读哪个字段） */
   edition: boolean
   /** 账号标识落在记录里的哪个键（uid / userId / account） */
@@ -74,8 +73,12 @@ type ProviderFeatures = {
  * provider 能力表：决定行上出现哪些按钮、哪行明细显示什么。
  *
  * 为什么是「按 provider 查表」而不是在渲染处写 if：账号页的每个分支（余额按钮、
- * 签到按钮、版本后缀、标识字段名）都要问同一个问题 ——「这家有没有这个概念」。
+ * 版本后缀、标识字段名）都要问同一个问题 ——「这家有没有这个概念」。
  * 散在各处写 if 的话，加一家就要翻一遍全文件，漏掉一处不报错、只静默少一个按钮。
+ *
+ * （签到**不在**这张表里：账号页已无签到按钮，签到中心的分组与可签判定在
+ * 后端 —— `core::auto_checkin` 的 CHECKIN_PROVIDERS 与 `billing::checkin::
+ * supports_checkin` 是唯一口径，各家的签到链路事实也记在那边的模块头里。）
  *
  * usage 各家都是 true（余额查询已扩到全部提供商），各由自己的适配器实现；前端只回答
  * 「这一家有没有这个概念」。CatPaw 的余额接口要单独配一个网页会话凭证（token2），
@@ -102,12 +105,12 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   qoder: { usage: true, checkin: true, edition: true, identifier: 'userId', expiry: 'expiresAt', emailAsName: true },
   // Cline 两条键：同一家上游按计费通道拆成两个 provider，账号形态完全一样（见
   // providers::cline::models）。查表按 id 精确匹配，只登记一个会让另一家掉进兜底
-  'cline-free': { usage: true, checkin: false, edition: false, identifier: 'account', expiry: 'expiresAt' },
-  'cline-pass': { usage: true, checkin: false, edition: false, identifier: 'account', expiry: 'expiresAt' },
-  // Accio 两个地区：额度可查（上游只给用量百分比）、没有签到、有地区概念
-  accio: { usage: true, checkin: false, edition: true, identifier: 'userId', expiry: 'expiresAt', emailAsName: true },
-  'accio-cn': { usage: true, checkin: false, edition: true, identifier: 'userId', expiry: 'expiresAt', emailAsName: true },
-  // ZCode 两个地区：**没有签到**，替代它的是「限时套餐领取」（claim 位）。
+  'cline-free': { usage: true, edition: false, identifier: 'account', expiry: 'expiresAt' },
+  'cline-pass': { usage: true, edition: false, identifier: 'account', expiry: 'expiresAt' },
+  // Accio 两个地区：额度可查（上游只给用量百分比）、有地区概念
+  accio: { usage: true, edition: true, identifier: 'userId', expiry: 'expiresAt', emailAsName: true },
+  'accio-cn': { usage: true, edition: true, identifier: 'userId', expiry: 'expiresAt', emailAsName: true },
+  // ZCode 两个地区：本家的运营动作是「限时套餐领取」（claim 位）。
   // `usage: true` 对应 providers::zcode::balance —— 余额读的是 billing 网关的
   //   `/zcode-plan/billing/balance`，认**套餐 JWT**（与转发用的 accessToken 不是
   //   一套凭证）。账号只粘了 accessToken 时后端回可识别的「未配置」，余额列显示成
@@ -116,19 +119,19 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   //   **每天一份新套餐**（plan_id 带日期段），领过之后按钮当天显示「今日已领」、
   //   次日自动恢复 —— 见 `claimedToday`。
   // expiry 取 expiresAt 是给 add_zcode_account 的契约（落账号时要写访问令牌的过期时间）
-  zcode: { usage: true, checkin: false, claim: true, planChannel: true, edition: true, identifier: 'userId', expiry: 'expiresAt' },
-  'zcode-intl': { usage: true, checkin: false, claim: true, planChannel: true, edition: true, identifier: 'userId', expiry: 'expiresAt' },
+  zcode: { usage: true, claim: true, planChannel: true, edition: true, identifier: 'userId', expiry: 'expiresAt' },
+  'zcode-intl': { usage: true, claim: true, planChannel: true, edition: true, identifier: 'userId', expiry: 'expiresAt' },
   // CodeArts（华为云 AI 代码助手）。各位各有出处，别照着别家抄：
   // `usage: true` —— 余额是**两份账**（订阅统计 + 福利网关，见 providers::codearts::balance），
   //   界面上「读到 0」与「没读到」必须能分开，后端因此把失败的一侧写进 statisticsError /
   //   benefitError 而不是整次失败（半次失败的呈现见 accounts-panels 的 usageSummary）。
-  // `welfare: true` —— 本家没有「每日签到」，对应物是 ops 福利领取（探测 → 确认 →
-  //   领取 → 回读二次确认），是用户点一下才走的独立按钮。
+  // `welfare: true` —— 本家的运营动作是 ops 福利领取（探测 → 确认 → 领取 → 回读
+  //   二次确认），是用户点一下才走的独立按钮。
   // `edition: false` —— 没有版本/地区概念：region 固定在 cn-north-4 且必须与 token
   //   签发地一致，不是用户可选项；`login_type`（WEB/IDE）也不是版本，别塞进这一列。
   // `expiry: 'expiresAt'` —— 临时凭据约一小时到期，这一列对本家**是主要信息**。
   codearts: {
-    usage: true, checkin: false, welfare: true, edition: false,
+    usage: true, welfare: true, edition: false,
     identifier: 'userId', expiry: 'expiresAt',
     concurrencyDefault: 3,
   },
@@ -143,14 +146,15 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   // Loomy（讯飞）：账号与每日首次登录刷新均已接入。
   loomy: { usage: true, checkin: true, edition: false, identifier: 'userId', expiry: 'expiresAt' },
 
+  kuku: { usage: true, checkin: true, edition: false, identifier: 'uid', expiry: '' },
 }
 
 /**
- * 未登记 provider 的兜底能力：不显示余额 / 签到 / 版本 —— 这三个都是 provider 私有
+ * 未登记 provider 的兜底能力：不显示余额 / 版本 —— 这两个都是 provider 私有
  * 概念，未知的家不该被假定拥有。标识字段假定成 userId，取不到时明细行自动少一项。
  */
 const GENERIC_FEATURES: ProviderFeatures = {
-  usage: false, checkin: false, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt',
+  usage: false, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt',
   emailAsName: false,
 }
 
@@ -238,6 +242,134 @@ export function tokenExpiryOf(account: AccountRecord | null | undefined): number
 /** 该账号所属 provider 是否有余额概念（没有就不渲染余额按钮，也不参与批量查询） */
 export function supportsUsage(account: AccountRecord | null | undefined): boolean {
   return providerFeatures(providerOf(account)).usage
+}
+
+/* ─── 每账号的余额查询设置（账号设置弹窗「查询设置」段 + 余额列徽章共用）─── */
+
+/** 自动查询间隔的边界（秒）—— 与后端 `usage_records` 的常量同一对数值 */
+export const USAGE_QUERY_MIN_SECONDS = 30
+export const USAGE_QUERY_MAX_SECONDS = 86_400
+
+/** 余额不足的处理档（与后端 `lowBalance.mode` 同一套取值） */
+export type LowBalanceMode = 'off' | 'skip' | 'disable'
+
+/**
+ * 缺省口径（记录上没有 usageQuery / lowBalance 字段时）—— 与后端
+ * `usage_records::DEFAULT_*` 同一对数值：自动查询**开启**、1 分钟；余额不足
+ * 缺省不处理（见 `defaultLowBalanceMode`）。自动查询的缺省必须对齐
+ * 全局任务时代「默认就在查」的行为，否则升级后所有人的余额列会静默停更。
+ */
+export const DEFAULT_USAGE_INTERVAL_SECONDS = 60
+export const DEFAULT_LOW_BALANCE_THRESHOLD = 1
+
+/**
+ * 与后端 `usage_records::default_low_balance_mode` 一致：所有提供商缺省
+ * 不处理余额不足；只有用户显式配置 skip / disable 才启用对应策略。
+ */
+export function defaultLowBalanceMode(_provider: string | undefined | null): LowBalanceMode {
+  return 'off'
+}
+
+/**
+ * 自动余额查询设置的规范化读取。缺省（字段缺失）= 开启、1 分钟；显式
+ * `{enabled:false}` 才是关；开着但间隔缺失 / 越界按缺省间隔跑（脏值不把
+ * 自动查询停掉）。调用方拿到的一定是完整形状，不必判「键缺失」。
+ */
+export function usageQueryOf(account: AccountRecord | null | undefined): {
+  enabled: boolean
+  interval: number
+} {
+  const config = account?.usageQuery
+  if (!config || typeof config !== 'object') {
+    return { enabled: true, interval: DEFAULT_USAGE_INTERVAL_SECONDS }
+  }
+  const enabled = config.enabled === undefined ? true : config.enabled === true
+  const interval = Number(config.interval) || 0
+  const valid = interval >= USAGE_QUERY_MIN_SECONDS && interval <= USAGE_QUERY_MAX_SECONDS
+  return { enabled, interval: enabled && !valid ? DEFAULT_USAGE_INTERVAL_SECONDS : interval }
+}
+
+/**
+ * 余额不足处理的规范化读取。缺省（字段缺失 / mode 缺失）不处理
+ * （见 `defaultLowBalanceMode`）；显式 `off` 必须保持 off（那是用户关掉的）；
+ * skip / disable 档下阈值缺失或非法回落缺省 1。
+ */
+export function lowBalanceOf(account: AccountRecord | null | undefined): {
+  mode: LowBalanceMode
+  threshold: number
+} {
+  const config = account?.lowBalance
+  const fallbackMode = defaultLowBalanceMode(providerOf(account))
+  if (!config || typeof config !== 'object') {
+    return fallbackMode === 'off'
+      ? { mode: 'off', threshold: 0 }
+      : { mode: 'skip', threshold: DEFAULT_LOW_BALANCE_THRESHOLD }
+  }
+  const mode: LowBalanceMode =
+    config.mode === 'skip' || config.mode === 'disable' || config.mode === 'off'
+      ? config.mode
+      : fallbackMode
+  const threshold = Number(config.threshold) || 0
+  if (mode === 'off') return { mode, threshold: 0 }
+  return { mode, threshold: threshold > 0 ? threshold : DEFAULT_LOW_BALANCE_THRESHOLD }
+}
+
+/**
+ * 秒数 → 人能读的间隔文案（`每 90 分钟` 这类），与后端变更提示同一口径：
+ * 整小时 / 整分钟进位，其余按秒。
+ */
+export function formatIntervalSeconds(seconds: number): string {
+  if (seconds > 0 && seconds % 3600 === 0) return `${seconds / 3600} 小时`
+  if (seconds > 0 && seconds % 60 === 0) return `${seconds / 60} 分钟`
+  return `${seconds} 秒`
+}
+
+/**
+ * 这条账号此刻是否应因「余额不足」被跳过（余额列徽章的判据）。
+ *
+ * 与后端选路过滤（`usage_records::balance_blocked`）同一口径：mode == 'skip'
+ * 且最近一次读数判得出数字且严格小于阈值（等于仍可用）。`entry` 是余额缓存的
+ * 读数（`usageEntryOf` 的结果）—— 判不出（未查询 / 失败行 / unlimited / 数字
+ * 缺失）一律放行：跳过是对「这个账号没钱」的断言，拿不出证据就不亮徽章。
+ */
+export function lowBalanceBlockedOf(
+  account: AccountRecord | null | undefined,
+  entry: UsageEntry,
+): boolean {
+  const { mode, threshold } = lowBalanceOf(account)
+  if (mode !== 'skip' || !(threshold > 0)) return false
+  if (!entry || typeof entry !== 'object') return false
+  const data = entry as Record<string, unknown>
+  if (data.unlimited) return false
+  // 数字口径与余额列同源：workbuddy 既有形状 totalLeft，其余 available
+  const raw = data.totalLeft ?? data.available
+  if (raw == null || (typeof raw !== 'number' && typeof raw !== 'string')
+    || (typeof raw === 'string' && !raw.trim())) return false
+  const remaining = Number(raw)
+  return Number.isFinite(remaining) && remaining < threshold
+}
+
+/**
+ * H 账号页的签到分类：两个入口共享同一判据，保活不冒充领取，领取确认不冒充到账。
+ * 已领取是正常状态；认证、任务及限流错误优先于保活结果。
+ */
+export type CheckinOutcome = { kind: 'ok' | 'already' | 'active' | 'failed'; reason: string }
+
+export function checkinOutcomeOf(row: Record<string, unknown> | undefined): CheckinOutcome {
+  if (!row) return { kind: 'failed', reason: '未返回签到结果' }
+  if (row.error) return { kind: 'failed', reason: String(row.error) }
+  const claim = row.claim as Record<string, unknown> | null | undefined
+  if (!claim) return { kind: 'failed', reason: '签到响应为空' }
+  const receiptMessage = claim.creditVerification ? String(claim.msg || '签到已确认，额度到账待核验') : ''
+  if (claim.success === true) return { kind: 'ok', reason: receiptMessage }
+  if (claim.alreadyCompleted === true || claim.status === 'already_claimed') return { kind: 'already', reason: receiptMessage }
+  if (claim.status === 'auth_expired') return { kind: 'failed', reason: String(claim.msg || '登录态已过期') }
+  if (claim.status === 'task_not_found') return { kind: 'failed', reason: String(claim.msg || '签到任务不存在') }
+  if (claim.status === 'unsupported') return { kind: 'failed', reason: String(claim.msg || '签到任务暂不可用') }
+  if (claim.status === 'backoff') return { kind: 'failed', reason: String(claim.msg || '签到触发限流，请稍后重试') }
+  const activity = row.activity as Record<string, unknown> | null | undefined
+  if (activity?.pokeSucceeded === true) return { kind: 'active', reason: '' }
+  return { kind: 'failed', reason: String(claim.msg || '未领取') }
 }
 
 /** 是否为「桌面端实时登录态」账号（凭证实时读客户端文件；可禁用、也可删除） */
@@ -739,32 +871,17 @@ export function accountTags(account: AccountRecord): AccountTag[] {
   ].filter((tag): tag is AccountTag => tag !== null)
 }
 
-/**
- * 「下次什么时候能再签」的说明（已签到按钮的悬停说明与明细面板共用一句）。
- *
- * 两家口径不同：
- *   - WorkBuddy / 小浣熊 / AutoClaw：按**自然日**重置，明天 0 点后可再签；
- *   - Qoder：每日权益是一个**活动窗口**（当天 10:00 → 次日 10:00），
- *     所以 0 点后不一定能签 —— 说「0 点后可再签」会让人白点一次。
- */
-export function checkinResetHint(account: AccountRecord | null | undefined): string {
-  return providerOf(account) === 'qoder'
-    ? 'Qoder 的每日权益按 10:00 → 次日 10:00 的活动窗口发放，新窗口开放后可再领'
-    : '签到按自然日重置，明天 0 点后可再签'
-}
+/** 更新时刻文案（时间戳非法时返回空串，调用处据此省略那半句） */
+export const formatUpdatedAt = formatTime
 
-/** 「已签到」按钮的悬停说明：给出签到时刻与重置时机，回答「为什么点不动、什么时候能再签」 */
 export function checkinDoneTitle(account: AccountRecord | null | undefined): string {
   const at = Number(account?.checkinAt) || 0
   const clock = at > 0 ? `今天 ${new Date(at).toTimeString().slice(0, 5)}` : '今天'
   return `${clock} 已签到；${checkinResetHint(account)}`
 }
 
-/** 签到明细里「今天已签到」那一刻的时钟串（0 返回空串） */
-export function checkinClock(account: AccountRecord | null | undefined): string {
-  const at = Number(account?.checkinAt) || 0
-  return at > 0 ? new Date(at).toTimeString().slice(0, 5) : ''
+export function checkinResetHint(account: AccountRecord | null | undefined): string {
+  return providerOf(account) === 'qoder'
+    ? 'Qoder 的每日权益按 10:00 → 次日 10:00 的活动窗口发放，新窗口开放后可再领'
+    : '签到按自然日重置，明天 0 点后可再签'
 }
-
-/** 更新时刻文案（时间戳非法时返回空串，调用处据此省略那半句） */
-export const formatUpdatedAt = formatTime

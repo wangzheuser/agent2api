@@ -32,8 +32,8 @@ import {
   type AccountRecord, type ClashSnapshot, type PanelKind, type PoolItem, type UsageEntry,
 } from './accounts-shared'
 import {
-  checkinableAccounts, claimedPlanIdsToday, displayNameOf, isDesktopAccount, isEnabled, isRateLimited,
-  supportsCheckin, supportsUsage,
+  checkinOutcomeOf, claimedPlanIdsToday, isDesktopAccount, isEnabled, isRateLimited,
+  supportsUsage, checkinableAccounts, displayNameOf,
 } from './accounts-domain'
 import * as domain from './accounts-domain'
 import { clampPriority, priorityOf } from './accounts-columns'
@@ -448,7 +448,6 @@ export function refreshCaches(validIds: Set<string>): void {
   }
   for (const account of allAccounts()) if (validIds.has(account.id)) ensureUsageIdentity(account.id)
   for (const id of [...usageFailureAt.keys()]) if (!validIds.has(id)) usageFailureAt.delete(id)
-  for (const id of [...checkinErrors.keys()]) if (!validIds.has(id)) { checkinErrors.delete(id); touched = true }
   const panels = new Map(getStore().panels)
   for (const id of [...panels.keys()]) if (!validIds.has(id)) { panels.delete(id); touched = true }
   const connections = new Map(getStore().connections)
@@ -549,7 +548,14 @@ function cacheEntryOf(row: Record<string, unknown>): UsageEntry {
   return { error: row.error ? String(row.error) : '余额响应为空', code: row.code }
 }
 
-/** 把一批余额结果写进列表缓存（定时快照、批量查询与外部调用共用）。返回写入条数。 */
+/**
+ * 把一批余额结果写进列表缓存（自动查询快照、批量查询与外部调用共用）。返回写入条数。
+ *
+ * 行的时间戳取**行上的 `at`**（快照端按账号到期查询，每行各带自己的结论时刻），
+ * 没有就按外层的 `at`（手动查询的响应不带 `at`，当刻就是它的结论时刻）。
+ * 失败行的时效判定按「这条结论的取得时刻」算，不能拿别人的时刻盖 ——
+ * 那正是行级 `at` 存在的原因（见后端 `usage_query::snapshot`）。
+ */
 export function applyBalances(
   balances: { at?: number; serverNow?: number; results?: Array<Record<string, unknown>> } | null | undefined,
   identities?: ReadonlyMap<string, string>,
@@ -567,7 +573,7 @@ export function applyBalances(
     if (requestVersions && requestVersions.get(id) !== (usageRequestVersions.get(id) || 0)) continue
     const entry = cacheEntryOf(row)
     const creditProvider = supportsCreditDetails(account)
-    const queriedAt = creditProvider ? rowQueriedAt(row) : 0
+    const queriedAt = rowQueriedAt(row) || serverTimestamp(row.at)
     const snapshotAt = serverTimestamp(balances?.at)
     const serverNow = serverTimestamp(balances?.serverNow)
     const at = queriedAt || creditFetchedAt(entry) || snapshotAt
@@ -590,14 +596,15 @@ export function applyBalances(
 }
 
 /**
- * 拉一次「定时查询积分」的结果快照并写进缓存，返回是否应用了新的一轮。
+ * 拉一次后端的余额快照并写进缓存，返回是否应用了新的一轮。
  *
- * 余额查询在后端有条定时任务（默认每 10 分钟查全部账号），结果存在后端快照里。
- * 界面不点按钮时也要跟着它更新 —— 否则定时任务在后台跑得好好的，用户看到的还是启动
- * 那一次的旧余额，那正是「定时查询」最容易让人觉得「没生效」的地方。
- * `at` 是那一刻的毫秒时间戳，用它判断「这一轮我应用过了没」：时间戳没变就直接返回，
- * 不做无谓的重绘。**失败的行同样会被应用**（后端快照里就带着它们），于是账号页会
- * 明确显示「查询失败」而不是悄悄留着上一个成功的旧值 —— 但后端出口会先丢掉
+ * 余额查询按账号各自的间隔在后端自动跑（账号设置里逐账号配置），结论存进
+ * 记录表；这份快照接口把它端出来。界面不点按钮时也要跟着它更新 —— 否则自动
+ * 查询在后台跑得好好的，用户看到的还是启动那一次的旧余额，那正是「自动查询」
+ * 最容易让人觉得「没生效」的地方。`at` 是最近一条结论的时刻，用它判断
+ * 「这份快照我应用过了没」：时间戳没变就直接返回，不做无谓的重绘。
+ * **失败的行同样会被应用**（后端快照里就带着它们），于是账号页会明确显示
+ * 「查询失败」而不是悄悄留着上一个成功的旧值 —— 但后端出口会先丢掉
  * 「账号记录比快照还新」的失败行（见 `usageEntryOf` 的说明），那些行这里也就收不到。
  * 失败静默（不 toast）：它是 20 秒一次的轮询，网关长时间不可用会变成刷屏。
  */
@@ -752,34 +759,6 @@ export async function checkinFor(id?: string | null): Promise<{
   skipped?: number
 } | null | undefined> {
   return shared().workbuddyDesktop?.checkinAllAccounts?.(id || null)
-}
-
-/**
- * 一行签到结果的分类。四种结局互斥，普通签到看 claim，WorkBuddy 国际版还看 activity：
- *   - `ok`：本次真的领到了（`claim.success === true`）；
- *   - `already`：上游说今天已经领过了（`claim.alreadyCompleted === true`）——
- *     **不是失败**：一天里大部分时候点签到都是这个结果，报红会把正常状态说成故障；
- *   - `active`：活跃保活成功（不伪造普通签到成功，也不落 `checkinAt`）；
- *   - `failed`：其余（`row.error` 后端分派层报的错、`claim.success === false` 且
- *     不是已领取、活跃保活也未成功、完全没返回结果），原因取 msg。
- */
-type CheckinOutcome = { kind: 'ok' | 'already' | 'active' | 'failed'; reason: string }
-
-function checkinOutcomeOf(row: Record<string, unknown> | undefined): CheckinOutcome {
-  if (!row) return { kind: 'failed', reason: '未返回签到结果' }
-  if (row.error) return { kind: 'failed', reason: String(row.error) }
-  const claim = row.claim as Record<string, unknown> | null | undefined
-  if (!claim) return { kind: 'failed', reason: '签到响应为空' }
-  const receiptMessage = claim.creditVerification ? String(claim.msg || '签到已确认，额度到账待核验') : ''
-  if (claim.success === true) return { kind: 'ok', reason: receiptMessage }
-  if (claim.alreadyCompleted === true || claim.status === 'already_claimed') return { kind: 'already', reason: receiptMessage }
-  if (claim.status === 'auth_expired') return { kind: 'failed', reason: String(claim.msg || '登录态已过期') }
-  if (claim.status === 'task_not_found') return { kind: 'failed', reason: String(claim.msg || '签到任务不存在') }
-  if (claim.status === 'unsupported') return { kind: 'failed', reason: String(claim.msg || '签到任务暂不可用') }
-  if (claim.status === 'backoff') return { kind: 'failed', reason: String(claim.msg || '签到触发限流，请稍后重试') }
-  const activity = row.activity as Record<string, unknown> | null | undefined
-  if (activity?.pokeSucceeded === true) return { kind: 'active', reason: '' }
-  return { kind: 'failed', reason: String(claim.msg || '未领取') }
 }
 
 /**
@@ -1157,11 +1136,7 @@ export type AccountsViewApi = {
   syncBalancesSnapshot(): Promise<boolean>
   queryUsageFor(id?: string | null): Promise<unknown>
   queryAllUsage(): Promise<void>
-  checkinFor(id?: string | null): Promise<unknown>
-  checkinAll(): Promise<void>
   refreshUsageAfterCheckin(id?: string | null): Promise<void>
-  checkinableAccounts: typeof checkinableAccounts
-  supportsCheckin: typeof supportsCheckin
   supportsUsage: typeof supportsUsage
   isDesktopAccount: typeof isDesktopAccount
   isEnabled: typeof isEnabled
@@ -1199,10 +1174,7 @@ type AccountsModelApi = {
   isEnabled: typeof domain.isEnabled
   isRateLimited: typeof domain.isRateLimited
   accountEdition: typeof domain.accountEdition
-  supportsCheckin: typeof domain.supportsCheckin
   supportsClaim: typeof domain.supportsClaim
-  checkedInToday: typeof domain.checkedInToday
-  checkinableAccounts: typeof domain.checkinableAccounts
   matchProvider: typeof domain.matchProvider
   matchEnabled: typeof domain.matchEnabled
   matchLimit: typeof domain.matchLimit
@@ -1242,10 +1214,7 @@ const ACCOUNTS_MODEL_API: AccountsModelApi = {
   isEnabled: domain.isEnabled,
   isRateLimited: domain.isRateLimited,
   accountEdition: domain.accountEdition,
-  supportsCheckin: domain.supportsCheckin,
   supportsClaim: domain.supportsClaim,
-  checkedInToday: domain.checkedInToday,
-  checkinableAccounts: domain.checkinableAccounts,
   matchProvider: domain.matchProvider,
   matchEnabled: domain.matchEnabled,
   matchLimit: domain.matchLimit,
@@ -1272,11 +1241,7 @@ export function installAccountsApi(): void {
     syncBalancesSnapshot,
     queryUsageFor,
     queryAllUsage,
-    checkinFor,
-    checkinAll,
     refreshUsageAfterCheckin,
-    checkinableAccounts,
-    supportsCheckin,
     supportsUsage,
     isDesktopAccount,
     isEnabled,
