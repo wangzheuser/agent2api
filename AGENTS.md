@@ -65,6 +65,78 @@ cd /opt/docker_projects/agent2api
 
 服务器项目目录可能保留项目维护的未跟踪运行材料（例如 `backups/`、`update_version.sh`）；只要更新脚本的受控检查允许，不得为了清理工作区删除或覆盖这些材料。部署脚本会先创建版本化数据库与配置备份，再构建候选镜像；如果构建或候选测试失败而 `release.env`、运行容器仍指向旧版本，必须保留备份和失败现场，按失败流程处理。
 
+### 3.2.1 SSH 300 秒限制下的异步更新流程
+
+`update_version.sh` 包含拉取代码、数据库备份、候选 builder 镜像构建、容器内 Rust 测试、正式镜像构建、容器替换和健康等待。完整过程可能超过 SSH 工具的 300 秒等待上限；SSH 请求超时只表示控制连接停止等待，不能表示远端任务失败，也不能触发第二次更新。
+
+以后每次 us2 更新固定采用“启动与等待分离”的方式：SSH 请求只负责启动一个脱离会话的远端 worker，worker 将完整输出写入项目 `.deploy/status/`，并在结束时原子写入退出码文件；后续 SSH 请求以不超过 180 秒的窗口轮询文件和进程。`update_version.sh` 仍是唯一部署入口，不能绕过它直接执行 Compose 替换。
+
+启动前在同一 SSH 请求内完成目标和并发预检：
+
+```bash
+cd /opt/docker_projects/agent2api
+target=$(git ls-remote origin refs/heads/dev/pr-integration | awk 'NR == 1 {print $1}')
+test -n "$target"
+test -x ./update_version.sh
+ps -eo pid=,etime=,args= | grep -E 'update_version\.sh|update-agent2api\.sh|docker build .*agent2api:test-|cargo test -p agent2api-server' | grep -v grep && exit 3 || true
+run_id="$(date -u +%Y%m%dT%H%M%SZ)-update-$(printf '%s' "$target" | cut -c1-8)"
+status_dir=.deploy/status
+log="$status_dir/$run_id.log"
+exit_file="$status_dir/$run_id.exit"
+pid_file="$status_dir/$run_id.pid"
+mkdir -p "$status_dir"
+rm -f "$exit_file"
+nohup sh -c '
+  cd /opt/docker_projects/agent2api || exit 125
+  ./update_version.sh >"$1" 2>&1
+  rc=$?
+  printf "%s\n" "$rc" >"$2.tmp"
+  mv "$2.tmp" "$2"
+  exit "$rc"
+' sh "$log" "$exit_file" </dev/null >/dev/null 2>&1 &
+pid=$!
+printf '%s\n' "$pid" >"$pid_file"
+printf 'run_id=%s\npid=%s\nlog=%s\nexit_file=%s\ntarget=%s\n' "$run_id" "$pid" "$log" "$exit_file" "$target"
+```
+
+启动请求返回后，必须保存 `run_id`、PID、日志路径和退出码路径。每次轮询只等待一个短窗口，例如 `timeout=180000`，并执行：
+
+```bash
+cd /opt/docker_projects/agent2api
+run_id='<启动请求返回的 run_id>'
+status_dir=.deploy/status
+log="$status_dir/$run_id.log"
+exit_file="$status_dir/$run_id.exit"
+pid_file="$status_dir/$run_id.pid"
+if test -f "$exit_file"; then
+  printf 'exit='; cat "$exit_file"
+  tail -n 80 "$log"
+else
+  printf 'running='; if kill -0 "$(cat "$pid_file")" 2>/dev/null; then echo true; else echo unknown; fi
+  ps -eo pid=,ppid=,etime=,stat=,args= | grep -E 'update_version\.sh|update-agent2api\.sh|docker build .*agent2api:test-|cargo test -p agent2api-server' | grep -v grep || true
+  tail -n 80 "$log"
+fi
+```
+
+若 SSH 工具在轮询期间再次超时，重新建立 SSH 会话后只检查同一个 `run_id` 的退出码、日志和进程；不得重新执行启动命令。只有退出码文件存在、对应 worker 和构建/测试子进程均已结束，且退出码为 `0` 时，才进入部署验收。退出码非零时保留日志、备份和容器现场，按第 3.4 节处理。
+
+异步 worker 结束后仍必须执行完整验收：
+
+```bash
+cd /opt/docker_projects/agent2api
+target=$(git ls-remote origin refs/heads/dev/pr-integration | awk 'NR == 1 {print $1}')
+test "$(git rev-parse HEAD)" = "$target"
+grep -E '^(AGENT2API_IMAGE|AGENT2API_COMMIT|AGENT2API_VERSION)=' .deploy/release.env
+docker image inspect "$(sed -n 's/^AGENT2API_IMAGE=//p' .deploy/release.env)" >/dev/null
+docker compose -f .deploy/docker-compose.us2.yml config -q
+docker inspect agent2api --format 'status={{.State.Status}} health={{.State.Health.Status}} image={{.Config.Image}} started={{.State.StartedAt}} restarts={{.RestartCount}}'
+curl --fail --silent --show-error http://172.17.0.1:19050/health >/dev/null
+```
+
+验收时必须记录更新前后提交、版本、镜像标签、容器 `StartedAt` 和本批次 `RestartCount`，并按第 3.3 节完成 `/v1/models`、管理面板、认证边界、一次授权范围内真实业务请求以及服务日志检查。启动请求返回、SSH 请求退出 0、HTTP 200 或容器健康中的任一项都不能单独结案。
+
+长期优化方向是让服务器维护的 `update_version.sh` 原生提供 `start/status/wait` 三个动作，并复用上述 `.deploy/status/<run_id>.*` 协议；在该入口尚未实现前，项目级标准流程以本节的 `nohup` worker 和退出码文件作为固定适配层。
+
 ### 3.3 部署验收
 
 更新脚本成功退出后，必须确认：
