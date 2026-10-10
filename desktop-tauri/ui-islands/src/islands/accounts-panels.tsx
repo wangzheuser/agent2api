@@ -58,7 +58,7 @@ import {
   PROXY_CUSTOM_CURRENT, PROXY_CUSTOM_EDIT, applyProxyPick, checkinErrorOf,
   commitPriority, connectionsOf, maskName, moveAccount, openCreditsDialog, openSettingsDialog, poolError,
   proxyPoolSnapshot, queryUsageOnce, runCheckin, setAccountEnabled, setPanelOpen,
-  startCodeArtsWelfare, startZcodeClaim, tokenUsageOf, toggleNamesHidden, usageEntryOf, usageFailureOf,
+  openZcodePlans, startCodeArtsWelfare, tokenUsageOf, toggleNamesHidden, usageEntryOf, usageFailureOf,
 } from './accounts-data'
 /** 图标（icons.js 的内联 SVG 串）：整站共用一份图标集，这里只做注入 */
 function iconHtml(name: string, size: number): string {
@@ -696,6 +696,27 @@ export function UsageCell({ account }: { account: AccountRecord }) {
     </Badge>
   ) : null
   const tokenSub = prominentTokenLimit(account)
+  // 所有已接入余额的 provider 都可从余额列打开统一余额弹窗；有结构化明细弹层的
+  // provider 保留自己的交互，其余读数和主额度进度条统一放进这个触发器。
+  const openDetails = (event: React.MouseEvent<HTMLButtonElement>): void => {
+    event.stopPropagation()
+    // 原生按钮键盘激活的 detail 为 0；触屏使用单击，避免双击缩放。
+    if (event.detail === 0 || window.matchMedia('(pointer: coarse)').matches) {
+      openCreditsDialog(account.id, event.currentTarget)
+    }
+  }
+  const trigger = (content: React.ReactNode): React.ReactNode => (
+    <button type='button' className={`usage-sum credit-balance-trigger ${summary.kind}`}
+      title={`${summary.title}；双击查看余额明细（Enter / Space 打开）`}
+      aria-label={`${summary.text}，查看余额明细`} aria-haspopup='dialog'
+      onDoubleClick={event => {
+        event.stopPropagation()
+        openCreditsDialog(account.id, event.currentTarget)
+      }}
+      onClick={openDetails}>
+      {content}
+    </button>
+  )
   if (supportsUsageDetail(account)) {
     const usable = summary.kind === 'ok' || summary.kind === 'warn'
     const detail = usable ? usageDetailOf(entry) : null
@@ -705,7 +726,7 @@ export function UsageCell({ account }: { account: AccountRecord }) {
     // 还没查到 / 查询失败 / 没拼出明细：维持单行读数的老样子
     return (
       <span className='usage-sum-wrap'>
-        <span className={`usage-sum ${summary.kind}`} title={summary.title}>{summary.text}</span>
+        {trigger(summary.text)}
         {blockedBadge}
         {tokenSub}
       </span>
@@ -717,22 +738,25 @@ export function UsageCell({ account }: { account: AccountRecord }) {
   if (!pool) {
     return (
       <span className='usage-sum-wrap'>
-        <span className={`usage-sum ${summary.kind}`} title={summary.title}>{summary.text}</span>
+        {trigger(summary.text)}
         {blockedBadge}
         {tokenSub}
       </span>
     )
   }
   return (
-    <span className='usage-pool' title={summary.title}>
-      {pool.planName ? <span className='usage-pool-name'>{pool.planName}</span> : null}
-      <span className='usage-pool-line'>
-        {pool.percent !== null ? <Progress value={pool.percent} className='usage-pool-bar' /> : null}
-        <span className={`usage-pool-view ${summary.kind}`}>{pool.text}</span>
-      </span>
+    <span className='usage-sum-wrap'>
+      {trigger(
+        <span className='usage-pool' title={summary.title}>
+          {pool.planName ? <span className='usage-pool-name'>{pool.planName}</span> : null}
+          <span className='usage-pool-line'>
+            {pool.percent !== null ? <Progress value={pool.percent} className='usage-pool-bar' /> : null}
+            <span className={`usage-pool-view ${summary.kind}`}>{pool.text}</span>
+          </span>
+        </span>,
+      )}
       {blockedBadge}
       {tokenSub}
-
     </span>
   )
 }
@@ -1043,7 +1067,6 @@ export function ProxyCell({ account }: { account: AccountRecord }) {
  * （领取状态也在那里标记），账号页不再放第二颗一样的按钮。）
  */
 export function ActionsCell({ account, atFront }: { account: AccountRecord; atFront: boolean }) {
-  const [claimBusy, setClaimBusy] = React.useState(false)
   const [usageBusy, setUsageBusy] = React.useState(false)
   const checkinFailed = checkinErrorOf(account.id)
   const checkedIn = checkedInToday(account)
@@ -1051,17 +1074,6 @@ export function ActionsCell({ account, atFront }: { account: AccountRecord; atFr
   const activeOnly = isWorkBuddyInternational(account)
   const canUsage = supportsUsage(account)
   const canClaim = supportsClaim(account)
-
-  async function claim(): Promise<void> {
-    // 一次领取要拖一次滑块，重复点击会开出第二个验证码流程（共用的求解器一次只允许
-    // 一个，后发起的那轮会把前一轮作废）—— 流程期间禁用这颗按钮
-    setClaimBusy(true)
-    try {
-      await startZcodeClaim(account.id)
-    } finally {
-      setClaimBusy(false)
-    }
-  }
 
   return (
     <div className='acct-actions'>
@@ -1085,11 +1097,11 @@ export function ActionsCell({ account, atFront }: { account: AccountRecord; atFr
         // （活动大额包 + 每日包），而上游的「已领取过」是按套餐判的 —— 领了 A
         // 之后 B 照样能领。今天领过没落在悬停提示里，逐份的状态（哪几份已领、
         // 还能选哪份）由弹窗给出，见 ui/zcode-claim.js。
-        <Button variant='outline' size='xs' disabled={claimBusy}
+        <Button variant='outline' size='xs'
           title={claimedToday(account)
             ? claimDoneTitle(account)
-            : '探测并领取官方限时体验套餐（每天一期，需要过一次人机验证）'}
-          onClick={() => void claim()}>领套餐</Button>
+            : '查看可领取的套餐与名下已有的套餐（每天一期，领取需过一次人机验证）'}
+          onClick={() => openZcodePlans(account.id)}>领套餐</Button>
       ) : null}
       {canUsage ? (
         <Button variant='outline' size='xs' disabled={usageBusy}

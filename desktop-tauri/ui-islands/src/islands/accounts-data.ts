@@ -42,6 +42,7 @@ import * as domain from './accounts-domain'
 import { clampPriority, priorityOf } from './accounts-columns'
 import { creditDetailsOf, genericBalanceDetailsOf, type GenericBalanceDetails } from './accounts-credit-details'
 import type { CreditSample } from './accounts-credit-overview'
+import { t } from '../i18n'
 import {
   allAccounts, bump, findAccount, getStore, isPicked, openPanelsFor, panelOpen, patch,
 } from './accounts-store'
@@ -1162,18 +1163,20 @@ export const PROXY_CUSTOM_EDIT = '__proxy_custom_edit__'
  * 设备领的），台账该补上它，否则用户会一直点它、每次拿回同一句话。
  */
 export async function startZcodeClaim(id: string): Promise<void> {
-  const account = findAccount(id) || undefined
-  const result = (await shared().wbZcodeClaim?.start?.(
-    account,
-    claimedPlanIdsToday(account),
-  )) as { ok?: boolean; failure?: string } | undefined
-  const settled = result?.ok === true || result?.failure === 'already_claimed'
-  if (!settled) return
-  // 余额静默刷新（不 await、不播报：领取结果那条 toast 不能被顶掉，
-  // 理由见 refreshUsageAfterCheckin）
-  void refreshUsageAfterCheckin(id)
-  // 重拉账号状态：领取台账是后端落盘的，弹窗与悬停提示据此更新「哪几份已领」
-  void shared().wbApp?.refresh?.()
+  // 兼容旧调用点；实际流程已迁到可逐份展示套餐状态的弹窗。
+  openZcodePlans(id)
+}
+
+/** 打开 ZCode 套餐明细弹窗；逐份领取和余额刷新由弹窗自己完成。 */
+export function openZcodePlans(id: string, name?: string): void {
+  const account = findAccount(id)
+  if (!account) { toast(t('账号不存在，请刷新后重试'), 'err'); return }
+  const modal = shared().wbZcodePlans
+  if (!modal?.open) {
+    toast(t('套餐明细弹窗未加载，请重启应用后重试'), 'err')
+    return
+  }
+  modal.open({ id, name: name || account.name })
 }
 
 /** 兼容旧账号页的 CodeArts 福利动作；实际入口已迁到签到中心。 */

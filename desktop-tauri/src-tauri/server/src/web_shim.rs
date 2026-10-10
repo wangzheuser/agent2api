@@ -931,6 +931,10 @@ pub fn shim_js() -> &'static str {
       return call('GET', '/api/stats/summary?range=' + encodeURIComponent(range));
     },
     getStatsRequests: function (query) { return call('GET', '/api/stats/requests' + toQuery(query)); },
+    // 中止一条在途请求；请求日志的「终止」与模型测试弹窗共用该桥接。
+    terminateStatsRequest: function (id) {
+      return call('POST', '/api/stats/requests/terminate' + toQuery({ id: id }));
+    },
     getStatsRequestFilters: function () { return call('GET', '/api/stats/requests/filters'); },
     clearStatsRequests: function (query) { return call('DELETE', '/api/stats/requests' + toQuery(query)); },
     // 按 id 取单条请求的原始正文（详情弹窗「预览对话」的数据源；找不到给 404）

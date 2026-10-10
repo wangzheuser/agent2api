@@ -463,11 +463,13 @@ export async function signSingleAccount(id: string, mode: 'checkin' | 'full' | '
     rest.delete(busyKey)
     patch({ signing: rest })
     await loadCheckinCenter()
-    // 只处理刚签的这个账号：从快照的新手任务清单里过滤，账号不在清单里则数组为空
-    // （清单由后端按 provider 组装：Loomy / 小浣熊 / CodeArts，别的家不发无意义的查询）
-    const onboardingRows = (getCheckinStore().snapshot?.extras.onboarding ?? [])
-      .filter(row => row.id === id)
-    void autoProcessOnboarding(onboardingRows)
+    // 只有本次普通签到明确成功/已领取才跟进新手任务；失败、空响应和仅保活
+    // 都不能把账号当作已完成，避免额外查询或领取无关奖励。
+    if (followUpOnboarding && !getCheckinStore().loadError) {
+      const onboardingRows = (getCheckinStore().snapshot?.extras.onboarding ?? [])
+        .filter(row => row.id === id)
+      void autoProcessOnboarding(onboardingRows)
+    }
 
     shared().wbApp?.refresh?.()
   }

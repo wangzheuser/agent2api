@@ -11,7 +11,7 @@ function load(name, window = {}, cache = {}) {
   const compiled = ts.transpileModule(fs.readFileSync(path.join(root, `${name}.ts`), 'utf8'), {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
   }).outputText
-  const context = { exports: {}, window, require: dependency => load(dependency.replace('./', ''), window, cache) }
+  const context = { exports: {}, window, require: dependency => load(dependency.replace(/^\.\//, ''), window, cache) }
   vm.runInNewContext(compiled, context, { filename: `${name}.ts` })
   return cache[name] = context.exports
 }
