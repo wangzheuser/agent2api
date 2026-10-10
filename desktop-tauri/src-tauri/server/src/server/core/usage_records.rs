@@ -265,6 +265,7 @@ pub const DEFAULT_LOW_BALANCE_THRESHOLD: f64 = 1.0;
 
 pub fn default_low_balance_mode(_provider: &str) -> &'static str {
     "off"
+
 }
 
 /// 缺省档的完整形状（mode + threshold）：公开形态（store_view）与写入侧
@@ -298,12 +299,9 @@ pub fn query_interval_of(account: &Value) -> Option<i64> {
 /// —— **缺省（无配置）不启用禁用**：自动禁用是不自动恢复的硬动作，缺省必须是
 /// 用户显式选过才会发生；缺省档为关闭。
 /// 阈值非法（非正 / 非有限数）一律 None —— 判不出就放行，不猜。
+
 pub fn low_balance_disable_threshold(account: &Value) -> Option<f64> {
-    let config = account.get("lowBalance")?;
-    if config.get("mode").and_then(Value::as_str) != Some("disable") {
-        return None;
-    }
-    valid_threshold(config.get("threshold"))
+    crate::server::core::limiter::balance_disable_threshold(account)
 }
 
 /// 账号是否应因「余额不足」在选路时被跳过（软跳过档）。
@@ -345,6 +343,7 @@ fn valid_threshold(value: Option<&Value>) -> Option<f64> {
     value
         .and_then(Value::as_f64)
         .filter(|threshold| threshold.is_finite() && *threshold > 0.0)
+
 }
 
 // ─── 旧 kv 快照的一次性迁移 ─────────────────────────────────

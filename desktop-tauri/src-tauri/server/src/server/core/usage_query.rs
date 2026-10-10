@@ -1,12 +1,45 @@
-//! 余额查询共用逐账号持久化占位、失败退避及身份校验。
-//! 全局配置保留为总开关和继承间隔，自动查询由单一心跳执行。
-//! 手动单查/批量与心跳逐条保存结果；显式低余额策略在写入与选路时生效。
+//! 余额 / 积分查询的编排层：目标集合解析、跨账号并发、结果落记录表，以及
+//! 「每账号各自到期」的心跳调度（全局「定时查询积分」任务已退役）。
+//!
+//! ── 查询的三条入口共用同一份编排 ─────────────────────────────
+//!   - 手动批量（工具栏「查询余额」→ `query_all(store, None)`）；
+//!   - 手动单查（账号行的「余额」按钮 → `query_all(store, Some(id))`）；
+//!   - 自动查询（`spawn_sweeper` 的心跳循环，每轮只查「配置了自动查询且到期」
+//!     的账号）。
+//! 三条路径查询完都**写记录表**（`core::usage_records`）：手动查询因此天然
+//! 顺延该账号的下一轮自动排期（到期 = 上次尝试 + 间隔，排期没有独立状态），
+//! 余额不足的跳过 / 禁用判定也拿到的都是最新读数。
+//!
+//! ── 每账号到期判定（没有独立排期状态）────────────────────────
+//! 到期 = `记录.last_attempt_at + 账号配置的间隔 <= now`，是「记录 + 配置」的
+//! 纯函数：重启不重置节奏（记录在库里）、手动查询天然顺延（写记录即推进
+//! last_attempt）、账号删除即失效（记录被孤儿清理扫掉）。失败**不退避**：
+//! 失败行照常写记录（上次尝试时间被推进），下一轮仍按配置间隔来 —— 与
+//! OmniProxy 的调度同口径。
+//!
+//! ── 余额不足的两档处理（与 OmniProxy 同构）───────────────────
+//!   - skip（软跳过）：不改任何状态，转发选路按 `usage_records::balance_facts`
+//!     的内存事实实时剔除（见 `upstream::rotate`），余额回升自动恢复参与；
+//!   - disable（硬禁用）：查询成功落记录后由 `enforce_low_balance_disable`
+//!     判定，低于阈值就把账号 `enabled` 置 false —— 不自动恢复，需手动启用；
+//!     自动查询**继续**跑（禁用只表示不参与转发，余额保持新鲜供用户判断）。
+//! 判定口径与余额列同一数字（`usage_records::extract_remaining`）。
+//!
+//! ── 限制器（余额 / Token 规则列表）与 Token 周期消耗 ─────────
+//! 「余额不足处理」已升级为每账号的**限制器规则列表**（`core::limiter`，
+//! 账号记录的 `limiters` 键）：余额规则沿用上面两档的语义与判定（判定函数
+//! 已改读有效规则），Token 规则另带重置周期。Token 侧的心跳职责在本循环：
+//! 每轮先**全量刷新窗口事实**（`limiter::refresh_token_facts`，窗口对齐自然
+//! 时间，翻页即归零），再做 **Token 自动禁用判定**（`enforce_token_disable`，
+//! disable 档命中即禁用、不自动恢复）；skip 档由选路过滤读同一份事实表拦截。
+
 
 use std::time::Duration;
 
 use serde_json::{json, Value};
 
 use crate::server::core::account_store::AccountStore;
+use crate::server::core::limiter;
 use crate::server::core::providers::adapter::adapter_for;
 use crate::server::core::{usage_records, task_state};
 
@@ -280,6 +313,7 @@ pub async fn query_all(store: &AccountStore, id: Option<&str>) -> Result<Value, 
     Ok(json!({ "results": results, "skipped": skipped }))
 }
 
+
 // ─── 每账号自动查询的心跳调度 ────────────────────────────────
 
 /// 心跳判定间隔：10 秒（与 `scheduled_tasks` 的 tick 同一量级）。
@@ -305,12 +339,72 @@ pub fn spawn_sweeper(store: AccountStore) {
 /// 批量查询排除 `supports_usage == false` 的家（避免一整片 501，与手动批量
 /// 同口径）；没凭证的账号**不排除**：那是本地就能给出的失败结论，写进记录
 /// 让界面如实显示「没有可用凭证」，与手动批量同一行为。
+///
+/// ── Token 限制器的两件事也在这一轮做（先于「没有到期账号」的早退）──
+///   ① **全量刷新窗口事实**（`limiter::refresh_token_facts`）：按启用中的全部
+///      Token 周期把当前窗口的每账号消耗重算一遍 —— 窗口翻页后的旧读数由此
+///      归零，新配的规则由此进表；10 秒一轮，走 schema v9 的聚合索引。
+///   ② **Token 自动禁用判定**（`enforce_token_disable`）：disable 档命中
+///      （当前窗口消耗 ≥ 阈值）就把账号禁用 —— 与余额禁用同一条硬动作语义。
+fn enforce_token_disable(store: &AccountStore, accounts: &[Value], now: i64) {
+    let facts = limiter::token_facts();
+    for account in accounts {
+        if matches!(account.get("enabled"), Some(Value::Bool(false))) {
+            continue;
+        }
+        let Some(id) = account.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some((rule, used)) = limiter::token_disable_hit(account, &facts, now) else {
+            continue;
+        };
+        let display = account
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(id);
+        match store.update_account(id, &json!({ "enabled": false })) {
+            Ok(_) => logging::log_with_level(
+                "[Usage]",
+                &format!(
+                    "账号「{display}」{}消耗 {} Token 达到上限 {}，已自动禁用（重置也不恢复，请手动启用）",
+                    if rule.reset == limiter::LimiterReset::Daily {
+                        "今日".to_string()
+                    } else {
+                        format!("{}内", limiter::describe_period(rule.period))
+                    },
+                    used,
+                    rule.threshold,
+                ),
+                "warn",
+            ),
+            Err(error) => logging::verbose(
+                "[Usage]",
+                &format!("账号 {id} Token 限额自动禁用失败：{}", error.message),
+            ),
+        }
+    }
+}
+
+
 async fn sweep_due(store: &AccountStore) {
     usage_records::sync_facts();
     if !crate::server::config::scheduled_settings().usage_query.enabled { return; }
     usage_records::prune_orphans();
     let Ok(states) = account_schedules(store) else { return };
     let now = logging::now_ms();
+    // Token 限制器读数覆盖所有配了规则的账号（含已禁用账号），以便重新启用后立即可用。
+    let all_accounts: Vec<Value> = store
+        .list_accounts()
+        .get("accounts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let kinds = limiter::enabled_token_kinds(&all_accounts);
+    if !kinds.is_empty() {
+        limiter::refresh_token_facts(&kinds);
+        enforce_token_disable(store, &all_accounts, now);
+    }
     let due: Vec<_> = states.into_iter().filter(|(_, _, state)| state.due_at() <= now).collect();
     if due.is_empty() {
         return;
@@ -390,6 +484,13 @@ pub fn scheduled_status(store: &AccountStore, task: &mut Value) {
 /// 时效判定必须按行算，不能再拿一个整轮的 `at` 盖所有人（前端 `applyBalances`
 /// 因此优先取行级 `at`）。
 ///
+/// ── Token 限制器读数（`tokenAt` / `tokenUsage`）──────────────
+/// 余额读数只在查询到期时变化，`at` 不动就说明整份快照没新东西；Token 周期
+/// 消耗随每条请求变化，所以另带自己的时刻 `tokenAt`（恒为本次计算时刻，前端
+/// 按它判断要不要应用），与余额的 `at` 各走各的。`tokenUsage` 按账号给启用中
+/// 的每个 Token 周期一项 `{period, windowStart, used}`（内存事实表投影，零
+/// SQL；事实由心跳 10 秒刷新 + 请求收尾增量记账兜着）。
+///
 /// 出口过滤的两条（与旧 kv 快照的 `prune_stale_failures` 同语义）：
 ///   - 账号已删除的行不端出（界面上没有那一行，留着只会对不上）；
 ///   - 失败行只在「这次尝试不早于账号记录的最后改动」时端出 —— 重新登录 /
@@ -441,5 +542,26 @@ pub fn snapshot(store: &AccountStore) -> Value {
             }
         }
     }
-    json!({ "at": at, "serverNow": logging::now_ms(), "results": rows, "skipped": 0 })
+    // Token 限制器读数：按账号投影内存事实表（没有配 Token 规则的账号不出现，
+    // 前端按「没配规则」处理）。前端 20 秒轮询这份快照，读数的时效上限即轮询间隔
+    let now = logging::now_ms();
+    let facts = limiter::token_facts();
+    let mut token_usage = serde_json::Map::new();
+    for account in list.into_iter().flatten() {
+        let entries = limiter::token_usage_rows(account, &facts, now);
+        if entries.is_empty() {
+            continue;
+        }
+        if let Some(id) = account.get("id").and_then(Value::as_str) {
+            token_usage.insert(id.to_string(), Value::Array(entries));
+        }
+    }
+    json!({
+        "at": at,
+        "results": rows,
+        "skipped": 0,
+        "tokenAt": now,
+        "tokenUsage": token_usage,
+    })
+
 }

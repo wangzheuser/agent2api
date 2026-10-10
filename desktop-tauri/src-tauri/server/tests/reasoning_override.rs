@@ -160,7 +160,7 @@ async fn management_and_three_protocol_wire_force_clear_and_legacy_preservation(
     // 账号地区的目录必须与最终计划同源（Global 支持该模型，CN 不支持）。
     use agent2api_server::server::core::providers::qoder::{credentials::Credentials, endpoints::Region as QoderRegion};
     let credentials = Credentials { region:QoderRegion::Cn, access_token:"fixture-only".into(), refresh_token:String::new(), expires_at:Some(i64::MAX), user_id:"fixture-cn".into(), email:String::new(), name:String::new(), machine_id:"fixture-machine".into() };
-    state.store().add_qoder_account(&credentials, None, "fixture").unwrap();
+    state.store().add_qoder_account(QoderRegion::Cn, &credentials, None, "fixture").unwrap();
     model_rules::add_mapping("fixture/qoder-cn", "DeepSeek-Flash", Some("qoder"), None, None, &[], Some(Some("max"))).unwrap();
     serial += 1;
     let (status, result) = request(&gateway, "/v1/chat/completions", &input("chat", "fixture/qoder-cn", false, serial)).await;

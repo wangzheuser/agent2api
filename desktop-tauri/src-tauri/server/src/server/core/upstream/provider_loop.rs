@@ -291,6 +291,10 @@ pub(super) async fn forward_with_providers(
     // 本函数是唯一消费方，日志也打在这里。
     let candidates = match ctx.test_target {
         Some(target) => crate::server::core::providers::catalog::providers_for_model(&target.model),
+        None if ctx.ignore_model_gate => ctx
+            .key_scope
+            .map(|scope| scope.allowed_provider_ids())
+            .unwrap_or_default(),
         None => route_for_forward(&model),
     };
     if crate::server::core::providers::catalog::providers_for_model(&model).is_empty() {

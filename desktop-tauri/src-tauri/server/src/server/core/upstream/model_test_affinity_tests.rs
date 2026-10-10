@@ -106,6 +106,7 @@ async fn model_test_entry_does_not_bind_reliable_session() {
                     allowed_providers: Some(KeyScope::provider_only(PROVIDER)),
                     pinned_account: None,
                     route_session: Some(session.clone()),
+                    ignore_model_gate: false,
                 },
                 WireTarget {
                     model: MODEL.into(),

@@ -649,6 +649,7 @@ async fn session_affinity_real_forward_protocols_lifecycle_and_strategy_rollback
             route_session: Some(RouteSession {
                 key: session.into(),
             }),
+            ignore_model_gate: false,
         })
         .await
         .unwrap();
