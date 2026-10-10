@@ -92,6 +92,7 @@ impl ProviderAdapter for MiniMaxCodeAdapter {
             headers,
             body: payload,
             response: UpstreamResponse::Anthropic,
+            system_proxy_when_unset: false,
         })
     }
 

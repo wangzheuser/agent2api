@@ -12,6 +12,7 @@
  */
 
 import { shared } from './add-account-bridge'
+import { t } from '../i18n'
 
 /* ─── 类型 ───────────────────────────────── */
 
@@ -619,6 +620,154 @@ const KUKU: ProviderConfig = {
   desktopNote: '读本机客户端当前登录态（明文 Cookie，无需解密）。客户端运行时 Cookies 文件被独占占用，导入前请先关闭 KukuAI 客户端。',
 }
 
+/**
+ * MonkeyCode（长亭科技）两个站点：国内版 `monkeycode-ai.com` / 国际版
+ * `monkeycode-ai.net`。
+ *
+ * ── 为什么两个站点 = 两家 provider ─────────────────────────
+ * 与 AutoClaw / Qoder / ZCode 同一思路：两站是同一套协议、同一个 session
+ * cookie 名、同一套任务流，只有站点不同；地区是 **provider 身份**而不是账号
+ * 属性（后端 `monkeycode::Region` 是「provider id → 站点」的唯一映射）。
+ * 拆家后两站各自有独立的账号与启停、界面上各占一个分组 —— 因此两块用同一个
+ * 工厂生成（表单相同、站点提示不同，照 `qoderForm` 的写法）。
+ *
+ * ── 粘贴 session、没有续期 ─────────────────────────────────
+ * 粘贴浏览器里 `monkeycode_ai_session` cookie 的值（整段 Cookie 直接粘也行，
+ * 网关会自己剥出值）。本家的密码登录要图形验证码、OAuth 要短信验证，两条都
+ * 不适合网关代跑，粘贴 session 是唯一可靠的入口。上游**没有 refresh 接口**：
+ * session 是约 30 天的硬限制，过期只能重新登录网页再粘贴（与 CatPaw /
+ * KukuAI 同一处境，所以不渲染「刷新 Token」那一类控件）。
+ *
+ * ── imageId 为什么可以留空 ─────────────────────────────────
+ * `imageId`（任务镜像 id）是发起对话的必需字段，但它不在登录响应里 —— 表单
+ * 允许留空，由网关在添加时从该账号**已有任务**里 best-effort 自动发现（老
+ * 用户一般能拿到）；新账号一个任务都没有、发现不到时**不阻断添加**，之后
+ * 手动补即可。
+ *
+ * ── 没有「导入桌面端登录态」────────────────────────────────
+ * 登录态就是浏览器 cookie，没有客户端 `auth.json` 那种稳定可读的文件形态
+ * （与 Accio / ZCode 同一处境），给了入口只会稳定失败。
+ */
+function monkeycodeForm(spec: { provider: string; label: string; siteNote: string }): ProviderConfig {
+  const { provider, label, siteNote } = spec
+  return {
+    provider,
+    label,
+    // 登录态是浏览器 cookie、没有可读的落盘文件（理由见上方注释）
+    desktop: false,
+    manualTitle: t('粘贴 session cookie'),
+    manualNoteHtml: t('粘贴网页登录态 cookie <code>monkeycode_ai_session</code> 的值（在浏览器里复制整段 Cookie 直接粘贴也行，网关会自己剥出值）。<br>{siteNote}<br>MonkeyCode <b>没有续期接口</b>：session 有效期约 30 天（硬限制），过期后重新登录网页、再粘贴一次即可。', { siteNote }),
+    fields: [
+      { key: 'session', label: 'session', rows: 3, placeholder: t('monkeycode_ai_session 的值（也可直接粘贴整段 Cookie）') },
+      { key: 'imageId', label: t('任务镜像 id'), optional: true, placeholder: t('可选：发起对话必需，留空则由网关从该账号已有任务里自动发现，发现不到时之后手动补') },
+      { key: 'name', label: t('备注名'), optional: true, placeholder: t('可选，留空则用上游返回的账号名或账号 id') },
+    ],
+  }
+}
+
+const MONKEYCODE = monkeycodeForm({
+  provider: 'monkeycode',
+  label: t('MonkeyCode'),
+  siteNote: t('这里填国内站（monkeycode-ai.com）的账号：请粘贴国内站的 session。国际站（monkeycode-ai.net）是另一家 provider、另一套账号，两边的凭证不通用。'),
+})
+
+const MONKEYCODE_INTL = monkeycodeForm({
+  provider: 'monkeycode-intl',
+  label: t('MonkeyCode 国际版'),
+  siteNote: t('这里填国际站（monkeycode-ai.net）的账号：请粘贴国际站的 session。国内站（monkeycode-ai.com）是另一家 provider、另一套账号，两边的凭证不通用。'),
+})
+
+/**
+ * Command Code（`api.commandcode.ai`）：一家一个 provider，没有地区之分
+ * （规格 §9：参考里只有这一个主机，没有 cn / intl 双域名、没有 region 头）。
+ *
+ * ── 凭证是一枚 `user_` 前缀的 API Key，粘贴式 ─────────────────
+ * 来源是官方 CLI 的 `~/.commandcode/auth.json` 或网页 studio
+ * （commandcode.ai/studio）。粘贴形态很杂（裸 key / 带成对引号 /
+ * `Authorization: Bearer …` 整行 / key 后面还跟着别的字段），网关会自己扫描
+ * `user_` 剥成裸 key —— 整行直接粘就行，不用手工裁剪。
+ *
+ * ── 无续期、无桌面端导入 ───────────────────────────────────
+ * key 是静态的：上游没有 refresh 接口、也不会过期，失效只能重新获取（所以
+ * 不渲染「刷新 Token」那一类控件）。本机 `~/.commandcode/auth.json` 是 CLI
+ * 自己的凭证文件，不是可导入的「客户端登录态」，没有那条路径（与 Loomy /
+ * MonkeyCode 同一处境）。
+ *
+ * ── 添加时的一次线上探活 ───────────────────────────────────
+ * 网关在添加时会打一次**轻量探活**（`GET /alpha/billing/credits`）：只有拿到
+ * 401/403 才判 key 无效，网络失败 / 5xx / 未知一律放行 —— 失败不阻断添加，
+ * 只作提示（不让一次上游抖动把用户挡在门外）。
+ */
+const COMMANDCODE: ProviderConfig = {
+  provider: 'commandcode',
+  label: t('Command Code'),
+  desktop: false,
+  manualTitle: t('粘贴 API Key'),
+  manualNote: t('粘贴 Command Code 的 API Key（user_ 开头；从官方 CLI 的 ~/.commandcode/auth.json 或网页 studio 获取）。整行 / 带引号 / 带 Bearer 前缀地粘都行，网关会自己剥成裸 key。key 不过期、也没有续期接口，失效后重新获取即可；添加时网关会做一次轻量探活，失败不影响添加。'),
+  fields: [
+    { key: 'apiKey', label: 'apiKey', rows: 3, placeholder: t('user_ 开头的 API Key（也可直接粘贴 Authorization: Bearer … 整行）') },
+    { key: 'name', label: t('备注名'), optional: true, placeholder: t('可选，留空则用 key 尾号') },
+  ],
+}
+
+/**
+ * Antigravity（Google 的 AI IDE，本次接它提供的 Gemini 模型）。
+ *
+ * ── 网页登录（Google OAuth 授权码 + loopback）───────────────
+ * 后端适配器本地拼授权地址（`accounts.google.com`，6 个 scope +
+ * `access_token=offline` / `prompt=consent`），完成后浏览器回到**网关自己的**
+ * loopback 端口 `/oauth-callback`（redirect_uri 就是网关端口拼出来的，见
+ * `providers::antigravity::oauth`）。回调落在网关，因此内嵌窗口与系统浏览器
+ * 两种方式都能用（与 CatPaw 同款）；远程 / Docker 场景下浏览器到不了容器内
+ * 的 loopback 端口时，可把地址栏整条回调 URL 粘回登录弹窗。
+ *
+ * ── 粘贴 Google refresh token（仍保留的手工入口）──────────────
+ * 已从别处（官方 IDE / 参考实现）拿到 refresh_token 的用户可以直接粘贴；
+ * 令牌以 `1//` 开头，直接粘贴含 `refresh_token=` 的整行也行（网关会归一化，
+ * `1//` 本体留着）。
+ *
+ * ── 有自动续期 ─────────────────────────────────────────────
+ * access_token 约一小时过期（Google 侧的 expires_in），refresh_token 是长寿命
+ * 的主凭证：网页登录与粘贴式都会在添加时打一次 Google token 端点做**真实校验**
+ * 并顺手拿到 access token，之后到期由网关自动续期 —— 令牌丢了只能重新走
+ * Google 授权。
+ *
+ * ── projectId 可以留空 ─────────────────────────────────────
+ * `projectId`（`cloudaicompanionProject`）是聊天请求必需、但每个 Google 账号
+ * 各不相同的值（不在 token 里）：留空时网关会 best-effort 自动发现
+ * （`loadCodeAssist` → 无则 `onboardUser`），失败不阻断添加，刷模型清单时会
+ * 再试。`email` 同样可选，只用于展示与身份识别（网页登录会自己取 userinfo）。
+ *
+ * ── 没有「导入桌面端登录态」────────────────────────────────
+ * 登录态在 Antigravity IDE 自己的存储里，没有 `auth.json` 那种稳定可读的
+ * 形态（与 Accio / ZCode / Loomy 同一处境）。
+ */
+const ANTIGRAVITY: ProviderConfig = {
+  provider: 'antigravity',
+  label: t('Antigravity'),
+  desktop: false,
+  // 网页登录：Google 账号授权页 + loopback 回调。回调落在网关自己的端口，
+  // 所以两种打开方式都可用（会复用系统浏览器里已登录的 Google 账号）。
+  webLogin: {
+    noteHtml: t('在打开的窗口里登录 Google 账号（Antigravity 的授权页），授权完成后自动加入账号列表。'),
+    button: t('打开 Antigravity 网页登录'),
+    busyText: t('等待 Google 授权完成…'),
+    modes: [
+      { value: 'embedded', label: t('内嵌窗口（推荐）'), hint: t('内嵌窗口打开；完成后自动加入列表，关窗即取消等待') },
+      { value: 'external', label: t('系统浏览器'), hint: t('系统浏览器打开（复用已登录的 Google 账号）；完成后自动加入列表') },
+    ],
+  },
+  manualTitle: t('粘贴 Google refresh token'),
+  manualNoteHtml: t('粘贴 Antigravity 的 Google refresh token（以 <code>1//</code> 开头；直接粘贴含 <code>refresh_token=</code> 的整行也行）。<br>这是网页登录之外的手工入口（例如从已登录的官方 IDE 里导出）。refresh token 不会过期，access token 到期由网关自动续期；令牌丢了只能重新走 Google 授权，请妥善保存。'),
+  fields: [
+    { key: 'refreshToken', label: 'refreshToken', rows: 2, placeholder: t('1// 开头的 Google refresh token（也可直接粘贴 refresh_token=… 整行）') },
+    { key: 'projectId', label: 'projectId', optional: true, placeholder: t('可选（cloudaicompanionProject）：留空由网关自动发现') },
+    { key: 'email', label: 'email', optional: true, placeholder: t('可选：账号邮箱，用于展示与身份识别（换新令牌也能认回同一账号）') },
+    { key: 'name', label: t('备注名'), optional: true, placeholder: t('可选，留空则用邮箱或令牌尾号') },
+  ],
+}
+
+
 /** 内置家的表单块，顺序与旧 ADD_FORMS 一致（只影响 DOM 里的块顺序，不影响界面） */
 export const BUILTIN_CONFIGS: ProviderConfig[] = [
   RACCOON,
@@ -649,6 +798,10 @@ export const BUILTIN_CONFIGS: ProviderConfig[] = [
   // KukuAI（百度文库库库 AI）：粘贴 Cookie / 导入本机登录态，排在末尾
   // （与后端注册表 PROVIDERS 的排列一致，2026-10 接入）
   KUKU,
+  MONKEYCODE,
+  MONKEYCODE_INTL,
+  COMMANDCODE,
+  ANTIGRAVITY,
 ]
 
 /** WorkBuddy 的块 id（结构特殊，单独一个组件） */

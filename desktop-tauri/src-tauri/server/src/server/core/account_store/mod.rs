@@ -86,17 +86,20 @@
 //!                网页登录共用入口）、续期回写、公开形态（含 edition）
 
 pub mod accio_accounts;
+pub mod antigravity_accounts;
 pub mod autoclaw_accounts;
 pub mod autoclaw_import;
 pub mod catpaw_accounts;
 pub mod catpaw_import;
 pub mod cline_accounts;
 pub mod codearts_accounts;
+pub mod commandcode_accounts;
 pub mod custom_accounts;
 pub mod lobsterai_accounts;
 pub mod kuku_accounts;
 pub mod loomy_accounts;
 pub mod minimax_code_accounts;
+pub mod monkeycode_accounts;
 pub mod priority;
 pub mod qoder_accounts;
 pub mod raccoon_accounts;
@@ -174,6 +177,23 @@ pub(crate) const LOBSTERAI_PROVIDER_ID: &str = crate::server::core::providers::k
 pub(crate) const MINIMAX_CODE_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
     crate::server::core::providers::ProviderKind::MiniMaxCode,
 );
+
+pub(crate) const MONKEYCODE_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
+    crate::server::core::providers::ProviderKind::MonkeyCode,
+);
+pub(crate) const MONKEYCODE_INTL_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
+    crate::server::core::providers::ProviderKind::MonkeyCodeIntl,
+);
+pub(crate) const COMMANDCODE_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
+    crate::server::core::providers::ProviderKind::CommandCode,
+);
+pub(crate) const ANTIGRAVITY_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
+    crate::server::core::providers::ProviderKind::Antigravity,
+);
+
+pub(crate) fn is_monkeycode_family(provider_id: &str) -> bool {
+    provider_id == MONKEYCODE_PROVIDER_ID || provider_id == MONKEYCODE_INTL_PROVIDER_ID
+}
 
 pub(crate) const QODER_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
     crate::server::core::providers::ProviderKind::Qoder,

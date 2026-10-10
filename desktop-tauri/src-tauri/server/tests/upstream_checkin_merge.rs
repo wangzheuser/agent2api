@@ -202,6 +202,7 @@ fn checkin_provider_union_retains_all_twelve_options() {
         "autoclaw",
         "autoclaw-intl",
         "qoder",
+        "qoder-intl",
         "trae",
         "minimax-code",
         "lobsterai",
@@ -210,7 +211,7 @@ fn checkin_provider_union_retains_all_twelve_options() {
         "kuku",
     ];
     let defaults = auto_checkin::default_providers();
-    assert_eq!(defaults.len(), 12);
+    assert_eq!(defaults.len(), 13);
     assert_eq!(
         defaults.iter().map(String::as_str).collect::<BTreeSet<_>>(),
         BTreeSet::from(expected)

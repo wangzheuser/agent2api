@@ -160,6 +160,11 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   loomy: { usage: true, checkin: true, edition: false, identifier: 'userId', expiry: 'expiresAt' },
 
   kuku: { usage: true, checkin: true, edition: false, identifier: 'uid', expiry: '' },
+  // 3.0 provider family: account identity and expiry are returned by the provider APIs.
+  monkeycode: { usage: true, edition: false, identifier: 'userId', expiry: 'expiresAt' },
+  'monkeycode-intl': { usage: true, edition: false, identifier: 'userId', expiry: 'expiresAt' },
+  commandcode: { usage: true, edition: false, identifier: 'userId', expiry: 'expiresAt' },
+  antigravity: { usage: true, edition: false, identifier: 'email', expiry: 'expiresAt', emailAsName: true },
 }
 
 /**

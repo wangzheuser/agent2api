@@ -137,6 +137,7 @@ pub struct ChatRequestPlan {
     pub body: Value,
     /// 上游**响应**说的是哪套协议（默认 [`UpstreamResponse::Chat`]）
     pub response: UpstreamResponse,
+    pub system_proxy_when_unset: bool,
 }
 
 impl ChatRequestPlan {
@@ -153,7 +154,16 @@ impl ChatRequestPlan {
             headers,
             body,
             response: UpstreamResponse::Chat,
+            system_proxy_when_unset: false,
         }
+    }
+
+    pub fn commandcode_ndjson(url: String, headers: Vec<(String, String)>, body: Value) -> Self {
+        Self { url, headers, body, response: UpstreamResponse::CommandCodeNdjson, system_proxy_when_unset: false }
+    }
+
+    pub fn antigravity_gemini(url: String, headers: Vec<(String, String)>, body: Value) -> Self {
+        Self { url, headers, body, response: UpstreamResponse::AntigravityGemini, system_proxy_when_unset: true }
     }
 
     /// WorkBuddy 的响应仍是 Chat SSE，但部分成功流以非空 `finish_reason`
@@ -164,6 +174,7 @@ impl ChatRequestPlan {
             headers,
             body,
             response: UpstreamResponse::WorkBuddy,
+            system_proxy_when_unset: false,
         }
     }
 }
@@ -189,6 +200,8 @@ pub enum UpstreamResponse {
     WorkBuddy,
     /// Anthropic Messages SSE：下发前折回标准 chat SSE（见 `upstream::translate`）
     Anthropic,
+    CommandCodeNdjson,
+    AntigravityGemini,
 }
 
 /// 上游错误分类（架构文档 §4.2；三个动作的语义见模块头）。
@@ -659,6 +672,11 @@ pub trait ProviderAdapter: Send + Sync {
     /// 消费方：`account_store::pick_current`（全局队首 = `/api/session` 的
     /// `currentAccountId`、退出登录的删除目标、界面 ★）。没有转发能力却排进队首，
     /// 会让顶栏把它显示成「当前登录态」、并让「退出登录」把它删掉。
+    /// 未配置账号代理时是否跟随系统代理。
+    fn system_proxy_when_unset(&self) -> bool {
+        false
+    }
+
     fn supports_chat(&self) -> bool {
         true
     }
@@ -1065,6 +1083,10 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         // 分配算力 → SSE），账号管理走粘贴 Cookie / 导入本机登录态
         // （见 `kuku/mod.rs` 的模块头）
         ProviderKind::Kuku => &super::kuku::KUKU_ADAPTER,
+        ProviderKind::MonkeyCode => &super::monkeycode::MONKEYCODE_ADAPTER,
+        ProviderKind::MonkeyCodeIntl => &super::monkeycode::MONKEYCODE_INTL_ADAPTER,
+        ProviderKind::CommandCode => &super::commandcode::COMMANDCODE_ADAPTER,
+        ProviderKind::Antigravity => &super::antigravity::ANTIGRAVITY_ADAPTER,
     }
 }
 
@@ -1142,6 +1164,10 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         // （`/wenchain/genflowpro/model_list`）—— 必须在列表里，否则刷新循环
         // 不会问它（与 Trae 同一理由）。
         ProviderKind::Kuku,
+        ProviderKind::MonkeyCode,
+        ProviderKind::MonkeyCodeIntl,
+        ProviderKind::CommandCode,
+        ProviderKind::Antigravity,
     ]
 }
 

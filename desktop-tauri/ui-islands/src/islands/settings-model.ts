@@ -668,4 +668,5 @@ export const STATES = {
   zoomWeb: '网页端的界面缩放由浏览器自己控制（Ctrl + / Ctrl -，或浏览器菜单里的缩放），此项不可调。',
   zoomDefault: '当前按 100% 显示（默认比例）。',
   languageOnly: '当前界面语言为简体中文（目前仅提供这一种）。',
+  languageHint: '切换后立即生效；部分旧版页面会在刷新后显示完整译文。',
 } as const
