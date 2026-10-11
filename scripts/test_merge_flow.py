@@ -85,6 +85,17 @@ class MergeFlowTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '同一候选'):
             flow.seal(self.root, self.path, self.record, ['business'])
 
+    def test_cli_check_persists_checked_phase(self):
+        self.assertEqual(self.run_check(), 0)
+        flow.seal(self.root, self.path, self.record, ['business'])
+        argv = ['merge-flow.py', '--root', str(self.root), '--record', str(self.path),
+                'check', '--commit', 'HEAD']
+        with patch.object(sys, 'argv', argv):
+            self.assertEqual(flow.main(), 0)
+        saved = json.loads(self.path.read_text(encoding='utf-8'))
+        self.assertEqual(saved['phase'], 'checked')
+        self.assertEqual(saved['checked_commit'], self.git('rev-parse', 'HEAD'))
+
     def test_failure_empty_or_missing_receipts_do_not_seal(self):
         self.assertNotEqual(self.run_check('raise SystemExit(7)'), 0)
         for names in [[], ['business'], ['missing']]:
@@ -153,6 +164,47 @@ class MergeFlowTests(unittest.TestCase):
         code = "import subprocess; subprocess.run(['git', 'checkout', '-qb', 'fixture-moved'], check=True)"
         self.assertEqual(self.run_check(code), 1)
         self.assertFalse(self.record['receipts'][-1]['source_unchanged'])
+
+    def test_status_and_plan_expose_resume_checkpoint(self):
+        flow.plan(self.root, self.path, self.record)
+        snapshot = flow.status(self.root, self.path, self.record)
+        self.assertEqual(snapshot['phase'], 'planned')
+        self.assertEqual(snapshot['next_action'], 'resolve first impacted domain')
+        self.assertEqual(self.record['plan']['required_gates'], ['impact-review'])
+        self.assertTrue((self.path.parent / 'plan.json').is_file())
+
+    def test_batch_runs_independent_gates_and_records_each_receipt(self):
+        tasks = [
+            {'name': 'alpha', 'cwd': '.', 'argv': [sys.executable, '-c', 'print("alpha")']},
+            {'name': 'beta', 'cwd': '.', 'argv': [sys.executable, '-c', 'print("beta")']},
+        ]
+        self.assertEqual(flow.execute_batch(self.root, self.path, self.record, tasks), 0)
+        self.assertEqual([item['name'] for item in self.record['receipts'][-2:]], ['alpha', 'beta'])
+        self.assertTrue(all(item['status'] == 'passed' for item in self.record['receipts'][-2:]))
+        self.assertEqual(self.record['last_successful_command'], 'run-batch')
+
+    def test_plan_change_requires_replanning_before_seal(self):
+        flow.plan(self.root, self.path, self.record)
+        self.git('add', 'source.py')
+        (self.root / 'source.py').write_text('value = 8\n', encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, '候选有未暂存修改'):
+            flow.seal(self.root, self.path, self.record, ['impact-review'])
+
+    def test_plan_keeps_renamed_contract_path_in_impact(self):
+        (self.root / 'docs').mkdir()
+        (self.root / 'docs' / 'local-contracts.json').write_text(json.dumps({
+            'contracts': [{
+                'id': 'renamed-source', 'level': 'P0', 'status': '必须保留',
+                'implementation': ['source.py'], 'tests': [],
+            }]
+        }), encoding='utf-8')
+        (self.root / 'renamed.py').write_text((self.root / 'source.py').read_text(), encoding='utf-8')
+        (self.root / 'source.py').unlink()
+        self.git('add', '.')
+        flow.plan(self.root, self.path, self.record)
+        self.assertEqual(self.record['plan']['impacted_contracts'][0]['id'], 'renamed-source')
+        paths = {path for domain in self.record['plan']['domains'] for path in domain['paths']}
+        self.assertIn('source.py', paths)
 
 
 if __name__ == '__main__':

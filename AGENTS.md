@@ -344,14 +344,25 @@ python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json fre
 # 读取上游/本地历史、预演、按调用链实施；不切换当前工作分支。
 # 先生成产物并明确暂存本轮文件；其他任务有改动时使用隔离候选，不替别人stash或提交。
 python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json impact
+python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json plan
+python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json status
 python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json run --name tools -- python -B -m unittest discover -s scripts -p 'test_*merge*.py' -v
 python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json run --name server --cwd desktop-tauri/src-tauri -- cargo test -p agent2api-server --locked
+# 独立且不写源码的验收可合并启动，JSON 数组元素为 name/cwd/argv。
+python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json run-batch --tasks diagnostic-artifacts/<本轮>/gates.json
 # 按同样方式记录清单检查、完整Node TAP、前端typecheck/build、浏览器、H重放和新增专项验收。
 python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json seal --required tools server <本轮其他必需验收名>
+# 已执行 plan 时可省略 --required，工具会使用计划计算出的必需 gate；显式参数用于人工复核或覆盖。
+python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json seal
 python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json check
 # 用户授权提交/push后执行；提交树须仍等于封存的候选tree。
 python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json check --commit HEAD
 ```
+
+- `status` 输出当前阶段、下一动作、候选 tree、未完成回执、失败原因和冻结的 H/U/B；续作先读取它，不重复 freeze 或启动已在运行的验收。
+- `plan` 固定当前候选 tree，比较 `B→U`、`H→候选`、`U→候选`，按变更路径和 `docs/local-contracts.json` 计算受影响领域、契约及必需 gate，并把摘要写入记录。候选改变后必须重新 plan、impact 和受影响验收。
+- `run-batch` 只适用于彼此独立、不会修改受控源码/索引/分支的任务；任务并行执行，记录仍由单一进程串行汇总。任一任务失败、切换分支或候选 tree 改变，批次整体不能封存。
+- `seal` 未提供 `--required` 时自动读取 `plan` 的必需 gate；没有计划或计划为空时仍拒绝空验收。`check` 成功后会把提交核验状态落盘，异常可由 `status` 继续定位。
 
 - 同一记录的 run/seal/check 串行执行；原生排他锁阻止多代理覆盖回执。异常退出残留锁时先核对锁文件内 PID 与相关进程确实结束，再处理该锁，不自动抢占。
 - 回执记录 argv、工作目录、候选 Git tree、实际退出码、输出哈希和执行前后是否变动。生成/测试命令修改受控文件、新源码未暂存、冲突未解、分支改变、旧树回执或输出篡改均不封存。新修改后明确重新暂存并重跑受影响验收，不复用旧树绿灯。
