@@ -255,7 +255,8 @@ def status(root, path, record=None):
         'tree_error': tree_error,
         'pending_receipts': pending,
         'receipt_count': len(record.get('receipts', [])),
-        'required_gates': (record.get('plan') or {}).get('required_gates', record.get('seal', {}).get('required', []) if record.get('seal') else []),
+        'required_gates': (record.get('seal') or {}).get('required', []) if record.get('seal')
+                          else (record.get('plan') or {}).get('required_gates', []),
         'last_successful_command': record.get('last_successful_command'),
         'last_successful_receipt': record.get('last_successful_receipt'),
         'last_failure': record.get('last_failure'),

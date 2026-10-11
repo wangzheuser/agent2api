@@ -280,8 +280,8 @@ bash scripts/release.sh vX.Y.Z <run-id>   # 或显式指定 run
 - P0 每次必跑：用量、账号选路/错误切换、凭证刷新、奖励去重及关键迁移。P1 按影响链路扩展提供商、积分/成长、地区及配置测试。涉及 UI、headless、登录或运行材料时补对应平台和生成产物验收。
 - Rust 从 `desktop-tauri/src-tauri` 执行 `cargo check --locked`、`cargo test -p agent2api-server --locked`，并显式执行关键契约用例。前端除 typecheck/build 外还须执行受影响的 Node/浏览器业务测试；build 不等于业务测试通过。
 - `scripts/check-merge-contracts.py` 使用标准库检查清单、入口、测试存在性与合并前基线；`--rust-list` 校验所有 target 的真实编译列表，`--node-report` 校验完整 TAP 中实际通过且未跳过的 Node 用例；失败、取消、截断和过滤后零用例均不能通过。基线的实现入口、状态、来源与测试映射不得由候选静默削弱。它不证明断言未削弱或业务正确，仍须代码审查和行为测试。
-- `.github/workflows/verify.yml` 在 PR、`main` / `dev/pr-integration` / `codex/**` 推送及手动触发时运行清单、Rust、Node、类型、构建与浏览器回归；使用 `scripts/replay-merge-baseline.py` 统一冻结事件保护基线：push 用 `before`，PR 用目标分支 base SHA（不冒充实际本地合并 H），手动可指定 `base_ref`，新分支或缺省手动输入用 first-parent；拒绝 HEAD、非祖先和浅历史。所有 job 使用同一完整 SHA。存在合并前检查器自测和独立契约测试时，先用当前向后兼容的检查器运行 H 原始门禁反例，再在隔离候选副本中按原路径重放 H 业务断言及全部样本；只冻结测试/辅助样本，不覆盖候选实现。原始运行报告独立生成，禁止与候选报告混合掩盖缺测。内联 Rust 原始断言仍需差异审查，不冒充已全部重放。首次建立基线须单独核验来源及覆盖，明确 BOOTSTRAP，不能冒充已有基线比较。
-- 按用户选择，GitHub 分支保护保持关闭；CI 是验证反馈，不阻断直推。提交、push 前必须完成本地候选验收，push 后检查对应提交的 `verify` 结果；失败不得部署。门禁自身、清单、保护用例和断言的削弱须单独审查。
+- 合并验收完全以本地门禁为准。`scripts/local-merge-gates.py --base-ref <H>` 串行完成合并工具、契约清单和 H 基线门禁，再并行完成 Rust 与前端/浏览器门禁；它使用 `scripts/replay-merge-baseline.py`、`scripts/check-merge-contracts.py` 和真实候选测试，输出独立报告与摘要到 `.verify/local-merge-gates/`。不访问 GitHub，不读取 GitHub Actions 状态，也不把远端提交状态当作业务验收。
+- `.github/workflows/verify.yml` 已移除；`build.yml`、`docker.yml` 等仍只服务于明确的正式发版产物，不参与上游合入放行。提交、push 前必须完成本地候选验收、`merge-flow.py seal/check --commit` 和敏感信息检查，push 后只核对目标远端完整 SHA；门禁自身、清单、保护用例和断言的削弱须单独审查。
 - 业务模拟优先使用无秘密、无真实领取及模型费用的样本；真实外部验证遵循既有授权与副作用边界。
 
 ### 8.6 双来源数据兼容
@@ -346,6 +346,7 @@ python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json fre
 python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json impact
 python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json plan
 python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json status
+python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json run --name local-gates -- python scripts/local-merge-gates.py --base-ref <H>
 python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json run --name tools -- python -B -m unittest discover -s scripts -p 'test_*merge*.py' -v
 python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json run --name server --cwd desktop-tauri/src-tauri -- cargo test -p agent2api-server --locked
 # 独立且不写源码的验收可合并启动，JSON 数组元素为 name/cwd/argv。
@@ -368,9 +369,9 @@ python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json che
 - 回执记录 argv、工作目录、候选 Git tree、实际退出码、输出哈希和执行前后是否变动。生成/测试命令修改受控文件、新源码未暂存、冲突未解、分支改变、旧树回执或输出篡改均不封存。新修改后明确重新暂存并重跑受影响验收，不复用旧树绿灯。
 - 必需验收项由本轮影响分析明确，P0 必跑、受影响 P1/新增能力补齐；不把脚本允许的一条任意成功命令当业务验收。脚本不检查任意 shell 命令的语义，独立审阅须核对回执覆盖真实业务入口。
 - 当前名字报告接口遇到受保护同名跨文件/target或重复运行名时拒绝歧义，不把另一个同名PASS当证据；保留稳定ID、用演进声明调整测试显示名，或先补精确locator报告。仅名字证据不覆盖未执行源与未映射同名输出的所有情况，须审阅真实target/文件。
-- Rust 用全量 `cargo test -p agent2api-server --locked` 和所有 target 的 `-- --list`，清单检查器接收 `--rust-list`；Node/浏览器由 `replay-merge-baseline.py candidate-node|candidate-browser` 从清单动态发现，用例新增不必另改硬编码 CI 清单。`candidate-node --report <完整TAP文件>` 的结果交给检查器 `--node-report`。
+- Rust 用全量 `cargo test -p agent2api-server --locked` 和所有 target 的 `-- --list`，清单检查器接收 `--rust-list`；Node/浏览器由 `replay-merge-baseline.py candidate-node|candidate-browser` 从清单动态发现，用例新增不必另改硬编码清单。`candidate-node --report <完整TAP文件>` 的结果交给检查器 `--node-report`。`scripts/local-merge-gates.py` 已固化这套本地命令矩阵，并在契约门禁通过后并行执行 server/frontend 两组独立验收。
 - H 验收执行 `replay-merge-baseline.py gate|rust|frontend --base-ref <H>`；后两项各用独立 `--report`，Rust 同时传 `--candidate-rust-list <候选全量编译列表>` 校验演进后的内联入口。原样与适配两种结果分开，首次无 H 清单明确 BOOTSTRAP。
-- 提交前检查 staged 范围及敏感信息；提交后核对封存 tree，push 到授权目标并核对远端完整 SHA；等待该 SHA 的 `verify` 全部通过。CI 基线和本地 H 分别记录，不混称。部署仍是独立授权流程，不能在 CI 尚未完成时结案为可部署。
+- 提交前检查 staged 范围及敏感信息；提交后核对封存 tree，push 到授权目标并核对远端完整 SHA。远端 SHA 核对不替代本地门禁，也不需要等待 GitHub CI。部署仍是独立授权流程，不能在未完成部署验收时结案为可部署。
 
 ### 8.11 每轮可复用的 AI 提示词
 
@@ -385,5 +386,5 @@ python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json che
 新功能增加契约；行为删改先获得具体授权，不由AI自签批准。内联断言改动独立审阅。
 生成产物后暂存明确范围，记录同一候选tree的实际命令/输出/退出码；候选变化重验。
 独立审阅双来源迁移、关键协议/路由/凭证/奖励及本轮受影响平台，逐项报告证据及已知边界。
-按授权提交与push，验证提交tree/远端SHA及该SHA的verify结果；不自动部署/发版/强推。
+按授权提交与push，验证提交tree和远端完整SHA；不自动部署/发版/强推，不等待GitHub CI。
 ```
