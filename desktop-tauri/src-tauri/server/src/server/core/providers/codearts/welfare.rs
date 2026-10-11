@@ -20,7 +20,7 @@
 //! delivery 列表里的 `CONFIRMED` **不带确认日期**：上一期登录周期留下的 CONFIRMED
 //! 会一直显示到今天。参考实现据此留了一条明确指令 —— 不要把观察到的状态变成本地
 //! 的全天跳过，每次都要重新判资格。所以本地台账只用来**限流写请求**
-//! （每天 ≤6 次、间隔 ≥10 分钟），手动点击永远重读资格，不受这两个闸约束。
+//! （每天 ≤6 次、间隔 ≥10 分钟）；手动点击同样受写请求限流，但每次都会重读资格。
 //!
 //! ── 领到的东西进哪个账户 ───────────────────────────────────
 //! ops 福利领的是**套餐赠送积分**，**不增加福利模型的 token 池**（两个账户各记各的，
@@ -34,6 +34,7 @@ use serde_json::{Value, json};
 use crate::server::core::account_store::AccountStore;
 use crate::server::core::egress;
 use crate::server::errors::GatewayError;
+use crate::server::config;
 use crate::server::logging;
 
 use super::{balance, chat, credentials::Credential, redact, signer};
@@ -541,17 +542,78 @@ pub async fn claim_account(
     Ok(claim_rewards(store, account_id, base, now_ms, manual, Rewards::DailyLogin).await?.outcome)
 }
 
+/// 定时领取入口：逐账号执行，单个账号的凭证或上游错误只记录到本轮结果，
+/// 不阻塞其它 CodeArts 账号。手动立即执行也复用同一份每账号限流台账。
+pub async fn run_auto_claim(store: &AccountStore, manual: bool) -> Result<String, String> {
+    let accounts = store
+        .list_accounts()
+        .get("accounts")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| "读取账号列表失败".to_string())?;
+    let mut checked = 0usize;
+    let mut confirmed = 0usize;
+    let mut already = 0usize;
+    let mut not_eligible = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+    let now_ms = logging::now_ms();
+    for account in accounts.iter().filter(|account| {
+        account.get("provider").and_then(Value::as_str) == Some("codearts")
+            && account.get("enabled").and_then(Value::as_bool) != Some(false)
+    }) {
+        if !manual && !config::scheduled_settings().codearts_auto_claim.enabled {
+            break;
+        }
+        let Some(id) = account.get("id").and_then(Value::as_str) else { continue };
+        checked += 1;
+        match claim_account(
+            store,
+            id,
+            super::models::DEFAULT_BASE_URL,
+            now_ms,
+            manual,
+        )
+        .await
+        {
+            Ok(Outcome::Confirmed) => {
+                confirmed += 1;
+                // 领取后让面板下一次刷新即可看到最新账号额度；余额读取失败不影响领取结论。
+                let _ = refresh_usage(store, id, now_ms).await;
+            }
+            Ok(Outcome::Already) => already += 1,
+            Ok(Outcome::NotEligible) => not_eligible += 1,
+            Ok(Outcome::Skipped) => skipped += 1,
+            Err(error) => {
+                failed += 1;
+                logging::log(
+                    "[CodeArts]",
+                    &format!("账号 {id} 自动领取失败：{}", error.message),
+                );
+            }
+        }
+    }
+    let summary = format!(
+        "检查 {checked} 个账号，确认 {confirmed} 个，已领取 {already} 个，无资格 {not_eligible} 个，跳过 {skipped} 个，失败 {failed} 个"
+    );
+    logging::log_with_level(
+        "[CodeArts]",
+        &format!("自动领取每日福利完成：{summary}"),
+        if failed > 0 { "error" } else { "info" },
+    );
+    Ok(summary)
+}
+
 /// 走一遍完整的领取流程。**这是本模块唯一会发写请求的函数。**
 ///
-/// `manual = true`（用户在面板上点）时**不受本地限流约束**：限流保护的是
-/// 「无人值守的自动重试」，用户主动要看一眼不该被一句「等待重试」挡回去 ——
+/// `manual` 仅保留调用协议兼容性；自动与手动都受同一份本地限流台账约束，
 /// 但资格仍每次重读，见模块头那条「不要把 CONFIRMED 变成全天跳过」。
 pub async fn claim_rewards(
     store: &AccountStore,
     account_id: &str,
     base: &str,
     now_ms: i64,
-    manual: bool,
+    _manual: bool,
     which: Rewards,
 ) -> Result<Run, GatewayError> {
     // 先取凭据（临期会真换发并写回账号记录），再往下走。台账的写回按 id 现读记录，
@@ -581,7 +643,7 @@ pub async fn claim_rewards(
         return Ok(Run { outcome: Outcome::Already, before: picked.clone(), after: Vec::new() });
     }
     // 限流只管**写**：读资格、判确认永远放行
-    if !manual && (ledger.attempts >= MAX_ATTEMPTS_PER_DAY || gap_remaining(&ledger, now_ms).is_some()) {
+    if ledger.attempts >= MAX_ATTEMPTS_PER_DAY || gap_remaining(&ledger, now_ms).is_some() {
         logging::log(
             "[CodeArts]",
             &format!("{}：本地限流（今日已 {} 次写尝试），本轮跳过", which.label(), ledger.attempts),
@@ -1018,7 +1080,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_local_rate_gate_blocks_writes_but_manual_still_runs() {
+    async fn the_local_rate_gate_blocks_writes_for_automatic_and_manual_runs() {
         let store = store_with("u6");
         let account_id = only_account_id(&store);
         // 先把台账写成「今天已经试过 6 次」
@@ -1030,23 +1092,20 @@ mod tests {
                         "lastAttemptMs": logging::now_ms(), "campaigns": {}}),
             )
             .unwrap();
-        // 脚本按「自动一次只读 + 手动一整轮」排：自动那趟只消费 1 条
+        // 自动与手动都只读一次：达到每日次数上限时不能再发送写请求。
         let upstream = mock_upstream(vec![
             delivery_of(vec![item("c6", true, "")]), // 自动：读列表后被限流挡住
-            delivery_of(vec![item("c6", true, "")]), // 手动：重新读资格
-            json!({"code": 0, "data": {"campaignId": "c6"}}),
-            json!({"code": 0, "data": {}}),
-            delivery_of(vec![item("c6", false, "CONFIRMED")]),
+            delivery_of(vec![item("c6", true, "")]), // 手动：同样被限流挡住
         ])
         .await;
         let outcome = claim_account(&store, &account_id, &upstream.base, logging::now_ms(), false).await.expect("限流不是错误");
         assert_eq!(Outcome::Skipped, outcome);
         assert_eq!(1, upstream.seen.lock().unwrap().len(), "自动路径被挡住时只读列表，不发写请求");
 
-        // 手动：不受这两个闸约束（读资格永远放行，写也允许用户主动补一次）
-        let outcome = claim_account(&store, &account_id, &upstream.base, logging::now_ms(), true).await.expect("手动该继续");
-        assert_eq!(Outcome::Confirmed, outcome, "手动这一次要真的把流程走完");
-        assert_eq!(5, upstream.seen.lock().unwrap().len(), "自动 1 次 + 手动 4 步");
+        // 手动：复用同一份限流台账，仍只读资格、不发写请求。
+        let outcome = claim_account(&store, &account_id, &upstream.base, logging::now_ms(), true).await.expect("手动限流不是错误");
+        assert_eq!(Outcome::Skipped, outcome, "手动立即执行也必须遵守限流");
+        assert_eq!(2, upstream.seen.lock().unwrap().len(), "自动 1 次 + 手动 1 次只读");
     }
 
     #[tokio::test]

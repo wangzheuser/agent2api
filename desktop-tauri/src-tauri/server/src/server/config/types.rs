@@ -429,6 +429,8 @@ pub const KEY_UPDATE_CHECK: &str = "updateCheck";
 pub const KEY_USAGE_QUERY: &str = "usageQuery";
 pub const KEY_ZCODE_AUTO_CLAIM: &str = "zcodeAutoClaim";
 pub const DEFAULT_ZCODE_AUTO_CLAIM_MINUTES: i64 = 10;
+pub const KEY_CODEARTS_AUTO_CLAIM: &str = "codeartsAutoClaim";
+pub const DEFAULT_CODEARTS_AUTO_CLAIM_MINUTES: i64 = 60;
 /// 国内个人账号的福利巡检，账号还须单独启用自动领奖或旅行。
 pub const KEY_WORKBUDDY_GROWTH: &str = "workbuddyGrowth";
 pub const DEFAULT_WORKBUDDY_GROWTH_MINUTES: i64 = 60;
@@ -496,6 +498,7 @@ pub struct ScheduledSettings {
     pub update_check: IntervalTask,
     pub usage_query: IntervalTask,
     pub zcode_auto_claim: IntervalTask,
+    pub codearts_auto_claim: IntervalTask,
     pub workbuddy_growth: IntervalTask,
 }
 
@@ -529,6 +532,10 @@ impl Default for ScheduledSettings {
             zcode_auto_claim: IntervalTask {
                 enabled: true,
                 interval: DEFAULT_ZCODE_AUTO_CLAIM_MINUTES,
+            },
+            codearts_auto_claim: IntervalTask {
+                enabled: true,
+                interval: DEFAULT_CODEARTS_AUTO_CLAIM_MINUTES,
             },
             workbuddy_growth: IntervalTask {
                 enabled: false,

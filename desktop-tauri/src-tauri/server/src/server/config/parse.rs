@@ -207,6 +207,12 @@ pub(super) fn scheduled_from(map: &Map<String, Value>) -> ScheduledSettings {
             INTERVAL_MIN_MINUTES,
             INTERVAL_MAX_MINUTES,
         ),
+        codearts_auto_claim: task(
+            KEY_CODEARTS_AUTO_CLAIM,
+            defaults.codearts_auto_claim.interval,
+            INTERVAL_MIN_MINUTES,
+            INTERVAL_MAX_MINUTES,
+        ),
         workbuddy_growth: {
             let object = task_object(map, KEY_WORKBUDDY_GROWTH);
             IntervalTask {
@@ -241,6 +247,21 @@ mod zcode_auto_claim_tests {
             assert_eq!(settings.zcode_auto_claim.interval, expected);
             assert!(settings.usage_query.enabled);
         }
+    }
+}
+
+#[cfg(test)]
+mod codearts_auto_claim_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn defaults_enabled_at_sixty_minutes_and_allow_explicit_disable() {
+        let defaults = scheduled_from(&Map::new()).codearts_auto_claim;
+        assert_eq!(defaults, IntervalTask { enabled: true, interval: 60 });
+        let raw = json!({"scheduledTasks":{"codeartsAutoClaim":{"enabled":false,"interval":1440}}});
+        assert_eq!(scheduled_from(raw.as_object().unwrap()).codearts_auto_claim,
+            IntervalTask { enabled: false, interval: 1440 });
     }
 }
 

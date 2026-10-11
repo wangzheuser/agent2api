@@ -19,6 +19,7 @@
  */
 
 import { buildIndex as buildReasoningIndex } from './models-reasoning'
+export { defaultMappingAlias } from './models-mapping'
 import * as customSource from './models-custom-source'
 import type { CustomProviderRecord, ManageMapping, ManageModel, ManageView } from './models-custom-source'
 import type { SegmentedControlOption } from '@ui'

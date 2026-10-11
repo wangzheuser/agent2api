@@ -75,7 +75,7 @@ use serde_json::Value;
 use crate::server::core::account_store::AccountStore;
 use crate::server::core::providers::content_block;
 use crate::server::core::providers::adapter::{
-    ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, UpstreamErrorClass,
+    ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, ReasoningPatch, UpstreamErrorClass,
 };
 use crate::server::core::providers::ProviderKind;
 use crate::server::errors::GatewayError;
@@ -134,6 +134,25 @@ impl ProviderAdapter for ClineAdapter {
     /// `advertise_models` 再收一层（那个方法的默认实现就是原样透传）。
     fn list_models(&self) -> Vec<Value> {
         models::list(self.pool)
+    }
+
+    /// Cline 上游直接消费顶层 `reasoning_effort`；请求体重建阶段会把该字段
+    /// 原样带到真正的出站 JSON。
+    fn reasoning_patch(&self, level: &str, _model: &str, body: &Value, force: bool) -> ReasoningPatch {
+        if !force && (explicit_reasoning_effort(body).is_some() || body.get("reasoning_effort").is_some()) {
+            return ReasoningPatch::Skip {
+                reason: "客户端请求体里已指定思考档位，绑定不覆盖",
+            };
+        }
+        if crate::server::core::model_rules::reasoning_rank(level).is_none() {
+            return ReasoningPatch::Skip {
+                reason: "该等级不在通用档位表内（自定义等级不参与转发）",
+            };
+        }
+        ReasoningPatch::Set {
+            field: "reasoning_effort",
+            value: Value::String(level.trim().to_lowercase()),
+        }
     }
 
     /// 构造 `POST {apiBase}/chat/completions`。

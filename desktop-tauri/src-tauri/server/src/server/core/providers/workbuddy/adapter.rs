@@ -52,7 +52,8 @@ use crate::server::core::upstream::request::TransportRequest;
 use crate::server::errors::GatewayError;
 
 use super::super::adapter::{
-    ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, RetryAdvice, UpstreamErrorClass,
+    ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, ReasoningField, ReasoningPatch,
+    RetryAdvice, UpstreamErrorClass,
 };
 use super::super::content_block;
 use super::super::ProviderKind;
@@ -130,6 +131,37 @@ impl ProviderAdapter for WorkBuddyAdapter {
     /// **按本实例的地区取**：两个地区各有一份（拆家前挤在同一份里，谁刷谁覆盖）。
     fn list_models(&self) -> Vec<Value> {
         self.catalog().list()
+    }
+
+    /// WorkBuddy 使用 OpenAI 兼容的 `reasoning_effort`；DeepSeek 系列还要求
+    /// 同时显式打开 `thinking.type`，否则档位字段会被上游当作普通参数忽略。
+    fn reasoning_patch(&self, level: &str, model: &str, body: &Value, force: bool) -> ReasoningPatch {
+        if !force && (crate::server::core::model_rules::read_client_level(body).is_some()
+            || body.get("thinking").is_some())
+        {
+            return ReasoningPatch::Skip {
+                reason: "客户端请求体里已指定思考参数，绑定不覆盖",
+            };
+        }
+        if crate::server::core::model_rules::reasoning_rank(level).is_none() {
+            return ReasoningPatch::Skip {
+                reason: "该等级不在通用档位表内（自定义等级不参与转发）",
+            };
+        }
+        let effort = Value::String(level.trim().to_lowercase());
+        if model.trim().to_ascii_lowercase().starts_with("deepseek") {
+            ReasoningPatch::SetMany {
+                fields: vec![
+                    ReasoningField { path: "thinking.type", value: Value::String("enabled".to_string()) },
+                    ReasoningField { path: "reasoning_effort", value: effort },
+                ],
+            }
+        } else {
+            ReasoningPatch::Set {
+                field: "reasoning_effort",
+                value: effort,
+            }
+        }
     }
 
     /// 构造 `POST {endpoint}/v2/chat/completions` 的请求（头集合与 URL 逐字沿用

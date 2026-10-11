@@ -361,9 +361,20 @@ fn affinity_reasoning_body(
             reasoning_body["reasoning_effort"] = Value::String(level.to_string());
         }
     } else if let Some(kind) = crate::server::core::providers::kind_from_id(provider) {
-        if let ReasoningPatch::Set { field, value } = adapter_for(kind).reasoning_patch(level, model, &reasoning_body, force) {
-            if force { model_rules::clear_client_controls(&mut reasoning_body); }
-            reasoning_body[field] = value;
+        match adapter_for(kind).reasoning_patch(level, model, &reasoning_body, force) {
+            ReasoningPatch::Set { field, value } => {
+                if force { model_rules::clear_client_controls(&mut reasoning_body); }
+                reasoning_body[field] = value;
+            }
+            ReasoningPatch::SetMany { fields } => {
+                if force { model_rules::clear_client_controls(&mut reasoning_body); }
+                for field in fields {
+                    if !insert_reasoning_path(&mut reasoning_body, field.path, field.value) {
+                        return reasoning_body;
+                    }
+                }
+            }
+            ReasoningPatch::Skip { .. } => {}
         }
     }
     reasoning_body
@@ -587,6 +598,45 @@ fn apply_reasoning(
             object.insert(field.to_string(), value);
             Ok(injected)
         }
+        crate::server::core::providers::adapter::ReasoningPatch::SetMany { fields } => {
+            let mut patched = body.as_ref().clone();
+            if force { crate::server::core::model_rules::clear_client_controls(&mut patched); }
+            for field in &fields {
+                if !insert_reasoning_path(&mut patched, field.path, field.value.clone()) {
+                    if force {
+                        return Err(crate::server::core::model_rules::override_error("强制覆盖思考要求请求体为 JSON 对象"));
+                    }
+                    logging::verbose(
+                        "[Upstream]",
+                        &format!(
+                            "provider={provider_id} 映射 {requested} → {wire_model} \
+                             绑定的思考等级 {level} 未注入：请求体不是 JSON 对象"
+                        ),
+                    );
+                    return Ok(None);
+                }
+            }
+            let details = fields
+                .iter()
+                .map(|field| format!("{}={}", field.path, field.value))
+                .collect::<Vec<_>>()
+                .join(", ");
+            logging::verbose(
+                "[Upstream]",
+                &format!(
+                    "provider={provider_id} 映射 {requested} → {wire_model} \
+                     注入思考等级 {level}（force={force}） → {details}"
+                ),
+            );
+            let injected = fields
+                .iter()
+                .find(|field| field.path.ends_with("reasoning_effort"))
+                .and_then(|field| field.value.as_str())
+                .or_else(|| fields.iter().find_map(|field| field.value.as_str()))
+                .map(str::to_string);
+            *body = Cow::Owned(patched);
+            Ok(injected)
+        }
         crate::server::core::providers::adapter::ReasoningPatch::Skip { reason } => {
             logging::verbose(
                 "[Upstream]",
@@ -602,10 +652,71 @@ fn apply_reasoning(
     }
 }
 
+/// 按点号路径写入 JSON 对象；路径中已有标量时拒绝覆盖，避免静默破坏客户端结构。
+fn insert_reasoning_path(root: &mut Value, path: &str, value: Value) -> bool {
+    let mut current = root;
+    let mut parts = path.split('.').peekable();
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+            let Some(object) = current.as_object_mut() else { return false; };
+            object.insert(part.to_string(), value);
+            return true;
+        }
+        let Some(object) = current.as_object_mut() else { return false; };
+        current = object.entry(part.to_string()).or_insert_with(|| Value::Object(serde_json::Map::new()));
+    }
+    false
+}
+
 #[cfg(test)]
 mod force_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn newly_verified_provider_fields_are_written_to_the_expected_shape() {
+        use crate::server::core::providers::adapter::{adapter_for, ReasoningPatch};
+        use crate::server::core::providers::ProviderKind;
+
+        let body = json!({"reasoning_effort":"low", "enable_thinking":false});
+        let cases = [
+            (ProviderKind::WorkBuddy, "gpt-5", "reasoning_effort", "high"),
+            (ProviderKind::ClineFree, "cline-free/model", "reasoning_effort", "high"),
+            (ProviderKind::CommandCode, "command-model", "reasoning_effort", "high"),
+            (ProviderKind::Trae, "trae-model", "reasoning_effort", "high"),
+            (ProviderKind::CodeArts, "codearts-model", "reasoning_effort", "high"),
+        ];
+        for (kind, model, field, value) in cases {
+            let patch = adapter_for(kind).reasoning_patch("high", model, &body, true);
+            match patch {
+                ReasoningPatch::Set { field: actual, value: actual_value } => {
+                    assert_eq!(actual, field, "{kind:?}");
+                    assert_eq!(actual_value, json!(value), "{kind:?}");
+                }
+                other => panic!("{kind:?} returned unexpected patch: {other:?}"),
+            }
+        }
+
+        let patch = adapter_for(ProviderKind::WorkBuddy)
+            .reasoning_patch("high", "deepseek-v4", &body, true);
+        let ReasoningPatch::SetMany { fields } = patch else { panic!("WorkBuddy DeepSeek should set both controls") };
+        assert_eq!(fields.iter().map(|field| field.path).collect::<Vec<_>>(), ["thinking.type", "reasoning_effort"]);
+
+        let mut outbound = Cow::Borrowed(&body);
+        let injected = apply_reasoning(
+            &mut outbound,
+            "workbuddy",
+            "alias",
+            "deepseek-v4",
+            Some("low"),
+            Some("high"),
+        )
+        .expect("WorkBuddy 强制覆盖应成功");
+        assert_eq!(injected.as_deref(), Some("high"));
+        assert_eq!(outbound["thinking"]["type"], "enabled");
+        assert_eq!(outbound["reasoning_effort"], "high");
+        assert!(outbound.get("enable_thinking").is_none());
+    }
 
     #[test]
     fn all_supported_providers_force_without_changing_default_precedence() {
@@ -655,7 +766,7 @@ mod force_tests {
         let mut body = Cow::Borrowed(&original);
         assert_eq!(apply_reasoning(&mut body, "zcode", "alias", "glm-5.3-flash", Some("medium"), Some(" ")).unwrap().as_deref(), Some("high"));
         assert_eq!(body["reasoning_effort"], "high");
-        for (provider, model, forced) in [("qoder", "not-a-model", "max"), ("accio", "glm-5", "max"), ("loomy", "other", "max"), ("zcode", "glm-4.7", "max"), ("workbuddy", "fixture", "max"), ("zcode", "glm-5.3-flash", "off"), ("zcode", "glm-5.3-flash", "unknown")] {
+        for (provider, model, forced) in [("qoder", "not-a-model", "max"), ("accio", "glm-5", "max"), ("loomy", "other", "max"), ("zcode", "glm-4.7", "max"), ("raccoon", "fixture", "max"), ("zcode", "glm-5.3-flash", "off"), ("zcode", "glm-5.3-flash", "unknown")] {
             let mut body = Cow::Borrowed(&original);
             let error = apply_reasoning(&mut body, provider, "alias", model, Some("medium"), Some(forced)).unwrap_err();
             assert_eq!(error.status_code, 400);
@@ -740,7 +851,7 @@ mod affinity_reasoning_tests {
     #[test]
     fn affinity_invalid_force_does_not_inject_and_send_remains_an_error() {
         let original = json!({"model":"fixture", "reasoning_effort":"medium", "messages":[]});
-        for (provider, model, forced) in [("workbuddy", "fixture", "max"),
+        for (provider, model, forced) in [("raccoon", "fixture", "max"),
             ("zcode", "glm-5.3-flash", "off"), ("zcode", "glm-5.3-flash", "unknown")] {
             let baseline = affinity_reasoning_body(provider, false, model, None, None, &original);
             assert_eq!(affinity_reasoning_body(provider, false, model, Some("low"), Some(forced), &original), baseline);

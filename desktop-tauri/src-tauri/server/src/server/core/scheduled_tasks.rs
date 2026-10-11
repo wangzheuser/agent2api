@@ -78,11 +78,12 @@ pub const TASK_REQUESTS_AUTO_REFRESH: &str = config::KEY_REQUESTS_AUTO_REFRESH;
 pub const TASK_REPORT_AUTO_REFRESH: &str = config::KEY_REPORT_AUTO_REFRESH;
 
 pub const TASK_ZCODE_AUTO_CLAIM: &str = config::KEY_ZCODE_AUTO_CLAIM;
+pub const TASK_CODEARTS_AUTO_CLAIM: &str = config::KEY_CODEARTS_AUTO_CLAIM;
 pub const TASK_WORKBUDDY_GROWTH: &str = config::KEY_WORKBUDDY_GROWTH;
 
 pub const TASK_USAGE_QUERY: &str = config::KEY_USAGE_QUERY;
 
-pub const TASKS: [TaskDef; 9] = [
+pub const TASKS: [TaskDef; 10] = [
     TaskDef {
         id: TASK_USAGE_QUERY,
         label: "定时查询积分",
@@ -112,6 +113,16 @@ pub const TASKS: [TaskDef; 9] = [
         min: config::INTERVAL_MIN_MINUTES,
         max: config::INTERVAL_MAX_MINUTES,
         default_interval: config::DEFAULT_ZCODE_AUTO_CLAIM_MINUTES,
+    },
+    TaskDef {
+        id: TASK_CODEARTS_AUTO_CLAIM,
+        label: "CodeArts 自动领取每日福利",
+        description: "定期领取已启用 CodeArts 账号的每日福利；已领取、无资格和本地限流跳过不算失败。默认开启，每 60 分钟检查。",
+        unit: "minutes",
+        runner: Runner::Backend,
+        min: config::INTERVAL_MIN_MINUTES,
+        max: config::INTERVAL_MAX_MINUTES,
+        default_interval: config::DEFAULT_CODEARTS_AUTO_CLAIM_MINUTES,
     },
     TaskDef {
         id: TASK_CREDENTIAL_MAINTENANCE,
@@ -186,6 +197,7 @@ fn settings_of(settings: config::ScheduledSettings, id: &str) -> config::Interva
         TASK_UPDATE_CHECK => settings.update_check,
         TASK_USAGE_QUERY => settings.usage_query,
         TASK_ZCODE_AUTO_CLAIM => settings.zcode_auto_claim,
+        TASK_CODEARTS_AUTO_CLAIM => settings.codearts_auto_claim,
         TASK_WORKBUDDY_GROWTH => settings.workbuddy_growth,
         TASK_LOGS_AUTO_REFRESH => settings.logs_auto_refresh,
         TASK_REQUESTS_AUTO_REFRESH => settings.requests_auto_refresh,
@@ -407,6 +419,14 @@ async fn run_backend(
             // 单账号失败在账号排期里退避，扫描本身按配置继续发现新套餐。
             (summary, true)
         }
+        TASK_CODEARTS_AUTO_CLAIM => {
+            let summary = crate::server::core::providers::codearts::welfare::run_auto_claim(
+                store,
+                manual,
+            )
+            .await?;
+            (summary, true)
+        }
         TASK_WORKBUDDY_GROWTH => {
             match crate::server::core::workbuddy_growth::scheduled_run(store).await {
                 Ok(summary) => (summary, true),
@@ -456,7 +476,7 @@ pub fn spawn(store: AccountStore, update: UpdateManager) {
                 }
                 // 到点：跑一次（`run_backend` 内部按当前间隔重新排期）。
                 // 被跳过（另一进程抢到、或在最短间隔内）不算错误，只留 verbose。
-                if matches!(task.id, TASK_ZCODE_AUTO_CLAIM | TASK_WORKBUDDY_GROWTH) {
+                if matches!(task.id, TASK_ZCODE_AUTO_CLAIM | TASK_CODEARTS_AUTO_CLAIM | TASK_WORKBUDDY_GROWTH) {
                     // 领取含验证码等待，独立运行；run_backend 的持久化占位防止重入。
                     let store = store.clone();
                     let update = update.clone();

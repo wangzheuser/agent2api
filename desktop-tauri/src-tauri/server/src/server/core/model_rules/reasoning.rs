@@ -35,7 +35,7 @@
 //! 一次解析、两个属性同源，这是「A 家的等级不会用到 B 家」的**全部**保证：
 //! 跨家串味唯一可能的来源是两处各自解析一次映射，而这里只有一个解析点。
 //!
-//! ── 各家的翻译规则（有证据的两家才接）────────────────────────
+//! ── 各家的翻译规则（按已确认的出站字段接入）────────────────────
 //! ```text
 //!   catpaw   reasoning_effort ∈ {low, high, max}（上游 resolve_effort 硬校验，
 //!            别的值当场 400）。6 档两两归并：
@@ -46,12 +46,16 @@
 //!            —— 它按模型自己声明的 efforts 归一与回退（minimal→low、
 //!            high|max→xhigh、模型不支持的档位退回该模型默认档）。「这一家收
 //!            哪个档位」在 Qoder 是模型级知识，翻译留在那边一份。
-//!   workbuddy / raccoon / autoclaw / cline
-//!            **不接**：四家都不注入档位字段（autoclaw 会改写 `model` 与 system
-//!            提示前缀，但那两处与档位无关，见它的 `adapter` / `prompt`），项目里
-//!            没有任何证据表明上游认识档位字段。塞一个上游不认识的键不叫
-//!            「生效」，只是把未知参数推给上游 —— 适配器的默认实现就是
-//!            「不接」，接一家要有一家的证据。
+//!   workbuddy  顶层 `reasoning_effort`；DeepSeek 系列同时写
+//!            `thinking.type = "enabled"`。
+//!   cline     顶层 `reasoning_effort`（构造器随后按 Cline 白名单重建）。
+//!   commandcode 顶层先写 `reasoning_effort`，`plan` 再移动到
+//!            `/params/reasoning_effort`。
+//!   trae      顶层 `reasoning_effort`，有状态 `payload::prepare_body` 保留它。
+//!   codearts  顶层 `reasoning_effort`，在 `send_body` 阶段写入，覆盖有状态
+//!            `forward_conversation` 的签名请求体。
+//!   raccoon / autoclaw
+//!            **不接**：目前没有已确认的对应上游字段，保持明确跳过。
 //! ```
 //!
 //! ── 哪些情况**故意不注入**（每一类都有具体理由）───────────────
@@ -217,13 +221,21 @@ pub fn read_client_level(body: &Value) -> Option<String> {
 /// 仅在强制等级成功翻译后清除冲突的请求控制；不碰消息里的思考内容。
 pub fn clear_client_controls(body: &mut Value) {
     let Some(object) = body.as_object_mut() else { return; };
-    for key in ["reasoning_effort", "reasoningEffort", "effort", "thinking"] {
+    for key in ["reasoning_effort", "reasoningEffort", "effort", "thinking", "enable_thinking"] {
         object.remove(key);
     }
     if object.get("reasoning").is_some_and(|value| !value.is_object()) {
         object.remove("reasoning");
     }
-    for (parent, field) in [("reasoning", "effort"), ("output_config", "effort"), ("properties", "reasoning_effort")] {
+    for (parent, field) in [
+        ("reasoning", "effort"),
+        ("output_config", "effort"),
+        ("properties", "reasoning_effort"),
+        ("params", "reasoning_effort"),
+        ("params", "reasoningEffort"),
+        ("params", "effort"),
+        ("params", "thinking"),
+    ] {
         if let Some(value) = object.get_mut(parent).and_then(Value::as_object_mut) {
             value.remove(field);
             if value.is_empty() { object.remove(parent); }

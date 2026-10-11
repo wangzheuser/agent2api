@@ -35,7 +35,7 @@ use serde_json::Value;
 
 use crate::server::core::account_store::AccountStore;
 use crate::server::core::providers::adapter::{
-    ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, UpstreamErrorClass,
+    ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, ReasoningPatch, UpstreamErrorClass,
 };
 use crate::server::core::providers::{content_block, ProviderKind};
 use crate::server::errors::GatewayError;
@@ -57,6 +57,25 @@ impl ProviderAdapter for CommandCodeAdapter {
     /// 模型清单来自远程目录（`models.rs` 的进程缓存 + 落盘缓存 + 内置兜底）
     fn list_models(&self) -> Vec<Value> {
         models::list()
+    }
+
+    /// Command Code 的入站档位先落在顶层 `reasoning_effort`，再由
+    /// `plan::build` 写入 `/alpha/generate` 的 `params.reasoning_effort`。
+    fn reasoning_patch(&self, level: &str, _model: &str, body: &Value, force: bool) -> ReasoningPatch {
+        if !force && crate::server::core::model_rules::read_client_level(body).is_some() {
+            return ReasoningPatch::Skip {
+                reason: "客户端请求体里已指定思考档位，绑定不覆盖",
+            };
+        }
+        if crate::server::core::model_rules::reasoning_rank(level).is_none() {
+            return ReasoningPatch::Skip {
+                reason: "该等级不在通用档位表内（自定义等级不参与转发）",
+            };
+        }
+        ReasoningPatch::Set {
+            field: "reasoning_effort",
+            value: Value::String(level.trim().to_lowercase()),
+        }
     }
 
     /// 构造 `POST /alpha/generate`（自有信封；`UpstreamResponse::CommandCodeNdjson`）。

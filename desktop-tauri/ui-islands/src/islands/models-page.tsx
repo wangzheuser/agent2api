@@ -131,6 +131,7 @@ import {
   rowEnabled, rowKeyOf, runRowAction, same, selectProvider, setSearch, setStateFilter, setTableEl,
   shared, subscribe, syncHead, toast, upstreamOptions, viewData, visibleColumns, writeAddModel,
   writeBinding, writeRemoveMapping, writeRemoveModel,
+  defaultMappingAlias,
   type Align, type Binding, type ColumnView, type CustomModelContext, type MappingContext,
 } from './models-panel-state'
 
@@ -961,8 +962,9 @@ function pickUpstream(providerId: string, keep: string, locked: boolean): string
  */
 function MappingDialog({ context, onClose }: { context: MappingContext; onClose: () => void }) {
   const editing = Boolean(context.alias)
-  const [provider, setProvider] = React.useState(() => context.provider || providerOptions()[0]?.id || '')
-  const [alias, setAlias] = React.useState(context.alias || '')
+  const initialProvider = context.provider || providerOptions()[0]?.id || ''
+  const [provider, setProvider] = React.useState(() => initialProvider)
+  const [alias, setAlias] = React.useState(() => context.alias || defaultMappingAlias(initialProvider, context.target))
   // 初值用上面那个 provider（context.provider 为空时它已经落到了首项），两者必须同源
   const [upstream, setUpstream] = React.useState(() => pickUpstream(provider, context.target, true))
   const [status, setStatus] = React.useState('')

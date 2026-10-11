@@ -38,7 +38,7 @@ use crate::server::core::upstream::usage::RequestTelemetry;
 use crate::server::errors::GatewayError;
 use crate::server::logging;
 
-use super::adapter::{ChatRequestPlan, ProviderAdapter, UpstreamErrorClass};
+use super::adapter::{ChatRequestPlan, ProviderAdapter, ReasoningPatch, UpstreamErrorClass};
 
 /// 进程级本地准入闸（同一上游身份的并发会话共享一个上限）。
 static SESSION_GATE: std::sync::OnceLock<session::SessionGate> = std::sync::OnceLock::new();
@@ -105,6 +105,30 @@ impl ProviderAdapter for CodeArtsAdapter {
     /// 清单来自刷新链路落的进程内缓存（`list_models` 是同步契约，发不了网络请求）。
     fn list_models(&self) -> Vec<Value> {
         models::list()
+    }
+
+    /// CodeArts 的 chat 端点消费顶层 `reasoning_effort`。它的模型侧只有
+    /// 开/关语义，但服务端接受通用档位名；保留绑定值，交给上游按二值语义处理。
+    /// 该补丁在 `send_body` 里执行，因此也覆盖本家的有状态会话转发。
+    fn reasoning_patch(&self, level: &str, _model: &str, body: &Value, force: bool) -> ReasoningPatch {
+        if !force
+            && (crate::server::core::model_rules::read_client_level(body).is_some()
+                || body.get("enable_thinking").is_some()
+                || body.get("thinking").is_some())
+        {
+            return ReasoningPatch::Skip {
+                reason: "客户端请求体里已指定思考参数，绑定不覆盖",
+            };
+        }
+        if crate::server::core::model_rules::reasoning_rank(level).is_none() {
+            return ReasoningPatch::Skip {
+                reason: "该等级不在通用档位表内（自定义等级不参与转发）",
+            };
+        }
+        ReasoningPatch::Set {
+            field: "reasoning_effort",
+            value: Value::String(level.trim().to_lowercase()),
+        }
     }
 
     /// 防御性报错：CodeArts 的对话要先占会话槽（每账号 3 路并发）、再签一次名、
@@ -844,7 +868,7 @@ mod store_hooks {
     use crate::server::db::Db;
 
     use super::{benefit_cooldown_group, daily_pool_reset_at, models};
-    use super::{CODEARTS_ADAPTER, CodeArtsAdapter, ProviderAdapter};
+    use super::{CODEARTS_ADAPTER, ProviderAdapter};
 
     static SEQ: AtomicUsize = AtomicUsize::new(0);
 

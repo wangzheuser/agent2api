@@ -6,11 +6,9 @@
 //! 的点击发起写请求。这与 ZCode 的限时套餐领取同一形状（`api::zcode_claim`），
 //! 也与本仓「不可逆动作要有预览」的既有做法一致。
 //!
-//! ── 为什么没有自动调度 ─────────────────────────────────────
-//! 参考实现把它挂在 cron 上（北京时间 `5-55/10 * * * *`，每天最多 6 次）。
-//! 本仓目前**不自动发写请求**：ZCode 的领取同样是手动。要把这条接进
-//! `core::auto_checkin` 那类调度框架，需要用户点头（无人值守地花掉账号的
-//! 领取机会是产品决定，不是移植的机械后果），所以这里只留手动入口。
+//! ── 自动调度与手动入口 ─────────────────────────────────────
+//! 定时任务会调用同一领取执行体；手动入口也复用每账号台账与写请求限流，
+//! 只在调用方显式传 `auto:true` 时保留自动调度标记。
 
 use axum::body::Bytes;
 use axum::response::Response;
@@ -37,9 +35,8 @@ pub async fn preview(state: &ServerState, account_id: &str) -> Response {
 
 /// `POST /api/accounts/{id}/codearts-welfare` —— 真的去领。
 ///
-/// body 可选 `{"auto": true}`：默认按**手动**处理（不受本地限流约束，因为限流
-/// 保护的是无人值守的重试）。将来接调度时传 `auto:true` 就会走那 6 次 / 10 分钟
-/// 两道闸。
+/// body 可选 `{"auto": true}`：自动与手动都复用 CodeArts 每账号限流台账；该字段
+/// 仅保留调度调用方的兼容语义。
 pub async fn claim(state: &ServerState, account_id: &str, body: &Bytes) -> Response {
     if state.store().codearts_account_record(account_id).is_none() {
         return management_error(404, "未找到 CodeArts 账号");
@@ -66,12 +63,8 @@ pub async fn claim(state: &ServerState, account_id: &str, body: &Bytes) -> Respo
     }
 }
 
-/// 这条领取算不算「无人值守的自动重试」。
-///
-/// 缺省必须是 **false（手动）**：限流两道闸存在的理由是「别在没人看着的时候反复花掉
-/// 账号的领取机会」，把它做成默认开就等于默认违反自己的注释。将来接调度时显式传
-/// `{"auto": true}` 才会被 6 次 / 10 分钟挡住。
-/// 非布尔（`"true"` / `1`）也按手动处理 —— 认字符串会让手滑的调用方**绕过**限流。
+/// 读取调用方是否标记为自动调度，供保持旧管理端请求形状；领取本身统一走限流台账。
+/// 非布尔（`"true"` / `1`）仍按手动处理，避免改变旧调用方语义。
 fn auto_requested(body: &Value) -> bool {
     body.get("auto").and_then(Value::as_bool).unwrap_or(false)
 }
@@ -83,8 +76,7 @@ fn welfare_base() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    //! 只钉一条：**限流的默认值是「手动」**。这条判据反了不会有任何测试红，
-    //! 而后果是面板每次点击都被 6 次/10 分钟挡住（或反过来说好调度绕过限流）。
+    //! 只钉请求体解析：`auto` 只接受显式布尔值，领取路径本身统一复用限流台账。
     use super::auto_requested;
     use serde_json::json;
 

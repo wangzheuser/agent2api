@@ -26,7 +26,7 @@ use crate::server::errors::GatewayError;
 use crate::server::core::proxies::ResolvedProxy;
 
 use super::super::adapter::{
-    ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, UpstreamErrorClass,
+    ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, ReasoningPatch, UpstreamErrorClass,
 };
 use super::super::content_block;
 use super::super::ProviderKind;
@@ -51,6 +51,25 @@ impl ProviderAdapter for TraeAdapter {
     /// 模型清单 = 上一次成功刷到的那张远程表（没刷到时为空，见 `models.rs`）。
     fn list_models(&self) -> Vec<Value> {
         models::list()
+    }
+
+    /// TRAE 的真实字段是 `reasoning_effort`；`payload::prepare_body` 会在
+    /// 有状态 forward 前保留该字段并过滤关闭思考的值。
+    fn reasoning_patch(&self, level: &str, _model: &str, body: &Value, force: bool) -> ReasoningPatch {
+        if !force && crate::server::core::model_rules::read_client_level(body).is_some() {
+            return ReasoningPatch::Skip {
+                reason: "客户端请求体里已指定思考档位，绑定不覆盖",
+            };
+        }
+        if crate::server::core::model_rules::reasoning_rank(level).is_none() {
+            return ReasoningPatch::Skip {
+                reason: "该等级不在通用档位表内（自定义等级不参与转发）",
+            };
+        }
+        ReasoningPatch::Set {
+            field: "reasoning_effort",
+            value: Value::String(level.trim().to_lowercase()),
+        }
     }
 
     /// 有状态路径的入口（转交给 `forward.rs`；理由见模块头）。

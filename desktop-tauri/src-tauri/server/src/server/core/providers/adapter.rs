@@ -289,6 +289,14 @@ pub struct RetryAdvice {
     pub reason: String,
 }
 
+/// 一个需要写入上游请求体的思考字段。
+#[derive(Clone, Debug)]
+pub struct ReasoningField {
+    /// 点号分隔的 JSON 对象路径；例如 `thinking.type`。
+    pub path: &'static str,
+    pub value: Value,
+}
+
 /// 一次思考等级翻译的结果（`ProviderAdapter::reasoning_patch` 的返回）。
 ///
 /// ── 为什么是「要么一个字段、要么一个原因」而不是 `Option<Value>` ──
@@ -309,6 +317,10 @@ pub enum ReasoningPatch {
         /// `reasoning_effort`）—— 注入点只负责写，不认识字段的语义。
         field: &'static str,
         value: Value,
+    },
+    /// 一次写入多个字段（例如 WorkBuddy DeepSeek 需要同时打开 thinking 和档位）。
+    SetMany {
+        fields: Vec<ReasoningField>,
     },
     /// 不注入（body 一个字节都不动，保持本功能之前的行为）。`reason` 进详细日志。
     Skip {

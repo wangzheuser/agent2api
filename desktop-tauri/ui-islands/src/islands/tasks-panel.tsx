@@ -472,7 +472,10 @@ function TasksPanel() {
         summary: result?.summary || t('已执行'),
       }))
       // 凭证刷新会改账号页的有效期 / 凭证状态，顺手刷新主界面
-      if (task.id === 'credentialMaintenance' || task.id === 'zcodeAutoClaim') await shared().wbApp?.refresh?.()
+      if (task.id === 'credentialMaintenance' || task.id === 'zcodeAutoClaim' || task.id === 'codeartsAutoClaim') {
+        await shared().wbApp?.refresh?.()
+        await shared().wbAccountsView?.syncBalancesSnapshot?.()
+      }
     } catch (error) {
       toast(t('执行失败：{reason}', { reason: errorMessage(error) }), 'err')
       await loadPanel()
