@@ -141,7 +141,7 @@ async function run() {
     await account.getByRole('status').filter({ hasText: '未领取奖励' }).waitFor()
     assert.doesNotMatch(await account.getByRole('status').getAttribute('class'), /text-destructive/)
     assert.doesNotMatch(await account.getByRole('status').innerText(), /登录态已过期|签到成功|已领取/)
-    assert.equal(await account.getByText('待签', { exact: true }).count(), 1)
+    assert.equal(await account.getByText('活跃保活完成', { exact: true }).count(), 1)
     await assertNoOnboarding()
     checks.push('keepalive remains visibly unclaimed after snapshot refresh')
 

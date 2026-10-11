@@ -172,11 +172,16 @@ function AccountRows({ group }: { group: CheckinProviderGroup }) {
           // 账号」）。只有 `workbuddy-intl` 这一组执行日活链。
           const dailyActivity = group.id === 'workbuddy-intl'
           const result = singleResults.get(account.id)
+          // 国际版网页会话完成后，奖励由上游异步结算，不能写入普通 checkinAt。
+          // 当前会话仍应明确显示已完成活跃，避免把成功的网页任务误显示成待签。
+          const activityCompleted = dailyActivity && result?.kind === 'active'
           return (
             <tr key={account.id}>
               <td>{account.name || account.id}</td>
               <td>
-                {account.checkedInToday
+                {activityCompleted
+                  ? <Badge variant='success' shape='tag'>{t('活跃保活完成')}</Badge>
+                  : account.checkedInToday
                   ? <Badge variant='success' shape='tag'>{t('已签')}</Badge>
                   : <Badge variant='brand' shape='tag'>{t('待签')}</Badge>}
               </td>

@@ -50,8 +50,8 @@ const RISK_TTL_MS: i64 = 50 * 60 * 1000;
 const RISK_TIMEOUT_MS: u64 = 25_000;
 /// stdout 大小上限（正常输出就一行 JSON，超限视为组件异常）
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
-/// 客户端版本读不到时的兜底（CreditDaddy 同值）
-const DEFAULT_CLIENT_VERSION: &str = "0.2.5";
+/// 客户端版本读不到时的兜底（参考 qoder2api-hub 的桌面端活动请求头）
+const DEFAULT_CLIENT_VERSION: &str = "0.4.3";
 
 /// 一次生成的设备风控身份三件套
 #[derive(Clone)]
@@ -223,23 +223,9 @@ pub fn available(region: Region) -> bool {
 
 // ─── 身份的辅助字段（请求头用）──────────────────────────────
 
-/// `Cosy-MachineOS`：与客户端一致的 `{架构}_{平台}` 形态（x86_64_win32 等）
+/// `Cosy-MachineOS`：活动接口按官方桌面端画像校验，固定使用 x86_64_win32。
 pub fn machine_os() -> String {
-    let arch = if cfg!(target_arch = "x86_64") {
-        "x86_64"
-    } else if cfg!(target_arch = "aarch64") {
-        "aarch64"
-    } else {
-        "unknown"
-    };
-    let platform = if cfg!(windows) {
-        "win32"
-    } else if cfg!(target_os = "macos") {
-        "darwin"
-    } else {
-        "linux"
-    };
-    format!("{arch}_{platform}")
+    "x86_64_win32".to_string()
 }
 
 /// `Cosy-MachineHostname`：可打印 ASCII，超长截断并附短哈希
@@ -428,18 +414,20 @@ pub async fn augment_headers(
     uid: &str,
 ) -> (Vec<(String, String)>, Option<String>) {
     headers.push(("Cosy-Version".to_string(), client_version(region)));
-    headers.push(("Cosy-MachineOS".to_string(), machine_os()));
-    // 与 COSY 签名头同一个机器标识（`machine::machine_id`：优先复用
-    // 客户端/qodercli 落盘的 id，否则在网关数据目录持久化一个）
-    match machine::machine_id() {
-        Ok(id) => headers.push(("Cosy-MachineId".to_string(), id)),
-        Err(_) => {}
-    }
-    if let Some(host) = machine_hostname() {
-        headers.push(("Cosy-MachineHostname".to_string(), host));
-    }
     match identity(region, uid).await {
         Some(risk) => {
+            // 参考 qoder2api-hub：只有官方 UMID 生成的真实身份可用时才发
+            // cosy-machine* 头。缺少真实身份时发送半套/派生头会让上游静默
+            // 过滤可领取活动，表现为 HTTP 200 但列表里没有 CLAIM_BENEFIT。
+            headers.push(("Cosy-MachineOS".to_string(), machine_os()));
+            // 与 COSY 签名头同一个机器标识（`machine::machine_id`：优先复用
+            // 客户端/qodercli 落盘的 id，否则在网关数据目录持久化一个）
+            if let Ok(id) = machine::machine_id() {
+                headers.push(("Cosy-MachineId".to_string(), id));
+            }
+            if let Some(host) = machine_hostname() {
+                headers.push(("Cosy-MachineHostname".to_string(), host));
+            }
             headers.push(("Cosy-MachineToken".to_string(), risk.machine_token));
             headers.push(("Cosy-MachineCode".to_string(), risk.machine_code));
             headers.push(("Cosy-MachineType".to_string(), risk.machine_type));
