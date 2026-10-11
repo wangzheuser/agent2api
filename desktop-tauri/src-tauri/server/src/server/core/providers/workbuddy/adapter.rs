@@ -753,6 +753,7 @@ pub(crate) fn build_daily_activity_request(
         headers,
         payload,
         proxy,
+        system_proxy_when_unset: false,
     })
 }
 

@@ -137,6 +137,7 @@ pub struct ChatRequestPlan {
     pub body: Value,
     /// 上游**响应**说的是哪套协议（默认 [`UpstreamResponse::Chat`]）
     pub response: UpstreamResponse,
+    pub system_proxy_when_unset: bool,
 }
 
 impl ChatRequestPlan {
@@ -153,7 +154,16 @@ impl ChatRequestPlan {
             headers,
             body,
             response: UpstreamResponse::Chat,
+            system_proxy_when_unset: false,
         }
+    }
+
+    pub fn commandcode_ndjson(url: String, headers: Vec<(String, String)>, body: Value) -> Self {
+        Self { url, headers, body, response: UpstreamResponse::CommandCodeNdjson, system_proxy_when_unset: false }
+    }
+
+    pub fn antigravity_gemini(url: String, headers: Vec<(String, String)>, body: Value) -> Self {
+        Self { url, headers, body, response: UpstreamResponse::AntigravityGemini, system_proxy_when_unset: true }
     }
 
     /// WorkBuddy 的响应仍是 Chat SSE，但部分成功流以非空 `finish_reason`
@@ -164,6 +174,7 @@ impl ChatRequestPlan {
             headers,
             body,
             response: UpstreamResponse::WorkBuddy,
+            system_proxy_when_unset: false,
         }
     }
 }
@@ -189,6 +200,8 @@ pub enum UpstreamResponse {
     WorkBuddy,
     /// Anthropic Messages SSE：下发前折回标准 chat SSE（见 `upstream::translate`）
     Anthropic,
+    CommandCodeNdjson,
+    AntigravityGemini,
 }
 
 /// 上游错误分类（架构文档 §4.2；三个动作的语义见模块头）。
@@ -659,6 +672,11 @@ pub trait ProviderAdapter: Send + Sync {
     /// 消费方：`account_store::pick_current`（全局队首 = `/api/session` 的
     /// `currentAccountId`、退出登录的删除目标、界面 ★）。没有转发能力却排进队首，
     /// 会让顶栏把它显示成「当前登录态」、并让「退出登录」把它删掉。
+    /// 未配置账号代理时是否跟随系统代理。
+    fn system_proxy_when_unset(&self) -> bool {
+        false
+    }
+
     fn supports_chat(&self) -> bool {
         true
     }
@@ -1041,6 +1059,9 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         // 参数化，见 `autoclaw::adapter` 与 `autoclaw::region` 的模块头）
         ProviderKind::AutoClawIntl => &super::autoclaw::AUTOCLAW_INTL_ADAPTER,
         ProviderKind::Qoder => &super::qoder::QODER_ADAPTER,
+        // Qoder 的两个地区是两个 provider、两个实例（同一份实现的按地区
+        // 参数化，见 `qoder::endpoints::Region` 与 `qoder::mod` 的模块头）
+        ProviderKind::QoderIntl => &super::qoder::QODER_INTL_ADAPTER,
         ProviderKind::CodeArts => &super::codearts::CODEARTS_ADAPTER,
         // Cline 的两个额度池是两个 provider、两个实例（同一份实现的按池
         // 参数化，见 `cline::adapter` 的模块头）
@@ -1062,6 +1083,10 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         // 分配算力 → SSE），账号管理走粘贴 Cookie / 导入本机登录态
         // （见 `kuku/mod.rs` 的模块头）
         ProviderKind::Kuku => &super::kuku::KUKU_ADAPTER,
+        ProviderKind::MonkeyCode => &super::monkeycode::MONKEYCODE_ADAPTER,
+        ProviderKind::MonkeyCodeIntl => &super::monkeycode::MONKEYCODE_INTL_ADAPTER,
+        ProviderKind::CommandCode => &super::commandcode::COMMANDCODE_ADAPTER,
+        ProviderKind::Antigravity => &super::antigravity::ANTIGRAVITY_ADAPTER,
     }
 }
 
@@ -1108,6 +1133,10 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         ProviderKind::AutoClaw,
         ProviderKind::AutoClawIntl,
         ProviderKind::Qoder,
+        // Qoder 国际版算一家：与国内版各自一份模型清单、各自的缓存槽与刷新
+        // 排期（拆家后的既定口径，与 WorkBuddy 两个地区同一理由）—— 不在的
+        // 话国际版的目录刷新永远不会被调度。
+        ProviderKind::QoderIntl,
         ProviderKind::ClineFree,
         ProviderKind::ClinePass,
         // Accio 的两个地区各算一家（同一份实现、两套账号与目录缓存）
@@ -1135,6 +1164,10 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         // （`/wenchain/genflowpro/model_list`）—— 必须在列表里，否则刷新循环
         // 不会问它（与 Trae 同一理由）。
         ProviderKind::Kuku,
+        ProviderKind::MonkeyCode,
+        ProviderKind::MonkeyCodeIntl,
+        ProviderKind::CommandCode,
+        ProviderKind::Antigravity,
     ]
 }
 
@@ -1238,9 +1271,10 @@ fn seed_current_workbuddy_defaults() {
 /// 对**当前缓存清单**里的 Qoder 模型补一次默认规则种子（默认只启用白名单内的
 /// 模型，见 `model_rules::seed_qoder_defaults`）。
 ///
-/// 委托给 `qoder::models::seed_default_rules` —— 那边取的是两个地区的**并集**，
-/// 与刷新落地时种的是同一份口径。要这一手补种的理由与 WorkBuddy 相同：Qoder
-/// 在没有账号 / 远程刷新失败时手里只剩静态兜底清单，而**升级用户**的并集正是
+/// 委托给 `qoder::models::seed_default_rules` —— 那边按地区各取各的清单、各按
+/// 各的 provider id 种（拆家后两家是两套 `(provider, id)` 命名空间），与刷新
+/// 落地时种的是同一份口径。要这一手补种的理由与 WorkBuddy 相同：Qoder 在
+/// 没有账号 / 远程刷新失败时手里只剩静态兜底清单，而**升级用户**的清单正是
 /// 那份兜底 —— 不补种的话，他们打开管理页看到的仍是旧的全开状态。
 fn seed_current_qoder_defaults() {
     qoder::models::seed_default_rules();

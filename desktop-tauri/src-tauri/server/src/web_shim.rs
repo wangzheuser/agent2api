@@ -785,8 +785,11 @@ pub fn shim_js() -> &'static str {
     // ── Loomy 新手任务（查询 / 一键领取）──
     // 与桌面 `bridge.rs` 的同名方法成对维护：签到后界面查询任务状态、有未领取才
     // 弹窗领取（accounts-dialog-onboarding）。
-    getOnboardingTasks: function (id) {
-      return call('GET', '/api/accounts/' + encodeURIComponent(String(id || '')) + '/onboarding');
+    // `refresh` = 界面手点「查询任务」→ `?refresh=1` 强制实查上游；不带则吃后端
+    // 的结算记忆（一次性福利领完就不再问上游，见 api::onboarding 的模块说明）。
+    getOnboardingTasks: function (id, refresh) {
+      return call('GET', '/api/accounts/' + encodeURIComponent(String(id || '')) + '/onboarding'
+        + (refresh ? '?refresh=1' : ''));
     },
     claimOnboardingTasks: function (id) {
       return call('POST', '/api/accounts/' + encodeURIComponent(String(id || '')) + '/onboarding/claim', {});
@@ -928,6 +931,10 @@ pub fn shim_js() -> &'static str {
       return call('GET', '/api/stats/summary?range=' + encodeURIComponent(range));
     },
     getStatsRequests: function (query) { return call('GET', '/api/stats/requests' + toQuery(query)); },
+    // 中止一条在途请求；请求日志的「终止」与模型测试弹窗共用该桥接。
+    terminateStatsRequest: function (id) {
+      return call('POST', '/api/stats/requests/terminate' + toQuery({ id: id }));
+    },
     getStatsRequestFilters: function () { return call('GET', '/api/stats/requests/filters'); },
     clearStatsRequests: function (query) { return call('DELETE', '/api/stats/requests' + toQuery(query)); },
     // 按 id 取单条请求的原始正文（详情弹窗「预览对话」的数据源；找不到给 404）

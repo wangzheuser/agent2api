@@ -43,7 +43,7 @@
 //! 是否还有在途请求持有该 Client 的 Arc 克隆（在途请求会正常跑完）。
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -243,6 +243,25 @@ fn build_client(proxy: Option<&ResolvedProxy>, timeouts: &TimeoutSettings, redir
 /// 复用账号出口配置，但禁用重定向且构造失败不回退直连，供短时凭据通道使用。
 pub(crate) fn client_without_redirects(proxy: Option<&ResolvedProxy>) -> Result<reqwest::Client, String> {
     build_client(proxy, &crate::server::config::timeout_settings(), false)
+}
+
+/// 构造跟随系统代理的客户端，供尚未绑定账号出口的登录/Google 链路使用。
+pub fn client_for_system_proxy() -> Arc<reqwest::Client> {
+    static CLIENT: OnceLock<Arc<reqwest::Client>> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        let settings = crate::server::config::timeout_settings();
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(settings.connect_ms()))
+            .user_agent(DEFAULT_USER_AGENT)
+            .pool_idle_timeout(Some(Duration::from_secs(90)))
+            .pool_max_idle_per_host(8)
+            .build()
+            .unwrap_or_else(|error| {
+                logging::log("[Upstream]", &format!("⚠️ 系统代理客户端构造失败: {error}"));
+                reqwest::Client::new()
+            });
+        Arc::new(client)
+    }).clone()
 }
 
 /// 取（或创建）某个出口对应的 Client；`proxy` 为 None 时是直连客户端。

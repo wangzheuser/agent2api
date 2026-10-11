@@ -54,6 +54,7 @@ async fn success_head_wait_is_cancelled_without_waiting_for_another_chunk() {
         headers: Vec::new(),
         payload: "{}".into(),
         proxy: None,
+        system_proxy_when_unset: false,
     };
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
@@ -128,6 +129,8 @@ async fn mock_upstream(
             headers: vec![("Content-Type".into(), "application/json".into())],
             payload: r#"{"stream":true}"#.into(),
             proxy: None,
+            // 测试替身按默认能力位（false = 直连），与生产里不带这一步的家同款
+            system_proxy_when_unset: false,
         },
         hits,
         task,
@@ -342,6 +345,7 @@ async fn one_time_proof_retries_return_for_rebuild_while_normal_requests_reuse_t
             headers: vec![("x-proof".into(), "first".into())],
             payload: "{}".into(),
             proxy: None,
+            system_proxy_when_unset: false,
         };
         let telemetry = RequestTelemetry::new();
         let mut budget = RetryBudget::new(1);
@@ -431,6 +435,7 @@ async fn cache_creation_raw_capture_is_exact_for_prefetched_and_translated_strea
                 headers: Vec::new(),
                 payload: "{}".into(),
                 proxy: None,
+                system_proxy_when_unset: false,
             };
             let telemetry = Arc::new(RequestTelemetry::new());
             let capture = Arc::new(TrafficCapture::begin("sample"));
@@ -517,6 +522,7 @@ async fn http_405_switches_accounts_without_same_account_retry() {
         headers: Vec::new(),
         payload: "{}".to_string(),
         proxy: None,
+        system_proxy_when_unset: false,
     };
     let adapter = &crate::server::core::providers::zcode::adapter::ZCODE_ADAPTER;
     let telemetry = crate::server::core::upstream::usage::RequestTelemetry::new();
@@ -574,6 +580,7 @@ async fn zcode_http_200_quota_envelope_returns_a_rotatable_failure() {
         headers: Vec::new(),
         payload: "{}".to_string(),
         proxy: None,
+        system_proxy_when_unset: false,
     };
     let adapter = &crate::server::core::providers::zcode::adapter::ZCODE_ADAPTER;
     let telemetry = crate::server::core::upstream::usage::RequestTelemetry::new();

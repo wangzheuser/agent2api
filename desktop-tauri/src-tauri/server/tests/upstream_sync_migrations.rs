@@ -15,6 +15,7 @@ mod server {
     pub use agent2api_server::server::{config, db, logging};
 
     pub mod core {
+        pub use agent2api_server::server::core::limiter;
         pub mod account_store {
             pub(crate) use crate::store_util;
             pub use agent2api_server::server::core::account_store::state;

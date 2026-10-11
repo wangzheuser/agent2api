@@ -309,6 +309,7 @@ fn build_payload(
         // 上游说 Anthropic：响应帧要先折成 chat SSE 再下发
         // （见 `upstream::translate`）
         response: UpstreamResponse::Anthropic,
+        system_proxy_when_unset: false,
     })
 }
 

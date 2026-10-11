@@ -126,6 +126,14 @@ pub const RESERVED_KV_KEYS: &[&str] = &[
     // —— 下次点「升级」会重复导入一遍历史明细。
     "requestsMigrated",
     "dailyMigrated",
+    // 模型用量口径订正的完成标记（request_stats::aggregate 的
+    // `MODEL_UPSTREAM_MARKER`）—— #139 的根因就是这个键漏登记：
+    // 它在 `remap_model_days` 里**直接写库**（与重算同一事务，有意的：
+    // 中断后标记必然没写、下次整批重跑），而 `config::init` 把全库读进内存
+    // 快照发生在那之前 —— 不登记的话，用户改任意一项配置时 `save_raw` 会把
+    // 它当「配置里已删掉的键」清掉，下次启动同一批历史被重算第二遍
+    // （日期键未变时是幂等覆盖、静默；变过日期键就留下重复的聚合行）。
+    "modelUsageUpstreamRemapped",
     // 远程模型清单的持久化缓存（core::providers::catalog_cache）：整份
     // 「各家上次成功拉到的清单」一个键（十份清单挤一个键的理由见那个模块头）。
     // 属于「其它零散状态」——它不是配置项，配置写入绝不能动它。
@@ -207,7 +215,10 @@ pub fn is_reserved(key: &str) -> bool {
 /// 上游 v7 已有 is_test，但会跳过本地 v7 的缓存创建列；曾升级到 v9 的库
 /// 也可能缺这列。保留已发布 v7-v9 含义，在新的事务中按实际列补齐。
 /// 版本 11：逐账号余额记录；兼容上游 v8 已建的同名表。
-pub const SCHEMA_VERSION: i64 = 11;
+/// 版本 12：补账号+时间聚合索引；不重新解释 v9-v11。
+/// 上游把该索引编号为 v9，本地发布线已占用 v9-v11，故以新版本追加。
+pub const SCHEMA_VERSION: i64 = 12;
+
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
@@ -582,6 +593,27 @@ CREATE TABLE IF NOT EXISTS account_usage_records (
 );
 ";
 
+/// 版本 12：给 `requests` 补「按账号 + 时间」的聚合索引。
+///
+/// ── 它服务什么 ──────────────────────────────────────────────
+/// 账号限制器的 **Token 消耗规则**：每条规则问的是「这个账号在当前重置窗口
+/// （对齐自然时间的固定窗口，30 分钟 ~ 24 小时）内一共消耗了多少 Token」——
+/// 一次 `SELECT account_id, SUM(total_tokens) FROM requests
+/// WHERE account_id = ? AND ts >= ?` 的聚合。没有这个索引它只能走
+/// `idx_requests_ts` 全表扫到过滤条件上，限制器的心跳刷新（每 10 秒一轮）
+/// 会把请求明细表整个翻一遍。
+///
+/// 为什么是复合索引 `(account_id, ts)` 而不是只补 `account_id`：窗口过滤
+/// （`ts >= 窗口起点`）要在**同一账号内**做范围扫描，复合索引让聚合变成
+/// 一次有序的范围读；单独的 account_id 索引拿到行号后还得回表逐行比 ts。
+///
+/// 聚合查询的全部调用方：`core::limiter` 的窗口刷新（按 distinct 周期分组
+/// 查）与单账号即时复查（自动禁用判定）。
+const V12_SCHEMA: &str = "
+-- ── requests 补按账号聚合的索引（schema v12）──────────────────
+CREATE INDEX IF NOT EXISTS idx_requests_account_ts ON requests(account_id, ts);
+";
+
 /// 把库升到 [`SCHEMA_VERSION`]（幂等：已是最新版时什么都不做）。
 ///
 /// 返回 `rusqlite::Result` 而不是本模块自造的字符串错误：调用方 `Db::open`
@@ -682,6 +714,9 @@ fn apply_version(conn: &Connection, version: i64) -> rusqlite::Result<()> {
             conn.execute("UPDATE account_usage_records SET queried_at=MAX(last_success_at,last_attempt_at) WHERE queried_at=0", [])?;
             Ok(())
         },
+        // v12：补按账号 + 时间的聚合索引；兼容上游已存在的同名索引。
+        12 => conn.execute_batch(V12_SCHEMA),
+
         _ => Ok(()),
     }
 }

@@ -78,6 +78,7 @@ async fn both_regions_wait_for_refill_and_cancel_without_sending_empty_proofs() 
             allowed_providers: None,
             pinned_account: Some(id.clone()),
             route_session: None,
+            ignore_model_gate: false,
         };
         assert_eq!(captcha::ready(), 0);
         let proof = format!("fixture-proof-{}", region.provider_id());

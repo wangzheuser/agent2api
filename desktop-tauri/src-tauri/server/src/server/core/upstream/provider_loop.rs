@@ -291,6 +291,10 @@ pub(super) async fn forward_with_providers(
     // 本函数是唯一消费方，日志也打在这里。
     let candidates = match ctx.test_target {
         Some(target) => crate::server::core::providers::catalog::providers_for_model(&target.model),
+        None if ctx.ignore_model_gate => ctx
+            .key_scope
+            .map(|scope| scope.allowed_provider_ids())
+            .unwrap_or_default(),
         None => route_for_forward(&model),
     };
     if crate::server::core::providers::catalog::providers_for_model(&model).is_empty() {
@@ -930,6 +934,7 @@ async fn attempt_queue(
                 } else {
                     target.proxy.clone()
                 },
+                system_proxy_when_unset: plan.system_proxy_when_unset,
             };
             // ── 调试模式：抓一份即将发出去的原始报文 ──────────────────
             // 位置在 `build_chat_request` 之后（URL / 头 / body 都已定稿）。
@@ -1320,15 +1325,25 @@ async fn attempt_queue(
                 response.stream, ctx.telemetry.clone(), response_protocol,
             );
         }
-        if response_protocol
-            == crate::server::core::providers::adapter::UpstreamResponse::Anthropic
+        if matches!(response_protocol,
+            crate::server::core::providers::adapter::UpstreamResponse::Anthropic
+                | crate::server::core::providers::adapter::UpstreamResponse::CommandCodeNdjson
+                | crate::server::core::providers::adapter::UpstreamResponse::AntigravityGemini)
         {
             // 状态码要在 consume response 之前取（与 chat 路径同一时机）
             let status = response.status;
             let translated: futures::stream::BoxStream<
                 'static,
                 Result<bytes::Bytes, std::io::Error>,
-            > = Box::pin(super::translate::AnthropicToChatStream::from_stream(response.stream, &wire_model));
+            > = match response_protocol {
+                crate::server::core::providers::adapter::UpstreamResponse::Anthropic =>
+                    Box::pin(super::translate::AnthropicToChatStream::from_stream(response.stream, &wire_model)),
+                crate::server::core::providers::adapter::UpstreamResponse::CommandCodeNdjson =>
+                    Box::pin(super::translate::CommandCodeToChatStream::from_stream(response.stream, &wire_model)),
+                crate::server::core::providers::adapter::UpstreamResponse::AntigravityGemini =>
+                    Box::pin(super::translate::AntigravityToChatStream::from_stream(response.stream, &wire_model)),
+                _ => unreachable!("response protocol matched above"),
+            };
             if ctx.stream {
                 return Ok(ForwardOutcome::Stream {
                     status,
@@ -2020,6 +2035,7 @@ async fn send_with_retry(
             adapter.refresh_route_request_id(&mut headers);
             fresh_transport = TransportRequest {
                 url: transport.url.clone(), headers, payload: transport.payload.clone(), proxy: transport.proxy.clone(),
+                system_proxy_when_unset: transport.system_proxy_when_unset,
             };
             if let Some(capture) = capture {
                 if let Ok(body) = serde_json::from_str(&fresh_transport.payload) {

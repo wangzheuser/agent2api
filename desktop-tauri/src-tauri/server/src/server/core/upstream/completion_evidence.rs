@@ -29,6 +29,7 @@ impl From<UpstreamResponse> for EvidenceProtocol {
             UpstreamResponse::Chat => Self::Chat,
             UpstreamResponse::WorkBuddy => Self::WorkBuddy,
             UpstreamResponse::Anthropic => Self::Anthropic,
+            UpstreamResponse::CommandCodeNdjson | UpstreamResponse::AntigravityGemini => Self::Chat,
         }
     }
 }
