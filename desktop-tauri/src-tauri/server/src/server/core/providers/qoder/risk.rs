@@ -24,8 +24,8 @@
 //! `riskRunner` 同款：协议一致，只有 env 编号不同）。
 //!
 //! ── 缓存 ────────────────────────────────────────────────────
-//! 客户端每 60±5 分钟轮换一次身份，这里保守缓存 50 分钟（按 region + uid）。
-//! 进程内缓存足够：身份只在本机使用，重启重新生成一次没有副作用。
+//! 客户端每 60±5 分钟轮换一次身份，这里保守缓存 50 分钟（按 region）。
+//! 完整身份同时落盘，避免容器重启后重新采样出不同的 VM 风控分支。
 //!
 //! ── panic=abort ─────────────────────────────────────────────
 //! 零 unwrap/expect/panic；子进程输出不信任（按行解析 + 长度上限）。
@@ -36,6 +36,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use base64::Engine;
+use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
 use crate::server::errors::GatewayError;
@@ -54,11 +55,25 @@ const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 const DEFAULT_CLIENT_VERSION: &str = "0.4.3";
 
 /// 一次生成的设备风控身份三件套
-#[derive(Clone)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct RiskIdentity {
     pub machine_token: String,
     pub machine_code: String,
     pub machine_type: String,
+    #[serde(default)]
+    pub vm_is_vm: Option<bool>,
+    #[serde(default)]
+    pub vm_brand: Option<String>,
+    #[serde(default)]
+    pub vm_type_code: Option<i64>,
+    #[serde(default)]
+    pub vm_percentage: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedIdentity {
+    at: i64,
+    identity: RiskIdentity,
 }
 
 /// 一个可调用的 UMID 组件
@@ -354,10 +369,29 @@ async fn run_component(component: &Component, uid: &str) -> Result<RiskIdentity,
         }
         Ok(value)
     };
+    let vm_info = parsed.get("vmInfo").and_then(serde_json::Value::as_object);
+    let vm_brand = vm_info
+        .and_then(|info| info.get("brand"))
+        .and_then(serde_json::Value::as_str)
+        .map(|value| truncate(value.trim(), 64))
+        .filter(|value| !value.is_empty());
+    let vm_type_code = vm_info
+        .and_then(|info| info.get("vmTypeCode"))
+        .and_then(serde_json::Value::as_i64);
+    let vm_percentage = vm_info
+        .and_then(|info| info.get("percentage"))
+        .and_then(serde_json::Value::as_i64);
+    let vm_is_vm = vm_info
+        .and_then(|info| info.get("isVm"))
+        .and_then(serde_json::Value::as_bool);
     Ok(RiskIdentity {
         machine_token: pick("machineToken")?,
         machine_code: pick("machineCode")?,
         machine_type: pick("machineType")?,
+        vm_is_vm,
+        vm_brand,
+        vm_type_code,
+        vm_percentage,
     })
 }
 
@@ -374,34 +408,114 @@ struct CacheEntry {
 
 static CACHE: Mutex<Option<HashMap<String, CacheEntry>>> = Mutex::new(None);
 
+fn persisted_identity_path(region: Region) -> PathBuf {
+    crate::server::config::config_dir()
+        .join("qoder-umid")
+        .join(format!("identity-{}.json", region.id()))
+}
+
+fn load_persisted_identity(region: Region, now: i64) -> Option<RiskIdentity> {
+    let text = std::fs::read_to_string(persisted_identity_path(region)).ok()?;
+    let saved = serde_json::from_str::<PersistedIdentity>(&text).ok()?;
+    (now.saturating_sub(saved.at) < RISK_TTL_MS).then_some(saved.identity)
+}
+
+fn persist_identity(region: Region, identity: &RiskIdentity, at: i64) {
+    let path = persisted_identity_path(region);
+    let Some(parent) = path.parent() else { return };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let temp = parent.join(format!("identity-{}.{}.tmp", region.id(), std::process::id()));
+    let saved = PersistedIdentity { at, identity: identity.clone() };
+    let Ok(text) = serde_json::to_vec_pretty(&saved) else { return };
+    if std::fs::write(&temp, text).is_err() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(windows)]
+    if path.exists() {
+        let _ = std::fs::remove_file(&path);
+    }
+    let _ = std::fs::rename(temp, path);
+}
+
+fn majority_identity(samples: &[RiskIdentity]) -> Option<RiskIdentity> {
+    let mut groups: Vec<(RiskIdentity, usize)> = Vec::new();
+    for sample in samples {
+        if let Some((_, count)) = groups.iter_mut().find(|(identity, _)| identity == sample) {
+            *count += 1;
+        } else {
+            groups.push((sample.clone(), 1));
+        }
+    }
+    groups.into_iter().max_by_key(|(_, count)| *count).map(|(identity, _)| identity)
+}
+
+fn identity_summary(identity: &RiskIdentity) -> String {
+    format!(
+        "vm={} brand={} type={} score={}",
+        identity.vm_is_vm.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string()),
+        identity.vm_brand.as_deref().unwrap_or("unknown"),
+        identity.vm_type_code.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string()),
+        identity.vm_percentage.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string()),
+    )
+}
+
 /// 取某账号的风控身份（带 50 分钟缓存）。组件不可用或生成失败返回 None，
 /// 失败原因只进 verbose 日志 —— 签到链路会给出「缺组件」的用户文案。
 pub async fn identity(region: Region, uid: &str) -> Option<RiskIdentity> {
     if uid.is_empty() {
         return None;
     }
-    let key = format!("{}:{uid}", region.id());
+    let key = region.id().to_string();
+    let now = logging::now_ms();
     if let Ok(guard) = CACHE.lock() {
         if let Some(entry) = guard.as_ref().and_then(|map| map.get(&key)) {
-            if logging::now_ms() - entry.at < RISK_TTL_MS {
+            if now - entry.at < RISK_TTL_MS {
                 return Some(entry.value.clone());
             }
         }
     }
-    let component = find_component(region)?;
-    match run_component(&component, uid).await {
-        Ok(value) => {
-            if let Ok(mut guard) = CACHE.lock() {
-                guard.get_or_insert_with(HashMap::new).insert(key, CacheEntry { value: value.clone(), at: logging::now_ms() });
-            }
-            logging::verbose("[Qoder]", &format!("设备风控身份已生成（来源 {}）", component.source));
-            Some(value)
+    if let Some(value) = load_persisted_identity(region, now) {
+        if let Ok(mut guard) = CACHE.lock() {
+            guard.get_or_insert_with(HashMap::new).insert(key, CacheEntry { value: value.clone(), at: now });
         }
-        Err(error) => {
-            logging::verbose("[Qoder]", &format!("设备风控身份生成失败：{error}"));
-            None
+        logging::verbose(
+            "[Qoder]",
+            &format!("复用持久化设备风控身份（地区={}，{}）", region.label(), identity_summary(&value)),
+        );
+        return Some(value);
+    }
+    let component = find_component(region)?;
+    let mut samples = Vec::new();
+    let mut last_error = None;
+    for _ in 0..3 {
+        match run_component(&component, uid).await {
+            Ok(value) => samples.push(value),
+            Err(error) => last_error = Some(error),
         }
     }
+    let Some(value) = majority_identity(&samples) else {
+        logging::verbose(
+            "[Qoder]",
+            &format!("设备风控身份生成失败：{}", last_error.unwrap_or_else(|| "没有有效采样".to_string())),
+        );
+        return None;
+    };
+    persist_identity(region, &value, now);
+    if let Ok(mut guard) = CACHE.lock() {
+        guard.get_or_insert_with(HashMap::new).insert(key, CacheEntry { value: value.clone(), at: now });
+    }
+    logging::verbose(
+        "[Qoder]",
+        &format!("设备风控身份已生成（来源 {}，采样={}，{}）", component.source, samples.len(), identity_summary(&value)),
+    );
+    Some(value)
 }
 
 /// 签到头增强：在基础头（`sash_headers`）上叠加客户端身份与设备风控身份。
@@ -660,6 +774,41 @@ impl<R: std::io::Read> BytesToVec for flate2::read::GzDecoder<R> {
         let mut out = Vec::new();
         std::io::Read::read_to_end(&mut self, &mut out).map_err(|error| error.to_string())?;
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{majority_identity, RiskIdentity};
+
+    fn identity(brand: &str, vm_type_code: i64) -> RiskIdentity {
+        RiskIdentity {
+            machine_token: "token".to_string(),
+            machine_code: format!("code-{brand}"),
+            machine_type: format!("type-{brand}"),
+            vm_is_vm: Some(true),
+            vm_brand: Some(brand.to_string()),
+            vm_type_code: Some(vm_type_code),
+            vm_percentage: Some(80),
+        }
+    }
+
+    #[test]
+    fn majority_identity_keeps_complete_sample() {
+        let docker = identity("Docker", 50);
+        let kvm = identity("KVM", 13);
+        let selected = majority_identity(&[docker.clone(), kvm, docker.clone()]);
+        assert_eq!(selected, Some(docker));
+    }
+
+    #[test]
+    fn risk_identity_deserializes_without_optional_vm_fields() {
+        let value: RiskIdentity = serde_json::from_str(
+            r#"{"machine_token":"token","machine_code":"code","machine_type":"type"}"#,
+        )
+        .expect("legacy identity should deserialize");
+        assert_eq!(value.vm_is_vm, None);
+        assert_eq!(value.vm_brand, None);
     }
 }
 
