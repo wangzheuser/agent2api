@@ -288,7 +288,16 @@ async fn claim_from(
 
     // POST 返回 CLAIMED 只代表接口接受了领取；再查一次活动状态，避免把
     // 2xx 或延迟响应误报成已经到账。失败时不写本地完成标记，后续轮询可重试。
-    let confirmed = fetch_campaigns(&credentials, proxy.as_ref()).await?;
+    // 国际版确认也必须带同一套风控头；普通请求只返回 VIEW_DETAILS，
+    // 会把已成功领取误判成「领取后状态未确认」。
+    let confirmed = if region == Region::Global {
+        let uid = list.get("uid").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        let (confirmed_headers, _) =
+            risk::augment_headers(endpoints::sash_headers(&credentials.access_token), region, &uid).await;
+        fetch_campaigns_with(&credentials, proxy.as_ref(), &confirmed_headers).await?
+    } else {
+        fetch_campaigns(&credentials, proxy.as_ref()).await?
+    };
     let confirmed = auth::payload(confirmed, "签到领取确认")?;
     if !campaign_status(nested_data(&confirmed), campaign_id, STATUS_CLAIMED) {
         logging::log(
