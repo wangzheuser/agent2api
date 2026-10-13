@@ -60,6 +60,107 @@ pub struct ModelRewrite {
     pub requested: String,
 }
 
+/// 下发帧的两项改写开关：都由**适配器**回答，通用层（本状态机与 `aggregate`）
+/// 只执行，不在那里出现 provider 分支。
+///
+/// 把两项打包成一个结构而不是各加一个位置参数：它们在链路上**永远同源**
+/// （都来自同一次 `adapter` 查询 + 同一个请求的模型名），拆成两个参数会让
+/// `ForwardStream` / 聚合器的五六个签名各多一个裸 `bool`，调用点上根本读不出
+/// 那个 `true` 是哪一项。
+#[derive(Clone, Debug, Default)]
+pub struct FramePolicy {
+    /// model 名回写（None = 原样透传上游的 `model`）
+    pub rewrite: Option<ModelRewrite>,
+    /// 丢弃「整片只有换行」的 content 分片（见模块头与 [`is_newline_keepalive`]）
+    pub strip_newline_chunks: bool,
+}
+
+impl FramePolicy {
+    /// 只带 model 回写、其余按默认（自定义家的转发路径用它：那家的保活形态
+    /// 没有实测过，不去动它的字节）
+    pub fn with_rewrite(rewrite: Option<ModelRewrite>) -> Self {
+        Self { rewrite, strip_newline_chunks: false }
+    }
+
+    /// 由**能力位 × 全局开关**装配（转发链上唯一的生产入口，见
+    /// `provider_loop::frame_policy_of`）。
+    ///
+    /// 两者的**顺序**是有意的：能力位在前、开关在后 ⇒ 这个开关只能**收窄**
+    /// （关掉它，一家本来就声明了能力位的提供商退回逐字节透传），不能**扩张**
+    /// （开了它，也不会替一家没实测过的上游凭空开始丢帧）。反过来的话，
+    /// 「改一个部署参数」就能动到任意一家的下发字节 —— 那正是本仓拒绝的形态：
+    /// 丢帧的依据只覆盖实测过的 WorkBuddy / AutoClaw 两家（见模块头），
+    /// 而部署参数是谁都能设的。
+    ///
+    /// 默认关（`config::KEY_STRIP_NEWLINE_KEEPALIVE`）：开着才会吃掉模型真·
+    /// 单独成片的那个换行 —— 少一个换行的外观损失换掉整屏断句，值不值由用户判，
+    /// 所以判权留在面板 / 环境变量上，而不是编译期替他决定。
+    pub fn assembled(rewrite: Option<ModelRewrite>, declared: bool, switch_on: bool) -> Self {
+        Self { rewrite, strip_newline_chunks: declared && switch_on }
+    }
+}
+
+/// 这一帧是不是「整片只有换行」的保活分片（判据全部是**宁可不丢**的方向）。
+///
+/// 命中要同时满足下面每一条：
+///   - `choices[0].delta.content` 是非空、且**只由换行符组成**的字符串；
+///   - 同一个 delta 里没有别的有效载荷：`reasoning_content` 为空/缺失、
+///     `tool_calls` 空数组、`function_call` 假值 —— 一帧里只要还有别的真东西，
+///     它就不只是节拍，不能丢；
+///   - `choices[0].finish_reason` 是 null 或空串：终端帧丢了客户端就等不到收尾；
+///   - 顶层 `usage` 缺失或为 null：usage 帧同理（本函数只在旁路提取**之后**
+///     才被调用，所以统计不会因为丢弃而少记）；
+///   - 顶层没有 `error`：流内错误帧一律保留。
+///
+/// `delta.role` 存在**不影响**判定：AutoClaw 的每一帧都带 `role:"assistant"`，
+/// 把它算进「有别的东西」就等于一条都丢不掉。
+pub fn is_newline_keepalive(chunk: &Value) -> bool {
+    let Some(object) = chunk.as_object() else {
+        return false;
+    };
+    if object.contains_key("error") {
+        return false;
+    }
+    if chunk.get("usage").is_some_and(|usage| !usage.is_null()) {
+        return false;
+    }
+    let Some(choice) = chunk
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+    else {
+        return false;
+    };
+    if choice.get("finish_reason").is_some_and(is_truthy) {
+        return false;
+    }
+    let Some(delta) = choice.get("delta").and_then(Value::as_object) else {
+        return false;
+    };
+    let newline_only = delta
+        .get("content")
+        .and_then(Value::as_str)
+        .map(|text| !text.is_empty() && text.chars().all(|ch| ch == '\n' || ch == '\r'))
+        .unwrap_or(false);
+    if !newline_only {
+        return false;
+    }
+    // 除 content 之外还有别的载荷就不算纯噪声
+    let carries_reasoning = delta
+        .get("reasoning_content")
+        .and_then(Value::as_str)
+        .map(|text| !text.is_empty())
+        .unwrap_or(false);
+    let carries_tool_calls = delta
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .map(|items| !items.is_empty())
+        .unwrap_or(false);
+    let carries_function_call = delta.get("function_call").map(is_truthy).unwrap_or(false);
+    !(carries_reasoning || carries_tool_calls || carries_function_call)
+}
+
+
 /// 帧元数据（对应 Node 的 `meta = { id, model, created }`）
 #[derive(Default, Clone, Debug)]
 struct FrameMeta {
@@ -94,6 +195,7 @@ pub struct ReasoningCoalescer {
     usage_cache_creation: Option<i64>,
     usage_has_output: bool,
     done_seen: bool,
+    strip_newline_chunks: bool,
 }
 
 impl Default for ReasoningCoalescer {
@@ -115,6 +217,7 @@ impl ReasoningCoalescer {
             usage_cache_creation: None,
             usage_has_output: false,
             done_seen: false,
+            strip_newline_chunks: false,
         }
     }
 
@@ -127,6 +230,12 @@ impl ReasoningCoalescer {
     /// 未被调用时行为与接入前逐字节一致。
     pub fn with_model_rewrite(mut self, rewrite: Option<ModelRewrite>) -> Self {
         self.rewrite = rewrite;
+        self
+    }
+
+    pub fn with_policy(mut self, policy: FramePolicy) -> Self {
+        self.rewrite = policy.rewrite;
+        self.strip_newline_chunks = policy.strip_newline_chunks;
         self
     }
 
@@ -226,6 +335,9 @@ impl ReasoningCoalescer {
             if let Some(created) = chunk.get("created").filter(|value| is_truthy(value)) {
                 self.meta.created = Some(created.clone());
             }
+        }
+        if self.strip_newline_chunks && is_newline_keepalive(&chunk) {
+            return;
         }
         let delta = chunk
             .get("choices")
@@ -582,5 +694,238 @@ mod tests {
             .collect::<String>();
         assert!(text.contains("\"prompt_tokens\":100"));
         assert!(text.contains("\"completion_tokens\":4"));
+    }
+
+    use super::*;
+    use serde_json::json;
+
+    fn raw(value: Value) -> String {
+        format!("data: {}\n\n", serde_json::to_string(&value).expect("测试里的帧必须是合法 JSON"))
+    }
+
+    /// 上游（WorkBuddy）形态的一帧：带 usage:null 与 finish_reason 两个尾巴字段，
+    /// 与真实流里的样子对齐 —— 判据依赖这两处，测试不能给一个过于干净的形状。
+    fn keepalive_frame(delta: Value) -> String {
+        raw(json!({
+            "id": "cmb-1",
+            "object": "chat.completion.chunk",
+            "created": 1_700_000_000,
+            "model": "deepseek-v4.1-flash",
+            "choices": [{"index": 0, "delta": delta, "finish_reason": null}],
+            "usage": Value::Null,
+        }))
+    }
+
+    fn coalescer(strip: bool) -> ReasoningCoalescer {
+        ReasoningCoalescer::new().with_policy(FramePolicy {
+            rewrite: None,
+            strip_newline_chunks: strip,
+        })
+    }
+
+    fn feed(coalescer: &mut ReasoningCoalescer, text: &str) -> String {
+        coalescer
+            .push(text.as_bytes())
+            .iter()
+            .map(|frame| String::from_utf8_lossy(frame).to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_newline_only_chunk_passes_through_when_the_policy_is_off() {
+        let keepalive = keepalive_frame(json!({"content": "\n"}));
+        let mut off = coalescer(false);
+        let out = feed(&mut off, &keepalive);
+        // 关着时是逐字节透传：整帧原样出去
+        assert_eq!(out, keepalive, "关着时帧的字节必须一模一样");
+        assert!(out.contains("\"content\":\"\\n\""), "关着时不能动这一帧: {out}");
+    }
+
+    #[test]
+    fn a_newline_only_chunk_is_dropped_when_the_policy_is_on() {
+        let mut on = coalescer(true);
+        assert!(feed(&mut on, &keepalive_frame(json!({"content": "\n"}))).is_empty());
+        assert!(feed(&mut on, &keepalive_frame(json!({"content": "\n\n\n"}))).is_empty());
+        assert!(feed(&mut on, &keepalive_frame(json!({"content": "\r\n"}))).is_empty());
+    }
+
+    #[test]
+    fn autoclaw_shape_is_dropped_too_role_included() {
+        // 本家每一帧都带 `role:"assistant"`，且没有 `finish_reason` 键 ——
+        // role 若算「有别的有效载荷」，这一家一条都丢不掉（见判据的说明）。
+        let dropped = raw(json!({
+            "id": "20260927001447d076",
+            "created": 1_790_439_287,
+            "object": "chat.completion.chunk",
+            "model": "glm-5.3-flash",
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": "\n"}}],
+        }));
+        let mut on = coalescer(true);
+        assert!(feed(&mut on, &dropped).is_empty());
+        let mut off = coalescer(false);
+        assert!(!feed(&mut off, &dropped).is_empty());
+    }
+
+    #[test]
+    fn a_dropped_keepalive_does_not_flush_the_reasoning_accumulator() {
+        let reasoning = keepalive_frame(json!({"reasoning_content": "abc"}));
+        let keepalive = keepalive_frame(json!({"content": "\n"}));
+        let mut on = coalescer(true);
+        let mut out = feed(&mut on, &reasoning);
+        out.push_str(&feed(&mut on, &keepalive));
+        assert!(out.is_empty(), "纯噪声帧既不该下发，也不该把攒了一半的思考结掉: {out}");
+        // 关掉时它是普通的「非 reasoning 事件」，照旧会冲刷 —— 这条对照证明
+        // 开启丢弃确实改变了这一帧的处理路径，而不是一直如此
+        let mut off = coalescer(false);
+        let mut out_off = feed(&mut off, &reasoning);
+        out_off.push_str(&feed(&mut off, &keepalive));
+        assert!(out_off.contains("reasoning_content"), "关着时应先冲刷思考帧: {out_off}");
+    }
+
+    #[test]
+    fn terminal_usage_and_error_frames_are_never_dropped() {
+        let cases = vec![
+            // 终端帧：丢了客户端就等不到收尾
+            json!({"choices": [{"index": 0, "delta": {"content": "\n"}, "finish_reason": "stop"}]}),
+            // usage 帧：丢了统计少一条
+            json!({"choices": [{"index": 0, "delta": {"content": "\n"}}], "usage": {"total_tokens": 3}}),
+            // 流内错误帧
+            json!({"error": {"message": "\n"}, "choices": [{"index": 0, "delta": {"content": "\n"}}]}),
+        ];
+        for case in cases {
+            let mut on = coalescer(true);
+            let text = raw(case.clone());
+            let out = feed(&mut on, &text);
+            assert!(!out.is_empty(), "这类帧绝不能被当成保活噪声丢掉: {case}");
+            assert_eq!(out, text, "保留时原样透传: {case}");
+        }
+    }
+
+    #[test]
+    fn text_bearing_frames_are_untouched_by_the_strip() {
+        let mut on = coalescer(true);
+        for delta in [
+            json!({"content": " real"}),
+            json!({"content": ".\n\n"}),
+            json!({"content": "\n \n"}),
+            json!({"content": "端"}),
+        ] {
+            let text = keepalive_frame(delta.clone());
+            assert_eq!(feed(&mut on, &text), text, "带正文的帧要逐字透传: {delta}");
+        }
+    }
+
+    /// 生产抓包（NAS `request_raw` 的下发字节，WorkBuddy 的
+    /// `deepseek-v4.1-flash`，请求 id `185d8dbf…`）里连续七帧的**原样字节**：
+    /// 上游把保活换行夹在正文分片之间。最后一帧 `":\n"` 是「真文本 + 换行」，
+    /// 一起丢掉就会把冒号也吞了 —— 这条测试锁住判据的边界。
+    const CAPTURED: [&str; 7] = [
+        r#"data: {"id":"cmb-22097200b9bf11f1a8cfb69a5c373198","model":"deepseek-v4.1-flash","object":"chat.completion.chunk","created":1790436599,"choices":[{"index":0,"delta":{"content":"A","reasoning_content":"","function_call":null,"refusal":"","tool_calls":[],"extra_fields":null},"logprobs":null,"finish_reason":""}],"usage":null}"#,
+        r#"data: {"id":"cmb-22097200b9bf11f1a8cfb69a5c373198","model":"deepseek-v4.1-flash","object":"chat.completion.chunk","created":1790436599,"choices":[{"index":0,"delta":{"content":"\n","reasoning_content":"","function_call":null,"refusal":"","tool_calls":[],"extra_fields":null},"logprobs":null,"finish_reason":""}],"usage":null}"#,
+        r#"data: {"id":"cmb-22097200b9bf11f1a8cfb69a5c373198","model":"deepseek-v4.1-flash","object":"chat.completion.chunk","created":1790436599,"choices":[{"index":0,"delta":{"content":" real","reasoning_content":"","function_call":null,"refusal":"","tool_calls":[],"extra_fields":null},"logprobs":null,"finish_reason":""}],"usage":null}"#,
+        r#"data: {"id":"cmb-22097200b9bf11f1a8cfb69a5c373198","model":"deepseek-v4.1-flash","object":"chat.completion.chunk","created":1790436599,"choices":[{"index":0,"delta":{"content":"\n","reasoning_content":"","function_call":null,"refusal":"","tool_calls":[],"extra_fields":null},"logprobs":null,"finish_reason":""}],"usage":null}"#,
+        r#"data: {"id":"cmb-22097200b9bf11f1a8cfb69a5c373198","model":"deepseek-v4.1-flash","object":"chat.completion.chunk","created":1790436599,"choices":[{"index":0,"delta":{"content":" finding","reasoning_content":"","function_call":null,"refusal":"","tool_calls":[],"extra_fields":null},"logprobs":null,"finish_reason":""}],"usage":null}"#,
+        r#"data: {"id":"cmb-22097200b9bf11f1a8cfb69a5c373198","model":"deepseek-v4.1-flash","object":"chat.completion.chunk","created":1790436599,"choices":[{"index":0,"delta":{"content":"\n","reasoning_content":"","function_call":null,"refusal":"","tool_calls":[],"extra_fields":null},"logprobs":null,"finish_reason":""}],"usage":null}"#,
+        r#"data: {"id":"cmb-22097200b9bf11f1a8cfb69a5c373198","model":"deepseek-v4.1-flash","object":"chat.completion.chunk","created":1790436599,"choices":[{"index":0,"delta":{"content":":\n","reasoning_content":"","function_call":null,"refusal":"","tool_calls":[],"extra_fields":null},"logprobs":null,"finish_reason":""}],"usage":null}"#,
+    ];
+
+    #[test]
+    fn a_replayed_production_stream_keeps_only_the_text_bearing_frames() {
+        let stream: String = CAPTURED.iter().map(|line| format!("{line}\n\n")).collect();
+        let text_bearing: Vec<String> = vec![0, 2, 4, 6]
+            .into_iter()
+            .map(|index| format!("{}\n\n", CAPTURED[index]))
+            .collect();
+
+        // 开启：只留带正文的四帧，且每帧逐字节不变（丢帧是整帧丢，不重写）
+        let mut on = coalescer(true);
+        let dropped = feed(&mut on, &stream);
+        assert_eq!(dropped, text_bearing.concat(), "开启时应当只留下带正文的帧");
+
+        // 关闭：七帧原样出去 —— 与接入本功能前的字节完全一致
+        let mut off = coalescer(false);
+        assert_eq!(feed(&mut off, &stream), stream, "关掉时要逐字节透传整段流");
+
+        // 客户端拼出来的正文（两种开关对照）
+        let content_of = |text: &str| -> String {
+            text.split("\n")
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+                .filter_map(|chunk| {
+                    chunk
+                        .get("choices")?
+                        .get(0)?
+                        .get("delta")?
+                        .get("content")?
+                        .as_str()
+                        .map(str::to_string)
+                })
+                .collect()
+        };
+        assert_eq!(content_of(&dropped), "A real finding:\n");
+        assert_eq!(content_of(&stream), "A\n real\n finding\n:\n");
+    }
+
+    #[test]
+    fn the_predicate_requires_every_signal_to_be_empty() {
+        assert!(is_newline_keepalive(&json!({"choices": [{"delta": {"content": "\n"}}]})));
+        assert!(!is_newline_keepalive(&json!({"choices": [{"delta": {"content": "\n "}}]})));
+        assert!(!is_newline_keepalive(&json!({"choices": [{"delta": {"content": ""}}]})));
+        assert!(!is_newline_keepalive(&json!({"choices": [{"delta": {"content": 7}}]})));
+        assert!(!is_newline_keepalive(&json!({"choices": [{"delta": {}}]})));
+        assert!(!is_newline_keepalive(&json!({"choices": []})));
+        assert!(!is_newline_keepalive(&json!({"choices": [{"delta": {"content": "\n"}, "finish_reason": "length"}]})));
+        assert!(!is_newline_keepalive(&json!({"choices": [{"delta": {"content": "\n", "reasoning_content": "x"}}]})));
+        assert!(!is_newline_keepalive(&json!({"choices": [{"delta": {"content": "\n", "tool_calls": [{"index": 0}]}}]})));
+        assert!(!is_newline_keepalive(&json!({"choices": [{"delta": {"content": "\n", "function_call": {"name": "x"}}}]})));
+        assert!(!is_newline_keepalive(&Value::Null));
+        assert!(!is_newline_keepalive(&json!("")));
+    }
+
+    /// 装配规则本身：**能力位 × 开关**，两位都真才丢。
+    ///
+    /// 三条断言各自对应一个会被搞反的方向 ——
+    ///   - `declared=false, switch=true` ⇒ 不丢：开关只能收窄不能扩张，
+    ///     否则"改一个部署参数"就会动到一家没实测过的上游的下发字节；
+    ///   - `declared=true, switch=false` ⇒ 不丢：默认态（也是关掉时的态），
+    ///     见下面那条端到端字节对照；
+    ///   - 两位都真 ⇒ 丢。
+    #[test]
+    fn the_strip_needs_both_the_capability_bit_and_the_switch() {
+        let rewrite = Some(ModelRewrite { requested: "m".to_string() });
+        assert!(
+            !FramePolicy::assembled(rewrite.clone(), false, true).strip_newline_chunks,
+            "开关不能替一家没声明能力位的提供商开始丢帧"
+        );
+        assert!(
+            !FramePolicy::assembled(rewrite.clone(), true, false).strip_newline_chunks,
+            "开关关着时，声明了能力位的那两家也不动字节"
+        );
+        assert!(FramePolicy::assembled(rewrite.clone(), true, true).strip_newline_chunks);
+        // 开关只管丢弃那一项，model 回写不受它影响（两者是两回事）
+        let policy = FramePolicy::assembled(rewrite, true, false);
+        assert_eq!(policy.rewrite.map(|value| value.requested).as_deref(), Some("m"));
+    }
+
+    /// 端到端一条：**能力位开着、开关关着**时，那条生产脏流要逐字节原样出去。
+    ///
+    /// 这条是"默认零影响"的证据，不是上面那条纯函数的重复：它走的是真实状态机
+    /// （`ReasoningCoalescer::push`），万一将来丢弃动作被挪到别处（比如挪到
+    /// reasoning 累积之前），纯函数的断言还会绿，而这条会红。
+    #[test]
+    fn a_capable_provider_with_the_switch_off_still_streams_byte_identical_frames() {
+        let stream: String = CAPTURED.iter().map(|line| format!("{line}\n\n")).collect();
+        let declared_but_switched_off =
+            FramePolicy::assembled(None, true, false).strip_newline_chunks;
+        let mut coalescer = ReasoningCoalescer::new().with_policy(FramePolicy {
+            rewrite: None,
+            strip_newline_chunks: declared_but_switched_off,
+        });
+        let out: String = coalescer
+            .push(stream.as_bytes())
+            .iter()
+            .map(|frame| String::from_utf8_lossy(frame).to_string())
+            .collect();
+        assert_eq!(out, stream, "开关关着时七帧要一字不动地出去");
     }
 }

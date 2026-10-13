@@ -274,6 +274,17 @@
   gap: 7px;
 }
 
+/* 「路由」分类的两行（路由策略 / 会话粘性）：行内问号紧跟分段控件 —— 问号
+   放在 118px 标签列的右侧、控件左边，视觉上就是「标签后的说明」 */
+.routing-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.routing-row .tip-q {
+  flex: none;
+}
+
 /* 覆盖 components.css 的 input[type=number]{max-width:130px}
 
 ：这里要收窄到 92px，
@@ -402,6 +413,41 @@
   color: var(--text-3);
   font-weight: 400;
   letter-spacing: 0;
+}
+
+/* ─── 模型级系统提示词 ─── */
+.model-prompt-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 14px -14px 0;
+  padding: 0 14px 2px;
+}
+
+.model-prompt-note { color: var(--text-2); font-size: 11.5px; line-height: 1.7; }
+
+.model-prompt-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+}
+
+.model-prompt-main { display: flex; flex: 1 1 auto; min-width: 0; flex-direction: column; gap: 3px; }
+.model-prompt-main code { color: var(--text); font-family: var(--font-mono); font-size: 12px; word-break: break-all; }
+.model-prompt-main span { color: var(--text-2); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-prompt-actions { display: flex; flex: 0 0 auto; gap: 6px; }
+.model-prompt-empty { padding: 16px; border: 1px dashed var(--border); border-radius: var(--r-sm); color: var(--text-3); text-align: center; }
+.model-prompt-add { display: grid; grid-template-columns: minmax(160px, .7fr) minmax(260px, 1.3fr) auto; align-items: start; gap: 8px; padding-top: 10px; border-top: 1px dashed var(--border); }
+.model-prompt-add textarea { min-height: 58px; }
+.model-prompt-save { display: flex; justify-content: flex-end; padding-top: 2px; }
+
+@media (max-width: 700px) {
+  .model-prompt-add { grid-template-columns: 1fr; }
+  .model-prompt-actions { flex-wrap: wrap; }
 }
 
 /* 「网关自带」那一行的标签：比普通行标签轻一档（它是同一家的**第二行**，

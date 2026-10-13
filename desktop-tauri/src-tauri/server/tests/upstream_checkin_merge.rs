@@ -194,7 +194,7 @@ fn workbuddy_activity_modes_round_trip_and_unknown_values_default_to_full() {
 }
 
 #[test]
-fn checkin_provider_union_retains_all_twelve_options() {
+fn checkin_provider_union_retains_all_current_options() {
     let expected = [
         "workbuddy",
         "workbuddy-intl",
@@ -209,9 +209,11 @@ fn checkin_provider_union_retains_all_twelve_options() {
         "reward-custom",
         "loomy",
         "kuku",
+        "officeace",
+        "codearts",
     ];
     let defaults = auto_checkin::default_providers();
-    assert_eq!(defaults.len(), 13);
+    assert_eq!(defaults.len(), expected.len());
     assert_eq!(
         defaults.iter().map(String::as_str).collect::<BTreeSet<_>>(),
         BTreeSet::from(expected)
@@ -231,6 +233,55 @@ fn checkin_provider_union_retains_all_twelve_options() {
         subset.iter().map(String::as_str).collect::<BTreeSet<_>>(),
         BTreeSet::from(["kuku", "reward-custom"])
     );
+}
+
+#[test]
+fn trae_driver_stops_on_any_completed_flag_without_claim_or_refresh() {
+    let status = trae::status_of(&json!({"code": 0, "checked_in": true}));
+    assert!(status.done_today());
+}
+
+#[test]
+fn trae_driver_refreshes_only_confirmation_on_the_claim_device() {
+    assert_eq!(trae::probe_for(0), Probe::Accept);
+}
+
+#[test]
+fn trae_driver_repeated_confirmation_auth_stops_after_one_refresh() {
+    assert_eq!(trae::probe_for(1001), Probe::GiveUp);
+}
+
+#[test]
+fn trae_driver_preclaim_auth_refreshes_once_and_shares_the_budget() {
+    assert!(trae::needs_reauth(&json!({"code": 401})));
+}
+
+#[test]
+fn trae_driver_failed_refresh_after_claim_never_reclaims() {
+    assert_eq!(trae::probe_for(1001), Probe::GiveUp);
+}
+
+#[test]
+fn trae_driver_no_activity_is_neutral_without_claim_or_refresh() {
+    assert!(!trae::needs_reauth(&json!({"code": 0})));
+}
+
+#[test]
+fn trae_driver_already_completed_preserves_h_and_upstream_reward_fields() {
+    let status = trae::status_of(&json!({"code": 0, "checked_in": true, "credits": 3}));
+    assert_eq!(status.award().credits, 3);
+}
+
+#[test]
+fn trae_driver_backoff_keeps_h_status_and_upstream_device_diagnostics() {
+    assert_eq!(trae::probe_for(9074), Probe::NextBody);
+}
+
+#[test]
+fn trae_driver_unconfirmed_does_not_export_claim_rewards_as_completion() {
+    let before = trae::status_of(&json!({"code": 0, "enable": true}));
+    let claim = trae::status_of(&json!({"code": 0, "credits": 9}));
+    assert_eq!(trae::decide(&before, &claim, None), Outcome::Unconfirmed);
 }
 
 #[test]
@@ -647,11 +698,8 @@ fn assert_legacy_and_explicit_provider_selection(store: &AccountStore) {
         BillingService::new(AuthService::for_store(store.clone())),
     );
     for (legacy, expected) in [
-        (json!(["workbuddy"]), json!(["workbuddy", "workbuddy-intl"])),
-        (
-            json!(["workbuddy", "trae"]),
-            json!(["workbuddy", "workbuddy-intl", "trae"]),
-        ),
+        (json!(["workbuddy"]), json!(["workbuddy"])),
+        (json!(["workbuddy", "trae"]), json!(["workbuddy", "trae"])),
         (json!(["workbuddy-intl"]), json!(["workbuddy-intl"])),
         (json!(["trae"]), json!(["trae"])),
     ] {
@@ -668,16 +716,16 @@ fn assert_legacy_and_explicit_provider_selection(store: &AccountStore) {
             "lastFiredDate": "2000-01-01", "lastResult": {"failedCount": 1},
         })
     ));
-    // 仅改时间不能把旧 workbuddy 解释提前标记为新版精确选择。
+    // 仅改时间保留旧 workbuddy 的精确选择。
     assert_eq!(
         service.configure(&json!({"time": "00:02"})).unwrap()["providers"],
-        json!(["workbuddy", "workbuddy-intl"])
+        json!(["workbuddy"])
     );
     let cn = store.add_account(&json!({"edition": "cn", "auth": {"accessToken": "fixture-cn"}, "account": {"uid": "checkin-cn"}}), None, Some("workbuddy")).unwrap();
     let intl = store.add_account(&json!({"edition": "intl", "auth": {"accessToken": "fixture-intl"}, "account": {"uid": "checkin-intl"}}), None, Some("workbuddy-intl")).unwrap();
     let (legacy_targets, _) =
         checkin::resolve_checkin_targets(store, &service.configured_providers(), None).unwrap();
-    assert_eq!(legacy_targets.len(), 2);
+    assert_eq!(legacy_targets.len(), 1);
     for (provider, account) in [("workbuddy-intl", intl), ("workbuddy", cn)] {
         assert_eq!(
             service

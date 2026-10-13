@@ -56,6 +56,7 @@
 
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{params, params_from_iter, Connection};
+use serde_json::Value;
 
 use super::record::{AttemptDetail, RequestEntry, RequestQuery, RunningProgress, SensitiveHit};
 use super::report::normalize_status_filter;
@@ -71,7 +72,7 @@ const REQUEST_COLUMNS: &str = "id, ts, model, account_id, account_name, status, 
      first_response_ms, attempts, error, prompt_tokens, completion_tokens, total_tokens, \
      cache_read_tokens, provider, client_model, upstream_model, attempt_details, sensitive_hits, \
      client_reasoning, upstream_reasoning, phase, phase_started_at, cache_creation_tokens, \
-     upstream_credits, is_test";
+     upstream_credits, is_test, route";
 
 // `request_daily`（按天聚合）那一支的列常量、编解码与读-改-写语句在
 // `daily.rs` —— 两张表的语句分文件后各自独立演化。
@@ -125,6 +126,10 @@ fn decode_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestEntry> {
         // SQLite 没有布尔类型，按 INTEGER 读再判非零 —— 不依赖驱动对 bool 的
         // 隐式转换（手改过的库里写成 2 也照样算「是测试」）
         is_test: row.get::<_, i64>(25)? != 0,
+        route: row
+            .get::<_, Option<String>>(26)?
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or(Value::Null),
     })
 }
 

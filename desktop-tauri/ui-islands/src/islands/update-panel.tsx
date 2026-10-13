@@ -2,11 +2,12 @@ import * as React from 'react'
 import { createRoot } from 'react-dom/client'
 import { Badge, Button, Progress } from '@ui'
 import {
-  errorMessage, handleExternalClick, markdownHtml, safeExternal, shared, toast,
+  errorMessage, handleExternalClick, markdownHtml, QQ_GROUP, safeExternal, shared, toast,
   type DownloadTask, type UpdateInfo,
 } from './update-shared'
 import { showUpdateModal } from './update-modal'
 import { UpdateSettingsDialog } from './update-settings'
+import { QqGroupDialog } from './update-qq-group'
 import { t } from '../i18n'
 
 /**
@@ -641,8 +642,10 @@ function downloadButton(snap: Snapshot): { label: string; disabled: boolean } | 
   return { label, disabled: snap.actionBusy }
 }
 
-/** 更新日志（最新一版）：正文与「在 GitHub 查看」都在一张静态卡片里，不再折叠 */
-function changelogCard(snap: Snapshot): React.ReactNode {
+/** 更新日志（最新一版）：正文与「在 GitHub 查看」都在一张静态卡片里，不再折叠。
+ *  第二个参数是页脚「加入 QQ 群」的动作 —— 卡片本体是普通函数不是组件（用不了
+ *  hook），弹窗开关得留在面板组件里，所以从那儿递进来 */
+function changelogCard(snap: Snapshot, onJoinQq: () => void): React.ReactNode {
   const info = snap.info
   const notes = String(info?.notes || '').trim()
   if (!notes) {
@@ -672,13 +675,30 @@ function changelogCard(snap: Snapshot): React.ReactNode {
             <p className='md-body-empty'>{t('这个版本没有填写发布说明。')}</p>
           </div>
         )}
-        {pageUrl ? (
-          <div className='rel-foot'>
+        {/* 页脚：GitHub 说明（有发布页时才有）+ 加入 QQ 群。两个入口看起来是同一副
+            长相 —— 左边是裸 <a>（.rel-foot a 管：平时无下划线，悬停才出），右边是
+            组件库 Button 的 link 变体（本身也是透明底 + 悬停下划线），尺寸/字重/颜色
+            三项按左边那条对齐。**别**为了省事换成裸 <button>：ui/css/components.css
+            那条 `button:hover:not(:disabled)`（0,3,1，带灰底）会压过页面级的同类声明，
+            鼠标一移上去就冒底色；组件库的工具类带 !important，正好压得住它。
+            QQ 那条不依赖 pageUrl（网页端没有 GitHub 链接，但群是一样的），故在条件外 */}
+        <div className='rel-foot'>
+          {pageUrl ? (
             <a href={pageUrl} data-external={pageUrl} target='_blank' rel='noopener'>
               {t('在 GitHub 查看完整说明')}
             </a>
-          </div>
-        ) : null}
+          ) : null}
+          <Button
+            type='button'
+            variant='link'
+            size='sm'
+            className='h-auto border-0 px-0 text-[11.5px] font-semibold text-primary-fg underline-offset-auto'
+            title={t('群号：{group}', { group: QQ_GROUP })}
+            onClick={onJoinQq}
+          >
+            {t('加入 QQ 群')}
+          </Button>
+        </div>
       </div>
     </div>
   )
@@ -692,6 +712,9 @@ function UpdatePanel() {
   // 「更新设置」弹窗的开关：弹窗是本组件条件渲染的（Dialog 自带 Portal 挂 body），
   // 读数在弹窗自己那里现拉（见 update-settings.tsx 的说明），不进模块快照
   const [settingsOpen, setSettingsOpen] = React.useState(false)
+  // 「加入 QQ 群」弹窗：同上（更新日志卡片里那颗按钮点开，卡片是普通函数、挂不了
+  // hook，所以开关留在这一层）
+  const [qqGroupOpen, setQqGroupOpen] = React.useState(false)
 
   // 面板常驻（root 随应用生命周期），正常不会卸载；万一将来被卸载（骨架变化 / 页面
   // 重载），把进度轮询收掉 —— 悬挂的定时器会一直按 1 秒打后端
@@ -810,13 +833,17 @@ function UpdatePanel() {
             <span className='update-log-title'>{t('更新日志')}</span>
             <span className='update-log-meta' id='update-log-meta'>{logMeta}</span>
           </div>
-          <div className='update-log-body' id='update-log-body'>{changelogCard(snap)}</div>
+          <div className='update-log-body' id='update-log-body'>
+            {changelogCard(snap, () => setQqGroupOpen(true))}
+          </div>
         </div>
       </div>
 
       {/* 「更新设置」弹窗：条件渲染（Dialog 自带 Portal 挂 body，放在 section 里
           只是声明位置，不影响视觉层级）；关闭即卸载，状态在弹窗内部自生自灭 */}
       {settingsOpen ? <UpdateSettingsDialog open onClose={() => setSettingsOpen(false)} /> : null}
+      {/* 「加入 QQ 群」：二维码 + 群号（图在项目仓库里，见 update-shared.ts 的说明） */}
+      {qqGroupOpen ? <QqGroupDialog open onClose={() => setQqGroupOpen(false)} /> : null}
     </section>
   )
 }

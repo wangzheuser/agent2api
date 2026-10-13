@@ -497,6 +497,12 @@ async fn dispatch_checkin(
                 "daily_checkin",
             )
         }
+        "officeace" => {
+            let claim = crate::server::core::providers::officeace::checkin::claim_daily_checkin(store, &id)
+                .await
+                .map_err(|error| error.message);
+            claim_result(id, name, &display, true, claim)
+        }
         other => with_reward_kind(
             json!({
                 "id": id,
@@ -643,7 +649,7 @@ fn claim_result(
 /// 可能一次都没签上，把它当作已签到去置灰按钮会白丢一天。这不是假想 ——
 /// 实测见过自动签到 4 个账号全部未领取、17 秒后手动逐个重试全部成功
 /// （批次撞上上游风控），所以判据必须收紧到「上游说签过了」。
-fn checkin_completed_today(claim: &Value) -> bool {
+pub(crate) fn checkin_completed_today(claim: &Value) -> bool {
     if claim.get("success").and_then(Value::as_bool) == Some(true) {
         return true;
     }
@@ -679,7 +685,11 @@ pub fn claim_pending(claim: &Value) -> bool {
     // 两个地区的「无活动」文案都含这一句；实现改措辞时这里要跟着对齐
     //（`providers::qoder::checkin::no_claim` 与 trae 的「未领取 + 原因」不同形，
     // trae 不走这条 pending 逻辑 —— 它没有窗口概念）。
-    message.contains("没有可领取的签到活动") || message.contains("未下发每日积分活动")
+    message.contains("没有可领取的签到活动")
+        || message.contains("当前没有可领取的奖励")
+        || message.contains("无每日签到活动")
+        || message.contains("未下发每日积分活动")
+        || message.contains("日活奖励尚未确认")
 }
 
 /// 执行一次签到并汇总（Node 版 `runCheckin(id)`）。
@@ -695,6 +705,7 @@ pub async fn run_checkin(
     providers: &[String],
     id: Option<&str>,
     reason: &str,
+    _source: &str,
 ) -> Result<Value, CheckinError> {
     let (targets, skipped) = resolve_checkin_targets(store, providers, id)?;
     let mut results = Vec::with_capacity(targets.len());

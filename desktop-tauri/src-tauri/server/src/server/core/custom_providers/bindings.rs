@@ -3,6 +3,7 @@
 use serde_json::{json, Value};
 
 use crate::server::core::capability;
+use crate::server::core::model_meta;
 use crate::server::core::models::model_id;
 
 pub fn resolve(provider: &Value, requested: &str) -> Option<(String, Option<String>, Option<String>)> {
@@ -60,6 +61,11 @@ fn resolve_binding(provider: &Value, requested: &str, testing: bool) -> Option<(
 /// 能力位**平铺**在条目顶层（与各内置家清单同形，`list_item` 直接读它们）；
 /// 存储里那层 `capabilities` 对象由 `capability::apply_overrides` 展开 ——
 /// 归一也走它，手改数据里的坏值到不了出口。
+///
+/// 登记里**没写**的键由 models.dev 补（`core::model_meta::apply`）——那条路径的
+/// 优先级与内置家同一条：用户登记的值（上面的 `capabilities`）> models.dev >
+/// 未声明。自定义家的条目只服务对外清单与管理页的「这家有哪些模型」，
+/// 它不出现在内置家的管理视图里（那套读的是 `providers::catalog::manage_view`）。
 pub fn public_models(provider: &Value) -> Vec<Value> {
     let models = provider.get("models").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
     let mut names = Vec::new();
@@ -83,6 +89,7 @@ pub fn public_models(provider: &Value) -> Vec<Value> {
                 .and_then(|model| model.get("capabilities")),
         );
         capability::apply_overrides(&mut item, &capabilities);
+        model_meta::apply(&mut item);
         result.push(item);
     }
     result

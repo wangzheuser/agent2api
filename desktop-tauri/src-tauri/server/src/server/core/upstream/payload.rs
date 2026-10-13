@@ -185,7 +185,12 @@ pub(super) fn send_body<'a>(
     // `degraded` = 本请求是否已进入降级（请求开始时状态机已生效，或本次撞了
     // 内容拦截后由转发层置位）：降级期用最小中性提示词（`custom` 模式除外，
     // 见 `PromptChoice::text_for`）。
-    let prompt = ctx.prompt.for_provider(provider_id);
+    let requested_model = ctx
+        .body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let prompt = ctx.prompt.for_provider(provider_id, requested_model);
     let after_prompt = match prompt.apply(ctx.body, degraded) {
         Some(next) => {
             logging::verbose(

@@ -252,6 +252,8 @@ impl GatewayBlocks {
 pub struct PromptPlan<'a> {
     /// 未单独配置的家用的那一份（对应全局的 `promptMode` / `promptFile`）
     pub default: PromptChoice<'a>,
+    /// 按客户端请求模型精确匹配的全局正文覆盖。
+    model_prompts: &'a std::collections::BTreeMap<String, String>,
     /// 逐家覆盖（借自配置快照；空表 = 所有家都用 default）
     providers: &'a std::collections::BTreeMap<String, crate::server::config::ProviderPrompt>,
 }
@@ -259,31 +261,40 @@ pub struct PromptPlan<'a> {
 impl<'a> PromptPlan<'a> {
     /// 组装一次请求的提示词决定（**唯一构造点**：`config::RuntimeConfig::prompt_plan`）。
     ///
-    /// 逐家覆盖不对外暴露字段：它只有「按 id 取一份」这一个合法用法（见
-    /// [`Self::for_provider`]），让调用方拿到整张表迟早会有人自己写一遍查找。
+    /// 模型映射与逐家覆盖都不对外暴露字段：调用方只通过统一选择方法按请求模型和
+    /// 提供商取一份决定，避免各处自行实现优先级。
     ///
     /// 「网关自带提示词」的开关**不在这里**：它由 `config::gateway_prompt_enabled`
     /// 直接读（那是一条热路径上的轻量读取，见那里的说明）。两个入口读同一张表，
     /// 各自不重复实现「缺省 = 装」的默认值，就不会有一处漏改。
     pub fn new(
         default: PromptChoice<'a>,
+        model_prompts: &'a std::collections::BTreeMap<String, String>,
         providers: &'a std::collections::BTreeMap<String, crate::server::config::ProviderPrompt>,
     ) -> Self {
-        Self { default, providers }
+        Self { default, model_prompts, providers }
     }
 
     /// 这一家实际要用的那一份（没单独配就走 `default`）。
     ///
-    /// 返回**借用**视图而不是值：逐家覆盖里带着几百行文本，克隆一次就等于把
-    /// 「借用视图」这层设计白做了。
-    pub fn for_provider(&self, provider_id: &str) -> PromptChoice<'_> {
-        match self.providers.get(provider_id) {
+    /// 返回**借用**视图而不是值：模型/提供商覆盖里带着长文本，克隆一次就等于
+    /// 把「借用视图」这层设计白做了。
+    pub fn for_provider(&self, provider_id: &str, requested_model: &str) -> PromptChoice<'_> {
+        let base = match self.providers.get(provider_id) {
             Some(entry) => PromptChoice {
                 mode: entry.mode,
                 text: &entry.text,
                 source: entry.source,
             },
             None => self.default,
+        };
+        match self.model_prompts.get(requested_model) {
+            Some(text) if !text.trim().is_empty() => PromptChoice {
+                text,
+                source: PromptSource::Inline,
+                ..base
+            },
+            _ => base,
         }
     }
 }
@@ -423,4 +434,88 @@ fn is_system_role(message: &Value) -> bool {
         .and_then(Value::as_str)
         .map(|role| role == "system" || role == "developer")
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PromptChoice, PromptMode, PromptPlan, PromptSource, DEGRADED_PROMPT};
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    fn plan<'a>(
+        mode: PromptMode,
+        global: &'a str,
+        model_prompts: &'a BTreeMap<String, String>,
+        providers: &'a BTreeMap<String, crate::server::config::ProviderPrompt>,
+    ) -> PromptPlan<'a> {
+        PromptPlan::new(
+            PromptChoice { mode, text: global, source: PromptSource::Inline },
+            model_prompts,
+            providers,
+        )
+    }
+
+    #[test]
+    fn exact_model_match_overrides_provider_text_and_keeps_mode() {
+        let mut model_prompts = BTreeMap::from([("model-a".to_string(), "model text".to_string())]);
+        let providers = BTreeMap::from([(
+            "provider-a".to_string(),
+            crate::server::config::ProviderPrompt {
+                mode: PromptMode::Append,
+                file: None,
+                inline: Some("provider text".to_string()),
+                text: "provider text".to_string(),
+                source: PromptSource::Inline,
+                file_error: None,
+            },
+        )]);
+        let first_plan = plan(PromptMode::Custom, "global text", &model_prompts, &providers);
+        let prompt = first_plan.for_provider("provider-a", "model-a");
+        assert_eq!(prompt.mode, PromptMode::Append);
+        assert_eq!(prompt.text, "model text");
+
+        model_prompts.insert("model-a-suffix".to_string(), "suffix".to_string());
+        let second_plan = plan(PromptMode::Custom, "global text", &model_prompts, &providers);
+        let unmatched = second_plan.for_provider("provider-a", "model");
+        assert_eq!(unmatched.text, "provider text");
+        let whitespace_unmatched = second_plan.for_provider("provider-a", " model-a ");
+        assert_eq!(whitespace_unmatched.text, "provider text");
+    }
+
+    #[test]
+    fn model_prompt_reuses_custom_and_append_behavior() {
+        let models = BTreeMap::from([("model".to_string(), "model text".to_string())]);
+        let providers = BTreeMap::new();
+        let body = json!({
+            "messages": [
+                {"role": "system", "content": "client"},
+                {"role": "user", "content": "hello"}
+            ]
+        });
+
+        let custom = plan(PromptMode::Custom, "global", &models, &providers)
+            .for_provider("provider", "model")
+            .apply(&body, false)
+            .expect("custom mode should rewrite");
+        assert_eq!(custom["messages"][0]["content"], "model text");
+        assert_eq!(custom["messages"].as_array().unwrap().len(), 2);
+
+        let append = plan(PromptMode::Append, "global", &models, &providers)
+            .for_provider("provider", "model")
+            .apply(&body, false)
+            .expect("append mode should add a message");
+        assert_eq!(append["messages"][0]["content"], "client");
+        assert_eq!(append["messages"][1]["content"], "model text");
+
+        let degraded = plan(PromptMode::Append, "global", &models, &providers)
+            .for_provider("provider", "model")
+            .apply(&body, true)
+            .expect("degraded append should rewrite with the neutral prompt");
+        assert_eq!(degraded["messages"][0]["content"], DEGRADED_PROMPT);
+
+        let passthrough = plan(PromptMode::Passthrough, "global", &models, &providers)
+            .for_provider("provider", "model")
+            .apply(&body, false);
+        assert!(passthrough.is_none());
+    }
 }

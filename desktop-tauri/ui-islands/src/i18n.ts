@@ -36,5 +36,8 @@ declare global {
 export function t(key: string, params?: TParams): string {
   const api = typeof window !== 'undefined' ? window.wbI18n : undefined
   if (api && typeof api.t === 'function') return api.t(key, params)
-  return key
+  return key.replace(/\{([A-Za-z0-9_]+)\}/g, (match, name: string) => {
+    const value = params?.[name]
+    return value === undefined ? match : String(value)
+  })
 }

@@ -42,7 +42,9 @@ use serde_json::{json, Value};
 
 use crate::server::config::{
     self, PromptSettings, ProviderPromptPatch, KEY_PROMPT_FILE, KEY_PROMPT_GATEWAY,
-    KEY_PROMPT_GATEWAY_TEXT, KEY_PROMPT_MODE, KEY_PROMPT_PROVIDERS, KEY_PROMPT_TEXT,
+    KEY_PROMPT_GATEWAY_TEXT, KEY_PROMPT_MODE, KEY_PROMPT_MODEL_SYSTEM_PROMPTS,
+    KEY_PROMPT_PROVIDERS, KEY_PROMPT_TEXT, MAX_PROMPT_MODEL_ENTRIES,
+    MAX_PROMPT_MODEL_NAME_CHARS, MAX_PROMPT_MODEL_POLICY_BYTES, MAX_PROMPT_MODEL_TEXT_CHARS,
 };
 use crate::server::core::degrade;
 use crate::server::core::prompt::{GatewayBlocks, PromptMode};
@@ -60,8 +62,8 @@ pub async fn get_prompt(State(_state): State<ServerState>) -> Response {
     ok_json(prompt_json(&config::current()))
 }
 
-/// PUT /api/prompt —— body `{promptMode?, promptFile?, promptText?, promptProviders?,
-/// promptGateway?, promptGatewayText?, clearDegrade?}`
+/// PUT /api/prompt —— body `{promptMode?, promptFile?, promptText?,
+/// promptModelSystemPrompts?, promptProviders?, promptGateway?, promptGatewayText?, clearDegrade?}`
 ///
 /// 允许部分字段（未出现的项保持原值，**`null` 同义**）—— 与 `/api/retry` 同一口径。
 /// 要**清除**提示词文件 / 界面正文就传空串（或只含空白的串）：`promptFile: ""`
@@ -145,6 +147,22 @@ pub async fn put_prompt(State(_state): State<ServerState>, body: Bytes) -> Respo
             }
         }
     }
+
+    // ── 全局模型级提示词（精确模型名 → 正文）────────────────────
+    // 缺失 / null = 不改；对象为空 = 清空；一条非法项使整次请求拒绝，避免半套写入。
+    let model_prompt_patch = match object.get(KEY_PROMPT_MODEL_SYSTEM_PROMPTS) {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(entries)) => match validate_model_prompts(entries) {
+            Ok(models) => Some(models),
+            Err(message) => return errors::management_error(400, message),
+        },
+        Some(value) => {
+            return errors::management_error(
+                400,
+                format!("{KEY_PROMPT_MODEL_SYSTEM_PROMPTS} 必须是对象或 null（收到: {value}）"),
+            )
+        }
+    };
 
     // ── 按提供商的覆盖（可选；先全部校验通过再落盘）──────────────
     // 形状：`{"<providerId>": {"promptMode"?, "promptFile"?, "promptText"?} | null}`
@@ -396,6 +414,14 @@ pub async fn put_prompt(State(_state): State<ServerState>, body: Bytes) -> Respo
             "⚠️  系统提示词设置写入失败，本次运行内仍生效",
         );
     }
+    if let Some(models) = model_prompt_patch.clone() {
+        if !config::set_prompt_model_prompts(models) {
+            logging::log(
+                "[Config]",
+                "⚠️ 全局模型系统提示词写入失败，本次运行内仍生效",
+            );
+        }
+    }
     // 逐家覆盖：一家一条地写（单条写入失败只影响那一家的持久化，其余照写）
     for (id, patch) in &provider_patches {
         if !config::set_prompt_provider(id, patch.clone()) {
@@ -435,6 +461,7 @@ pub async fn put_prompt(State(_state): State<ServerState>, body: Bytes) -> Respo
         || next.inline != settings.inline
         || next.source != settings.source
         || next.file_error != settings.file_error
+        || model_prompt_patch.is_some()
         || !provider_patches.is_empty()
         || !gateway_patches.is_empty()
         || !gateway_text_patches.is_empty();
@@ -455,6 +482,9 @@ pub async fn put_prompt(State(_state): State<ServerState>, body: Bytes) -> Respo
                 })
                 .collect();
             detail.push_str(&format!("；按提供商：{}", names.join(", ")));
+        }
+        if model_prompt_patch.is_some() {
+            detail.push_str(&format!("；全局模型系统提示词={} 项", next.model_prompts.len()));
         }
         if !gateway_patches.is_empty() {
             // 关掉是**用户主动放弃上游要求**的动作，日志里必须看得见（排障时
@@ -498,6 +528,73 @@ pub async fn put_prompt(State(_state): State<ServerState>, body: Bytes) -> Respo
     ok_json(prompt_json(&after))
 }
 
+fn validate_model_prompts(
+    entries: &serde_json::Map<String, Value>,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    if entries.len() > MAX_PROMPT_MODEL_ENTRIES {
+        return Err(format!(
+            "{KEY_PROMPT_MODEL_SYSTEM_PROMPTS} 最多配置 {MAX_PROMPT_MODEL_ENTRIES} 个模型"
+        ));
+    }
+    let serialized = serde_json::to_vec(&Value::Object(entries.clone()))
+        .map_err(|error| format!("{KEY_PROMPT_MODEL_SYSTEM_PROMPTS} 无法序列化：{error}"))?;
+    if serialized.len() > MAX_PROMPT_MODEL_POLICY_BYTES {
+        return Err(format!("{KEY_PROMPT_MODEL_SYSTEM_PROMPTS} 超过 64 KiB 限制"));
+    }
+    let mut models = std::collections::BTreeMap::new();
+    for (model, value) in entries {
+        if model.trim() != model
+            || model.is_empty()
+            || model.chars().count() > MAX_PROMPT_MODEL_NAME_CHARS
+        {
+            return Err(format!(
+                "{KEY_PROMPT_MODEL_SYSTEM_PROMPTS}.{model} 模型名必须是 1-{MAX_PROMPT_MODEL_NAME_CHARS} 个字符且不能带首尾空白"
+            ));
+        }
+        let Some(prompt) = value.as_str() else {
+            return Err(format!("{KEY_PROMPT_MODEL_SYSTEM_PROMPTS}.{model} 必须是字符串"));
+        };
+        if prompt.trim().is_empty() || prompt.chars().count() > MAX_PROMPT_MODEL_TEXT_CHARS {
+            return Err(format!(
+                "{KEY_PROMPT_MODEL_SYSTEM_PROMPTS}.{model} 正文不能为空且最多 {MAX_PROMPT_MODEL_TEXT_CHARS} 个字符"
+            ));
+        }
+        models.insert(model.clone(), prompt.to_string());
+    }
+    Ok(models)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_model_prompts;
+    use serde_json::json;
+
+    #[test]
+    fn model_prompt_validation_accepts_exact_map_and_empty_clear() {
+        let value = json!({"claude-3-7-sonnet": "回答用中文"});
+        let map = validate_model_prompts(value.as_object().unwrap()).unwrap();
+        assert_eq!(map["claude-3-7-sonnet"], "回答用中文");
+        let empty = serde_json::Map::new();
+        assert!(validate_model_prompts(&empty).unwrap().is_empty());
+    }
+
+    #[test]
+    fn model_prompt_validation_rejects_trimmed_duplicate_shape_and_oversize() {
+        let padded = json!({" model": "prompt"});
+        assert!(validate_model_prompts(padded.as_object().unwrap()).is_err());
+        let empty = json!({"model": "  "});
+        assert!(validate_model_prompts(empty.as_object().unwrap()).is_err());
+        let long = json!({"model": "x".repeat(65_537)});
+        assert!(validate_model_prompts(long.as_object().unwrap()).is_err());
+
+        let oversized_map = json!({
+            "model-a": "x".repeat(33_000),
+            "model-b": "y".repeat(33_000),
+        });
+        assert!(validate_model_prompts(oversized_map.as_object().unwrap()).is_err());
+    }
+}
+
 /// 响应体（GET 与 PUT 共用；前端直接用响应刷新界面，不必再 GET 一次）。
 ///
 /// 键名对前端是**契约**（`settings-panel.js` 逐字对齐），因此都用常量标识符
@@ -512,6 +609,7 @@ fn prompt_json(config: &config::RuntimeConfig) -> Value {
         // 不隐藏它 —— 编辑功能要的正是这份文本，「提示词几百行」在设置页这一路
         // （进页面 / 点刷新时才请求一次）里不是问题。
         KEY_PROMPT_TEXT: settings.text,
+        KEY_PROMPT_MODEL_SYSTEM_PROMPTS: settings.model_prompts,
         // 生效文本的来源：none（passthrough）/ builtin（内置默认）/ file（文件）/
         // inline（界面里编辑的那份）
         "promptSource": settings.source.as_str(),

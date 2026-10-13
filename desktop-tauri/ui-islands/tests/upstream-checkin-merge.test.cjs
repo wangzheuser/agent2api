@@ -31,7 +31,7 @@ before(async context => {
     plugins: [{
       name: 'checkin-test-boundaries',
       setup(builder) {
-        builder.onResolve({ filter: /^(react|react-dom\/client|@ui|\.\/add-provider-pick)$/ }, args => ({
+        builder.onResolve({ filter: /^(react|react-dom(?:\/.*)?|@ui|\.\/add-provider-pick)$/ }, args => ({
           path: args.path, external: true,
         }))
         builder.onLoad({ filter: /[\\/]checkin-page\.tsx$/ }, args => ({
@@ -90,6 +90,7 @@ async function fixture({ row = { id: 'A', claim: { success: true } }, onboarding
     document: { querySelector: () => null, addEventListener() {} },
     require(dependency) {
       if (dependency === 'react') return React
+      if (dependency === 'react-dom') return { flushSync(callback) { callback() } }
       if (dependency === '@ui') return {
         Badge: 'span', Button: 'button', Checkbox: 'input', Input: 'input',
         Progress: 'progress', Spinner: 'span', Switch: 'input',

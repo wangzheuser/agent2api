@@ -71,7 +71,7 @@ async fn loomy_and_workbuddy_dispatch_preserve_completion_and_failures() {
     }
 
     let loomy_result =
-        checkin::run_checkin(&store, &billing, &["loomy".into()], None, "fixture-loomy")
+        checkin::run_checkin(&store, &billing, &["loomy".into()], None, "fixture-loomy", "manual")
             .await
             .unwrap();
     assert_eq!(loomy_result["total"], 2);
@@ -109,6 +109,7 @@ async fn loomy_and_workbuddy_dispatch_preserve_completion_and_failures() {
         &["workbuddy".into()],
         None,
         "fixture-workbuddy",
+        "manual",
     )
     .await
     .unwrap();
@@ -171,6 +172,7 @@ async fn assert_workbuddy_http200_completion(store: &AccountStore, billing: &Bil
             &["workbuddy".into()],
             Some(&id),
             "fixture-http200",
+            "single",
         )
         .await
         .unwrap();

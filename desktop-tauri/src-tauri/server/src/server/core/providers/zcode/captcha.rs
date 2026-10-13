@@ -2,10 +2,13 @@
 //! 等待不持锁；取消释放等待计数；通知注册后再查库存，防止丢失唤醒。
 use serde_json::{json, Value};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::Notify;
+
+use crate::server::core::providers::readiness;
+use crate::server::logging;
 
 pub(super) const VERIFY_PARAM_HEADER: &str = "x-aliyun-captcha-verify-param";
 pub(super) const VERIFY_REGION_HEADER: &str = "x-aliyun-captcha-verify-region";
@@ -155,7 +158,11 @@ fn pool() -> &'static CaptchaPool {
 }
 
 pub fn push(param: &str, region: &str) -> usize {
-    pool().push(param, region, crate::server::logging::now_ms())
+    let ready = pool().push(param, region, crate::server::logging::now_ms());
+    if ready > 0 {
+        ungate();
+    }
+    ready
 }
 pub fn take() -> Option<Proof> {
     pool().take(crate::server::logging::now_ms())
@@ -174,6 +181,61 @@ pub fn note_challenge() {
         p.entries.clear();
     }
     pool().demand.notify_one();
+}
+
+/// 上游明确拒绝了免码请求：把配置结论翻回“需要令牌”。
+pub fn note_challenge_and_require_token() {
+    note_challenge();
+    set_required(true);
+}
+
+static TOKEN_REQUIRED: AtomicBool = AtomicBool::new(true);
+static LAST_SYNC_AT: AtomicI64 = AtomicI64::new(0);
+
+fn env_forces_token() -> bool {
+    static FORCED: OnceLock<bool> = OnceLock::new();
+    *FORCED.get_or_init(|| {
+        let raw = std::env::var("ZCODE_REQUIRE_CAPTCHA")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        matches!(raw.as_str(), "1" | "true" | "yes" | "on")
+    })
+}
+
+/// 当前请求是否必须携带验证码令牌。
+pub fn required() -> bool {
+    env_forces_token() || TOKEN_REQUIRED.load(Ordering::SeqCst)
+}
+
+pub fn set_required(required: bool) -> bool {
+    if env_forces_token() && !required {
+        return false;
+    }
+    let changed = TOKEN_REQUIRED.swap(required, Ordering::SeqCst) != required;
+    if changed {
+        if required {
+            logging::console_line("[ZCode]", "🔒 活动套餐通道改回每条请求需要验证码令牌");
+        } else {
+            logging::console_line("[ZCode]", "🔓 上游配置允许活动套餐通道免码直发");
+            ungate();
+        }
+    }
+    changed
+}
+
+pub fn note_synced() {
+    LAST_SYNC_AT.store(crate::server::logging::now_ms(), Ordering::SeqCst);
+}
+
+pub fn last_sync_at() -> i64 {
+    LAST_SYNC_AT.load(Ordering::SeqCst)
+}
+
+fn ungate() {
+    for region in super::region::Region::ALL {
+        readiness::release(region.provider_id());
+    }
 }
 
 pub fn set_producer(status: &str, failures: u64) {
@@ -205,6 +267,7 @@ pub fn stats() -> Value {
         "lastChallengeAt": p.last_challenge_at, "lastMintAt": p.last_mint_at,
         "waiting": pool().waiting.load(Ordering::Relaxed), "timedOut": p.timed_out,
         "producer": p.producer,
+        "required": required(), "lastSyncAt": last_sync_at(),
     })
 }
 

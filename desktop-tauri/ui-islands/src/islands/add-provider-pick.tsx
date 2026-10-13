@@ -77,6 +77,20 @@ export const PROVIDER_ICONS: Record<string, string> = {
   // KukuAI：取自客户端 `GenFlowPro.exe` 的 RT_ICON 资源（256×256 那张，
   // 与系统里显示的应用图标为同一张）
   kuku: 'assets/providers/kuku.png',
+  // MonkeyCode：取自客户端 asar 内嵌的应用图标（`electron/icon.png`，与系统里
+  // 显示的应用图标为同一张；国内 / 国际版共用这一张，同 AutoClaw 的形态）
+  monkeycode: 'assets/providers/monkeycode.png',
+  'monkeycode-intl': 'assets/providers/monkeycode.png',
+  // Command Code / Antigravity：这两家没有可解的本地安装包，图取自官方资产 ——
+  // Command Code 用官网 `apple-touch-icon.png`（黑底 + 白结的应用图标形态；官方
+  // brand 页那种「白描边框 + 满幅黑底」的变体在 13px 徽章里会糊），Antigravity
+  // 用官方 press 页的「Icon - Full Color」（antigravity.google/press）
+  commandcode: 'assets/providers/commandcode.png',
+  antigravity: 'assets/providers/antigravity.png',
+  // OfficeAce（华为云果办）：取自官网产品页的产品图标
+  // （`res-static.hc-cdn.cn/.../OfficeAce/新图标.png`，176×176 RGBA，
+  // 归一成 256×256 入库 —— 与系统里显示的应用图标为同一形象）
+  officeace: 'assets/providers/officeace.png',
 }
 
 type CardItem = {

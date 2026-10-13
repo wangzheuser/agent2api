@@ -243,7 +243,7 @@ mod tests {
         let aggregate = super::super::aggregate::aggregate_frame_stream(
             Box::pin(input),
             aggregate_telemetry.clone(),
-            None,
+            super::super::sse::FramePolicy::default(),
         )
         .await
         .unwrap();
@@ -1024,6 +1024,7 @@ struct LiveWrite {
 /// 只能靠一个双方都能拿到的句柄传话。槽位只在一条请求内共享，不存在争用。
 pub struct RequestTelemetry {
     inner: Mutex<TelemetrySnapshot>,
+    route: Mutex<Option<Value>>,
     /// 调试模式的原始报文采集器（`core::debug_traffic`；None = 未开启调试模式）。
     ///
     /// 挂在这里供原始响应入口取用；协议转换与聚合层不重复采集。
@@ -1150,11 +1151,20 @@ impl RequestTelemetry {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(TelemetrySnapshot::default()),
+            route: Mutex::new(None),
             capture: Mutex::new(None),
             live: Mutex::new(LiveWrite::default()),
             cancel: Mutex::new(None),
             affinity: Mutex::new(AffinityObservation::default()),
         }
+    }
+
+    pub fn set_route_decision(&self, decision: Value) {
+        *self.route.lock().unwrap_or_else(|p| p.into_inner()) = Some(decision);
+    }
+
+    pub fn route_decision(&self) -> Option<Value> {
+        self.route.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     pub(crate) fn begin_affinity_attempt(
