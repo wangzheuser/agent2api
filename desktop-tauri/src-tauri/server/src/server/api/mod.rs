@@ -98,6 +98,8 @@ pub mod proxies;
 pub mod qoder_umid;
 pub mod queue_api;
 pub mod retry_api;
+// 完整账号路由配置与候选队列可见化（兼容桌面桥接与设置页）。
+pub mod routing_api;
 pub mod rewards;
 pub mod sanitize;
 pub mod scheduled_tasks;
@@ -111,3 +113,5 @@ pub mod upgrade_api;
 // 活动套餐通道的人机验证令牌池（界面铸造 → 网关消费），见该文件模块头
 pub mod zcode_captcha;
 pub mod zcode_claim;
+// 活动套餐验证码池的补货节奏设置。
+pub mod zcode_captcha_pool;
