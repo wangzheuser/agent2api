@@ -1281,14 +1281,11 @@ export function TableHead({ namesHidden, allPicked, somePicked, disabled, onTogg
             title='全选 / 取消全选当前筛选结果（与批量栏同一个选择）'
             onCheckedChange={next => onToggleAll(next)} />
         </th>
-        <th className='cell-priority' data-col='priority'>
-          <span className='th-label' title='全局一条队列：数值越小越先用，不分提供商'>
-            优先级<span className='th-hint'>全局队列</span>
+        <th className='cell-order' data-col='order'>
+          <span className='th-label' title='组内先后：按住左边的把手上下拖动即可调整；整组的先后拖分组带的把手'>
+            顺序
           </span>
           {grip}
-        </th>
-        <th className='cell-provider' data-col='provider'>
-          <span className='th-label'>提供商</span>{grip}
         </th>
         <th className='cell-account' data-col='account'>
           <span className='th-label'>

@@ -227,10 +227,8 @@ function AccountsPage() {
             aria-label='勾选后可批量操作'
             onCheckedChange={next => togglePick(account.id, next)} />
         )
-      case 'priority':
+      case 'order':
         return <PriorityStepper account={account} seat={ctx.seat} />
-      case 'provider':
-        return <ProviderCell account={account} />
       case 'account':
         return <AccountCell account={account} namesHidden={store.namesHidden} />
       case 'proxy':
@@ -419,7 +417,7 @@ function setTableElement(el: HTMLTableElement | null): void {
   tableEl = el
 }
 
-/** 列宽骨架（colgroup）：11 列的字面量顺序，`data-col` 与表头、列设置、列宽层三处同名 */
+/** 列宽骨架（colgroup）：列定义的字面量顺序，`data-col` 与表头、列设置、列宽层三处同名 */
 function ColGroup() {
   const widths = columnWidths()
   const col = (key: string) => (
@@ -428,8 +426,7 @@ function ColGroup() {
   return (
     <colgroup>
       {col('pick')}
-      {col('priority')}
-      {col('provider')}
+      {col('order')}
       {col('account')}
       {col('proxy')}
       {col('connections')}
