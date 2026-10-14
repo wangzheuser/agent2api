@@ -79,11 +79,11 @@ async function run() {
   assert.match(await page.locator('.credits-balance').innerText(),/不限量/);assert.equal(await page.locator('.credits-distribution').count(),0);checks.push('enterprise unlimited has no false percentage');
   await page.keyboard.press('Escape');
   await apply(page,details(),'B');
-  await page.locator('.credit-balance-trigger').nth(1).press('Enter');
+  await page.locator('tr[data-id="B"] .credit-balance-trigger').press('Enter');
   assert.match(await page.locator('.credits-description').innerText(),/WorkBuddy 国际版/);checks.push('native international account routes through same dialog');
   await page.keyboard.press('Escape');
   await apply(page,details(),'D');
-  await page.locator('.credit-balance-trigger').nth(3).press('Enter');
+  await page.locator('tr[data-id="D"] .credit-balance-trigger').press('Enter');
   assert.match(await page.locator('.credits-description').innerText(),/WorkBuddy 国际版/);checks.push('legacy international account keeps dialog compatibility');
   assert.equal(await page.locator('.credit-balance-trigger').count(),4);checks.push('all balance-capable providers expose the same dialog trigger');
   await page.close();

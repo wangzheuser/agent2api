@@ -22,5 +22,9 @@ assert.deepEqual(colgroup, declared, '账号表 colgroup 必须与列定义保�
 assert.deepEqual(header, declared, '账号表表头必须与列定义保持同一列序')
 assert.equal(header.includes('priority'), false, '账号表不能恢复已移除的优先级列')
 assert.equal(header.includes('provider'), false, '账号表不能恢复已移除的提供商列')
+assert.match(page, /groupView\(usageEntryOf, tokenUsageOf\)/, '账号页必须按提供商恢复分组视图')
+assert.match(page, /bindQueueDrag\(listRef\.current/, '账号页必须绑定顺序拖拽')
+assert.match(page, /<GroupBandRow group=\{group\}/, '账号页必须渲染分组带')
+assert.match(panels, /export function OrderCell/, '顺序列必须使用组内顺序单元格')
 
 console.log('accounts layout columns stay aligned')

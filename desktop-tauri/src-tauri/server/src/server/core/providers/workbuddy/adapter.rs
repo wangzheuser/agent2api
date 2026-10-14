@@ -673,22 +673,29 @@ impl ProviderAdapter for WorkBuddyAdapter {
                 .query_usage(Some(&entry.session), None)
                 .await
                 .map_err(|error| error.to_gateway_error())?;
-            let mut document = crate::server::core::billing::credits_summary_from(&usage);
-            let Some(object) = document.as_object_mut() else {
-                return Ok(document);
-            };
-            // 企业账号没有资源包（那份额度是「本周期已用 / 上限」一笔账，
-            // 见 `get_enterprise_usage`）：明细与套餐两项都不挂，界面退回单行读数
-            let packs = crate::server::core::billing::credit_packs_from(&usage);
-            if !packs.is_empty() {
-                object.insert("credits".to_string(), Value::Array(packs));
-            }
-            if let Some(subscription) = subscription_of(&usage) {
-                object.insert("subscription".to_string(), subscription);
-            }
-            Ok(document)
+            Ok(usage_document(&usage))
         })
     }
+}
+
+fn usage_document(usage: &Value) -> Value {
+    let mut document = crate::server::core::billing::credits_summary_from(usage);
+    let Some(object) = document.as_object_mut() else {
+        return document;
+    };
+    // 摘要与结构化明细必须来自同一次上游查询；缺少明细会让前端退回通用余额。
+    object.insert(
+        "creditDetails".to_string(),
+        usage.get("creditDetails").cloned().unwrap_or(Value::Null),
+    );
+    let packs = crate::server::core::billing::credit_packs_from(usage);
+    if !packs.is_empty() {
+        object.insert("credits".to_string(), Value::Array(packs));
+    }
+    if let Some(subscription) = subscription_of(usage) {
+        object.insert("subscription".to_string(), subscription);
+    }
+    document
 }
 
 /// `get_personal_usage` 的成果 → 统一契约里的 `subscription`（账号页弹层头部那一行）。
@@ -961,6 +968,30 @@ mod tests {
             .unwrap()
             .1
             .as_str()
+    }
+
+    #[test]
+    fn usage_document_keeps_credit_details_with_legacy_summary() {
+        let details = json!({
+            "version": 1,
+            "kind": "personal",
+            "fetchedAt": 1_800_000_000_000i64,
+            "complete": true,
+            "remaining": 12.5,
+            "unlimited": false,
+            "unattributedRemaining": 0,
+            "issues": [],
+            "segments": [],
+        });
+        let usage = json!({
+            "kind": "personal",
+            "resources": [{"left": 12.5, "packageCode": "trial"}],
+            "creditDetails": details,
+        });
+        let document = usage_document(&usage);
+        assert_eq!(document["totalLeft"], 12);
+        assert_eq!(document["creditDetails"]["fetchedAt"], 1_800_000_000_000i64);
+        assert!(document["credits"].is_array());
     }
 
     #[test]

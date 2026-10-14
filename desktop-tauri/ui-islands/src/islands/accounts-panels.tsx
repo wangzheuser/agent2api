@@ -57,12 +57,99 @@ import { creditDetailsOf, formatCreditAmount } from './accounts-credit-details'
 import {
   PROXY_CUSTOM_CURRENT, PROXY_CUSTOM_EDIT, applyProxyPick, checkinErrorOf,
   commitPriority, connectionsOf, maskName, moveAccount, openCreditsDialog, openSettingsDialog, poolError,
-  proxyPoolSnapshot, queryUsageOnce, runCheckin, setAccountEnabled, setPanelOpen,
-  openZcodePlans, startCodeArtsWelfare, tokenUsageOf, toggleNamesHidden, usageEntryOf, usageFailureOf,
+  openBatchDialog, openZcodePlans, proxyPoolSnapshot, queryUsageOnce, runCheckin, setAccountEnabled,
+  setGroupEnabled, setPanelOpen, startCodeArtsWelfare, toggleGroupCollapsed, tokenUsageOf,
+  toggleNamesHidden, usageEntryOf, usageFailureOf,
 } from './accounts-data'
+import type { AccountGroup } from './accounts-domain'
+import { PROVIDER_ICONS } from './add-provider-pick'
+import { t } from '../i18n'
 /** 图标（icons.js 的内联 SVG 串）：整站共用一份图标集，这里只做注入 */
 function iconHtml(name: string, size: number): string {
   return shared().wbIcons?.icon?.(name, size) || ''
+}
+
+/* ─── 分组顺序 ──────────────────────────────── */
+
+export function OrderCell({ rank }: { account: AccountRecord; rank: number }) {
+  return (
+    <div className='order-cell'>
+      <span className='order-grip' role='button' tabIndex={-1} aria-label={t('拖动调整组内顺序')}
+        title={t('按住拖动，调整这个账号在本组内的顺序')}
+        dangerouslySetInnerHTML={{ __html: iconHtml('gripVertical', 14) }} />
+      <span className='order-rank' title={t('组内第 {rank} 位', { rank })}>{`#${rank}`}</span>
+    </div>
+  )
+}
+
+function GroupMenu({ group, ids }: { group: AccountGroup; ids: string[] }) {
+  const [open, setOpen] = React.useState(false)
+  const itemClass = 'w-full justify-start px-2 font-normal'
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger render={<button type='button' className='grp-iconbtn' title={t('本组操作')} />}>⋯</PopoverTrigger>
+      <PopoverContent align='end' sideOffset={4} className='w-[196px] p-1.5'>
+        <div className='flex flex-col gap-0.5'>
+          <Button variant='ghost' size='sm' className={itemClass}
+            onClick={() => { setOpen(false); void setGroupEnabled(ids, true) }}>
+            {t('全部启用（{n}）', { n: ids.length })}
+          </Button>
+          <Button variant='ghost' size='sm' className={itemClass}
+            onClick={() => { setOpen(false); void setGroupEnabled(ids, false) }}>
+            {t('全部禁用（{n}）', { n: ids.length })}
+          </Button>
+          <Button variant='ghost' size='sm' className={itemClass}
+            onClick={() => { setOpen(false); openBatchDialog(ids, 'proxy') }}>
+            {t('批量操作本组…')}
+          </Button>
+          <div className='my-1 h-px bg-hairline' />
+          <Button variant='ghost' size='sm' className={itemClass}
+            onClick={() => { setOpen(false); toggleGroupCollapsed(group.provider) }}>
+            {t('折叠本组')}
+          </Button>
+        </div>
+      </PopoverContent>
+    </Popover>
+  )
+}
+
+export function GroupBandRow({ group, collapsed, colSpan }: {
+  group: AccountGroup
+  collapsed: boolean
+  colSpan: number
+}) {
+  const icon = PROVIDER_ICONS[group.provider]
+  return (
+    <tr className='grp-band' data-provider={group.provider}>
+      <td colSpan={colSpan}>
+        <div className='grp-band-inner'>
+          <span className='queue-grip' role='button' tabIndex={-1} aria-label={t('拖动调整整组顺序')}
+            title={t('按住拖动，调整这一家的组顺位（整组一起动）')}
+            dangerouslySetInnerHTML={{ __html: iconHtml('gripVertical', 14) }} />
+          <span className='grp-rank' title={t('组顺位：越小越先用（拖动分组带调整）')}>
+            {t('第 {rank} 顺位', { rank: group.rank })}
+          </span>
+          <span className='grp-logo'>
+            {icon ? <img src={icon} alt='' loading='lazy' />
+              : <span className='grp-logo-txt'>{String(group.label || '?').trim().slice(0, 1).toUpperCase()}</span>}
+          </span>
+          <span className='grp-name'>{group.label}</span>
+          <span className='grp-stat'>{t('{total} 个账号 · 启用 {enabled} · 禁用 {disabled}{limited}', {
+            total: group.members.length,
+            enabled: group.enabled,
+            disabled: group.disabled,
+            limited: group.limited > 0 ? t(' · 限流 {n}', { n: group.limited }) : '',
+          })}</span>
+          <span className='grp-spacer' />
+          <button type='button' className='grp-iconbtn grp-fold' aria-expanded={!collapsed}
+            title={collapsed ? t('展开这一组') : t('折叠这一组')}
+            onClick={() => toggleGroupCollapsed(group.provider)}
+            dangerouslySetInnerHTML={{ __html: iconHtml('chevronDown', 14) }} />
+          <GroupMenu group={group} ids={group.members.map(account => account.id)} />
+        </div>
+      </td>
+    </tr>
+  )
 }
 
 /* ─── 优先级列 ──────────────────────────────── */
