@@ -85,6 +85,7 @@ pub(super) async fn query_usage(
     account_id: &str,
 ) -> Result<Value, GatewayError> {
     let credentials = credentials::snapshot_for(store, account_id)?;
+    let account_record = store.raccoon_account_record(account_id);
     if credentials.token.trim().is_empty() {
         return Err(GatewayError::with_status(
             401,
@@ -101,7 +102,7 @@ pub(super) async fn query_usage(
     }
 
     let available = to_int(points.get("available_points"));
-    let wallets: Vec<Value> = WALLET_LABELS
+    let mut wallets: Vec<Value> = WALLET_LABELS
         .iter()
         .filter_map(|(key, display_name)| {
             let balance = to_int(points.get(*key))?;
@@ -112,6 +113,7 @@ pub(super) async fn query_usage(
             }))
         })
         .collect();
+    wallets.extend(onboarding_wallets(account_record.as_ref()));
 
     // 订阅失败只记原因，不阻断余额展示（见上）
     let (subscription, subscription_error) =
@@ -133,6 +135,57 @@ pub(super) async fn query_usage(
         "subscription": subscription,
         "raw": Value::Object(raw),
     }))
+}
+
+/// 领取接口返回的首登奖励是独立积分段；已知到期时间时才加入明细，旧台账保持未知。
+fn onboarding_wallets(record: Option<&Value>) -> Vec<Value> {
+    let Some(ledger) = record
+        .and_then(|value| value.get("onboardingGrants"))
+        .and_then(Value::as_object)
+    else {
+        return Vec::new();
+    };
+    ledger
+        .iter()
+        .filter_map(|(key, value)| {
+            let object = value.as_object()?;
+            let points = to_int(object.get("points"))?;
+            let expires_at = object.get("expiresAt")?.clone();
+            if points <= 0 || expires_at.is_null() {
+                return None;
+            }
+            Some(json!({
+                "type": format!("onboarding:{key}"),
+                "displayName": "首登奖励积分",
+                "balance": points,
+                "expiresAt": expires_at,
+                "detail": "首次登录奖励",
+            }))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::onboarding_wallets;
+    use serde_json::json;
+
+    #[test]
+    fn onboarding_wallets_expose_known_reward_expiry_without_old_ledger_breakage() {
+        let wallets = onboarding_wallets(Some(&json!({
+            "onboardingGrants": {
+                "desktop_login_grant": {
+                    "at": 1,
+                    "points": 3000,
+                    "expiresAt": "2026-11-01"
+                },
+                "mobile_login_grant": 2
+            }
+        })));
+        assert_eq!(wallets.len(), 1);
+        assert_eq!(wallets[0]["balance"], 3000);
+        assert_eq!(wallets[0]["expiresAt"], "2026-11-01");
+    }
 }
 
 /// 发一次 GET 并解包 `{code, message, data}`（源实现 `requestJson` 的判定链）。

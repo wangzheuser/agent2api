@@ -91,7 +91,11 @@ fn settled_at(record: &Value, key: &str) -> i64 {
     record
         .get("onboardingGrants")
         .and_then(|ledger| ledger.get(key))
-        .and_then(Value::as_i64)
+        .and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.get("at").and_then(Value::as_i64))
+        })
         .unwrap_or(0)
 }
 
@@ -203,6 +207,16 @@ fn granted_outcome(data: &Value) -> (bool, i64) {
     (granted, points)
 }
 
+fn grant_expiry(data: &Value) -> Option<Value> {
+    data.pointer("/popup/expire_at")
+        .filter(|value| !value.is_null())
+        .and_then(|value| match value {
+            Value::String(text) if !text.trim().is_empty() => Some(value.clone()),
+            Value::Number(_) => Some(value.clone()),
+            _ => None,
+        })
+}
+
 /// 查询任务状态（`GET /api/accounts/{id}/onboarding` 的小浣熊执行体，只读：
 /// 不发任何上游请求）。
 ///
@@ -273,7 +287,13 @@ pub async fn claim_all(store: &AccountStore, account_id: &str) -> Result<Value, 
                 let (granted, points) = granted_outcome(&data);
                 claimed += 1;
                 claimed_points += points;
-                settled.insert(task.key.to_string(), Value::from(now));
+                let mut ledger_entry = Map::new();
+                ledger_entry.insert("at".to_string(), Value::from(now));
+                ledger_entry.insert("points".to_string(), Value::from(points));
+                if let Some(expires_at) = grant_expiry(&data) {
+                    ledger_entry.insert("expiresAt".to_string(), expires_at);
+                }
+                settled.insert(task.key.to_string(), Value::Object(ledger_entry));
                 rows.push(json!({
                     "key": task.key,
                     "ok": true,
@@ -348,4 +368,27 @@ pub async fn claim_all(store: &AccountStore, account_id: &str) -> Result<Value, 
         "settled": unclaimed == 0,
         "settledAt": if unclaimed == 0 { json!(settled_at_of(&merged)) } else { Value::Null },
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{grant_expiry, settled_at};
+    use serde_json::json;
+
+    #[test]
+    fn grant_expiry_reads_the_upstream_popup() {
+        assert_eq!(
+            grant_expiry(&json!({"popup":{"expire_at":"2026-11-01"}})),
+            Some(json!("2026-11-01"))
+        );
+        assert_eq!(grant_expiry(&json!({"popup":{"expire_at":""}})), None);
+    }
+
+    #[test]
+    fn settled_at_keeps_old_integer_ledgers_compatible() {
+        let old = json!({"onboardingGrants":{"desktop_login_grant":123}});
+        let current = json!({"onboardingGrants":{"desktop_login_grant":{"at":456,"points":3000}}});
+        assert_eq!(settled_at(&old, "desktop_login_grant"), 123);
+        assert_eq!(settled_at(&current, "desktop_login_grant"), 456);
+    }
 }

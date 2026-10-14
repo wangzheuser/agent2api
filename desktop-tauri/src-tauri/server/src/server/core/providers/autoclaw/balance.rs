@@ -202,7 +202,7 @@ async fn query_points(credentials: &AutoClawCredentials) -> Result<Value, Gatewa
 
     let data = wallet_payload.get("data").cloned().unwrap_or(Value::Null);
     let code_ok = wallet_payload.get("code").and_then(Value::as_i64) == Some(0);
-    let (total_balance, wallets, raw) = if code_ok
+    let (total_balance, mut wallets, raw) = if code_ok
         && data.get("wallets").and_then(Value::as_array).is_some()
     {
         let wallets = data
@@ -326,12 +326,39 @@ async fn query_points(credentials: &AutoClawCredentials) -> Result<Value, Gatewa
         Err(_) => Value::Null,
     };
 
+    if let Some(wallet) = expiring_wallet(&expiring) {
+        wallets.push(wallet);
+    }
+
     Ok(json!({
         "totalBalance": total_balance,
         "wallets": wallets,
         "expiring": expiring,
         "raw": raw,
     }))
+}
+
+/// 将上游「即将过期」汇总接到通用余额弹窗；它是一个聚合段，不能伪装成某个原生钱包。
+fn expiring_wallet(expiring: &Value) -> Option<Value> {
+    let balance = number_or_null(expiring.get("points"))?;
+    let expires_at = expiring
+        .get("expireTimeValue")
+        .filter(|value| !is_blank(value))?
+        .clone();
+    let mut wallet = json!({
+        "type": "expiring",
+        "displayName": "即将过期积分",
+        "balance": balance,
+        "balanceView": json_number_text(balance),
+        "expiresAt": expires_at,
+    });
+    if let Some(kind) = expiring
+        .get("expireTimeType")
+        .filter(|value| !is_blank(value))
+    {
+        wallet["detail"] = kind.clone();
+    }
+    Some(wallet)
 }
 
 /// v1 钱包实例按 `wallet_scope` 归类（源实现 `normalizeLegacyWallets`）。
@@ -623,5 +650,34 @@ fn json_number_text(value: f64) -> String {
         format!("{}", value as i64)
     } else {
         format!("{value}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expiring_wallet;
+    use serde_json::json;
+
+    #[test]
+    fn expiring_points_become_a_wallet_with_expiry() {
+        let wallet = expiring_wallet(&json!({
+            "points": 1200,
+            "expireTimeValue": "2026-11-01T00:00:00Z",
+            "expireTimeType": "date"
+        }))
+        .expect("有效的即将过期数据应生成钱包");
+        assert_eq!(wallet["balance"], 1200.0);
+        assert_eq!(wallet["expiresAt"], "2026-11-01T00:00:00Z");
+        assert_eq!(wallet["detail"], "date");
+    }
+
+    #[test]
+    fn incomplete_expiring_points_are_not_invented() {
+        assert!(expiring_wallet(&json!({"points": 1200})).is_none());
+        assert!(expiring_wallet(&json!({
+            "points": 0,
+            "expireTimeValue": ""
+        }))
+        .is_none());
     }
 }
