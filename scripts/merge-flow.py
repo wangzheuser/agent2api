@@ -94,6 +94,23 @@ def branch(root):
     return git(root, 'branch', '--show-current').decode().strip()
 
 
+def repository_snapshot(root):
+    """Capture the caller's worktree so a frozen round cannot absorb later work."""
+    status = git(root, 'status', '--porcelain=v1', '-z').decode().split('\0')
+    untracked = sorted(item[3:] for item in status if item.startswith('?? '))
+    return {
+        'head': commit(root, 'HEAD'),
+        'branch': branch(root),
+        'index_tree': git(root, 'write-tree').decode().strip(),
+        'cached_diff': digest(git(root, 'diff', '--cached', '--binary', '--')),
+        'worktree_diff': digest(git(root, 'diff', '--binary', '--')),
+        'untracked': untracked,
+        'merge_head': commit(root, 'MERGE_HEAD') if subprocess.run(
+            ['git', 'rev-parse', '-q', '--verify', 'MERGE_HEAD'], cwd=root,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0 else None,
+    }
+
+
 def freeze(root, path, upstream):
     if path.exists():
         raise ValueError('记录已存在；续作复用它，不覆盖冻结输入')
@@ -110,6 +127,7 @@ def freeze(root, path, upstream):
         raise ValueError('共同祖先不是唯一值；先分析历史，不自行选基线')
     record = {'schema_version': 1, 'root': str(root), 'branch': branch(root),
               'inputs': {'H': h, 'U': u, 'B': bases[0]},
+              'frozen_workspace': repository_snapshot(root),
               'initial_status': [item for item in git(root, 'status', '--porcelain=v1', '-z').decode().split('\0') if item],
               'receipts': [], 'seal': None}
     ensure_state(record)
@@ -118,6 +136,19 @@ def freeze(root, path, upstream):
     write_record(path, record)
     print(f'FROZEN: H={h}; U={u}; B={bases[0]}; branch={record["branch"]}')
     return record
+
+
+def preflight(root, path, record):
+    """Verify that the frozen caller checkout was not changed behind the record."""
+    expected = record.get('frozen_workspace')
+    if not expected:
+        raise ValueError('记录缺少冻结工作区快照；不能继续旧流程')
+    actual = repository_snapshot(root)
+    if actual != expected:
+        raise ValueError('冻结后的工作区已改变；重新 freeze，不能吸收后续工作')
+    if actual['merge_head'] is not None:
+        raise ValueError('当前工作区仍有 MERGE_HEAD；先恢复或继续原合并')
+    print(f"PREFLIGHT: branch={actual['branch']}; head={actual['head']}; untracked={len(actual['untracked'])}")
 
 
 def read_record(root, path):
@@ -684,6 +715,7 @@ def main():
     overlap_action.add_argument('--decision', action='append', default=[],
                                 help='重复功能决策：path=upstream_equivalent|local_extension|semantic_conflict|local_only')
     actions.add_parser('status')
+    actions.add_parser('preflight')
     actions.add_parser('plan')
     run = actions.add_parser('run')
     run.add_argument('--name', required=True)
@@ -707,6 +739,8 @@ def main():
                 overlap(root, path, record, args.decision)
             elif args.action == 'status':
                 status(root, path, record)
+            elif args.action == 'preflight':
+                preflight(root, path, record)
             elif args.action == 'plan':
                 plan(root, path, record)
             elif args.action == 'run':

@@ -43,6 +43,12 @@ class MergeFlowTests(unittest.TestCase):
         self.assertEqual(len(self.record['impact']), 3)
         self.assertTrue(all(Path(x['path']).is_file() for x in self.record['impact']))
 
+    def test_preflight_rejects_changes_after_freeze(self):
+        flow.preflight(self.root, self.path, self.record)
+        (self.root / 'source.py').write_text('value = 8\n', encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, '冻结后的工作区已改变'):
+            flow.preflight(self.root, self.path, self.record)
+
     def test_record_has_single_writer(self):
         with flow.locked_record(self.path):
             with self.assertRaises(FileExistsError):
