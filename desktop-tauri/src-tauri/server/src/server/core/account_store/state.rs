@@ -323,7 +323,8 @@ impl StoredAccount {
             .insert("claimPlans".to_string(), Value::Object(ledger));
     }
 
-    /// 小浣熊新手任务的**结算台账**：`{ "<task_key>": <毫秒时刻> }`。
+    /// 小浣熊新手任务的**结算台账**：旧记录值为毫秒时刻；新记录值为
+    /// `{ "at": <毫秒时刻>, "points": n, "expiresAt": ... }`。
     ///
     /// 键是 `providers::raccoon::onboarding` 的任务 key（`desktop_login_grant` /
     /// `mobile_login_grant`），值是这条**一次性**登录奖励结算的时刻 —— 「本轮刚

@@ -48,6 +48,7 @@
 import * as React from 'react'
 import { flushSync } from 'react-dom'
 import { createRoot } from 'react-dom/client'
+import { t } from '../i18n'
 import {
   Button,
   Checkbox,
@@ -60,20 +61,22 @@ import {
   cn,
 } from '@ui'
 import { TableFooter, useClientPaging } from './table-shell'
-import { shared, type AccountRecord, type ColSettingsHandle } from './accounts-shared'
-import { isDesktopAccount, isEnabled, supportsUsage, checkinableAccounts,
+import { shared, toast, type AccountRecord, type ColSettingsHandle } from './accounts-shared'
+import { isDesktopAccount, isEnabled, providerOf, supportsUsage, checkinableAccounts,
 } from './accounts-domain'
 import { ACCOUNT_COLUMNS, bindColumnGrips, columnWidths, tableMinWidth } from './accounts-columns'
 import {
-  allAccounts, checkinAll, clearLimits, clearSelection, ensureProxyPoolOptions,
-  getStore, installAccountsApi, normalizeFilter, openBatchDialog, panelOpen, patch, providerSummaryList,
-  queryAllUsage, rowContext, seats, segmentCounts, setAllPicked, setProviderFilter, setSegmentFilter,
-  snapshot, startConnectionsPolling, subscribe, tokenUsageOf, togglePick, usageEntryOf, visibleList,
+  allAccounts, checkinAll, clearFilter, clearLimits, clearSelection, ensureProxyPoolOptions,
+  filterActive, getStore, groupView, installAccountsApi, normalizeFilter, openBatchDialog, panelOpen, patch,
+  providerSummaryList, queryAllUsage, reorderQueue, rowContext, seats, segmentCounts, setAllGroupsCollapsed,
+  setAllPicked, setProviderFilter, setSegmentFilter, snapshot, startConnectionsPolling, subscribe,
+  tokenUsageOf, togglePick, usageEntryOf, visibleList,
 } from './accounts-data'
 import {
-  AccountCell, ActionsCell, ConnectionsCell, ExpiryCell, LimitsCell, PanelsRow, PriorityStepper,
-  ProviderCell, ProxyCell, StatusCell, TableHead, UsageCell,
+  AccountCell, ActionsCell, ConnectionsCell, ExpiryCell, GroupBandRow, LimitsCell, OrderCell, PanelsRow,
+  ProxyCell, StatusCell, TableHead, UsageCell,
 } from './accounts-panels'
+import { bindQueueDrag, type QueueDrop } from './accounts-queue-drag'
 import { AccountsDialogs } from './accounts-dialogs'
 
 /** 列设置的句柄（注册在挂载后的布局 effect 里，见下方说明） */
@@ -137,6 +140,7 @@ function AccountsPage() {
 
   const loaded = Boolean(snapshot())
   const all = allAccounts()
+  const { groups, allGroups } = groupView(usageEntryOf, tokenUsageOf)
   const summaries = providerSummaryList()
   // 限流维度的分段把「余额不足已跳过 / Token 限额已跳过」都算进已限流
   // （isLimitedNow 的口径），所以筛选与计数要带上余额与 Token 两份读数的查找口
@@ -155,6 +159,8 @@ function AccountsPage() {
    */
   const paging = useClientPaging(visible.length, 'accounts', { defaultSize: 'all' })
   const pageRows = paging.paged ? paging.slice(visible) : visible
+  const locked = filterActive() || paging.paged
+  const lockReason = filterActive() ? t('清除筛选') : t('把每页调回「全部」')
 
   // 归一化与自愈都放在 effect 里（渲染期改状态会与 React 的渲染顺序打架）：
   //   · 摘要里已不存在的 provider（账号被删光）复位成「全部」；
@@ -211,6 +217,47 @@ function AccountsPage() {
     bindColumnGrips(listRef.current, requestRender)
   }, [])
 
+  const allCollapsed = groups.length > 0 && groups.every(group => store.collapsed.has(group.provider))
+  const dragRef = React.useRef({ displayed: groups, all: allGroups })
+  React.useEffect(() => { dragRef.current = { displayed: groups, all: allGroups } })
+  const dragHandlers = React.useRef({ locked: false, lockReason: '', onDrop: (_drop: QueueDrop) => {} })
+  const onDrop = React.useCallback((drop: QueueDrop) => {
+    const { displayed, all: current } = dragRef.current
+    if (drop.kind === 'group') {
+      const from = current.findIndex(group => group.provider === drop.provider)
+      if (from < 0) return
+      const moved = current[from]
+      const rest = current.filter((_, position) => position !== from)
+      const anchor = drop.index < displayed.length ? displayed[drop.index].provider : null
+      const anchorIndex = anchor === null ? -1 : rest.findIndex(group => group.provider === anchor)
+      const at = anchor === null || anchorIndex < 0 ? rest.length : anchorIndex
+      const next = [...rest.slice(0, at), moved, ...rest.slice(at)]
+      void reorderQueue(next.flatMap(group => group.members.map(account => account.id)),
+        t('{name} 移到第 {rank} 顺位', { name: moved.label, rank: at + 1 }))
+      return
+    }
+    const group = current.find(item => item.provider === drop.provider)
+    if (!group) return
+    const from = group.members.findIndex(account => account.id === drop.accountId)
+    if (from < 0) return
+    const moved = group.members[from]
+    const rest = group.members.filter((_, position) => position !== from)
+    const to = Math.max(0, Math.min(rest.length, drop.index))
+    if (to === from) return
+    const nextMembers = [...rest.slice(0, to), moved, ...rest.slice(to)]
+    const next = current.map(item => item.provider === drop.provider ? { ...item, members: nextMembers } : item)
+    void reorderQueue(next.flatMap(item => item.members.map(account => account.id)),
+      t('{name} 移到 {group} 组内第 {rank} 位', { name: String(moved.name || moved.id), group: group.label, rank: to + 1 }))
+  }, [])
+  React.useEffect(() => { dragHandlers.current = { locked, lockReason, onDrop } })
+  React.useEffect(() => {
+    bindQueueDrag(listRef.current, {
+      isLocked: () => dragHandlers.current.locked,
+      onLockedAttempt: () => toast(t('当前视图不能调整顺序：{reason} 之后再拖动', { reason: dragHandlers.current.lockReason }), 'err'),
+      onDrop: drop => dragHandlers.current.onDrop(drop),
+    })
+  }, [])
+
   const visibleIds = visible.map(account => account.id)
   const allPicked = visibleIds.length > 0 && visibleIds.every(id => store.selected.has(id))
   const somePicked = visibleIds.some(id => store.selected.has(id))
@@ -227,10 +274,8 @@ function AccountsPage() {
             aria-label='勾选后可批量操作'
             onCheckedChange={next => togglePick(account.id, next)} />
         )
-      case 'priority':
-        return <PriorityStepper account={account} seat={ctx.seat} />
-      case 'provider':
-        return <ProviderCell account={account} />
+      case 'order':
+        return <OrderCell account={account} rank={ctx.rank} />
       case 'account':
         return <AccountCell account={account} namesHidden={store.namesHidden} />
       case 'proxy':
@@ -302,6 +347,11 @@ function AccountsPage() {
           </div>
 
           <div className='actions'>
+            <Button id='btn-fold-groups' variant='outline' disabled={!groups.length}
+              title={allCollapsed ? t('展开全部分组') : t('折叠全部分组（只留组头）')}
+              onClick={() => setAllGroupsCollapsed(allGroups.map(group => group.provider), !allCollapsed)}>
+              {allCollapsed ? t('展开全部') : t('折叠全部')}
+            </Button>
             {/* 「添加账号」的打开逻辑归 add-account.js（它按同一个 id 绑了监听），这里再挂
                 一次 onClick 是**冗余保险**：万一那个脚本的绑定因加载顺序没接上，按钮仍可用
                 （openModal / resetAddStep 都是幂等的，重复调用无副作用） */}
@@ -341,6 +391,12 @@ function AccountsPage() {
           <span className='provider-summary' id='accounts-provider-summary'>
             {summaries.filter(item => item.count > 0).map(item => `${item.label} ${item.count}`).join(' · ')}
           </span>
+          {locked ? <span className='batch-hidden' title={t('筛选 / 搜索 / 分页生效时顺序不可拖动（行被裁过，拖动会错位）')}>
+            {t('顺序已锁定')}
+          </span> : null}
+          {filterActive() ? <Button id='btn-clear-filter' variant='ghost' size='xs'
+            title={t('清空搜索与两个筛选档位，回到全部账号')}
+            onClick={() => clearFilter()}>{t('清除筛选')}</Button> : null}
           {hiddenByFilter ? (
             <span className='batch-hidden' id='batch-hidden-hint'>
               另有 {hiddenByFilter} 个已勾选账号被当前筛选隐藏，仍会参与操作
@@ -371,26 +427,35 @@ function AccountsPage() {
               <ColGroup />
               <TableHead namesHidden={store.namesHidden} allPicked={allPicked} somePicked={somePicked}
                 disabled={!visibleIds.length} onToggleAll={next => setAllPicked(visibleIds, next)} />
-              <tbody>
-                {pageRows.map(account => {
-                  const ctx = rowContext(account, seatMap)
-                  return (
-                    <React.Fragment key={account.id}>
-                      <tr className={cn('acct-row', !isEnabled(account) && 'disabled', ctx.picked && 'selected')}
-                        data-id={account.id} data-desktop={isDesktopAccount(account) ? '1' : undefined}>
-                        {columns.map(column => (
-                          <td key={column.key} className={`cell-${column.key} ta-${column.align}`}>
-                            {cell(column.key, account, ctx)}
-                          </td>
-                        ))}
-                      </tr>
-                      <PanelsRow account={account} colSpan={columns.length}
-                        limitsOpen={panelOpen(account.id, 'limits')}
-                        onClear={(id, model) => void clearLimits(id, model)} />
-                    </React.Fragment>
-                  )
-                })}
-              </tbody>
+              {groups.map(group => {
+                const collapsed = store.collapsed.has(group.provider)
+                const rows = pageRows.filter(account => providerOf(account) === group.provider)
+                return (
+                  <tbody key={group.provider} className='acct-group' data-provider={group.provider}>
+                    <GroupBandRow group={group} collapsed={collapsed} colSpan={columns.length} />
+                    {collapsed ? null : rows.map(account => {
+                      const rank = group.members.findIndex(member => member.id === account.id) + 1
+                      const ctx = rowContext(account, seatMap, rank > 0 ? rank : 1)
+                      return (
+                        <React.Fragment key={account.id}>
+                          <tr className={cn('acct-row', !isEnabled(account) && 'disabled', ctx.picked && 'selected')}
+                            data-id={account.id} data-provider={group.provider}
+                            data-desktop={isDesktopAccount(account) ? '1' : undefined}>
+                            {columns.map(column => (
+                              <td key={column.key} className={`cell-${column.key} ta-${column.align}`}>
+                                {cell(column.key, account, ctx)}
+                              </td>
+                            ))}
+                          </tr>
+                          <PanelsRow account={account} colSpan={columns.length}
+                            limitsOpen={panelOpen(account.id, 'limits')}
+                            onClear={(id, model) => void clearLimits(id, model)} />
+                        </React.Fragment>
+                      )
+                    })}
+                  </tbody>
+                )
+              })}
             </table>
           )}
         </div>
@@ -419,7 +484,7 @@ function setTableElement(el: HTMLTableElement | null): void {
   tableEl = el
 }
 
-/** 列宽骨架（colgroup）：11 列的字面量顺序，`data-col` 与表头、列设置、列宽层三处同名 */
+/** 列宽骨架（colgroup）：列定义的字面量顺序，`data-col` 与表头、列设置、列宽层三处同名 */
 function ColGroup() {
   const widths = columnWidths()
   const col = (key: string) => (
@@ -428,8 +493,7 @@ function ColGroup() {
   return (
     <colgroup>
       {col('pick')}
-      {col('priority')}
-      {col('provider')}
+      {col('order')}
       {col('account')}
       {col('proxy')}
       {col('connections')}

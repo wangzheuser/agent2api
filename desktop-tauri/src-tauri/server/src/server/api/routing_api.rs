@@ -7,9 +7,8 @@
 //!
 //! ── /api/routing/queue（队列可见化，账号页面板的数据源）────────
 //! 回答「按当前策略，这个模型的候选账号会怎么排、谁被跳过、为什么」。
-//! **排序实现与转发选路是同一个函数**（`routing::plan_route`）—— 转发那次
-//! 怎么排，这里就怎么画；两处若各写一份，界面标的顺序迟早和实际转发分叉
-//! （这正是「候选队列可见化」要消灭的那类问题）。
+//! 候选过滤与转发选路共用 `routing` 的账号判定；本地转发实现没有上游
+//! `PlanMeta` 队列快照，因此这里只做无副作用的候选预览。
 //!
 //! 与 `/api/session` 的 `routedAccountId` 的关系：那个字段只回答「队首是谁」
 //! （★ 的数据源，保持不变），本端点给的是**整张清单 + 原因句** —— 面板要
@@ -170,10 +169,7 @@ pub async fn get_routing_queue(
         .filter(|value| !value.is_empty())
         .map(str::to_string);
     let snapshot = config::current();
-    let accounts_value = state.store().list_accounts();
-    let accounts = routing::accounts_of(&accounts_value);
-    // 候选收窄：点名了模型 → 只留「清单里有它的家」（与转发同一张家清单，
-    // `route_for_forward`）；没点名 → 全部账号。与 session.rs 的 ★ 推算同一取材。
+    let accounts = routing::accounts_of(&state.store().list_accounts());
     let providers: Vec<String> = match &model {
         Some(model) => router::route_for_forward(model),
         None => Vec::new(),
@@ -182,7 +178,7 @@ pub async fn get_routing_queue(
         Some(_) if providers.is_empty() => accounts.clone(),
         Some(_) => accounts
             .iter()
-            .filter(|account| providers.contains(&routing::provider_of(account).to_string()))
+            .filter(|account| providers.iter().any(|provider| provider == routing::provider_of(account)))
             .cloned()
             .collect(),
         None => accounts.clone(),
@@ -195,8 +191,7 @@ pub async fn get_routing_queue(
         .into_iter()
         .collect();
     let keys = routing::CooldownKeys::new(model.as_deref().unwrap_or(""));
-    // 限制器软跳过与转发的选路同一判据（被拦的账号在面板上也是「跳过」，
-    // 原因写明是限制器而不是限流 —— 两回事）
+    let settings = config::routing_settings();
     let facts = crate::server::core::usage_records::balance_facts();
     let token_facts = crate::server::core::limiter::token_facts();
     let limiter_blocked: HashSet<String> = scoped
@@ -207,41 +202,71 @@ pub async fn get_routing_queue(
         })
         .filter_map(|account| routing::account_id(account).map(str::to_string))
         .collect();
-    let settings = config::routing_settings();
-    // 面板只**看**当前状态，不做粘性查找、不前进轮转游标 —— 预演不该刷新
-    // 任何会话的计时，也不该消耗下一次轮转
-    let (sunk, resting, open) = state.upstream().route_queue_facts(now);
-    let meta = routing::PlanMeta {
-        strategy: settings.strategy,
-        sunk: &sunk,
-        resting: &resting,
-        open: &open,
-        limiter_blocked: &limiter_blocked,
-        cursor: None,
-        sticky_account: None,
-    };
-    let plan = routing::plan_route(&scoped, &keys, &counts, &[], now, &meta);
-    let entry_json = |entry: &routing::PlanEntry| {
+    let candidates: Vec<Value> = scoped
+        .iter()
+        .filter(|account| {
+            routing::account_id(account)
+                .map(|id| !limiter_blocked.contains(id))
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect();
+    let picked = routing::pick_account_peek(&candidates, &keys, &counts, &[], now);
+    let picked_id = picked
+        .as_ref()
+        .and_then(|account| routing::account_id(account))
+        .unwrap_or("")
+        .to_string();
+    let entry_json = |account: &Value, state: &str, reason: &str| {
+        let id = routing::account_id(account).unwrap_or("");
+        let provider = routing::provider_of(account).to_string();
+        let provider_label = crate::server::core::providers::kind_from_id(&provider)
+            .map(|kind| crate::server::core::providers::meta(kind).label.to_string())
+            .unwrap_or_else(|| provider.clone());
+        let reset_at = routing::rate_limit_reset_at(account, &keys, now);
         json!({
-            "id": entry.id,
-            "name": entry.name,
-            "provider": entry.provider,
-            "providerLabel": crate::server::core::providers::kind_from_id(&entry.provider)
-                .map(|kind| crate::server::core::providers::meta(kind).label.to_string())
-                .unwrap_or_else(|| entry.provider.clone()),
-            "state": entry.state,
-            "reason": entry.reason,
-            "resetAt": if entry.reset_at > 0 { Value::from(entry.reset_at) } else { Value::Null },
-            "priority": entry.account.get("priority").cloned().unwrap_or(Value::Null),
+            "id": id,
+            "name": routing::account_name(account, id),
+            "provider": provider,
+            "providerLabel": provider_label,
+            "state": state,
+            "reason": reason,
+            "resetAt": if reset_at > 0 { Value::from(reset_at) } else { Value::Null },
+            "priority": account.get("priority").cloned().unwrap_or(Value::Null),
         })
     };
+    let mut ordered = Vec::new();
+    let mut blocked = Vec::new();
+    for account in &scoped {
+        let Some(id) = routing::account_id(account) else { continue };
+        if limiter_blocked.contains(id) {
+            blocked.push(entry_json(account, "blocked", "限制器拦截"));
+            continue;
+        }
+        let usability = routing::account_usability(account, &keys, now);
+        if !usability.usable {
+            blocked.push(entry_json(account, "blocked", usability.reason.unwrap_or("不可用")));
+            continue;
+        }
+        let max = routing::max_concurrent_of(account);
+        let busy = max > 0 && counts.get(id).copied().unwrap_or(0) as u64 >= max;
+        if busy {
+            blocked.push(entry_json(account, "blocked", "并发已满"));
+        } else {
+            ordered.push(entry_json(
+                account,
+                if id == picked_id { "picked" } else { "available" },
+                if id == picked_id { "当前选中" } else { "候选" },
+            ));
+        }
+    }
     ok_json(json!({
         "strategy": settings.strategy.as_str(),
         "sticky": settings.sticky.as_str(),
         "model": model.clone().map(Value::String).unwrap_or(Value::Null),
         "lastRequestModel": snapshot.last_request_model(),
-        "pickedId": plan.ordered.first().map(|entry| entry.id.clone()).unwrap_or_default(),
-        "ordered": plan.ordered.iter().map(entry_json).collect::<Vec<_>>(),
-        "blocked": plan.blocked.iter().map(entry_json).collect::<Vec<_>>(),
+        "pickedId": picked_id,
+        "ordered": ordered,
+        "blocked": blocked,
     }))
 }

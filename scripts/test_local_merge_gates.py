@@ -24,6 +24,8 @@ class LocalMergeGatesTests(unittest.TestCase):
         matrix = local_gates.command_matrix(Path('.'), 'H', Path('.verify'))
         server_names = {name for name, _ in matrix['server']}
         frontend_names = {name for name, _ in matrix['frontend']}
+        contract_names = {name for name, _ in matrix['contracts']}
+        self.assertIn('integration-closure', contract_names)
         self.assertIn('rust-list', server_names)
         self.assertIn('candidate-node', frontend_names)
         self.assertIn('baseline-rust', server_names)

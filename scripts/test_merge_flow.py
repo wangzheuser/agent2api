@@ -43,6 +43,12 @@ class MergeFlowTests(unittest.TestCase):
         self.assertEqual(len(self.record['impact']), 3)
         self.assertTrue(all(Path(x['path']).is_file() for x in self.record['impact']))
 
+    def test_preflight_rejects_changes_after_freeze(self):
+        flow.preflight(self.root, self.path, self.record)
+        (self.root / 'source.py').write_text('value = 8\n', encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, '冻结后的工作区已改变'):
+            flow.preflight(self.root, self.path, self.record)
+
     def test_record_has_single_writer(self):
         with flow.locked_record(self.path):
             with self.assertRaises(FileExistsError):
@@ -205,6 +211,67 @@ class MergeFlowTests(unittest.TestCase):
         self.assertEqual(self.record['plan']['impacted_contracts'][0]['id'], 'renamed-source')
         paths = {path for domain in self.record['plan']['domains'] for path in domain['paths']}
         self.assertIn('source.py', paths)
+
+    def divergent_record(self):
+        base = self.git('rev-parse', 'HEAD')
+        base_branch = self.git('branch', '--show-current')
+        self.git('checkout', '-qb', 'fixture-upstream')
+        (self.root / 'source.py').write_text(
+            'export const SHARED_VALUE = 8;\nexport function test_shared() {}\nconst payload = {"credits": 1};\n',
+            encoding='utf-8')
+        self.git('commit', '-qam', 'fixture upstream change')
+        self.git('checkout', '-q', base_branch)
+        self.git('checkout', '-qb', 'fixture-local')
+        (self.root / 'source.py').write_text(
+            'export const SHARED_VALUE = 70;\nexport function test_shared() {}\nconst payload = {"credits": 2};\n',
+            encoding='utf-8')
+        self.git('commit', '-qam', 'fixture local change')
+        path = self.path.parent / 'overlap-run.json'
+        record = flow.freeze(self.root, path, 'fixture-upstream')
+        flow.impact(self.root, path, record)
+        self.assertEqual(record['inputs']['B'], base)
+        return path, record
+
+    def test_overlap_reports_shared_paths_signals_and_blocks_unclassified_seal(self):
+        path, record = self.divergent_record()
+        flow.overlap(self.root, path, record)
+        self.assertEqual(record['overlap']['path_overlap'], ['source.py'])
+        item = record['overlap']['items'][0]
+        self.assertEqual(item['decision'], 'unclassified')
+        self.assertIn('SHARED_VALUE', item['shared']['symbols'])
+        self.assertIn('credits', item['shared']['fields'])
+        self.assertIn('test_shared', item['shared']['symbols'])
+        flow.plan(self.root, path, record)
+        self.assertEqual(record['plan']['overlap_unresolved'], ['source.py'])
+        self.assertEqual(self.run_check_for(record, path), 0)
+        with self.assertRaisesRegex(ValueError, '重复功能决策'):
+            flow.seal(self.root, path, record, ['business'])
+
+    def run_check_for(self, record, path, code='assert True'):
+        return flow.execute(self.root, path, record, 'business', '.', [sys.executable, '-c', code])
+
+    def test_overlap_decision_prefers_upstream_and_is_invalidated_by_candidate_change(self):
+        path, record = self.divergent_record()
+        flow.overlap(self.root, path, record, ['source.py=upstream_equivalent'])
+        flow.plan(self.root, path, record)
+        self.assertEqual(record['overlap']['unresolved'], [])
+        self.assertEqual(self.run_check_for(record, path), 0)
+        flow.seal(self.root, path, record, ['business'])
+        (self.root / 'source.py').write_text('candidate = True\n', encoding='utf-8')
+        self.git('add', 'source.py')
+        with self.assertRaisesRegex(ValueError, '重复功能分析'):
+            flow.validate_overlap(record, flow.candidate_tree(self.root))
+
+    def test_cli_overlap_accepts_explicit_decision(self):
+        path, record = self.divergent_record()
+        flow.overlap(self.root, path, record)
+        argv = ['merge-flow.py', '--root', str(self.root), '--record', str(path),
+                'overlap', '--decision', 'source.py=local_extension']
+        with patch.object(sys, 'argv', argv):
+            self.assertEqual(flow.main(), 0)
+        saved = json.loads(path.read_text(encoding='utf-8'))
+        self.assertEqual(saved['decisions'], [{'path': 'source.py', 'decision': 'local_extension'}])
+        self.assertEqual(saved['overlap']['unresolved'], [])
 
 
 if __name__ == '__main__':

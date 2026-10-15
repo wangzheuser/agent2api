@@ -37,6 +37,7 @@ def ensure_state(record):
     record.setdefault('decisions', [])
     record.setdefault('events', [])
     record.setdefault('plan', None)
+    record.setdefault('overlap', None)
     record.setdefault('last_successful_command', None)
     record.setdefault('last_successful_receipt', None)
     return record
@@ -93,6 +94,23 @@ def branch(root):
     return git(root, 'branch', '--show-current').decode().strip()
 
 
+def repository_snapshot(root):
+    """Capture the caller's worktree so a frozen round cannot absorb later work."""
+    status = git(root, 'status', '--porcelain=v1', '-z').decode().split('\0')
+    untracked = sorted(item[3:] for item in status if item.startswith('?? '))
+    return {
+        'head': commit(root, 'HEAD'),
+        'branch': branch(root),
+        'index_tree': git(root, 'write-tree').decode().strip(),
+        'cached_diff': digest(git(root, 'diff', '--cached', '--binary', '--')),
+        'worktree_diff': digest(git(root, 'diff', '--binary', '--')),
+        'untracked': untracked,
+        'merge_head': commit(root, 'MERGE_HEAD') if subprocess.run(
+            ['git', 'rev-parse', '-q', '--verify', 'MERGE_HEAD'], cwd=root,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0 else None,
+    }
+
+
 def freeze(root, path, upstream):
     if path.exists():
         raise ValueError('记录已存在；续作复用它，不覆盖冻结输入')
@@ -109,6 +127,7 @@ def freeze(root, path, upstream):
         raise ValueError('共同祖先不是唯一值；先分析历史，不自行选基线')
     record = {'schema_version': 1, 'root': str(root), 'branch': branch(root),
               'inputs': {'H': h, 'U': u, 'B': bases[0]},
+              'frozen_workspace': repository_snapshot(root),
               'initial_status': [item for item in git(root, 'status', '--porcelain=v1', '-z').decode().split('\0') if item],
               'receipts': [], 'seal': None}
     ensure_state(record)
@@ -117,6 +136,19 @@ def freeze(root, path, upstream):
     write_record(path, record)
     print(f'FROZEN: H={h}; U={u}; B={bases[0]}; branch={record["branch"]}')
     return record
+
+
+def preflight(root, path, record):
+    """Verify that the frozen caller checkout was not changed behind the record."""
+    expected = record.get('frozen_workspace')
+    if not expected:
+        raise ValueError('记录缺少冻结工作区快照；不能继续旧流程')
+    actual = repository_snapshot(root)
+    if actual != expected:
+        raise ValueError('冻结后的工作区已改变；重新 freeze，不能吸收后续工作')
+    if actual['merge_head'] is not None:
+        raise ValueError('当前工作区仍有 MERGE_HEAD；先恢复或继续原合并')
+    print(f"PREFLIGHT: branch={actual['branch']}; head={actual['head']}; untracked={len(actual['untracked'])}")
 
 
 def read_record(root, path):
@@ -179,8 +211,161 @@ def domain_for(path):
     return 'other'
 
 
+OVERLAP_DECISIONS = {
+    'upstream_equivalent',
+    'local_extension',
+    'semantic_conflict',
+    'local_only',
+}
+
+
+def _diff_added_lines(root, left, right, path):
+    data = git(root, 'diff', '--unified=0', left, right, '--', path).decode('utf-8', errors='replace')
+    return {
+        re.sub(r'\s+', ' ', line[1:].strip())
+        for line in data.splitlines()
+        if line.startswith('+') and not line.startswith('+++') and line[1:].strip()
+    }
+
+
+def _signals(lines):
+    symbols = set()
+    fields = set()
+    tests = set()
+    apis = set()
+    declaration = re.compile(
+        r'\b(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?'
+        r'(?:fn|struct|enum|trait|type|const|class|interface|function)\s+([A-Za-z_]\w*)'
+    )
+    js_declaration = re.compile(
+        r'\b(?:export\s+)?(?:async\s+)?(?:const|let|var|type|class|interface|enum|function)\s+([A-Za-z_]\w*)'
+    )
+    for line in lines:
+        symbols.update(declaration.findall(line))
+        symbols.update(js_declaration.findall(line))
+        fields.update(re.findall(r'["\']([A-Za-z_][\w.-]*)["\']\s*:', line))
+        fields.update(re.findall(r'\b([A-Za-z_][\w.-]*)\s*:', line))
+        fields.update(re.findall(r'\b([A-Z][A-Z0-9_]+)\s*=', line))
+        tests.update(re.findall(r'\b(?:test|it)\s*\(\s*["\']([^"\']+)', line))
+        tests.update(name for name in symbols if name.startswith(('test_', 'test')))
+        apis.update(re.findall(r'/(?:v1|api|oauth|models)[A-Za-z0-9_./?=&{}:-]*', line))
+    return {
+        'lines': sorted(lines),
+        'symbols': sorted(symbols),
+        'fields': sorted(fields),
+        'tests': sorted(tests),
+        'apis': sorted(apis),
+    }
+
+
+def _path_set(rows):
+    return {value for row in rows for value in (row.get('path'), row.get('from')) if value}
+
+
+def _decision_map(record):
+    result = {}
+    for item in record.get('decisions', []):
+        if isinstance(item, dict) and item.get('path') and item.get('decision'):
+            result[item['path']] = item['decision']
+    return result
+
+
+def _parse_decisions(values):
+    parsed = {}
+    for value in values or []:
+        if '=' not in value:
+            raise ValueError('决策格式必须为 path=decision')
+        path, decision = value.split('=', 1)
+        if not path or decision not in OVERLAP_DECISIONS:
+            raise ValueError('决策必须是 upstream_equivalent/local_extension/semantic_conflict/local_only')
+        parsed[path] = decision
+    return parsed
+
+
+def overlap(root, path, record, decisions=None):
+    tree = candidate_tree(root)
+    inputs = record['inputs']
+    upstream_rows = changed_paths(root, inputs['B'], inputs['U'])
+    local_rows = changed_paths(root, inputs['B'], inputs['H'])
+    common = sorted(_path_set(upstream_rows) & _path_set(local_rows))
+    upstream_by_path = {row['path']: row for row in upstream_rows}
+    local_by_path = {row['path']: row for row in local_rows}
+    selected = _decision_map(record)
+    selected.update(_parse_decisions(decisions))
+    record['decisions'] = [
+        {'path': item, 'decision': selected[item]}
+        for item in sorted(selected)
+        if selected[item] in OVERLAP_DECISIONS
+    ]
+    items = []
+    for changed_path in common:
+        upstream_lines = _diff_added_lines(root, inputs['B'], inputs['U'], changed_path)
+        local_lines = _diff_added_lines(root, inputs['B'], inputs['H'], changed_path)
+        upstream_signals = _signals(upstream_lines)
+        local_signals = _signals(local_lines)
+        shared = {
+            key: sorted(set(upstream_signals[key]) & set(local_signals[key]))
+            for key in ('lines', 'symbols', 'fields', 'tests', 'apis')
+        }
+        shared['generated_artifact'] = bool(
+            domain_for(changed_path) == 'generated-artifact'
+            or changed_path.endswith(('.generated.ts', '.generated.js', '.generated.json'))
+        )
+        decision = selected.get(changed_path, 'unclassified')
+        items.append({
+            'path': changed_path,
+            'upstream_status': upstream_by_path.get(changed_path, {}).get('status'),
+            'local_status': local_by_path.get(changed_path, {}).get('status'),
+            'upstream': upstream_signals,
+            'local': local_signals,
+            'shared': shared,
+            'decision': decision,
+        })
+    unresolved = [item['path'] for item in items if item['decision'] == 'unclassified']
+    report = {
+        'version': 1,
+        'candidate_tree': tree,
+        'inputs': dict(inputs),
+        'path_overlap': common,
+        'items': items,
+        'unresolved': unresolved,
+        'decision_summary': {
+            decision: sum(item['decision'] == decision for item in items)
+            for decision in ['unclassified', *sorted(OVERLAP_DECISIONS)]
+        },
+        'generated_at': time.time(),
+    }
+    report['digest'] = digest(json.dumps(report, ensure_ascii=False, sort_keys=True).encode('utf-8'))
+    record['overlap'] = report
+    record['overlap_tree'] = tree
+    set_phase(record, 'overlap', 'resolve overlap decisions' if unresolved else 'generate plan',
+              overlap_digest=report['digest'])
+    output = path.parent / 'overlap.json'
+    output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+    event(record, 'overlap', path=str(output), paths=len(common), unresolved=unresolved)
+    write_record(path, record)
+    print(f'OVERLAP: paths={len(common)}; unresolved={len(unresolved)}; tree={tree}')
+
+
+def validate_overlap(record, tree):
+    report = record.get('overlap')
+    if report is None:
+        raise ValueError('缺少重复功能分析；先运行 overlap')
+    if report.get('candidate_tree') != tree or record.get('overlap_tree') != tree:
+        raise ValueError('重复功能分析不是当前候选树；重新运行 overlap')
+    expected = dict(report)
+    actual_digest = expected.pop('digest', None)
+    if not actual_digest or digest(json.dumps(expected, ensure_ascii=False, sort_keys=True).encode('utf-8')) != actual_digest:
+        raise ValueError('重复功能分析摘要已改变；重新运行 overlap')
+    unresolved = report.get('unresolved', [])
+    if unresolved:
+        raise ValueError('存在未完成的重复功能决策: ' + ', '.join(unresolved))
+
+
 def plan(root, path, record):
     tree = candidate_tree(root)
+    if record.get('overlap') is None:
+        overlap(root, path, record)
     inputs = record['inputs']
     upstream_rows = changed_paths(root, inputs['B'], inputs['U'])
     local_rows = changed_paths(root, inputs['H'], tree)
@@ -221,12 +406,16 @@ def plan(root, path, record):
         'candidate_paths': candidate_rows,
         'domains': domain_rows,
         'impacted_contracts': impacted,
+        'overlap_digest': record['overlap']['digest'],
+        'overlap_paths': record['overlap']['path_overlap'],
+        'overlap_unresolved': record['overlap']['unresolved'],
         'required_gates': list(dict.fromkeys(required)),
         'generated_at': time.time(),
     }
     plan_data['digest'] = digest(json.dumps(plan_data, ensure_ascii=False, sort_keys=True).encode('utf-8'))
     record['plan'] = plan_data
-    set_phase(record, 'planned', 'resolve first impacted domain', plan_digest=plan_data['digest'])
+    next_action = 'resolve overlap decisions' if plan_data['overlap_unresolved'] else 'resolve first impacted domain'
+    set_phase(record, 'planned', next_action, plan_digest=plan_data['digest'])
     output = path.parent / 'plan.json'
     output.write_text(json.dumps(plan_data, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     event(record, 'plan', path=str(output), required_gates=plan_data['required_gates'])
@@ -257,6 +446,8 @@ def status(root, path, record=None):
         'receipt_count': len(record.get('receipts', [])),
         'required_gates': (record.get('seal') or {}).get('required', []) if record.get('seal')
                           else (record.get('plan') or {}).get('required_gates', []),
+        'overlap_paths': (record.get('overlap') or {}).get('path_overlap', []),
+        'overlap_unresolved': (record.get('overlap') or {}).get('unresolved', []),
         'last_successful_command': record.get('last_successful_command'),
         'last_successful_receipt': record.get('last_successful_receipt'),
         'last_failure': record.get('last_failure'),
@@ -461,6 +652,8 @@ def validate_plan(record, tree):
         return
     if plan_data.get('candidate_tree') != tree:
         raise ValueError('合并计划不是当前候选树；重新运行 plan')
+    if plan_data.get('overlap_digest') != (record.get('overlap') or {}).get('digest'):
+        raise ValueError('合并计划与重复功能分析不一致；重新运行 plan')
     expected = dict(plan_data)
     actual_digest = expected.pop('digest', None)
     if actual_digest:
@@ -475,8 +668,11 @@ def seal(root, path, record, required):
         required = (record.get('plan') or {}).get('required_gates', [])
     tree = candidate_tree(root)
     validate_impact(record, tree)
+    if record.get('overlap') is None:
+        overlap(root, path, record)
     validate_plan(record, tree)
     validate_receipts(record, tree, required)
+    validate_overlap(record, tree)
     record['seal'] = {'candidate_tree': tree, 'required': required, 'sealed_at': time.time()}
     set_phase(record, 'sealed', 'check candidate or commit', sealed_tree=tree)
     event(record, 'sealed', tree=tree, required=required)
@@ -491,6 +687,7 @@ def check(root, record, ref=None):
     if actual != record['seal']['candidate_tree']:
         raise ValueError('候选或提交树与已验收输入不一致；重跑受影响验收')
     validate_impact(record, actual)
+    validate_overlap(record, actual)
     validate_plan(record, actual)
     validate_receipts(record, actual, record['seal']['required'])
     if ref:
@@ -514,7 +711,11 @@ def main():
     actions = parser.add_subparsers(dest='action', required=True)
     actions.add_parser('freeze').add_argument('--upstream', required=True)
     actions.add_parser('impact')
+    overlap_action = actions.add_parser('overlap')
+    overlap_action.add_argument('--decision', action='append', default=[],
+                                help='重复功能决策：path=upstream_equivalent|local_extension|semantic_conflict|local_only')
     actions.add_parser('status')
+    actions.add_parser('preflight')
     actions.add_parser('plan')
     run = actions.add_parser('run')
     run.add_argument('--name', required=True)
@@ -534,8 +735,12 @@ def main():
             record = read_record(root, path)
             if args.action == 'impact':
                 impact(root, path, record)
+            elif args.action == 'overlap':
+                overlap(root, path, record, args.decision)
             elif args.action == 'status':
                 status(root, path, record)
+            elif args.action == 'preflight':
+                preflight(root, path, record)
             elif args.action == 'plan':
                 plan(root, path, record)
             elif args.action == 'run':

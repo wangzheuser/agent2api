@@ -279,6 +279,13 @@ pub fn panel_router(state: ServerState) -> Router {
             get(api::account_selection_api::get_account_selection)
                 .put(api::account_selection_api::put_account_selection),
         )
+        // 兼容设置页与桌面桥接仍使用的完整路由配置接口；
+        // `/api/account-selection` 保留给简化选路设置，两套入口互不覆盖。
+        .route(
+            "/api/routing",
+            get(api::routing_api::get_routing).put(api::routing_api::put_routing),
+        )
+        .route("/api/routing/queue", get(api::routing_api::get_routing_queue))
         // ── 调试模式（设置页「通用 → 调试模式」）──
         // GET/PUT 开关；traffic 是按 id 取原始报文的详情端点（列表接口不返回
         // 报文，见 debug_api 的模块头）。挂 protected：报文含上游 URL 与请求体。
@@ -299,6 +306,9 @@ pub fn panel_router(state: ServerState) -> Router {
         // 全部业务表（账号、日志、统计、配置），与 /api/config 同级敏感。
         .route("/api/upgrade", get(api::upgrade_api::get_upgrade))
         .route("/api/upgrade/run", post(api::upgrade_api::run_upgrade))
+        // 整库备份 / 恢复含账号凭据，必须沿用受保护的管理路由。
+        .route("/api/backup/export", post(api::backup_api::export_backup))
+        .route("/api/backup/import", post(api::backup_api::import_backup))
         // ── 账号管理（对照 workbuddy-account-routes.mjs）──
         // 用 any(...) 注册两条入口（无尾段 + 通配尾段），方法/路径的判定交给
         // api::accounts::dispatch —— 这是为了复刻 Node 版 tryHandle 的判定顺序
@@ -540,6 +550,12 @@ pub fn panel_router(state: ServerState) -> Router {
         .route(
             "/api/zcode/captcha",
             get(api::zcode_captcha::get_captcha).post(api::zcode_captcha::push_captcha),
+        )
+        // 验证码池补货节奏设置；与上面的令牌入池接口分开。
+        .route(
+            "/api/zcode/captcha-pool",
+            get(api::zcode_captcha_pool::get_captcha_pool)
+                .put(api::zcode_captcha_pool::put_captcha_pool),
         )
         // ── 系统提示词与内容拦截降级 ──
         // 与 /api/sanitize 同为「出站内容处理」的开关，但形状不同（枚举 + 文件

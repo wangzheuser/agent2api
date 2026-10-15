@@ -234,7 +234,9 @@ pub fn is_reserved(key: &str) -> bool {
 /// 版本 11：逐账号余额记录；兼容上游 v8 已建的同名表。
 /// 版本 12：补账号+时间聚合索引；不重新解释 v9-v11。
 /// 上游把该索引编号为 v9，本地发布线已占用 v9-v11，故以新版本追加。
-pub const SCHEMA_VERSION: i64 = 13;
+/// 版本 13：requests 路由回放字段。
+/// 版本 14：补回合并时丢失的签到记录表；兼容已到 v13 但缺表的存量库。
+pub const SCHEMA_VERSION: i64 = 14;
 
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
@@ -633,6 +635,31 @@ CREATE INDEX IF NOT EXISTS idx_requests_account_ts ON requests(account_id, ts);
 
 const V13_SCHEMA: &str = "ALTER TABLE requests ADD COLUMN route TEXT;";
 
+/// 版本 14：签到记录的每账号明细台账。
+///
+/// 上游 3.0.3 已使用这张表；本地 schema 分叉时把 V11 用作余额表，
+/// 导致签到记账代码存在但存量库没有表。新增版本只补表，不重编号旧迁移。
+const V14_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS checkin_records (
+  row_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts           INTEGER NOT NULL,
+  date         TEXT NOT NULL DEFAULT '',
+  source       TEXT NOT NULL DEFAULT '',
+  reason       TEXT NOT NULL DEFAULT '',
+  account_id   TEXT NOT NULL DEFAULT '',
+  account_name TEXT NOT NULL DEFAULT '',
+  provider     TEXT NOT NULL DEFAULT '',
+  outcome      TEXT NOT NULL DEFAULT '',
+  ok           INTEGER NOT NULL DEFAULT 0,
+  message      TEXT,
+  error        TEXT,
+  kept_active  INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_checkin_records_ts ON checkin_records(ts);
+CREATE INDEX IF NOT EXISTS idx_checkin_records_outcome ON checkin_records(outcome);
+CREATE INDEX IF NOT EXISTS idx_checkin_records_provider ON checkin_records(provider);
+";
+
 /// 把库升到 [`SCHEMA_VERSION`]（幂等：已是最新版时什么都不做）。
 ///
 /// 返回 `rusqlite::Result` 而不是本模块自造的字符串错误：调用方 `Db::open`
@@ -736,6 +763,8 @@ fn apply_version(conn: &Connection, version: i64) -> rusqlite::Result<()> {
         // v12：补按账号 + 时间的聚合索引；兼容上游已存在的同名索引。
         12 => conn.execute_batch(V12_SCHEMA),
         13 => conn.execute_batch(V13_SCHEMA),
+        // v14：补回签到记录表；兼容合并后已到 v13 但表缺失的存量库。
+        14 => conn.execute_batch(V14_SCHEMA),
 
         _ => Ok(()),
     }

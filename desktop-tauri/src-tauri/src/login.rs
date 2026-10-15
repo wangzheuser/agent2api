@@ -660,9 +660,10 @@ fn allowed_hosts(provider: &str) -> Option<&'static [&'static str]> {
         // 见 `providers::officeace::oauth` 的模块头），所以这里没有 CodeArts 那种
         // loopback 回调要放行；但「不设限」仍是必须显式写出的选择（落进默认分支
         // 会拿到 WorkBuddy 的白名单 → 窗口白屏）。
+        // 本地原生 MiniMax Code / LobsterAI 也必须显式放行，避免合并后落入默认白名单。
         "catpaw" | "qoder" | "qoder-intl" | "cline-free" | "cline-pass" | "autoclaw"
         | "autoclaw-intl" | "accio" | "accio-cn" | "zcode" | "zcode-intl" | "codearts" | "trae"
-        | "kuku" | "antigravity" | "officeace" => None,
+        | "kuku" | "antigravity" | "officeace" | "minimax-code" | "lobsterai" => None,
         // WorkBuddy 的两个地区共用这一张表（表里 `workbuddy.ai` 那一行就是国际站
         // 的登录域）。**显式列出**而不是靠下面的默认分支：上面那条警告要求
         // 「新 provider 落到默认分支」必须是有意的选择，写出来才看得出是选过的
@@ -851,6 +852,8 @@ fn normalize_provider(provider: &str) -> Result<&'static str, String> {
         // 上游把这个地址按正则逐字校验），所以窗口**必须允许**导航到本机端口，
         // 否则用户点完授权、回调请求根本发不出去（见下面 allowed_hosts 的同一条）。
         "trae" => Ok("trae"),
+        // Google OAuth 与 loopback 回调由后端处理，与 CodeArts 同一条壳侧路径。
+        "antigravity" => Ok("antigravity"),
         // MiniMax Code / LobsterAI 的授权地址和 loopback 回调由原生 Provider 生成，
         // 壳侧只负责打开页面并等待后端任务完成。
         "minimax-code" => Ok("minimax-code"),
@@ -2002,4 +2005,69 @@ pub fn open_in_browser(url: &str) -> Result<(), String> {
         .spawn()
         .map(|_| ())
         .map_err(|error| format!("打开系统浏览器失败: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{host_allowed, normalize_provider};
+    use url::Url;
+
+    #[test]
+    fn native_provider_login_hosts_are_not_blocked() {
+        let minimax = Url::parse("https://account.minimax.cn/oauth-authorize").unwrap();
+        let lobsterai = Url::parse("https://lobsterai.youdao.com/portal#/login").unwrap();
+
+        assert!(host_allowed(&minimax, "minimax-code", false));
+        assert!(host_allowed(&lobsterai, "lobsterai", false));
+        let callback = Url::parse("http://127.0.0.1:3066/auth/callback?state=fixture").unwrap();
+        assert!(host_allowed(&callback, "lobsterai", false));
+        assert!(!host_allowed(
+            &Url::parse("javascript:alert(1)").unwrap(),
+            "minimax-code",
+            false
+        ));
+        assert!(!host_allowed(
+            &Url::parse("file:///fixture").unwrap(),
+            "lobsterai",
+            false
+        ));
+    }
+
+    #[test]
+    fn supported_login_providers_are_normalized() {
+        for provider in [
+            "workbuddy",
+            "workbuddy-intl",
+            "raccoon",
+            "catpaw",
+            "qoder",
+            "qoder-intl",
+            "cline-free",
+            "cline-pass",
+            "autoclaw-intl",
+            "accio",
+            "accio-cn",
+            "zcode",
+            "zcode-intl",
+            "codearts",
+            "trae",
+            "antigravity",
+            "kuku",
+            "officeace",
+            "minimax-code",
+            "lobsterai",
+        ] {
+            assert_eq!(normalize_provider(provider).unwrap(), provider);
+        }
+        assert!(normalize_provider("unknown-provider").is_err());
+    }
+
+    #[test]
+    fn unknown_provider_keeps_workbuddy_default_allowlist() {
+        let workbuddy = Url::parse("https://workbuddy.ai/login").unwrap();
+        let unrelated = Url::parse("https://example.com/login").unwrap();
+
+        assert!(host_allowed(&workbuddy, "unknown-provider", false));
+        assert!(!host_allowed(&unrelated, "unknown-provider", false));
+    }
 }

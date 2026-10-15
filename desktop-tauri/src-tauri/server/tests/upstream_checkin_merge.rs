@@ -194,7 +194,7 @@ fn workbuddy_activity_modes_round_trip_and_unknown_values_default_to_full() {
 }
 
 #[test]
-fn checkin_provider_union_retains_all_current_options() {
+fn checkin_provider_union_retains_all_twelve_options() {
     let expected = [
         "workbuddy",
         "workbuddy-intl",

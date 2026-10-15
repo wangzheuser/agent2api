@@ -603,7 +603,7 @@ impl TempRestoreDb {
         }
         let conn = Connection::open_with_flags(
             &path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
         )
         .map_err(|e| format!("创建暂存库失败: {e}"))?;
         Ok(Self { path, conn })

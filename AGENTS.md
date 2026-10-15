@@ -339,12 +339,21 @@ bash scripts/release.sh vX.Y.Z <run-id>   # 或显式指定 run
 
 `scripts/merge-flow.py` 是标准库薄记录入口，不替 AI 做业务判断，也不自动 merge、stage、commit 或 push。每轮在被忽略的诊断目录保留独立记录，续作复用同一记录：
 
+每轮先用 `scripts/prepare-merge-candidate.py` 从冻结的 H 创建隔离 worktree；脚本先拒绝上游删除 `AGENTS.md`、`docs/local-contracts.json` 或合并门禁脚本，再创建候选。主工作区只允许保留冻结时已存在的未跟踪诊断文件，不能在主工作区进入 `MERGE_HEAD`。在候选 worktree 内先 freeze，再运行 `preflight` 固化快照，然后执行 `git merge --no-commit --no-ff <U>` 并解决冲突。合并完成后运行 `check-merge-closure.py`；注册、迁移、桌面登录接线或生成产物闭包失败时，不得进入 Rust/前端长门禁。
+
 ```sh
 python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json freeze --upstream upstream/main
 # 读取上游/本地历史、预演、按调用链实施；不切换当前工作分支。
 # 先生成产物并明确暂存本轮文件；其他任务有改动时使用隔离候选，不替别人stash或提交。
+python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json preflight
+git merge --no-commit --no-ff <U>
 python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json impact
+python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json overlap
+# 对每个共同修改路径明确取舍；重复能力默认以上游实现为权威
+python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json overlap \
+  --decision <path>=upstream_equivalent
 python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json plan
+python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json run --name integration-closure -- python scripts/check-merge-closure.py --base-ref <H> --report diagnostic-artifacts/<本轮>/integration-closure.json
 python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json status
 python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json run --name local-gates -- python scripts/local-merge-gates.py --base-ref <H>
 python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json run --name tools -- python -B -m unittest discover -s scripts -p 'test_*merge*.py' -v
@@ -359,6 +368,15 @@ python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json che
 # 用户授权提交/push后执行；提交树须仍等于封存的候选tree。
 python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json check --commit HEAD
 ```
+
+`overlap` 固定比较 `B→U` 与 `B→H`，输出 `overlap.json`，记录共同修改路径、规范化新增行、Rust/TypeScript 声明、API/config/JSON 字段、测试 ID 和生成产物信号。候选树变化会使报告失效，必须重新运行 `overlap` 和 `plan`。每个共同修改路径必须在封存前明确一种决策：
+
+- `upstream_equivalent`：两边是同一能力，采用上游实现；
+- `local_extension`：保留本地扩展，并说明它不被上游能力覆盖；
+- `semantic_conflict`：业务语义确有冲突，已完成代码层取舍并保留验证；
+- `local_only`：上游对应改动不构成本地同一能力，保留本地实现。
+
+未分类路径会阻止 `seal`/`check`，不能用“无冲突”或“函数仍存在”替代决策。`overlap` 只记录分析和取舍，不自动修改源码、暂存、合并、提交或推送；决策完成后仍须按 `plan` 计算的门禁执行本地验收。
 
 - `status` 输出当前阶段、下一动作、候选 tree、未完成回执、失败原因和冻结的 H/U/B；续作先读取它，不重复 freeze 或启动已在运行的验收。
 - `plan` 固定当前候选 tree，比较 `B→U`、`H→候选`、`U→候选`，按变更路径和 `docs/local-contracts.json` 计算受影响领域、契约及必需 gate，并把摘要写入记录。候选改变后必须重新 plan、impact 和受影响验收。

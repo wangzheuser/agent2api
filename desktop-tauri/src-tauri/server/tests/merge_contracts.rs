@@ -211,6 +211,37 @@ fn assert_request_schema(conn: &Connection) {
             .unwrap();
         assert_eq!(indexed, column);
     }
+    let checkin_table: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='checkin_records'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(checkin_table, 1, "签到记录表必须由 schema 迁移创建");
+}
+
+#[test]
+fn migration_v13_repairs_missing_checkin_records_table() {
+    let conn = legacy_v6();
+    schema::migrate(&conn).unwrap();
+    conn.execute_batch("DROP TABLE checkin_records; PRAGMA user_version=13;")
+        .unwrap();
+    schema::migrate(&conn).unwrap();
+    schema::migrate(&conn).unwrap();
+
+    let migrated_version = conn
+        .pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(migrated_version, schema::SCHEMA_VERSION);
+    let columns: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('checkin_records')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(columns, 13);
 }
 
 fn assert_columns_and_data(conn: &Connection) {

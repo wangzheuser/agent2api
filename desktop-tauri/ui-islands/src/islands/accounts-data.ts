@@ -1130,6 +1130,32 @@ export async function setAccountEnabled(id: string, enabled: boolean): Promise<v
   }
 }
 
+export async function setGroupEnabled(ids: string[], enabled: boolean): Promise<void> {
+  if (!ids.length) return
+  try {
+    await shared().workbuddyDesktop?.batchAccounts?.({ action: enabled ? 'enable' : 'disable', ids })
+    toast(enabled ? t('✅ 已启用 {n} 个账号', { n: ids.length }) : t('✅ 已禁用 {n} 个账号', { n: ids.length }))
+    await shared().wbApp?.refresh?.()
+  } catch (error) {
+    toast(t('操作失败：{message}', { message: errorMessage(error) }), 'err')
+    void shared().wbApp?.refresh?.()
+  }
+}
+
+export async function reorderQueue(ids: string[], note?: string): Promise<boolean> {
+  if (!ids.length) return false
+  try {
+    await shared().workbuddyDesktop?.reorderAccounts?.(ids)
+    toast(note ? t('✅ 已保存：{note}', { note }) : t('✅ 顺序已保存'))
+    await shared().wbApp?.refresh?.()
+    return true
+  } catch (error) {
+    toast(t('顺序未保存：{message}', { message: errorMessage(error) }), 'err')
+    void shared().wbApp?.refresh?.()
+    return false
+  }
+}
+
 /**
  * 与全局相邻账号交换优先级。
  *
@@ -1282,15 +1308,21 @@ export async function startCodeArtsWelfare(id: string): Promise<void> {
 /** 一行账号的渲染上下文（视图层按它取位置、勾选、余额与连接数） */
 export type RowContext = {
   seat: { position: number; total: number }
+  rank: number
   picked: boolean
   usageEntry: UsageEntry
   limitsOpen: boolean
   connections: number
 }
 
-export function rowContext(account: AccountRecord, seatMap: Map<string, { position: number; total: number }>): RowContext {
+export function rowContext(
+  account: AccountRecord,
+  seatMap: Map<string, { position: number; total: number }>,
+  rank = 1,
+): RowContext {
   return {
     seat: seatMap.get(account.id) || { position: 1, total: 1 },
+    rank,
     picked: isPicked(account.id),
     usageEntry: usageMap.get(account.id),
     limitsOpen: panelOpen(account.id, 'limits'),

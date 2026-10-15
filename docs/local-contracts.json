@@ -2358,6 +2358,50 @@
           "id": "case-1b87d3dd48fb"
         }
       ]
+    },
+    {
+      "id": "desktop-login-provider-wiring",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "所有可见网页登录入口在桌面壳显式登记 provider 与导航策略；本地 MiniMax Code/LobsterAI 与上游 Antigravity 登录均可进入。",
+      "source_commits": [
+        "3764beb",
+        "e8a9d57"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/src/login.rs",
+        "desktop-tauri/ui-islands/src/islands/add-account-configs.ts"
+      ],
+      "tests": [
+        {
+          "id": "case-desktop-login-provider-wiring",
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/login-provider-wiring.test.cjs",
+          "name": "every visible web login provider has explicit desktop normalization and navigation policy"
+        }
+      ]
+    },
+    {
+      "id": "database-backup-management-routes",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "整库导出和恢复通过受保护管理路由执行，拒绝无认证和非法路径；临时库真实恢复保留账号、创建安全备份并重装鉴权状态。",
+      "source_commits": [
+        "e8a9d57"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/http.rs",
+        "desktop-tauri/src-tauri/server/src/server/api/backup_api.rs",
+        "desktop-tauri/src-tauri/server/src/server/db/backup.rs"
+      ],
+      "tests": [
+        {
+          "id": "case-database-backup-management-routes",
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/management_restore.rs",
+          "name": "restored_management_routes_preserve_auth_validation_and_selection"
+        }
+      ]
     }
   ],
   "replay_patches": [

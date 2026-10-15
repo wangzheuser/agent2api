@@ -38,6 +38,9 @@ def command_matrix(root, base_ref, report_dir):
         'contracts': [
             ('merge-tooling', python_script('-B', '-m', 'unittest', 'discover', '-s', 'scripts',
                                             '-p', 'test_*merge*.py', '-v')),
+            ('integration-closure', python_script('scripts/check-merge-closure.py',
+                                                  '--base-ref', base,
+                                                  '--report', str(report_dir / 'integration-closure.json'))),
             ('contract-manifest', python_script('scripts/check-merge-contracts.py', '--base-ref', base)),
             ('baseline-gate', python_script('scripts/replay-merge-baseline.py', 'gate', '--base-ref', base)),
         ],
