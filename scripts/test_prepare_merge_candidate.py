@@ -52,6 +52,27 @@ class PrepareCandidateTests(unittest.TestCase):
             with patch.object(sys, 'argv', args):
                 self.assertEqual(prepare.main(), 1)
 
+    def test_protected_control_file_deletion_is_rejected_before_worktree(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.git(root, 'init', '-q')
+            self.git(root, 'config', 'user.name', 'fixture')
+            self.git(root, 'config', 'user.email', 'fixture@example.invalid')
+            (root / 'AGENTS.md').write_text('rules\n', encoding='utf-8')
+            (root / 'source.txt').write_text('base\n', encoding='utf-8')
+            self.git(root, 'add', '.')
+            self.git(root, 'commit', '-qm', 'H')
+            self.git(root, 'branch', 'fixture-upstream')
+            self.git(root, 'checkout', '-q', 'fixture-upstream')
+            (root / 'AGENTS.md').unlink()
+            self.git(root, 'add', '-u')
+            self.git(root, 'commit', '-qm', 'delete governance')
+            self.git(root, 'checkout', '-q', 'master')
+            self.assertEqual(
+                prepare.protected_deletions(root, self.git(root, 'rev-parse', 'HEAD'), 'fixture-upstream'),
+                ['AGENTS.md'],
+            )
+
 
 if __name__ == '__main__':
     unittest.main()

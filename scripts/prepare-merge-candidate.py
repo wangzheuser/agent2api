@@ -7,9 +7,29 @@ import subprocess
 import sys
 
 
+PROTECTED_CONTROL_FILES = {
+    'AGENTS.md',
+    'docs/local-contracts.json',
+    'scripts/check-merge-contracts.py',
+    'scripts/local-merge-gates.py',
+    'scripts/merge-flow.py',
+    'scripts/replay-merge-baseline.py',
+}
+
+
 def git(root, *args, check=True):
     return subprocess.run(['git', *args], cwd=root, text=True,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=check)
+
+
+def protected_deletions(root, head, upstream):
+    deleted = []
+    rows = git(root, 'diff', '--name-status', head, upstream).stdout.splitlines()
+    for row in rows:
+        fields = row.split('\t')
+        if len(fields) >= 2 and fields[0] == 'D' and fields[1] in PROTECTED_CONTROL_FILES:
+            deleted.append(fields[1])
+    return sorted(deleted)
 
 
 def main():
@@ -48,6 +68,12 @@ def main():
     if len(bases) != 1:
         print('FAIL: upstream and H do not have one unique merge base', file=sys.stderr)
         return 1
+    blocked = protected_deletions(root, head, upstream)
+    if blocked:
+        print('FAIL: upstream deletes protected merge-control files; preserve them before any merge', file=sys.stderr)
+        for path in blocked:
+            print(f' - {path}', file=sys.stderr)
+        return 2
     candidate_branch = f'codex/merge-candidate-{upstream[:12]}'
     if git(root, 'show-ref', '--verify', f'refs/heads/{candidate_branch}', check=False).returncode == 0:
         print(f'FAIL: candidate branch already exists: {candidate_branch}', file=sys.stderr)
