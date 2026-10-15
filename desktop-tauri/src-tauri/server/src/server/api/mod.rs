@@ -41,6 +41,8 @@ pub mod account_selection_api;
 // 「只服务 workbuddy」扩到四家混查时新增，见该文件模块头）
 pub mod accounts_usage;
 pub mod accounts_growth;
+// 整库备份 / 恢复（设置页调用的受保护管理接口；核心实现见 `db::backup`）。
+pub mod backup_api;
 pub mod auto_checkin;
 pub mod billing;
 pub mod captcha;

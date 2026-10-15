@@ -28,6 +28,20 @@ async fn restored_management_routes_preserve_auth_validation_and_selection() {
         ("POST", "/api/rewards/configure", "{}", 400),
         ("GET", "/api/rewards/status", "", 400),
         ("POST", "/api/rewards/claim", "{}", 400),
+        ("POST", "/api/backup/export", "{}", 400),
+        ("POST", "/api/backup/import", "{}", 400),
+        (
+            "POST",
+            "/api/backup/export",
+            "{\"filePath\":\"relative.sql\"}",
+            400,
+        ),
+        (
+            "POST",
+            "/api/backup/import",
+            "{\"filePath\":\"relative.sql\"}",
+            400,
+        ),
     ];
     for (method, path, body, status) in cases {
         let request = |authorized: bool| {
@@ -70,6 +84,7 @@ async fn restored_management_routes_preserve_auth_validation_and_selection() {
         agent2api_server::server::core::workbuddy_growth::target(&state.store(), id).unwrap();
     assert!(!target.supported);
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri(format!("/api/accounts/workbuddy/policy?id={id}"))
@@ -87,4 +102,72 @@ async fn restored_management_routes_preserve_auth_validation_and_selection() {
     )
     .unwrap();
     assert_eq!(value["data"]["identity"], target.identity);
+
+    // 只在临时库验证真实导出、替换恢复与运行时鉴权重装。
+    let backup_path = dir.join("fixture.sql");
+    let accounts_before = state.store().list_accounts();
+    let export = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/backup/export")
+                .header("x-api-key", "fixture-key")
+                .body(Body::from(
+                    json!({"filePath": backup_path, "includeLogs": false}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(export.status(), StatusCode::OK);
+    let dump = std::fs::read_to_string(&backup_path).unwrap();
+    assert!(dump.starts_with(agent2api_server::server::db::backup::BACKUP_SQL_HEADER));
+    assert!(config::set_api_key(Some("changed-fixture-key".into())));
+    let import = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/backup/import")
+                .header("x-api-key", "changed-fixture-key")
+                .body(Body::from(json!({"filePath": backup_path}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let import_status = import.status();
+    let import_body = axum::body::to_bytes(import.into_body(), 100_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        import_status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&import_body)
+    );
+    let restored: Value = serde_json::from_slice(&import_body).unwrap();
+    assert!(restored["success"].as_bool().unwrap());
+    assert!(dir
+        .join("backups")
+        .join(restored["data"]["safetyBackup"].as_str().unwrap())
+        .is_file());
+    assert_eq!(state.store().list_accounts(), accounts_before);
+    for (key, expected) in [
+        ("fixture-key", StatusCode::OK),
+        ("changed-fixture-key", StatusCode::UNAUTHORIZED),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/routing")
+                    .header("x-api-key", key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+    }
 }
