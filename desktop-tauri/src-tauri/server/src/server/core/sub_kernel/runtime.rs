@@ -453,14 +453,26 @@ async fn restart_with_config(
     let log_err = log_file
         .try_clone()
         .map_err(|error| format!("打开内核日志失败: {error}"))?;
-    let mut child = tokio::process::Command::new(&binary)
+    let mut command = tokio::process::Command::new(&binary);
+    command
         .arg("-d")
         .arg(&dir)
         .arg("-f")
         .arg(dir.join("config.yaml"))
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_err))
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    // ── Windows：绝不给内核分配控制台窗口 ────────────────────────
+    // 桌面端是 GUI 子系统进程（没有控制台），启动控制台程序（mihomo）时系统会
+    // **新开一个控制台窗口**，标题就是 `-d` 指的内核目录。那个窗口不是装饰：
+    // 内核挂在它的控制台上，用户点 ✕ 关掉 = 控制台关闭事件把内核一起杀掉
+    //（实测「一关闭黑框，内核就停了」）。内核的 stdout/stderr 早已写进
+    // kernel.log，不需要控制台，所以直接不创建（CREATE_NO_WINDOW）。
+    #[cfg(windows)]
+    {
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let mut child = command
         .spawn()
         .map_err(|error| format!("启动内核进程失败: {error}"))?;
 
@@ -612,8 +624,12 @@ fn controller_alive_port(port: u16) -> bool {
 fn kill_by_pid(pid: u64) -> bool {
     #[cfg(windows)]
     {
+        // taskkill 是控制台程序：不加 CREATE_NO_WINDOW 时桌面端会闪一个黑框
+        // （这条路径在「清理上次运行遗留的内核进程」与端口回收时都会走）
+        use std::os::windows::process::CommandExt;
         match std::process::Command::new("taskkill")
             .args(["/F", "/PID", &pid.to_string()])
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
             .output()
         {
             Ok(output) => output.status.success(),

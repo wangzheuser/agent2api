@@ -187,6 +187,9 @@ fn install_binary(archive_path: &std::path::Path, dir: &std::path::Path) -> Resu
             .map_err(|error| format!("创建解压目录失败: {error}"))?;
         let archive = archive_path.to_string_lossy().to_string();
         let destination = extract_dir.to_string_lossy().to_string();
+        // powershell 也是控制台程序：桌面端不加 CREATE_NO_WINDOW 就会在解压那几秒
+        // 闪一个黑框（与内核进程本身同一个成因，见 runtime::start_kernel 的说明）
+        use std::os::windows::process::CommandExt;
         let output = std::process::Command::new("powershell")
             .args([
                 "-NoProfile",
@@ -194,6 +197,7 @@ fn install_binary(archive_path: &std::path::Path, dir: &std::path::Path) -> Resu
                 "-Command",
                 &format!("Expand-Archive -LiteralPath '{archive}' -DestinationPath '{destination}' -Force"),
             ])
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
             .output()
             .map_err(|error| format!("调用 PowerShell 解压失败: {error}"))?;
         if !output.status.success() {

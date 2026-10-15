@@ -170,6 +170,9 @@
     },
     {
       key: 'opencode-go', name: 'OpenCode Go', icon: 'opencode-go.png',
+      // Go 面与免费档的要求不同：网关按端点自动补上游要求的会话头
+      // （x-opencode-session）与产品 UA，**不需要开伪装开关**（那是 Zen
+      // 免费档的，Go 面拒绝被塞桩工具）。见后端 emulation 的「Go 面」一节。
       protocol: P.openai, baseUrl: 'https://opencode.ai/zen/go/v1',
       hint: wbI18n.t('同地址换 anthropic 协议即走它的 Claude 兼容端点。转发必须填 OpenCode Go 的 API Key（订阅制；获取模型清单不需要 Key，但发请求上游会回 401「Missing API key」）'),
     },
