@@ -38,6 +38,8 @@ def main():
     parser.add_argument('--upstream', required=True)
     parser.add_argument('--worktree', type=Path, required=True)
     parser.add_argument('--record', type=Path, required=True)
+    parser.add_argument('--preserve-protected-control', action='store_true',
+                        help='保留当前分支治理文件；删除清单会写入候选记录并继续隔离合并')
     args = parser.parse_args()
     root = args.root.resolve()
     worktree = args.worktree.resolve()
@@ -69,11 +71,15 @@ def main():
         print('FAIL: upstream and H do not have one unique merge base', file=sys.stderr)
         return 1
     blocked = protected_deletions(root, head, upstream)
-    if blocked:
+    if blocked and not args.preserve_protected_control:
         print('FAIL: upstream deletes protected merge-control files; preserve them before any merge', file=sys.stderr)
         for path in blocked:
             print(f' - {path}', file=sys.stderr)
         return 2
+    if blocked:
+        print('DECISION: preserve protected merge-control files', file=sys.stderr)
+        for path in blocked:
+            print(f' - {path}', file=sys.stderr)
     candidate_branch = f'codex/merge-candidate-{upstream[:12]}'
     if git(root, 'show-ref', '--verify', f'refs/heads/{candidate_branch}', check=False).returncode == 0:
         print(f'FAIL: candidate branch already exists: {candidate_branch}', file=sys.stderr)
@@ -93,6 +99,8 @@ def main():
         'candidate_root': str(worktree),
         'candidate_branch': candidate_branch,
         'source_untracked': sorted(item[3:] for item in status if item.startswith('?? ')),
+        'protected_deletions': blocked,
+        'protected_deletion_decision': 'preserve-local' if blocked else None,
         'merge_started': False,
     }
     record_path.parent.mkdir(parents=True, exist_ok=True)
