@@ -48,8 +48,12 @@ def main():
     if len(bases) != 1:
         print('FAIL: upstream and H do not have one unique merge base', file=sys.stderr)
         return 1
+    candidate_branch = f'codex/merge-candidate-{upstream[:12]}'
+    if git(root, 'show-ref', '--verify', f'refs/heads/{candidate_branch}', check=False).returncode == 0:
+        print(f'FAIL: candidate branch already exists: {candidate_branch}', file=sys.stderr)
+        return 1
     worktree.parent.mkdir(parents=True, exist_ok=True)
-    added = git(root, 'worktree', 'add', '--detach', str(worktree), head, check=False)
+    added = git(root, 'worktree', 'add', '-b', candidate_branch, str(worktree), head, check=False)
     if added.returncode:
         print(added.stderr, file=sys.stderr, end='')
         return added.returncode
@@ -61,6 +65,7 @@ def main():
         'U': upstream,
         'B': bases[0],
         'candidate_root': str(worktree),
+        'candidate_branch': candidate_branch,
         'source_untracked': sorted(item[3:] for item in status if item.startswith('?? ')),
         'merge_started': False,
     }
