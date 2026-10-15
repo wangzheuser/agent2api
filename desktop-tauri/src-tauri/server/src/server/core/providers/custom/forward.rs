@@ -113,7 +113,6 @@ pub(crate) async fn forward(
     telemetry: &Arc<RequestTelemetry>,
     slot: &mut Option<InFlightGuard>,
     connections: &mut ConnectionGuard,
-    test_target: Option<&crate::server::core::providers::catalog::WireTarget>,
 ) -> Result<ForwardOutcome, GatewayError> {
     // ── 配置与凭证（顺序：先家后账号，错误文案各自指向要修的地方）──────
     let provider = custom_providers::get(provider_id).ok_or_else(|| {
@@ -169,13 +168,13 @@ pub(crate) async fn forward(
             "该自定义提供商没有可用的 baseUrl（提供商与账号上都没有配置）",
         ));
     }
-    telemetry.validate_affinity_session(&serde_json::json!({
-        "apiKey": credential.api_key,
-        "baseUrl": base_url,
-        "noAuth": credential.no_auth,
-    }));
     // 翻译协议在这里分出去（凭证与基址已就绪；chat 路径继续往下走）
     let quirks = ProviderQuirks::from_provider(&provider);
+    // 存量记录里可能还写着 OpenCode 免费档的**旧端点**（`/zen/v1`，2026-10 起
+    // 打它一律 403）—— 提供商记录与账号覆盖项两层都可能是旧值，所以在**解析出
+    // 最终地址之后**再过一次读侧迁移（提供商层已在 `custom_providers::item_of`
+    // 过了一遍，账号覆盖项只在这里能碰到）。
+    let base_url = custom_providers::migrate_base_url(&base_url, quirks.emulate_opencode);
     if let Some(kind) = kind {
         return forward_translated(
             kind,
@@ -190,7 +189,6 @@ pub(crate) async fn forward(
             telemetry,
             slot,
             connections,
-            test_target,
         )
         .await;
     }
@@ -234,21 +232,20 @@ pub(crate) async fn forward(
         .unwrap_or("")
         .trim()
         .to_string();
-    let (mut outbound, rewrite) = rewrite_body(body, provider_id, &requested, test_target)?;
-    telemetry.validate_affinity_custom_target(protocol, &base_url, &outbound);
+    let (mut outbound, rewrite) = rewrite_body(body, provider_id, &requested);
     // 客户端形态伪装（OpenCode 免费档）：补桩工具。未开启时不碰请求体。
     // 放在 `rewrite_body` 之后、序列化之前 —— 会话种子取自**改写后**的体，
     // 与最终发出去的字节同源（模型名换了不影响 messages，两种取法等价，
     // 但同源更不容易在将来改坏）
-    quirks.apply_emulation_to_body(&mut outbound);
-    telemetry.note_upstream_reasoning(model_rules::read_client_level(&outbound));
+    quirks.apply_emulation_to_body(&mut outbound, &base_url);
     let payload = serde_json::to_string(&outbound)
         .map_err(|error| GatewayError::with_status(500, format!("请求体序列化失败: {error}")))?;
     // ── 出站头（三段拼装，顺序不可换）────────────────────────────
     //   ① 默认头：**只有 apiKey 非空才带凭证头** —— 无需鉴权的上游
     //      （`noAuth` 账号）拿到一个空 `Bearer ` 会当成凭证错误，
     //      与「这家不要凭证」的语义正好相反；
-    //   ② 伪装头（OpenCode）：补齐官方客户端的头与匿名凭证 `public`；
+    //   ② 伪装头（OpenCode 两个面，按端点分派）：免费档面补齐官方客户端的头
+    //      与匿名凭证 `public`；Go 面只补会话头与产品 UA（见方法说明）；
     //   ③ 记录上的静态额外头（`quirks.apply_to`）：用户手写的最优先。
     let api_key = credential.api_key.trim();
     let mut headers = vec![("Content-Type".to_string(), "application/json".to_string())];
@@ -258,7 +255,7 @@ pub(crate) async fn forward(
             format!("Bearer {api_key}"),
         ));
     }
-    quirks.apply_emulation_headers(&mut headers, api_key, &outbound);
+    quirks.apply_emulation_headers(&mut headers, api_key, &outbound, &base_url);
     quirks.apply_to(&mut headers);
 
     logging::verbose(
@@ -278,7 +275,6 @@ pub(crate) async fn forward(
         // 自定义家没有能力位（用户自己配的出口就是唯一口径：配了就代理，没配就直连）
         system_proxy_when_unset: false,
     };
-    telemetry.record_affinity_send();
     let response = send_chat_request(&transport)
         .await
         .map_err(|error| error.to_gateway_error())?;
@@ -426,23 +422,39 @@ impl ProviderQuirks {
     ///
     /// **调用顺序**：默认头 → 本函数 → `apply_to`（静态额外头）。放在 `apply_to`
     /// 之前是刻意的：手写在记录上的头优先级最高，伪装不该盖掉用户的显式选择。
+    ///
+    /// ── 两个面（按 `base_url` 分派，判据见 `custom_providers::is_opencode_go_endpoint`）──
+    ///   - **Go 面**（`/zen/go/v1`）：只补会话头与产品 UA（见
+    ///     [`emulation::apply_go_headers`]）。它**不套伪装开关** —— 那条要求是
+    ///     端点自身公开的路由要求，不是伪装；用户就算把开关打开（或关掉），
+    ///     Go 面该发的会话头照发、该走自己的 Key 照走；
+    ///   - **免费档面**（其余端点）：四会话头 + 匿名/账号凭证的完整伪装，
+    ///     仍然只在开关打开时生效。
     fn apply_emulation_headers(
         &self,
         headers: &mut Vec<(String, String)>,
         api_key: &str,
         body: &Value,
+        base_url: &str,
     ) {
+        let session = emulation::session_id(&emulation::conversation_seed(body));
+        if custom_providers::is_opencode_go_endpoint(base_url) {
+            emulation::apply_go_headers(headers, &session);
+            return;
+        }
         if !self.emulate_opencode {
             return;
         }
-        let session = emulation::session_id(&emulation::conversation_seed(body));
         emulation::apply_headers(headers, api_key, &session);
     }
 
     /// 请求体补成「智能体形态」（`stream: true` + `bash` / `read` 桩工具）。
     /// 未开启伪装时**一个字节都不动** —— 透传是自定义家的默认语义。
-    fn apply_emulation_to_body(&self, body: &mut Value) {
-        if !self.emulate_opencode {
+    ///
+    /// **Go 面同样一个字节都不动**：它拒绝被塞桩工具的请求（社区实测
+    /// #44300/#44382），那条桩工具逻辑只属于免费档面。
+    fn apply_emulation_to_body(&self, body: &mut Value, base_url: &str) {
+        if !self.emulate_opencode || custom_providers::is_opencode_go_endpoint(base_url) {
             return;
         }
         let _ = emulation::ensure_agent_shape(body);
@@ -469,7 +481,6 @@ async fn forward_translated(
     telemetry: &Arc<RequestTelemetry>,
     slot: &mut Option<InFlightGuard>,
     connections: &mut ConnectionGuard,
-    test_target: Option<&crate::server::core::providers::catalog::WireTarget>,
 ) -> Result<ForwardOutcome, GatewayError> {
     // ── 请求体：先在 chat 体上做自定义语义的改写，再整体翻译 ──────
     // （模型名映射与思考等级绑定是「客户端语义」的修正，与协议无关；
@@ -481,15 +492,10 @@ async fn forward_translated(
         .unwrap_or("")
         .trim()
         .to_string();
-    let (mut outbound_chat, rewrite) = rewrite_body(body, provider_id, &requested, test_target)?;
-    let protocol = match kind {
-        OutboundKind::Responses => custom_providers::PROTOCOL_RESPONSES,
-        OutboundKind::Anthropic => custom_providers::PROTOCOL_ANTHROPIC,
-    };
-    telemetry.validate_affinity_custom_target(protocol, base_url, &outbound_chat);
+    let (mut outbound_chat, rewrite) = rewrite_body(body, provider_id, &requested);
     // 客户端形态伪装：与 chat 分支同一时机（改写后、翻译前）—— 桩工具要由
-    // 转换器一起翻成上游协议的形态（anthropic 的 tools 数组）
-    quirks.apply_emulation_to_body(&mut outbound_chat);
+    // 转换器一起翻成上游协议的形态（anthropic 的 tools 数组）；Go 面不改请求体
+    quirks.apply_emulation_to_body(&mut outbound_chat, base_url);
     // 发给上游的真名 = 改写后的 model 字段（rewrite_body 的产物；请求没带
     // model 时是空串，与 chat 分支「没有回写答案」的口径一致）
     let wire_model = outbound_chat
@@ -523,7 +529,7 @@ async fn forward_translated(
             if has_key {
                 headers.push(("Authorization".to_string(), format!("Bearer {api_key}")));
             }
-            quirks.apply_emulation_headers(&mut headers, api_key, &outbound_chat);
+            quirks.apply_emulation_headers(&mut headers, api_key, &outbound_chat, base_url);
             quirks.apply_to(&mut headers);
             (url, headers, payload)
         }
@@ -571,12 +577,11 @@ async fn forward_translated(
             if has_key {
                 headers.push(("x-api-key".to_string(), api_key.to_string()));
             }
-            quirks.apply_emulation_headers(&mut headers, api_key, &outbound_chat);
+            quirks.apply_emulation_headers(&mut headers, api_key, &outbound_chat, base_url);
             quirks.apply_to(&mut headers);
             (url, headers, payload)
         }
     };
-    telemetry.note_upstream_reasoning(model_rules::read_client_level(&outbound_chat));
     let payload = serde_json::to_string(&payload)
         .map_err(|error| GatewayError::with_status(500, format!("请求体序列化失败: {error}")))?;
 
@@ -597,7 +602,6 @@ async fn forward_translated(
         // 自定义家没有能力位（用户自己配的出口就是唯一口径：配了就代理，没配就直连）
         system_proxy_when_unset: false,
     };
-    telemetry.record_affinity_send();
     let response = send_chat_request(&transport)
         .await
         .map_err(|error| error.to_gateway_error())?;
@@ -714,15 +718,8 @@ impl ProtocolTranslateStream {
                 std::io::Error::other(crate::server::core::egress::describe_error_detail(&error))
             })
         });
-        let original = crate::server::core::upstream::completion_evidence::observe_stream(
-            Box::pin(described), telemetry.clone(),
-            match kind {
-                OutboundKind::Responses => crate::server::core::upstream::completion_evidence::EvidenceProtocol::Responses,
-                OutboundKind::Anthropic => crate::server::core::upstream::completion_evidence::EvidenceProtocol::Anthropic,
-            },
-        );
         let guarded = crate::server::core::upstream::stall::idle_guard(
-            original,
+            Box::pin(described),
             std::time::Duration::from_millis(
                 crate::server::config::timeout_settings().stream_idle_ms(),
             ),
@@ -801,13 +798,12 @@ impl futures::Stream for ProtocolTranslateStream {
 ///
 /// `rewrite` 是 SSE/聚合的 model 回写参数：请求带了 model 才给 ——
 /// 客户端没点名模型时（上游用自家默认）没有「回写成什么」的答案。
-fn rewrite_body(body: &Value, provider_id: &str, requested: &str, test_target: Option<&crate::server::core::providers::catalog::WireTarget>) -> Result<(Value, Option<ModelRewrite>), GatewayError> {
+fn rewrite_body(body: &Value, provider_id: &str, requested: &str) -> (Value, Option<ModelRewrite>) {
     let mut outbound = body.clone();
     if requested.is_empty() {
-        return Ok((outbound, None));
+        return (outbound, None);
     }
-    let (wire_model, reasoning, forced) = test_target.map(|target| (target.model.clone(), target.reasoning.clone(), target.reasoning_override.clone()))
-        .unwrap_or_else(|| custom_providers::wire_model_for(provider_id, requested));
+    let (wire_model, reasoning) = custom_providers::wire_model_for(provider_id, requested);
     if !wire_model.eq_ignore_ascii_case(requested) {
         logging::verbose(
             "[CustomProvider]",
@@ -817,15 +813,7 @@ fn rewrite_body(body: &Value, provider_id: &str, requested: &str, test_target: O
             object.insert("model".to_string(), Value::String(wire_model));
         }
     }
-    if let Some(level) = forced.as_deref() {
-        if model_rules::reasoning_rank(level).is_none() {
-            return Err(model_rules::override_error("自定义提供商强制思考只支持标准正向等级；请清空强制配置或选择有效等级"));
-        }
-        model_rules::clear_client_controls(&mut outbound);
-        let object = outbound.as_object_mut().ok_or_else(|| model_rules::override_error("强制覆盖思考要求请求体为 JSON 对象"))?;
-        object.insert("reasoning_effort".to_string(), Value::String(level.to_lowercase()));
-        logging::verbose("[CustomProvider]", &format!("provider={provider_id} 映射 {requested} 强制覆盖思考 reasoning_effort={level}"));
-    } else if let Some(level) = reasoning
+    if let Some(level) = reasoning
         .as_deref()
         .map(str::trim)
         .filter(|text| !text.is_empty())
@@ -861,12 +849,12 @@ fn rewrite_body(body: &Value, provider_id: &str, requested: &str, test_target: O
             );
         }
     }
-    Ok((
+    (
         outbound,
         Some(ModelRewrite {
             requested: requested.to_string(),
         }),
-    ))
+    )
 }
 
 /// 非 2xx 的响应 → 分类后的 `GatewayError`（分类语义见模块头）。
