@@ -20,6 +20,7 @@
 //!   "protocol": "chat_completions", // chat_completions / responses / anthropic
 //!   "baseUrl": "https://api.example.com/v1",
 //!   "enabled": true,
+//!   "rewardProfile": "astudio",   // 可选：astudio / dumate（预置 API 奖励）
 //!   "createdAt": 1730000000000,
 //!   "models": [                     // 用户登记的模型清单（第二阶段起）
 //!     { "id": "gpt-x", "enabled": true, "reasoning": "",
@@ -110,7 +111,11 @@ pub const PROTOCOL_RESPONSES: &str = "responses";
 pub const PROTOCOL_ANTHROPIC: &str = "anthropic";
 
 /// 全部合法协议（校验用；顺序即错误文案与前端下拉的顺序）
-pub const PROTOCOLS: &[&str] = &[PROTOCOL_CHAT_COMPLETIONS, PROTOCOL_RESPONSES, PROTOCOL_ANTHROPIC];
+pub const PROTOCOLS: &[&str] = &[
+    PROTOCOL_CHAT_COMPLETIONS,
+    PROTOCOL_RESPONSES,
+    PROTOCOL_ANTHROPIC,
+];
 
 /// 展示名长度上限（字符数；1~64 是契约）
 const MAX_NAME_CHARS: usize = 64;
@@ -178,13 +183,11 @@ fn read_items() -> Vec<Value> {
     // 对外契约是「按 createdAt 升序」。存储里本来就应当是这个顺序（create 追加），
     // 但手改配置/旧版本写入可能乱序，所以读取时**总是**重排一次 —— 稳定排序，
     // 同一个 createdAt（毫秒相同）保持原有相对顺序。
-    items.sort_by_key(|item| {
-        item.get("createdAt").and_then(Value::as_i64).unwrap_or(0)
-    });
+    items.sort_by_key(|item| item.get("createdAt").and_then(Value::as_i64).unwrap_or(0));
     items
 }
 
-/// 一条存储条目 → 对外形态：补齐缺失的默认字段，**只有契约里的八个键**。
+/// 一条存储条目 → 对外形态：补齐缺失的默认字段。
 ///
 /// 为什么在这里做「补键」而不是原样透出：手改过的配置可能少一个 `enabled`，
 /// 原样透出会让前端拿到 undefined，行为在多处分叉（开关渲染成关闭、过滤被跳过）。
@@ -214,15 +217,14 @@ fn item_of(object: &Map<String, Value>) -> Value {
         .filter(|text| valid_protocol(text))
         .unwrap_or(PROTOCOL_CHAT_COMPLETIONS)
         .to_string();
-    let client_emulation = client_emulation_of(object.get("clientEmulation"));
-    let base_url = migrate_base_url(
-        object
-            .get("baseUrl")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .unwrap_or(""),
-        client_emulation == CLIENT_EMULATION_OPENCODE,
-    );
+    let base_url = object
+        .get("baseUrl")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
+    // 公开形态只允许提供商定义字段。账号 apiKey / rewardCredential 属于账号
+    // 记录，不能因为配置里出现未知键就被带入提供商列表或管理响应。
     json!({
         "id": id,
         "name": name,
@@ -233,27 +235,39 @@ fn item_of(object: &Map<String, Value>) -> Value {
         "models": model_entries_of(object.get("models")),
         "mappings": mapping_entries_of(object.get("mappings")),
         // per-provider 特判字段：读侧容错归一（坏值按缺省丢弃，与 models 同一口径）。
-        // 缺省即「无特判」—— 老记录没有这几个键，转发侧按缺省走。
+        // 缺省即「无特判」—— 老记录没有这些键，转发侧按缺省走。
         "urlSuffix": url_suffix_of(object.get("urlSuffix")),
         "headers": headers_of(object.get("headers")),
         "anthropicToolType": tool_type_of(object.get("anthropicToolType")),
-        "clientEmulation": client_emulation,
+        "rewardProfile": reward_profile_of(object.get("rewardProfile")),
+        "clientEmulation": client_emulation_of(object.get("clientEmulation")),
     })
+}
+
+/// 读侧归一：奖励签到 profile。空串表示未配置，未知/畸形值按未配置处理，
+/// 这样旧版本读取未来新增 profile 时不会把整个提供商条目丢掉。
+fn reward_profile_of(value: Option<&Value>) -> String {
+    let text = value.and_then(Value::as_str).map(str::trim).unwrap_or("");
+    if text.is_empty() {
+        return String::new();
+    }
+    crate::server::core::reward_profiles::normalize_profile_id(text).unwrap_or_default()
 }
 
 /// 读侧归一：urlSuffix。合法形态 = 空串（无特判）或 `?` 开头、无空白、
 /// 长度有限的查询串（如 `?beta=true`）；坏值一律按无特判处理 —— 导入的
 /// 定义不该因为一个畸形后缀整条被拒，丢弃后转发仍然可用。
 fn url_suffix_of(value: Option<&Value>) -> String {
-    let text = value
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or("");
+    let text = value.and_then(Value::as_str).map(str::trim).unwrap_or("");
     let usable = text.starts_with('?')
         && text.len() >= 2
         && text.len() <= MAX_URL_SUFFIX_CHARS
         && !text.chars().any(char::is_whitespace);
-    if usable { text.to_string() } else { String::new() }
+    if usable {
+        text.to_string()
+    } else {
+        String::new()
+    }
 }
 
 /// 读侧归一：静态额外头。只收「键值都是非空字符串」的条目（上限
@@ -265,24 +279,25 @@ fn headers_of(value: Option<&Value>) -> Map<String, Value> {
         return out;
     };
     for entry in entries.iter().take(MAX_HEADER_ENTRIES * 2) {
-        let Some(object) = entry.as_object() else { continue };
+        let Some(object) = entry.as_object() else {
+            continue;
+        };
         // 数组形态 [{name, value}] 与对象形态 {"Name": "value"} 都收：
         // 对象形态是创建/编辑的入参形态，数组形态留给将来的编辑器
-        let pairs: Vec<(String, String)> = if let Some(name) =
-            object.get("name").and_then(Value::as_str)
-        {
-            match object.get("value").and_then(Value::as_str) {
-                Some(value) => vec![(name.to_string(), value.to_string())],
-                None => vec![],
-            }
-        } else {
-            object
-                .iter()
-                .filter_map(|(key, value)| {
-                    value.as_str().map(|text| (key.clone(), text.to_string()))
-                })
-                .collect()
-        };
+        let pairs: Vec<(String, String)> =
+            if let Some(name) = object.get("name").and_then(Value::as_str) {
+                match object.get("value").and_then(Value::as_str) {
+                    Some(value) => vec![(name.to_string(), value.to_string())],
+                    None => vec![],
+                }
+            } else {
+                object
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        value.as_str().map(|text| (key.clone(), text.to_string()))
+                    })
+                    .collect()
+            };
         for (key, value) in pairs {
             let key = truncate_chars(key.trim(), MAX_HEADER_NAME_CHARS);
             let value = truncate_chars(value.trim(), MAX_HEADER_VALUE_CHARS);
@@ -329,12 +344,20 @@ fn client_emulation_of(value: Option<&Value>) -> String {
 /// 「能显示、能使用」，把脏值裁进合法范围比整条消失好定位。
 fn model_entries_of(value: Option<&Value>) -> Vec<Value> {
     let mut entries: Vec<Value> = Vec::new();
-    for item in value.and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]) {
+    for item in value
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+    {
         let Some(object) = item.as_object() else {
             continue;
         };
         let id = truncate_chars(
-            object.get("id").and_then(Value::as_str).map(str::trim).unwrap_or(""),
+            object
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or(""),
             MAX_MODEL_ID_CHARS,
         );
         if id.is_empty() {
@@ -348,6 +371,9 @@ fn model_entries_of(value: Option<&Value>) -> Vec<Value> {
                 MAX_REASONING_CHARS,
             ),
         });
+        if let Some(level) = object.get("reasoningOverride").and_then(Value::as_str).and_then(crate::server::core::model_rules::normalize_reasoning) {
+            entry["reasoningOverride"] = Value::String(level);
+        }
         // 能力位覆盖（可选的稀疏表，键名与归一规则见 `core::capability`：
         // 内置家的同一层覆盖在 `modelRules.capabilities`，两处共用该模块的判定）。
         // **空表不落键**：老记录（没有这个键的）读回再写时一个字节都不多，
@@ -371,22 +397,34 @@ fn model_entries_of(value: Option<&Value>) -> Vec<Value> {
 /// 请求命中它）。两者都在才算一条可用的映射。
 fn mapping_entries_of(value: Option<&Value>) -> Vec<Value> {
     let mut entries: Vec<Value> = Vec::new();
-    for item in value.and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]) {
+    for item in value
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+    {
         let Some(object) = item.as_object() else {
             continue;
         };
         let alias = truncate_chars(
-            object.get("alias").and_then(Value::as_str).map(str::trim).unwrap_or(""),
+            object
+                .get("alias")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or(""),
             MAX_ALIAS_CHARS,
         );
         let target = truncate_chars(
-            object.get("target").and_then(Value::as_str).map(str::trim).unwrap_or(""),
+            object
+                .get("target")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or(""),
             MAX_MODEL_ID_CHARS,
         );
         if alias.is_empty() || target.is_empty() {
             continue;
         }
-        entries.push(json!({
+        let mut entry = json!({
             "alias": alias,
             "target": target,
             "enabled": object.get("enabled").and_then(Value::as_bool).unwrap_or(true),
@@ -394,7 +432,14 @@ fn mapping_entries_of(value: Option<&Value>) -> Vec<Value> {
                 object.get("reasoning").and_then(Value::as_str).map(str::trim).unwrap_or(""),
                 MAX_REASONING_CHARS,
             ),
-        }));
+        });
+        // 同名 legacy 映射的显式清空须保留，不能重新继承模型上的强制配置。
+        if object.contains_key("reasoningOverride") {
+            let level = object.get("reasoningOverride").and_then(Value::as_str)
+                .and_then(crate::server::core::model_rules::normalize_reasoning).unwrap_or_default();
+            entry["reasoningOverride"] = Value::String(level);
+        }
+        entries.push(entry);
     }
     entries
 }
@@ -473,11 +518,7 @@ pub fn is_custom_provider_id(id: &str) -> bool {
 
 /// 自定义提供商的展示名；不存在返回 None（调用方决定回退到什么）。
 pub fn label_of(id: &str) -> Option<String> {
-    get(id).and_then(|item| {
-        item.get("name")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-    })
+    get(id).and_then(|item| item.get("name").and_then(Value::as_str).map(str::to_string))
 }
 
 /// 自定义提供商的协议；不存在返回 None。
@@ -502,12 +543,7 @@ pub fn create(payload: &Value) -> Result<Value, String> {
         .ok_or_else(|| "请求体必须是 JSON 对象".to_string())?;
     let name = normalize_name(object.get("name"))?;
     let protocol = normalize_protocol(object.get("protocol"))?;
-    let base_url = normalize_base_url(
-        object
-            .get("baseUrl")
-            .and_then(Value::as_str)
-            .unwrap_or(""),
-    )?;
+    let base_url = normalize_base_url(object.get("baseUrl").and_then(Value::as_str).unwrap_or(""))?;
     let id = new_provider_id()?;
     let item = json!({
         "id": id,
@@ -522,6 +558,7 @@ pub fn create(payload: &Value) -> Result<Value, String> {
         "urlSuffix": validate_url_suffix(object.get("urlSuffix"))?,
         "headers": validate_headers(object.get("headers"))?,
         "anthropicToolType": validate_tool_type(object.get("anthropicToolType"))?,
+        "rewardProfile": validate_reward_profile(object.get("rewardProfile"))?,
         "clientEmulation": validate_client_emulation(object.get("clientEmulation"))?,
     });
     let mut items = read_items();
@@ -591,6 +628,12 @@ pub fn update(id: &str, payload: &Value) -> Result<Value, String> {
         merged.insert(
             "anthropicToolType".to_string(),
             Value::String(validate_tool_type(Some(value))?),
+        );
+    }
+    if let Some(value) = object.get("rewardProfile") {
+        merged.insert(
+            "rewardProfile".to_string(),
+            Value::String(validate_reward_profile(Some(value))?),
         );
     }
     if let Some(value) = object.get("clientEmulation") {
@@ -687,8 +730,8 @@ pub fn set_models(id: &str, models: Value, mappings: Value) -> Result<Value, Str
     let mappings_raw = mappings
         .as_array()
         .ok_or_else(|| "mappings 必须是数组".to_string())?;
-    let models = validate_model_entries(models_raw)?;
-    let mappings = validate_mapping_entries(mappings_raw)?;
+    let mut models = validate_model_entries(models_raw)?;
+    let mut mappings = validate_mapping_entries(mappings_raw)?;
     let mut items = read_items();
     let Some(index) = items
         .iter()
@@ -696,6 +739,20 @@ pub fn set_models(id: &str, models: Value, mappings: Value) -> Result<Value, Str
     else {
         return Err(format!("自定义提供商不存在: {id}"));
     };
+    // 老客户端整表更新省略新增字段时，按原绑定身份保留；显式空串才清空。
+    for (name, next, keys) in [("models", &mut models, &["id"][..]), ("mappings", &mut mappings, &["alias", "target"][..])] {
+        if let Some(previous) = items[index].get(name).and_then(Value::as_array) {
+            for entry in next {
+                if entry.get("reasoningOverride").is_some() { continue; }
+                if let Some(old) = previous.iter().find(|old| keys.iter().all(|key| {
+                    old.get(*key).and_then(Value::as_str).zip(entry.get(*key).and_then(Value::as_str))
+                        .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+                })) {
+                    if let Some(level) = old.get("reasoningOverride") { entry["reasoningOverride"] = level.clone(); }
+                }
+            }
+        }
+    }
     // 从既有记录的键表出发整体写回：除 models/mappings 外的键原样保留
     let mut merged = items[index].as_object().cloned().unwrap_or_default();
     merged.insert("models".to_string(), Value::Array(models));
@@ -723,10 +780,18 @@ pub fn set_models(id: &str, models: Value, mappings: Value) -> Result<Value, Str
 /// 转发热路径每请求调用一两次，无需缓存。
 pub fn carriers_of_model(name: &str) -> Vec<String> {
     let name = name.trim();
-    if name.is_empty() { return Vec::new(); }
-    read_items().into_iter()
+    if name.is_empty() {
+        return Vec::new();
+    }
+    read_items()
+        .into_iter()
         .filter(|provider| bindings::resolve(provider, name).is_some())
-        .filter_map(|provider| provider.get("id").and_then(Value::as_str).map(str::to_string))
+        .filter_map(|provider| {
+            provider
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
         .collect()
 }
 
@@ -749,10 +814,15 @@ pub fn carriers_of_model(name: &str) -> Vec<String> {
 /// `off`/`none`（本网关不向任何上游发「关闭思考」字段，判据
 /// `model_rules::reasoning_is_off`）。名字与等级**同源同次解析** —— 拆成两次
 /// 调用就会出现「A 条映射改了名、B 条映射的等级被注入」的串味。
-pub fn wire_model_for(provider_id: &str, requested_name: &str) -> (String, Option<String>) {
+pub fn wire_model_for(provider_id: &str, requested_name: &str) -> (String, Option<String>, Option<String>) {
     let requested = requested_name.trim();
-    get(provider_id).and_then(|provider| bindings::resolve(&provider, requested))
-        .unwrap_or_else(|| (requested.to_string(), None))
+    get(provider_id)
+        .and_then(|provider| bindings::resolve(&provider, requested))
+        .unwrap_or_else(|| (requested.to_string(), None, None))
+}
+
+pub(crate) fn test_wire_model_for(provider_id: &str, model: &str) -> Option<(String, Option<String>, Option<String>)> {
+    get(provider_id).and_then(|provider| bindings::resolve_test(&provider, model.trim()))
 }
 
 /// **服务端代理拉取**上游的模型清单（`POST /api/custom-providers/fetch-models`）。
@@ -789,8 +859,8 @@ pub async fn fetch_upstream_models(
     provider_id: &str,
     store: &AccountStore,
 ) -> Result<Vec<String>, String> {
-    let provider = get(provider_id)
-        .ok_or_else(|| format!("自定义提供商不存在: {}", provider_id.trim()))?;
+    let provider =
+        get(provider_id).ok_or_else(|| format!("自定义提供商不存在: {}", provider_id.trim()))?;
     let protocol = provider
         .get("protocol")
         .and_then(Value::as_str)
@@ -831,9 +901,10 @@ pub async fn fetch_upstream_models(
             builder.header("Authorization", format!("Bearer {api_key}"))
         };
     }
-    let response = builder.send().await.map_err(|error| {
-        format!("上游请求失败: {}", egress::describe_error_detail(&error))
-    })?;
+    let response = builder
+        .send()
+        .await
+        .map_err(|error| format!("上游请求失败: {}", egress::describe_error_detail(&error)))?;
     let status = response.status().as_u16();
     let text = response.text().await.unwrap_or_default();
     if !response_ok(status) {
@@ -842,8 +913,8 @@ pub async fn fetch_upstream_models(
         let summary: String = text.trim().chars().take(200).collect();
         return Err(format!("上游返回 {status}: {summary}"));
     }
-    let payload: Value = serde_json::from_str(&text)
-        .map_err(|error| format!("上游响应不是合法 JSON: {error}"))?;
+    let payload: Value =
+        serde_json::from_str(&text).map_err(|error| format!("上游响应不是合法 JSON: {error}"))?;
     let ids = payload
         .get("data")
         .and_then(Value::as_array)
@@ -890,11 +961,13 @@ fn validate_model_entries(raw: &[Value]) -> Result<Vec<Value>, String> {
             return Err(format!("models 第 {} 项缺少模型 id", position + 1));
         }
         if id.chars().count() > MAX_MODEL_ID_CHARS {
-            return Err(format!(
-                "模型 id 过长（最多 {MAX_MODEL_ID_CHARS} 个字符）"
-            ));
+            return Err(format!("模型 id 过长（最多 {MAX_MODEL_ID_CHARS} 个字符）"));
         }
         let reasoning = validate_reasoning(object.get("reasoning"))?;
+        let forced = validate_reasoning(object.get("reasoningOverride"))?;
+        if !forced.is_empty() && crate::server::core::model_rules::reasoning_rank(&forced).is_none() {
+            return Err("reasoningOverride 只支持标准正向思考等级；空串或 null 可清空".to_string());
+        }
         // 能力位覆盖（可选；校验见 validate_capabilities）—— 它是整表替换里
         // **必须原样带回**的字段：前端草稿漏了它，用户填过的能力就会被一次
         // 「切开关」的提交顺手清掉。
@@ -917,6 +990,7 @@ fn validate_model_entries(raw: &[Value]) -> Result<Vec<Value>, String> {
             "enabled": enabled,
             "reasoning": reasoning,
         });
+        if object.contains_key("reasoningOverride") { entry["reasoningOverride"] = Value::String(forced); }
         if let Some(capabilities) = capabilities {
             if let Some(map) = entry.as_object_mut() {
                 map.insert("capabilities".to_string(), Value::Object(capabilities));
@@ -949,13 +1023,19 @@ fn validate_mapping_entries(raw: &[Value]) -> Result<Vec<Value>, String> {
             .map(str::trim)
             .unwrap_or("");
         if alias.is_empty() {
-            return Err(format!("mappings 第 {} 项缺少映射名（alias）", position + 1));
+            return Err(format!(
+                "mappings 第 {} 项缺少映射名（alias）",
+                position + 1
+            ));
         }
         if alias.chars().count() > MAX_ALIAS_CHARS {
             return Err(format!("映射名过长（最多 {MAX_ALIAS_CHARS} 个字符）"));
         }
         if target.is_empty() {
-            return Err(format!("mappings 第 {} 项缺少目标上游模型（target）", position + 1));
+            return Err(format!(
+                "mappings 第 {} 项缺少目标上游模型（target）",
+                position + 1
+            ));
         }
         if target.chars().count() > MAX_MODEL_ID_CHARS {
             return Err(format!(
@@ -963,25 +1043,35 @@ fn validate_mapping_entries(raw: &[Value]) -> Result<Vec<Value>, String> {
             ));
         }
         let reasoning = validate_reasoning(object.get("reasoning"))?;
+        let forced = validate_reasoning(object.get("reasoningOverride"))?;
+        if !forced.is_empty() && crate::server::core::model_rules::reasoning_rank(&forced).is_none() {
+            return Err("reasoningOverride 只支持标准正向思考等级；空串或 null 可清空".to_string());
+        }
         let enabled = object
             .get("enabled")
             .and_then(Value::as_bool)
             .unwrap_or(true);
         let duplicated = entries.iter().any(|known| {
-            known.get("alias").and_then(Value::as_str)
+            known
+                .get("alias")
+                .and_then(Value::as_str)
                 .is_some_and(|text| text.eq_ignore_ascii_case(alias))
-                && known.get("target").and_then(Value::as_str)
+                && known
+                    .get("target")
+                    .and_then(Value::as_str)
                     .is_some_and(|text| text.eq_ignore_ascii_case(target))
         });
         if duplicated {
             continue;
         }
-        entries.push(json!({
+        let mut entry = json!({
             "alias": alias,
             "target": target,
             "enabled": enabled,
             "reasoning": reasoning,
-        }));
+        });
+        if object.contains_key("reasoningOverride") { entry["reasoningOverride"] = Value::String(forced); }
+        entries.push(entry);
     }
     Ok(entries)
 }
@@ -993,7 +1083,10 @@ fn validate_mapping_entries(raw: &[Value]) -> Result<Vec<Value>, String> {
 ///
 /// 返回**归一后的稀疏表**；缺省 / null / 归一后为空都返回 `None`
 /// （调用方不落键，见 `model_entries_of`）。
-fn validate_capabilities(value: Option<&Value>, position: usize) -> Result<Option<Map<String, Value>>, String> {
+fn validate_capabilities(
+    value: Option<&Value>,
+    position: usize,
+) -> Result<Option<Map<String, Value>>, String> {
     let Some(value) = value.filter(|item| !item.is_null()) else {
         return Ok(None);
     };
@@ -1021,9 +1114,7 @@ fn validate_reasoning(value: Option<&Value>) -> Result<String, String> {
         Some(Value::String(text)) => {
             let text = text.trim();
             if text.chars().count() > MAX_REASONING_CHARS {
-                return Err(format!(
-                    "思考等级过长（最多 {MAX_REASONING_CHARS} 个字符）"
-                ));
+                return Err(format!("思考等级过长（最多 {MAX_REASONING_CHARS} 个字符）"));
             }
             Ok(text.to_string())
         }
@@ -1050,10 +1141,7 @@ fn new_provider_id() -> Result<String, String> {
 
 /// 展示名校验：trim 后 1~64 字符（按字符数，不是字节数 —— 中文名一样受 64 限制）。
 fn normalize_name(value: Option<&Value>) -> Result<String, String> {
-    let name = value
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or("");
+    let name = value.and_then(Value::as_str).map(str::trim).unwrap_or("");
     if name.is_empty() {
         return Err("缺少提供商名称".to_string());
     }
@@ -1065,15 +1153,9 @@ fn normalize_name(value: Option<&Value>) -> Result<String, String> {
 
 /// 协议校验：必须是 [`PROTOCOLS`] 三选一。
 fn normalize_protocol(value: Option<&Value>) -> Result<String, String> {
-    let protocol = value
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or("");
+    let protocol = value.and_then(Value::as_str).map(str::trim).unwrap_or("");
     if !valid_protocol(protocol) {
-        return Err(format!(
-            "协议必须是以下之一: {}",
-            PROTOCOLS.join(" / ")
-        ));
+        return Err(format!("协议必须是以下之一: {}", PROTOCOLS.join(" / ")));
     }
     Ok(protocol.to_string())
 }
@@ -1100,57 +1182,12 @@ pub fn normalize_base_url(raw: &str) -> Result<String, String> {
     if raw.is_empty() {
         return Err("缺少 baseUrl".to_string());
     }
-    let parsed = url::Url::parse(raw).map_err(|error| format!("baseUrl 不是合法的 URL: {error}"))?;
+    let parsed =
+        url::Url::parse(raw).map_err(|error| format!("baseUrl 不是合法的 URL: {error}"))?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err("baseUrl 必须以 http:// 或 https:// 开头".to_string());
     }
     Ok(parsed.as_str().trim_end_matches('/').to_string())
-}
-
-/// OpenCode Zen 免费档的**旧端点**：2026-10 起打它一律 403 `FreeTierError`
-/// （实测，见 `providers::custom::emulation` 的模块头）。
-pub const LEGACY_OPENCODE_BASE_URL: &str = "https://opencode.ai/zen/v1";
-
-/// OpenCode Zen 免费档的**当前端点**（旧端点已废弃，见上）。
-pub const OPENCODE_BASE_URL: &str = "https://opencode.ai/inference/v1";
-
-/// OpenCode **Go**（订阅制）的端点。它与免费档的要求**不同**：免费档要「伪装成
-/// 官方客户端」（四会话头 + 工具对 + 匿名凭证），Go 只要客户端**带一个稳定的
-/// 会话头**——上游文档 `docs/go/#where-can-i-use-it` 的公开路由要求（「Send a
-/// stable session ID in `x-opencode-session` for each conversation」），缺了直接
-/// `400 MissingSessionID`（实测：这道检查在鉴权之前，且只看在场、不校验形状）。
-/// 两面的要求不同，转发侧按端点分派，见 `providers::custom::emulation`。
-pub const OPENCODE_GO_BASE_URL: &str = "https://opencode.ai/zen/go/v1";
-
-/// 这条记录的 baseUrl 是否逐字命中 OpenCode Go 端点（忽略末尾斜杠与 ASCII 大小写）。
-///
-/// 与 [`migrate_base_url`] 同一口径的**精确匹配**：只有官方那个端点走 Go 面的
-/// 特殊处理，用户自建的中转/代理地址一概不碰（那类地址背后是什么取决于中转
-/// 自己，网关不该替它猜）。
-pub fn is_opencode_go_endpoint(base_url: &str) -> bool {
-    base_url
-        .trim()
-        .trim_end_matches('/')
-        .eq_ignore_ascii_case(OPENCODE_GO_BASE_URL)
-}
-
-/// 读侧迁移：把**逐字等于旧端点**的 baseUrl 改写成当前端点。
-///
-/// 为什么在读侧做而不是写一条一次性迁移：旧端点是免费档的入口，2026-10 起打它
-/// 一律 403；存量记录里有两处可能还指着它 —— 预置卡早先写进提供商记录的，
-/// 以及用户在**账号**上覆盖的（那条由 `forward` 在解析完最终 baseUrl 后再过一次
-/// 本函数）。读侧改写让老记录不改盘、不迁移也能立刻恢复可用，新写的记录本来就
-/// 用新端点。
-///
-/// `is_opencode` 是**显式开关**（调用方传记录的 `clientEmulation`）：只对
-/// 「按 OpenCode 客户端形状伪装」的记录动手，别家填了同名字符串也不改 ——
-/// 与 `client_emulation` 整体的 opt-in 取向一致。
-pub fn migrate_base_url(raw: &str, is_opencode: bool) -> String {
-    let text = raw.trim();
-    if is_opencode && text.trim_end_matches('/').eq_ignore_ascii_case(LEGACY_OPENCODE_BASE_URL) {
-        return OPENCODE_BASE_URL.to_string();
-    }
-    text.to_string()
 }
 
 // ── per-provider 特判字段的写侧校验（create / update 共用）────────
@@ -1164,7 +1201,9 @@ pub fn migrate_base_url(raw: &str, is_opencode: bool) -> String {
 /// [`MAX_URL_SUFFIX_CHARS`] 的查询串（如 `?beta=true`）。转发时原样追加到
 /// 出站 URL 末尾（GLM / MiniMax 的 Claude 兼容端点要求 `?beta=true`）。
 fn validate_url_suffix(value: Option<&Value>) -> Result<String, String> {
-    let Some(value) = value else { return Ok(String::new()) };
+    let Some(value) = value else {
+        return Ok(String::new());
+    };
     let text = value.as_str().unwrap_or("").trim();
     if text.is_empty() {
         return Ok(String::new());
@@ -1185,7 +1224,9 @@ fn validate_url_suffix(value: Option<&Value>) -> Result<String, String> {
 /// 默认头上 —— **同名的默认头被覆盖**（包括 Authorization / x-api-key：那是
 /// 「换一种鉴权方式」的高级用法，覆盖后默认凭证头不再发出，由使用者负责）。
 fn validate_headers(value: Option<&Value>) -> Result<Map<String, Value>, String> {
-    let Some(value) = value else { return Ok(Map::new()) };
+    let Some(value) = value else {
+        return Ok(Map::new());
+    };
     let object = value
         .as_object()
         .ok_or_else(|| "headers 必须是 JSON 对象（{\"头名\": \"值\"}）".to_string())?;
@@ -1200,7 +1241,9 @@ fn validate_headers(value: Option<&Value>) -> Result<Map<String, Value>, String>
             return Err("headers 的头名与值都必须是非空字符串".to_string());
         }
         if key.contains(':') || key.chars().any(char::is_whitespace) {
-            return Err(format!("headers 的头名「{key}」不是合法的头名（不能含空白或冒号）"));
+            return Err(format!(
+                "headers 的头名「{key}」不是合法的头名（不能含空白或冒号）"
+            ));
         }
         if key.chars().count() > MAX_HEADER_NAME_CHARS {
             return Err(format!("headers 的头名最长 {MAX_HEADER_NAME_CHARS} 个字符"));
@@ -1217,7 +1260,9 @@ fn validate_headers(value: Option<&Value>) -> Result<Map<String, Value>, String>
 /// 工具补 `type: "custom"`。其余值一律拒绝 —— 这是请求体修正的开关，不是
 /// 自由字段，拼错的值等于静默改变转发行为。
 fn validate_tool_type(value: Option<&Value>) -> Result<String, String> {
-    let Some(value) = value else { return Ok(String::new()) };
+    let Some(value) = value else {
+        return Ok(String::new());
+    };
     let text = value.as_str().unwrap_or("").trim();
     if text.is_empty() {
         return Ok(String::new());
@@ -1226,6 +1271,40 @@ fn validate_tool_type(value: Option<&Value>) -> Result<String, String> {
         return Ok(TOOL_TYPE_CUSTOM.to_string());
     }
     Err("anthropicToolType 只支持 \"custom\"（留空表示不补 type）".to_string())
+}
+
+/// 预置 API 奖励 profile：空串表示关闭该自定义提供商的签到适配；非空值必须是
+/// `core::reward_profiles` 注册的 AStudio / DuMate profile id。原生 Provider 的
+/// 奖励由各自 Provider 处理，不应配置在 custom provider 上。写侧拒绝未知值，避免保存成功后
+/// 定时签到才发现没有对应协议；读侧则由 [`reward_profile_of`] 对未来 profile
+/// 做容错回落。
+fn validate_reward_profile(value: Option<&Value>) -> Result<String, String> {
+    let Some(value) = value else {
+        return Ok(String::new());
+    };
+    let Some(text) = value.as_str() else {
+        return Err("rewardProfile 必须是字符串（留空表示不启用签到）".to_string());
+    };
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(String::new());
+    }
+    if !crate::server::core::reward_profiles::is_known_profile(text) {
+        return Err(format!("不支持的 rewardProfile: {text}"));
+    }
+    crate::server::core::reward_profiles::normalize_profile_id(text)
+        .map_err(|error| format!("rewardProfile 无效: {error}"))
+}
+
+/// 返回已注册的奖励 profile；提供商不存在或未配置 profile 时返回 None。
+///
+/// API/签到层使用这一入口获取 profile，避免把 `rewardProfile` 的空串、未知值
+/// 与自定义提供商不存在的情况各自实现一遍。
+pub fn reward_profile_of_provider(id: &str) -> Option<String> {
+    get(id).and_then(|item| {
+        let profile = item.get("rewardProfile").and_then(Value::as_str)?.trim();
+        (!profile.is_empty()).then(|| profile.to_string())
+    })
 }
 
 /// 客户端形态伪装：空 = 不伪装；`opencode` = 按 OpenCode 官方 CLI 的形状补齐
