@@ -25,7 +25,7 @@ import {
  *   window.wbRequestPhase  = { labelOf, badgeHtml, elapsedLineHtml, elapsedText, phaseOf }
  *
  * ── 数据口径（照旧，别改）──────────────────────────────────────
- * 明细全量保留（不按天数 / 条数自动删除），条数没有上限，所以走后端 offset/limit 真分页（每页 50 条 = 后端默认值，显式传
+ * 明细按保留期存盘、条数无上限，所以走后端 offset/limit 真分页（每页 50 条 = 后端默认值，显式传
  * 页数才算得出来）。后端支持时间区间 / 状态 / 模型 / 提供商四个维度，四者在存储层的**同一份
  * FilterPlan** 里编译成 SQL —— 所以「页面上筛出来的 N 条」与「清理弹窗删掉的那批」必然是同一个
  * 集合。前端这份口径只有一处实现（filterParams），列表 GET 与 clearParams 都从它取（见下）。
@@ -78,9 +78,6 @@ type RequestEntry = {
   /** 模型测试发起的请求（后端 `is_test`；此前落盘的老行没有这个键） */
   isTest?: boolean
   phase?: string; phaseElapsedMs?: number | null; phaseStartedAt?: number | null
-  /** 来源客户端（后端 `client`：入口按下游 User-Agent 分类的结果；
-   *  空串 / 缺键 = 没有记录 —— 旧行、模型测试、请求未带 UA 的行） */
-  client?: string
 }
 
 type RequestQueryResult = {
@@ -859,28 +856,6 @@ function requestCell(entry: RequestEntry, column: VisibleColumn): React.ReactNod
       )
     }
 
-    case 'client': {
-      // 后端存的是**归类结果**（Codex / ZCode / Claude Code / …，见 core::client），
-      // 空串 = 没有记录（旧行、模型测试、请求未带 UA）。产品名是标识符不翻译，
-      // 只有兜底类 `other` 翻成「其它」；空值给占位符而不是空格子。
-      const value = String(entry.client ?? '').trim()
-      if (!value) {
-        return (
-          <span key={key} className={`${className} is-empty`}
-            title={t('这条明细没有记录来源客户端（旧数据、模型测试，或请求未带 User-Agent）')}>—</span>
-        )
-      }
-      const label = value === 'other' ? t('其它') : value
-      return (
-        <span key={key} className={className}
-          title={value === 'other'
-            ? t('识别到 User-Agent，但不属于已知的客户端类型：{ua}', { ua: value })
-            : t('来源客户端：{client}', { client: label })}>
-          {label}
-        </span>
-      )
-    }
-
     case 'dur': {
       if (isRunning(entry)) {
         // 进行中行没有 durationMs（收尾才记账）：主行显示已用时（每拍轮询在走）
@@ -1065,7 +1040,7 @@ function RequestsPage() {
         loaded: true,
         error: '',
       }
-      // 明细被清空后，停在第 5 页会看到一片空白：先把 offset 夹回最后一页
+      // 明细被清空或被保留期裁掉后，停在第 5 页会看到一片空白：先把 offset 夹回最后一页
       const lastOffset = Math.max(0, (Math.ceil(next.matched / current.size) - 1) * current.size)
       if (current.offset > lastOffset) {
         applyOffset(lastOffset)

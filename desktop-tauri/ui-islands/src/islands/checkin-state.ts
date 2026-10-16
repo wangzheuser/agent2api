@@ -315,23 +315,9 @@ type CheckinBridge = {
     message?: unknown
     credit?: unknown
   } | null | undefined>
-  /**
-   * Qoder UMID 组件（设备风控身份）的状态与安装（与 bridge.rs、web_shim.rs 三处成对）。
-   *
-   * `available` 决定签到页那条提示出不出现，`installSupported` 决定给「一键安装」
-   * 按钮还是文字说明（只有 Linux / headless 支持下载安装），`installing` 让界面在
-   * 安装期间持续回读状态。
-   */
-  getQoderUmid?(): Promise<{
-    available?: boolean
-    source?: string | null
-    installSupported?: boolean
-    installing?: boolean
-  } | null | undefined>
-  installQoderUmid?(): Promise<{ version?: string; registry?: string; installedAt?: number } | null | undefined>
 }
 
-export function bridge(): CheckinBridge {
+function bridge(): CheckinBridge {
   return (shared().workbuddyDesktop ?? {}) as CheckinBridge
 }
 
@@ -668,11 +654,8 @@ export async function signSingleAccount(id: string, mode: 'checkin' | 'full' | '
     } else if (authExpired) {
       toast(claim?.msg || t('登录态已过期'), 'err')
     } else if (mode === 'keepalive') {
-      // 只保活：结果就一句话（保活成功 / 失败），不存在领取语义。
-      // 活跃上报（点亮连登的那条通道）与网页会话（issue #277：「当日活跃」
-      // 计数的判定通道）成功同样算保活成功；三者都失败才是失败。
-      if (activity?.pokeSucceeded === true || webOk || reportOk)
-        toast(t('✅ {message}', { message: claim?.msg || t('活跃保活完成') }))
+      // 只保活：结果就一句话（保活成功 / 失败），不存在领取语义
+      if (activity?.pokeSucceeded === true) toast(t('✅ {message}', { message: claim?.msg || t('活跃保活完成') }))
       else toast(claim?.msg || t('活跃保活失败'), 'err')
     } else if (pendingCredit) {
       toast(t('✅ {message}', { message }))
