@@ -4,7 +4,7 @@
 //!   GET  /v2/activity/workbuddy/banner    运营 banner（需客户端白名单头）
 //!   GET  /v2/activity/ambassador/status    大使状态
 //!   签到 + 查余额的组合动作（"签到并回报最新积分"）
-//!   WorkBuddy 国际版的每日活跃任务（探测 → 条件领取 → 免费模型保活 + 网页会话）
+//!   WorkBuddy 国际版的每日活跃任务（探测 → 条件领取 → 免费模型保活）
 //!
 //! 从 billing/mod.rs 拆出（单文件行数约定）。banner / ambassador **吞掉所有错误
 //! 返回 null**（装饰性内容，拉不到不该让首屏报错）；组合动作里的签到失败则收敛成
@@ -15,7 +15,6 @@
 use serde_json::{json, Map, Value};
 
 use crate::server::core::endpoints::RESPONSE_CODE_OK;
-use crate::server::core::upstream::request::new_request_id;
 use crate::server::logging;
 
 use super::request::{
@@ -288,7 +287,7 @@ impl BillingService {
 
     // ─── WorkBuddy 国际版：每日活跃任务 ─────────────────────
 
-    /// 国际版每日活跃任务：活动探测 → 条件领取 → 免费模型保活 → 网页会话。
+    /// 国际版每日活跃任务：活动探测 → 条件领取 → 免费模型保活。
     ///
     /// [`WorkbuddyActivity`] 决定这次跑到哪一步 —— 界面上「保活 / 领取 /
     /// 保活+领取」三颗按钮各对应一种粒度；**定时与批量签到恒走 [`WorkbuddyActivity::Full`]**
@@ -305,8 +304,7 @@ impl BillingService {
     ///     `alreadyCompleted`（上游幂等，但少一发是一发），活动没开就不打领取。
     ///
     /// 保活的模型链来自 `keepalive::models()`（签到中心可自定义，空回落缺省链），
-    /// 逐个尝试、第一个成功的收口（见 `poke_daily_activity` 与
-    /// `create_web_conversation`）。
+    /// 逐个尝试、第一个成功的收口（见 `poke_daily_activity`）。
     pub async fn workbuddy_daily_activity(&self, session: &Value, mode: WorkbuddyActivity) -> Value {
         let balance_before = self.log_workbuddy_activity_balance(session, "前").await;
 

@@ -258,34 +258,6 @@ fn defer_to_next_account(
 /// 它的出路只有换号一条（见 [`defer_to_next_account`]）。
 const TRANSIENT_RETRY_STATUSES: &[u16] = &[408, 500, 502, 503, 504];
 
-/// 按**请求体字节数**拒收的状态码：这一档的结论只由「这份 body 有多大」决定，
-/// 重发同一份字节必然得到同一个失败 ⇒ 不进原地重发（见 [`fallback_retry_advice`]）。
-///
-/// 与 [`TRANSIENT_RETRY_STATUSES`] 相反：那三个码说的是「上游或链路自己抖了一下」，
-/// 再看一眼有意义；413 没有任何会变的量。
-const PAYLOAD_SIZE_REJECTION_STATUSES: &[u16] = &[413];
-
-/// 按**请求的路由 / 模型名**拒收的状态码：上游在解析请求时就没找到目标
-/// （模型不在这一家的套餐里、路由不存在），结论只由「这份 body 长什么样」决定，
-/// 同一账号重发同一份 body 必然得到同一个 404 ⇒ 不进原地重发，
-/// 换账号才是有意义的动作（别的账号可能有这个模型）。
-///
-/// 实测形状（issue #255）：OfficeAce 对目录里有、套餐里没有的名字回
-/// `404 {"code":null,"message":"Invalid model."}`，旧判据把它当普通 Fatal，
-/// 原地重发 3 次 × 5 秒才换号——客户端白等 15 秒，换来的还是同一个 404。
-///
-/// 与 [`PAYLOAD_SIZE_REJECTION_STATUSES`] 分成两个常量而不是合一：
-/// 一个是「字节」，一个是「名字」，出处与措辞不同，将来各自的排除面也可能变。
-const DETERMINISTIC_NOT_FOUND_STATUSES: &[u16] = &[404];
-
-/// 轮询出网档（`core::proxy_rotate`）在 429 时**原地换出口**的次数上限。
-///
-/// 为什么是 3：OpenCode Zen 免费档的 429 按 IP 判（这个出口的额度用完），换出口
-/// 就有机会过；但一次请求也不该无限换下去 —— 池里几十个出口全试一遍意味着
-/// 几十次往返，客户端白等。换满 3 个仍 429，按「这台账号此刻确实被上游拒了」
-/// 收尾（走既有的按模型冷却 + 顺延下一个账号），与没有轮询时的行为一致。
-const MAX_ROTATE_EXIT_RETRIES: usize = 3;
-
 /// 这次的失败状态码是否命中「指定错误码直接换号」名单（设置页「通用 → 请求重试」）。
 ///
 /// 命中的失败**跳过本账号**：不进 [`send_with_retry`] 的原地重发，也不做同
@@ -354,12 +326,7 @@ fn transport_retry_advice(error: &super::request::UpstreamRequestError, remainin
 ///     走到这里说明已经刷过一轮仍失败，重发没有新变量；
 ///   - `ContentBlocked`（内容策略拦截）：也有专属动作（换中性提示词重发一次，
 ///     见 `attempt_queue` 的动作 0），走到这里说明那次补救已经用掉 ——
-///     再原地重发同一份 body 结论不变（拦的是字节，不是账号）；
-///   - `Fatal` + **413**（见 [`PAYLOAD_SIZE_REJECTION_STATUSES`]）：上游入口按请求体
-///     字节数拒收（实测 Loomy 的网关回 `{"error_code":"APIG.0201","error_msg":
-///     "Request entity too large"}`），判据里没有任何会变的量。而代价不对称：
-///     每次往返约 13 秒 + 一个 5 秒间隔，三次下来客户端的 60 秒等待墙先到，
-///     面板里只剩下「408 客户端在响应完成前断开」，真实成因埋在 attempt_details。
+///     再原地重发同一份 body 结论不变（拦的是字节，不是账号）。
 fn fallback_retry_advice(
     class: &UpstreamErrorClass,
     remaining: usize,
@@ -372,14 +339,6 @@ fn fallback_retry_advice(
         UpstreamErrorClass::QuotaLimited { .. }
         | UpstreamErrorClass::TokenExpired { .. }
         | UpstreamErrorClass::ContentBlocked { .. } => None,
-        // 体积被入口拒收：重发同一份字节只会得到同一个 413（换号也一样，但那是
-        // 编排层的事，这里只撤「原地再发一次」这一件事）
-        UpstreamErrorClass::Fatal { .. }
-            if PAYLOAD_SIZE_REJECTION_STATUSES.contains(&status)
-                || DETERMINISTIC_NOT_FOUND_STATUSES.contains(&status) =>
-        {
-            None
-        }
         UpstreamErrorClass::Fatal { .. } => Some(RetryAdvice {
             delay_ms: config::retry_settings().delay_ms(),
             reason: format!("上游错误（HTTP {status}），换账号前先原地重发"),
@@ -605,7 +564,7 @@ async fn attempt_queue(
         if ctx.telemetry.is_cancelled() {
             return Err(cancellation::cancelled_error());
         }
-        let mut target = rotate::select_target_account(
+        let target = rotate::select_target_account(
             service,
             provider_ids,
             &cooldown_keys,
@@ -1673,15 +1632,6 @@ fn mark_conversation_limited(
 /// （数据源是提供商记录上的 `models` / `mappings`）。冷却键在调用方的 Err
 /// 分支用 `custom_forward::cooldown_model` 解析 —— 与发送名同一纯函数、同一
 /// 结果，两次调用不会分叉（见那个函数的说明）。
-///
-/// ── 轮询出网档（`core::proxy_rotate`）的 429 补救 ─────────────
-/// 这条路径是**唯一**会把「429」再拆一层的地方：轮询档（目前只有 OpenCode Zen
-/// 免费档）下的 429 说的是「这个出口 IP 的免费额度用完了」，不是「这台账号不行」
-/// —— 换一个出口重发往往就过。所以本函数在轮询档上最多原地换
-/// [`MAX_ROTATE_EXIT_RETRIES`] 个出口，换出口的次数与原因记进本轮的尝试明细
-/// （`note_attempt_retry`，与「动作 0 换提示词」同一记账形态：同一个账号、同一条
-/// 明细，不另起一轮）；换满仍 429 才把错误交给调用方，走既有的「按模型冷却 +
-/// 顺延下一个账号」。别的档、别的错误码一律不换出口（理由见函数内注释）。
 ///
 /// 明细记账的定稿粒度与无状态路径对齐：成功时记**上游真实状态码**（流式在
 /// `ForwardOutcome::Stream.status`、聚合完成恒为 200 —— 非 2xx 在 forward

@@ -54,7 +54,6 @@ pub async fn put_routing(State(_state): State<ServerState>, body: Bytes) -> Resp
         let known = [
             config::ROUTING_STRATEGY_ORDER,
             config::ROUTING_STRATEGY_ROTATE,
-            config::ROUTING_STRATEGY_PROVIDER,
         ];
         if !known.contains(&text) {
             return errors::management_error(

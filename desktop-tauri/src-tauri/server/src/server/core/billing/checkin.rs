@@ -747,14 +747,6 @@ pub async fn run_checkin(
                 .and_then(|activity| activity.get("pokeSucceeded"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
-                // 活跃上报（/v2/report，点亮国际版连登的那条通道）成功同样算
-                // 「完成活跃」—— 这才是国际版日活的主动作；保活对话只是补充。
-                || item
-                    .get("activity")
-                    .and_then(|activity| activity.get("report"))
-                    .and_then(|report| report.get("succeeded"))
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
         })
         .count();
     let eligible = results.len();

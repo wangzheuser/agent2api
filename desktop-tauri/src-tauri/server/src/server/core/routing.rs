@@ -517,21 +517,15 @@ pub fn account_id(account: &Value) -> Option<&str> {
         .filter(|id| !id.is_empty())
 }
 
-/// 账号展示名：`displayName`（统一展示名，见 `store_view::display_name_of`）
-/// → `name` → id（快照缺 `displayName` 时按旧口径回落）
+/// 账号展示名：`account.name || account.id`（Node 的 blocked 列表用这个兜底）
 pub fn account_name(account: &Value, id: &str) -> String {
-    account
-        .get("displayName")
-        .filter(|value| js_truthy(value))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .or_else(|| {
-            account.get("name").filter(|value| js_truthy(value)).and_then(|value| match value {
-                Value::String(text) => Some(text.to_string()),
-                other => Some(other.to_string()),
-            })
-        })
-        .unwrap_or_else(|| id.to_string())
+    match account.get("name") {
+        Some(value) if js_truthy(value) => match value.as_str() {
+            Some(text) => text.to_string(),
+            None => value.to_string(),
+        },
+        _ => id.to_string(),
+    }
 }
 
 /// 从 store 快照 `{ currentAccountId, accounts: [...] }` 取账号数组。

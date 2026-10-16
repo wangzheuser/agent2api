@@ -38,16 +38,10 @@ pub const DEFAULT_LOCALE: &str = "zh-CN";
 
 /// 事件日志（统一库的 `logs` 表）保留天数
 pub const KEY_LOG_RETENTION_DAYS: &str = "logRetentionDays";
-/// 请求日志（统一库的 `requests` 表）保留天数。
-///
-/// 为什么不是旧版的 `requestRetentionDays`：那个键在「全量保留」时期
-/// （`4a0e104`）退役过，老库 / 旧 config.json 里残留的值是**旧默认**（30 天）。
-/// 恢复这项设置时默认改成了 99999 天 —— 沿用旧键会让那些残留值悄悄生效，
-/// 升级后的第一次记账就把老日志裁掉。换新键让它从新默认起步；旧键残留
-/// 不被读取、也无害（与全量保留时期的口径一致）。
-pub const KEY_REQUEST_RETENTION_DAYS: &str = "requestLogRetentionDays";
-/// 按天聚合（统一库的 `request_daily` 表）保留天数（改名理由同上）
-pub const KEY_DAILY_RETENTION_DAYS: &str = "dailyAggregateRetentionDays";
+/// 请求日志（统一库的 `requests` 表）保留天数
+pub const KEY_REQUEST_RETENTION_DAYS: &str = "requestRetentionDays";
+/// 按天聚合（统一库的 `request_daily` 表）保留天数
+pub const KEY_DAILY_RETENTION_DAYS: &str = "dailyRetentionDays";
 
 /// 事件日志的保存目录（config.json 键）。
 ///
@@ -68,29 +62,6 @@ pub const KEY_DEBUG_DIR: &str = "debugDir";
 /// 归一与解析都复用账号代理那两份实现（`normalize_account_proxy` /
 /// `resolve_account_proxy`），这里只存取。
 pub const KEY_UPDATE_PROXY: &str = "updateProxy";
-
-/// 代理内核（mihomo）的**存放目录**（config.json 键）。
-///
-/// 值是**绝对路径**；缺省 / 空串 / 相对路径（读侧视为写坏）都回落
-/// `{config_dir}/proxy-kernel` —— 与 `logDir` 那几个键同一口径。
-/// 目录由内核下载弹窗选择（「网络代理」页 →「下载内核」），里面放二进制、
-/// `config.yaml`、`kernel-state.json`（节点 → 端口映射）与 provider 缓存，
-/// **整份都跟着这个键走**：改目录 = 换一整套内核数据的位置。
-/// 所以它只在「未安装」时可改（弹窗只在此时出现）—— 已装之后改键会让
-/// `installed()` 指向一个空目录，界面上看着像「内核没装」而旧文件仍在原处。
-pub const KEY_KERNEL_DIR: &str = "kernelDir";
-
-/// 代理内核的**下载出网线路**（config.json 键，缺省 = 默认链）。
-///
-/// 形状与 `updateProxy` 完全相同（归一后的账号代理配置对象 / null），
-/// 归一与解析复用同一套实现。**与 `updateProxy` 是两个独立的键**：下载内核
-/// 走哪条线路与「软件更新」走哪条线路是两件事（前者是订阅功能的前置条件，
-/// 后者是壳自己的更新），互不覆盖。
-///
-/// 缺省（未设置 / null）= 默认链：直连失败自动借 Clash 混合端口重试一次
-/// （见 `core::sub_kernel::download` 的出口候选）。**显式选定后只走选的那条**
-/// —— 用户专门选了出口，静默改走别的（尤其改走直连）会让失败信息变得不可信。
-pub const KEY_KERNEL_PROXY: &str = "kernelProxy";
 
 /// GitHub 令牌的密文信封（config.json 键，**存的不是明文**）。
 ///
@@ -384,15 +355,10 @@ pub struct ProviderPrompt {
     pub file_error: Option<String>,
 }
 
-/// 三档保留天数的默认值（缺失时用它们）。
-///
-/// 请求日志与按天聚合的默认是 99999 天（约 274 年）：效果上等于「全量保留」，
-/// 同时界面仍是一个普通的天数输入框 —— 想清理历史数据的用户可以把它改小，
-/// 不必再专程去各页面找「清空」入口（旧「全量保留」版本的行为仍是兜底：
-/// 清空 / 按筛选删除的入口保留）。
+/// 三档保留天数的默认值（缺失时用它们）
 pub const DEFAULT_LOG_RETENTION_DAYS: i64 = 30;
-pub const DEFAULT_REQUEST_RETENTION_DAYS: i64 = 99999;
-pub const DEFAULT_DAILY_RETENTION_DAYS: i64 = 99999;
+pub const DEFAULT_REQUEST_RETENTION_DAYS: i64 = 30;
+pub const DEFAULT_DAILY_RETENTION_DAYS: i64 = 365;
 
 /// **历史**路由优先级键：`{"workbuddy": 10, "raccoon": 20}`。
 ///
@@ -449,15 +415,12 @@ impl Default for AccountSelectionStrategy {
 /// （比如接口拒绝 5000 而读侧接受它）。两侧的处理方式不同是有意的：
 /// 走接口的非法值给 400（用户当场能改），手改文件的非法值回落到默认（不打扰）。
 pub const RETENTION_MIN_DAYS: i64 = 1;
-pub const RETENTION_MAX_DAYS: i64 = 99999;
+pub const RETENTION_MAX_DAYS: i64 = 3650;
 
 /// 三档保留天数（设置页「数据保留」区域）。
 ///
-/// 请求日志与按天聚合的默认 99999 天是**故意的近似无限**：默认行为与
-/// 「全量保留」一致，但用户随时可以把某一项改小 —— 保存后立即裁剪
-/// （`stats_api::put_retention`），不用去各页面手动清。事件日志维持 30 天默认
-/// 不变。保留结构而不直接摊成三个函数：GET / PUT 与日志存储的回调都按
-/// 「一份 `Copy` 值」的形状传，将来若再加保留项，调用方不必跟着改签名。
+/// 用独立结构而不是三个散落的取值函数：三个值总是一起用（GET 一起返回、
+/// 裁剪时各自取用），打包成一个 `Copy` 值让调用方一次拿到、不必多次读锁。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetentionSettings {
     /// 事件日志保留天数
@@ -1046,12 +1009,8 @@ pub const KEY_ROUTING_STRATEGY: &str = "routingStrategy";
 pub const KEY_ROUTING_STICKY: &str = "routingSticky";
 /// 失败退避：转发失败的账号休息一会儿再回来（`routingFailoverBackoff`，默认开）
 pub const KEY_ROUTING_FAILOVER_BACKOFF: &str = "routingFailoverBackoff";
-/// 限流垫底（Sink）：还有额度时被 429 的账号排到队尾，**30 分钟后自动回到队列**，
-/// 或提前成功转发一次即解除（`routingSink`，默认开）。
-///
-/// 数值以 `route_state::SINK_TTL_MS` 为准，别在这里写一个具体数字：从前这里是
-/// 「轮一圈才回来」，而那个语义正是自锁的成因（429 沉底 → 排到队尾 → 轮不到 →
-/// 没机会成功 → 永远解不开；实测国际版 11 个账号被逐个撞完后全部永久沉底）。
+/// 限流垫底（Sink）：还有额度时被 429 的账号排到队尾，轮一圈才回来
+/// （`routingSink`，默认开）
 pub const KEY_ROUTING_SINK: &str = "routingSink";
 /// 熔断开关（`routingBreakerEnabled`，默认关）
 pub const KEY_ROUTING_BREAKER_ENABLED: &str = "routingBreakerEnabled";
@@ -1064,11 +1023,6 @@ pub const KEY_ROUTING_BREAKER_SUCCESS: &str = "routingBreakerSuccessThreshold";
 
 pub const ROUTING_STRATEGY_ORDER: &str = "order";
 pub const ROUTING_STRATEGY_ROTATE: &str = "rotate";
-/// 家内轮询（`provider`）：家之间按优先级，同一家内部轮流用各账号。
-///
-/// 与「负载均衡」的差别在**轮转的边界**：这里家的先后固定（由优先级定），
-/// 只有家内换人 —— 适合「想优先用某几家、又不愿把某一家的某个账号焊死」。
-pub const ROUTING_STRATEGY_PROVIDER: &str = "provider";
 
 pub const STICKY_OFF: &str = "off";
 pub const STICKY_TURN: &str = "turn";
@@ -1087,15 +1041,12 @@ pub const ROUTING_BREAKER_MAX_SUCCESS: i64 = 10;
 
 /// 路由策略（`RouteStrategy` 的 Rust 形态；配置里存 `as_str`）
 ///
-/// 三档：顺序优先（队列第 1 位接走所有请求）、负载均衡（逐请求轮换）、
-/// 家内轮询（家之间按优先级、同一家内部轮流用各账号）。
+/// 两档：顺序优先（队列第 1 位接走所有请求）与负载均衡（逐请求轮换）。
 /// 「余额优先（usage）」已下线（2026-10，按用户要求移除）—— 见 `from_id` 的兜底说明。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RouteStrategy {
     Order,
     Rotate,
-    /// 家内轮询（本仓新增，上游没有）：轮转的边界收在「家」里面
-    Provider,
 }
 
 impl RouteStrategy {
@@ -1103,7 +1054,6 @@ impl RouteStrategy {
         match self {
             Self::Order => ROUTING_STRATEGY_ORDER,
             Self::Rotate => ROUTING_STRATEGY_ROTATE,
-            Self::Provider => ROUTING_STRATEGY_PROVIDER,
         }
     }
 
@@ -1114,7 +1064,6 @@ impl RouteStrategy {
     /// 静默退回「排第 1 的接走所有请求」会与他的本意相反。
     pub fn from_id(value: &str) -> Self {
         match value {
-            ROUTING_STRATEGY_PROVIDER => Self::Provider,
             ROUTING_STRATEGY_ROTATE | "usage" => Self::Rotate,
             _ => Self::Order,
         }

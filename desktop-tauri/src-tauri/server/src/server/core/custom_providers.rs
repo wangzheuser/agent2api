@@ -152,49 +152,6 @@ pub const TOOL_TYPE_CUSTOM: &str = "custom";
 /// 塞两个假工具。
 pub const CLIENT_EMULATION_OPENCODE: &str = "opencode";
 
-/// ── 余额查询方案（`balanceScheme`）────────────────────────────
-///
-/// 上游**自家**有没有余额接口、怎么查，各家写法完全不同（金额型 / 百分比窗口
-/// / 账号密码换 JWT / 控制台令牌 / API Key 签名），因此这条事实必须跟着记录走，
-/// 不能按 baseUrl 猜。七个取值的实现见 `providers::custom::balance`
-/// （移植来源：OmniProxy 的六种 `BalanceScheme`，取值逐字相同，便于两仓对照；
-/// 国际站 `zhipu_zai` 是本项目自研补充）。
-///
-/// ── 谁写这个键 ──────────────────────────────────────────────
-/// **预置 API 卡片**（`ui/preset-providers.js` 的 `balance.scheme`）：用户从
-/// 「预置 API」段点开 DeepSeek / NewAPI / 商汤日日新 这类卡片时，前端把方案
-/// 一并提交，后端在这里校验后落盘。手工新建的自定义提供商不带这个键 ——
-/// 方案只对「已经知道是哪一家」的预置上游成立（见下 baseUrl 兜底）。
-///
-/// ── 为什么读侧还要按 baseUrl 兜底识别 ────────────────────────
-/// 这个键是本轮新加的：存量记录（同一次升级前从预置卡建的）没有它，而它们的
-/// baseUrl 恰好是官方固定域名的那几家（DeepSeek / OpenCode Go / 智谱 /
-/// 商汤）**可以可靠认出**，于是读侧按域名补一次，让它们升级后直接能用。
-/// 自建上游（sub2api / NewAPI 的域名千奇百怪）没有兜底，必须重建一次或手改
-/// 记录 —— 这两个方案的凭证本来就要用户自己填，多填一次不算门槛。
-pub const BALANCE_SCHEME_SUB2API: &str = "sub2api";
-pub const BALANCE_SCHEME_NEW_API: &str = "new_api";
-pub const BALANCE_SCHEME_DEEPSEEK: &str = "deepseek";
-pub const BALANCE_SCHEME_OPENCODE: &str = "opencode";
-pub const BALANCE_SCHEME_SENSENOVA: &str = "sensenova";
-pub const BALANCE_SCHEME_ZHIPU: &str = "zhipu";
-/// 智谱**国际站**（z.ai）：与国内站同一条账户报告接口、同一个信封，但
-/// 鉴权与币种都不同（API Key 铸 SIGN 签名 / 美元），因此是独立方案而不是
-/// `zhipu` 的一个参数 —— 方案决定「打哪里、用什么凭证」，凭证差异大到
-/// 界面的「查询设置」字段表都不一样（国内站要控制台令牌，国际站不用填）。
-pub const BALANCE_SCHEME_ZHIPU_ZAI: &str = "zhipu_zai";
-
-/// 全部合法方案（校验与读侧归一共用；顺序不影响行为）
-pub const BALANCE_SCHEMES: &[&str] = &[
-    BALANCE_SCHEME_SUB2API,
-    BALANCE_SCHEME_NEW_API,
-    BALANCE_SCHEME_DEEPSEEK,
-    BALANCE_SCHEME_OPENCODE,
-    BALANCE_SCHEME_SENSENOVA,
-    BALANCE_SCHEME_ZHIPU,
-    BALANCE_SCHEME_ZHIPU_ZAI,
-];
-
 /// 拉取上游模型清单的总超时（毫秒）。清单接口是一次性的管理动作，
 /// 不参与对话转发的长连接口径（egress 的 read_timeout 是给 SSE 的）。
 const FETCH_MODELS_TIMEOUT_MS: u64 = 15_000;
@@ -603,8 +560,6 @@ pub fn create(payload: &Value) -> Result<Value, String> {
         "anthropicToolType": validate_tool_type(object.get("anthropicToolType"))?,
         "rewardProfile": validate_reward_profile(object.get("rewardProfile"))?,
         "clientEmulation": validate_client_emulation(object.get("clientEmulation"))?,
-        // 余额查询方案（预置卡片提交，见 BALANCE_SCHEMES 的说明）
-        "balanceScheme": validate_balance_scheme(object.get("balanceScheme"))?,
     });
     let mut items = read_items();
     items.push(item.clone());
@@ -685,15 +640,6 @@ pub fn update(id: &str, payload: &Value) -> Result<Value, String> {
         merged.insert(
             "clientEmulation".to_string(),
             Value::String(validate_client_emulation(Some(value))?),
-        );
-    }
-    // 余额查询方案：与上面同一 patch 语义（带键才动）。编辑弹窗不发它 ——
-    // 方案是「这一家是谁」的派生事实，用户改协议 / 改名不该顺手把它改掉；
-    // 要清掉它得显式传空串（存储层读侧认空 = 无方案）。
-    if let Some(value) = object.get("balanceScheme") {
-        merged.insert(
-            "balanceScheme".to_string(),
-            Value::String(validate_balance_scheme(Some(value))?),
         );
     }
     let updated = Value::Object(merged);
@@ -1244,96 +1190,6 @@ pub fn normalize_base_url(raw: &str) -> Result<String, String> {
     Ok(parsed.as_str().trim_end_matches('/').to_string())
 }
 
-/// OpenCode Zen 免费档的**旧端点**：2026-10 起打它一律 403 `FreeTierError`
-/// （实测，见 `providers::custom::emulation` 的模块头）。
-pub const LEGACY_OPENCODE_BASE_URL: &str = "https://opencode.ai/zen/v1";
-
-/// OpenCode Zen 免费档的**当前端点**（旧端点已废弃，见上）。
-pub const OPENCODE_BASE_URL: &str = "https://opencode.ai/inference/v1";
-
-/// OpenCode **Go**（订阅制）的端点。它与免费档的要求**不同**：免费档要「伪装成
-/// 官方客户端」（四会话头 + 工具对 + 匿名凭证），Go 只要客户端**带一个稳定的
-/// 会话头**——上游文档 `docs/go/#where-can-i-use-it` 的公开路由要求（「Send a
-/// stable session ID in `x-opencode-session` for each conversation」），缺了直接
-/// `400 MissingSessionID`（实测：这道检查在鉴权之前，且只看在场、不校验形状）。
-/// 两面的要求不同，转发侧按端点分派，见 `providers::custom::emulation`。
-pub const OPENCODE_GO_BASE_URL: &str = "https://opencode.ai/zen/go/v1";
-
-/// 这条记录的 baseUrl 是否逐字命中 OpenCode Go 端点（忽略末尾斜杠与 ASCII 大小写）。
-///
-/// 与 [`migrate_base_url`] 同一口径的**精确匹配**：只有官方那个端点走 Go 面的
-/// 特殊处理，用户自建的中转/代理地址一概不碰（那类地址背后是什么取决于中转
-/// 自己，网关不该替它猜）。
-pub fn is_opencode_go_endpoint(base_url: &str) -> bool {
-    base_url
-        .trim()
-        .trim_end_matches('/')
-        .eq_ignore_ascii_case(OPENCODE_GO_BASE_URL)
-}
-
-/// 这条（提供商, 账号）组合是不是 **OpenCode Zen 免费档** —— 出网「轮询」档
-/// 唯一允许的对象。
-///
-/// 判据两条：
-///   1. 提供商记录开着客户端形态伪装（`clientEmulation == "opencode"`）。这与
-///      `providers::custom::forward` 判定「这家要走 OpenCode 免费档的那套补齐」
-///      是**同一个开关**：VPN 无 Key、按 IP 限流、429 只管这个 IP 的免费额度，
-///      都是这一档的事实。预置卡「OpenCode Zen」就是靠它落库的；
-///   2. 最终 baseUrl 不是 Go 面端点。OpenCode **Go** 是订阅制（按 Key / 订阅
-///      额度计费），同域不同档，轮换出口对它没有意义 —— 用户手工把伪装开关
-///      开在 Go 记录上时不该被放行（`is_opencode_go_endpoint` 是既有的端点
-///      判据，转发侧也用它分派两套补齐行为）。
-///
-/// `base_url_override` 是**账号**上的覆盖项（None / 空 = 未覆盖，回落提供商
-/// 的 baseUrl）：两层的值都可能指着 Go 端点，只看提供商那一层会漏掉
-/// 「提供商填 Zen、账号覆盖成 Go」这种组合。
-pub fn is_opencode_zen_account(provider_id: &str, base_url_override: Option<&str>) -> bool {
-    let Some(provider) = get(provider_id) else {
-        return false;
-    };
-    let emulation = provider
-        .get("clientEmulation")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    if !emulation.eq_ignore_ascii_case(CLIENT_EMULATION_OPENCODE) {
-        return false;
-    }
-    let base_url = base_url_override
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            provider
-                .get("baseUrl")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .unwrap_or_default();
-    // baseUrl 也要过读侧迁移：存量记录里可能还写着旧端点（/zen/v1），
-    // 它是免费档的旧入口 —— 漏了这一步会把「旧端点的 Zen 账号」判成非 Zen
-    let base_url = migrate_base_url(&base_url, true);
-    !base_url.trim().is_empty() && !is_opencode_go_endpoint(&base_url)
-}
-
-/// 读侧迁移：把**逐字等于旧端点**的 baseUrl 改写成当前端点。
-///
-/// 为什么在读侧做而不是写一条一次性迁移：旧端点是免费档的入口，2026-10 起打它
-/// 一律 403；存量记录里有两处可能还指着它 —— 预置卡早先写进提供商记录的，
-/// 以及用户在**账号**上覆盖的（那条由 `forward` 在解析完最终 baseUrl 后再过一次
-/// 本函数）。读侧改写让老记录不改盘、不迁移也能立刻恢复可用，新写的记录本来就
-/// 用新端点。
-///
-/// `is_opencode` 是**显式开关**（调用方传记录的 `clientEmulation`）：只对
-/// 「按 OpenCode 客户端形状伪装」的记录动手，别家填了同名字符串也不改 ——
-/// 与 `client_emulation` 整体的 opt-in 取向一致。
-pub fn migrate_base_url(raw: &str, is_opencode: bool) -> String {
-    let text = raw.trim();
-    if is_opencode && text.trim_end_matches('/').eq_ignore_ascii_case(LEGACY_OPENCODE_BASE_URL) {
-        return OPENCODE_BASE_URL.to_string();
-    }
-    text.to_string()
-}
-
 // ── per-provider 特判字段的写侧校验（create / update 共用）────────
 //
 // 与读侧（url_suffix_of / headers_of / tool_type_of）的分工：读侧面向「盘上
@@ -1466,27 +1322,5 @@ fn validate_client_emulation(value: Option<&Value>) -> Result<String, String> {
     }
     Err(format!(
         "clientEmulation 只支持 \"{CLIENT_EMULATION_OPENCODE}\"（留空表示不伪装上游客户端）"
-    ))
-}
-
-/// 余额查询方案：空 = 这一家不查余额（手工新建的家）；非空必须是六个合法值
-/// 之一（见 [`BALANCE_SCHEMES`]）。其余值一律拒绝 —— 与 `validate_tool_type`
-/// 同一理由：方案决定**打哪个上游接口、带哪份凭证**，拼错的值等于把余额查到
-/// 别的接口上去。
-///
-/// 这个键由预置卡片提交（`ui/preset-providers.js` 的 `balance.scheme`），
-/// 界面不给用户手选（方案是「这一家是谁」的派生事实）。
-fn validate_balance_scheme(value: Option<&Value>) -> Result<String, String> {
-    let Some(value) = value else { return Ok(String::new()) };
-    let text = value.as_str().unwrap_or("").trim();
-    if text.is_empty() {
-        return Ok(String::new());
-    }
-    if let Some(scheme) = BALANCE_SCHEMES.iter().find(|scheme| **scheme == text) {
-        return Ok((*scheme).to_string());
-    }
-    Err(format!(
-        "balanceScheme 只支持 {}（留空表示不查询余额）",
-        BALANCE_SCHEMES.join(" / ")
     ))
 }
