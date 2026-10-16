@@ -73,6 +73,15 @@ def generated_closure(root, base):
     return [f'UI source changed without generated artifact: {path}' for path in missing]
 
 
+def version_closure(root):
+    checker = root / 'scripts/check-version-consistency.py'
+    if not checker.is_file():
+        return ['version consistency checker is missing']
+    result = subprocess.run([sys.executable, str(checker), '--root', str(root)],
+                            capture_output=True, text=True)
+    return [] if result.returncode == 0 else [line for line in result.stderr.splitlines() if line]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parents[1])
@@ -86,6 +95,7 @@ def main():
         findings.extend(schema_versions(root))
         findings.extend(login_closure(root))
         findings.extend(generated_closure(root, args.base_ref))
+        findings.extend(version_closure(root))
     except (OSError, subprocess.CalledProcessError, UnicodeError) as error:
         findings.append(f'closure checker error: {error}')
     report = {'base_ref': args.base_ref, 'findings': findings, 'passed': not findings}

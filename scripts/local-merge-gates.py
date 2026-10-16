@@ -41,6 +41,7 @@ def command_matrix(root, base_ref, report_dir):
             ('integration-closure', python_script('scripts/check-merge-closure.py',
                                                   '--base-ref', base,
                                                   '--report', str(report_dir / 'integration-closure.json'))),
+            ('version-consistency', python_script('scripts/check-version-consistency.py')),
             ('contract-manifest', python_script('scripts/check-merge-contracts.py', '--base-ref', base)),
             ('baseline-gate', python_script('scripts/replay-merge-baseline.py', 'gate', '--base-ref', base)),
         ],

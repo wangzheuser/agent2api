@@ -198,6 +198,14 @@ def contract_matches(contract, paths):
 
 
 def domain_for(path):
+    if path in {
+        'package.json',
+        'desktop-tauri/package.json',
+        'desktop-tauri/src-tauri/Cargo.toml',
+        'desktop-tauri/src-tauri/tauri.conf.json',
+        'desktop-tauri/src-tauri/server/Cargo.toml',
+    }:
+        return 'release-metadata'
     if path.startswith('desktop-tauri/src-tauri/'):
         return 'server'
     if path.startswith('desktop-tauri/ui-islands/') or path.startswith('desktop-tauri/ui-kit/'):
@@ -387,6 +395,8 @@ def plan(root, path, record):
                 domains.setdefault(domain_for(changed_path), set()).add(changed_path)
     domain_rows = [{'id': ident, 'paths': sorted(paths)} for ident, paths in sorted(domains.items())]
     required = ['impact-review']
+    if 'release-metadata' in domains:
+        required.append('integration-closure')
     if any(item['level'] == 'P0' for item in impacted):
         required.append('contracts-p0')
     kinds = {test.get('kind') for item in contracts if contract_matches(item, all_paths)
