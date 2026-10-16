@@ -626,6 +626,10 @@ def execute_batch(root, path, record, tasks):
 
 
 def validate_receipts(record, tree, required):
+    planned = set((record.get('plan') or {}).get('required_gates', []))
+    missing = planned - set(required)
+    if missing:
+        raise ValueError('不得缩减计划必需验收项: ' + ', '.join(sorted(missing)))
     if not required or len(set(required)) != len(required):
         raise ValueError('须明确本轮必需验收项且不得重复')
     latest = {receipt['name']: receipt for receipt in record['receipts']}

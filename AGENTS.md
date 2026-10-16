@@ -362,7 +362,7 @@ python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json run
 python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json run-batch --tasks diagnostic-artifacts/<本轮>/gates.json
 # 按同样方式记录清单检查、完整Node TAP、前端typecheck/build、浏览器、H重放和新增专项验收。
 python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json seal --required tools server <本轮其他必需验收名>
-# 已执行 plan 时可省略 --required，工具会使用计划计算出的必需 gate；显式参数用于人工复核或覆盖。
+# 已执行 plan 时可省略 --required；显式参数只能增加验收项，不能缩减计划必需 gate。
 python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json seal
 python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json check
 # 用户授权提交/push后执行；提交树须仍等于封存的候选tree。

@@ -504,3 +504,216 @@ pub(super) fn routing_from(map: &Map<String, Value>) -> RoutingSettings {
         ),
     }
 }
+
+pub(super) fn switch_on_from_env_text(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|value| value.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("true") | Some("on")
+    )
+}
+
+pub(super) fn bounded_int_from_env_text(raw: Option<&str>, min: i64, max: i64) -> Option<i64> {
+    let text = raw.map(str::trim).filter(|text| !text.is_empty())?;
+    let value = text.parse::<i64>().ok()?;
+    (min..=max).contains(&value).then_some(value)
+}
+
+pub(crate) fn int_in_range(value: &Value, min: i64, max: i64) -> Option<i64> {
+    let parsed = match value {
+        Value::Number(number) => number.as_i64().or_else(|| {
+            number
+                .as_f64()
+                .filter(|raw| raw.is_finite() && raw.fract() == 0.0)
+                .map(|raw| raw as i64)
+        }),
+        _ => None,
+    };
+    parsed.filter(|value| (min..=max).contains(value))
+}
+
+pub(super) fn bounded_int_option(map: &Map<String, Value>, key: &str, min: i64, max: i64) -> Option<i64> {
+    map.get(key).and_then(|value| int_in_range(value, min, max))
+}
+
+pub(super) fn env_auto_continue() -> bool {
+    switch_on_from_env_text(std::env::var("AGENT2API_AUTO_CONTINUE").ok().as_deref())
+}
+
+pub(super) fn env_auto_continue_max_rounds() -> Option<i64> {
+    bounded_int_from_env_text(
+        std::env::var("AGENT2API_AUTO_CONTINUE_MAX").ok().as_deref(),
+        AUTO_CONTINUE_MIN_ROUNDS,
+        AUTO_CONTINUE_MAX_ROUNDS,
+    )
+}
+
+pub(super) fn auto_continue_from(map: &Map<String, Value>) -> bool {
+    resolve_auto_continue(
+        map.get(KEY_AUTO_CONTINUE).and_then(Value::as_bool),
+        env_auto_continue(),
+    )
+}
+
+pub(super) fn resolve_auto_continue(from_file: Option<bool>, from_env: bool) -> bool {
+    from_file.unwrap_or(from_env)
+}
+
+pub(super) fn auto_continue_rounds_from(map: &Map<String, Value>) -> i64 {
+    resolve_rounds(
+        bounded_int_option(
+            map,
+            KEY_AUTO_CONTINUE_MAX_ROUNDS,
+            AUTO_CONTINUE_MIN_ROUNDS,
+            AUTO_CONTINUE_MAX_ROUNDS,
+        ),
+        env_auto_continue_max_rounds(),
+    )
+}
+
+pub(super) fn resolve_rounds(from_file: Option<i64>, from_env: Option<i64>) -> i64 {
+    from_file.or(from_env).unwrap_or(DEFAULT_AUTO_CONTINUE_MAX_ROUNDS)
+}
+
+#[cfg(test)]
+mod continuation_parse_tests {
+    //! 三条取值口径：环境变量的「只认 1 / true / on」、越界的「回落默认而非夹紧」、
+    //! 以及「文件 > 环境变量 > 默认」这条优先级链。
+    //!
+    //! ── 为什么这些用例都不碰进程环境 ────────────────────────
+    //! `std::env::set_var` 在同一进程里全局可见，并行用例互相踩（同类取舍见
+    //! `core::providers::trae::forward::forward_at` 的注释），而本模块里
+    //! 「没设环境变量」是有明确表达的输入 —— `None`。所以三段判据都被抽成
+    //! 吃参数的纯函数（[`switch_on_from_env_text`] / [`bounded_int_from_env_text`] /
+    //! [`resolve_auto_continue`] / [`resolve_rounds`]），`env_*` 只是把它们接到
+    //! 真环境上的那一薄层。
+
+    use super::*;
+    use serde_json::json;
+
+    /// 一份只含给定几项的原始底稿。
+    fn map_of(pairs: &[(&str, Value)]) -> Map<String, Value> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), value.clone()))
+            .collect()
+    }
+
+    /// 开关的环境变量只认 `1` / `true` / `on`（忽略大小写与首尾空白）。
+    ///
+    /// 钉住的写歪：「非 0 即开」（`env_captcha_enabled` 那条口径）。按它写会
+    /// 把 `AGENT2API_AUTO_CONTINUE=`（compose 里未设置变量的插值形态）读成**开**，
+    /// 于是一个谁都没打算开的部署开始替用户多打上游。
+    #[test]
+    fn the_env_switch_only_accepts_one_true_or_on() {
+        for on in ["1", "true", "on", " TRUE ", "On", "ON "] {
+            assert!(switch_on_from_env_text(Some(on)), "{on} 应当算开启（大小写与首尾空白都要被吃掉）");
+        }
+        for off in ["", " ", "0", "yes", "10", "2", "no", "开启", "trueX", "one"] {
+            assert!(!switch_on_from_env_text(Some(off)), "{off} 不该被当成开启");
+        }
+        assert!(!switch_on_from_env_text(None), "环境变量没设（None）必须是关");
+    }
+
+    /// 整数型环境变量的口径：只有**纯整数**且在范围内才算数。
+    ///
+    /// 钉住的写歪：先 `parse::<f64>()` 再取整（于是 `3.7` 变成 3），或越界时
+    /// 夹紧到 8 —— 后者会让人以为自己的 99 生效了。
+    #[test]
+    fn the_env_integer_must_be_a_plain_integer_in_range() {
+        assert_eq!(bounded_int_from_env_text(Some("1"), 1, 8), Some(1), "下限要收");
+        assert_eq!(bounded_int_from_env_text(Some(" 8 "), 1, 8), Some(8), "上限要收，空白要吃掉");
+        for unusable in ["", " ", "0", "9", "-1", "3.0", "3.5", "abc", "8.", "+"] {
+            assert_eq!(
+                bounded_int_from_env_text(Some(unusable), 1, 8),
+                None,
+                "{unusable} 不是可用值，必须交回 None 让下一级兜（而不是夹紧）"
+            );
+        }
+        assert_eq!(bounded_int_from_env_text(None, 1, 8), None);
+    }
+
+    /// 文件里越界 → **回落默认，不夹紧**（`bounded_int_field` 全线口径）。
+    ///
+    /// 钉住的写歪：`clamp(min, max)`。写了 99 的人若看到设置页显示 8，
+    /// 只会以为「8 是系统给的硬值」，而 99 从未生效这件事再也问不出来。
+    #[test]
+    fn an_out_of_range_file_value_falls_back_to_the_default_not_the_bound() {
+        let too_many = map_of(&[(KEY_AUTO_CONTINUE_MAX_ROUNDS, json!(99))]);
+        assert_eq!(
+            bounded_int_option(&too_many, KEY_AUTO_CONTINUE_MAX_ROUNDS, AUTO_CONTINUE_MIN_ROUNDS, AUTO_CONTINUE_MAX_ROUNDS),
+            None,
+            "越界必须表达成「这一级没给出可用值」，夹紧就不叫回落了"
+        );
+        assert_eq!(
+            bounded_int_field(&too_many, KEY_AUTO_CONTINUE_MAX_ROUNDS, DEFAULT_AUTO_CONTINUE_MAX_ROUNDS, AUTO_CONTINUE_MIN_ROUNDS, AUTO_CONTINUE_MAX_ROUNDS),
+            DEFAULT_AUTO_CONTINUE_MAX_ROUNDS,
+            "回落的是默认值 3，不是上限 8"
+        );
+        // 边界上的两个数与「写坏的类型」各归各位
+        let zero = map_of(&[(KEY_AUTO_CONTINUE_MAX_ROUNDS, json!(0))]);
+        assert_eq!(bounded_int_field(&zero, KEY_AUTO_CONTINUE_MAX_ROUNDS, DEFAULT_AUTO_CONTINUE_MAX_ROUNDS, AUTO_CONTINUE_MIN_ROUNDS, AUTO_CONTINUE_MAX_ROUNDS), DEFAULT_AUTO_CONTINUE_MAX_ROUNDS, "0 在范围外（想关去关开关）");
+        let text = map_of(&[(KEY_AUTO_CONTINUE_MAX_ROUNDS, json!("3"))]);
+        assert_eq!(bounded_int_option(&text, KEY_AUTO_CONTINUE_MAX_ROUNDS, AUTO_CONTINUE_MIN_ROUNDS, AUTO_CONTINUE_MAX_ROUNDS), None, "字符串数字不算（与写侧同一口径）");
+        // `3.0` 算 3：JSON 里 3 与 3.0 是同一个数，手改文件时写成 3.0 完全可能
+        let floaty = map_of(&[(KEY_AUTO_CONTINUE_MAX_ROUNDS, json!(3.0))]);
+        assert_eq!(bounded_int_option(&floaty, KEY_AUTO_CONTINUE_MAX_ROUNDS, AUTO_CONTINUE_MIN_ROUNDS, AUTO_CONTINUE_MAX_ROUNDS), Some(3));
+    }
+
+    /// 优先级链：文件写了就以它为准（**包括 false 与 1**），否则环境变量，否则默认。
+    ///
+    /// 钉住的写歪：把开关写成 `文件值 || 环境变量值` —— 看上去也是「文件优先」，
+    /// 实际让用户在面板上关不掉（库里已经是 false，环境里那句 `on` 一直把它顶开）。
+    #[test]
+    fn the_file_value_beats_the_env_even_when_it_says_off() {
+        assert!(!resolve_auto_continue(Some(false), true), "文件里的 false 必须盖过环境变量的开");
+        assert!(resolve_auto_continue(Some(true), false), "文件里的 true 必须盖过环境变量的关");
+        assert!(resolve_auto_continue(None, true), "文件没配时环境变量说话");
+        assert!(!resolve_auto_continue(None, false), "两级都没配 → 默认关");
+
+        assert_eq!(resolve_rounds(Some(1), Some(8)), 1, "文件里的 1 必须盖过环境变量的 8");
+        assert_eq!(resolve_rounds(Some(8), None), 8);
+        assert_eq!(resolve_rounds(None, Some(8)), 8, "文件不可用时环境变量说话");
+        assert_eq!(resolve_rounds(None, None), DEFAULT_AUTO_CONTINUE_MAX_ROUNDS, "两级都不可用才落默认");
+        // 越界的文件值在这里已经是 None（上面试用例过了），链上表现为「让位给下一级」
+        assert_eq!(resolve_rounds(None, Some(1)), 1);
+    }
+
+    /// 整条链的形状：`*_from(&map)` 必须与纯函数那一层给出同一个答案。
+    ///
+    /// 钉住的写歪：`auto_continue_rounds_from` 里把范围常量写歪（例如上限用了
+    /// `AUTO_CONTINUE_MAX_ROUNDS - 1`），那会让 8 在读侧被当成「没配」——
+    /// 而写侧刚收下的值读侧不认，正是 `parse` 模块头明令不许出现的两套口径。
+    #[test]
+    fn the_map_level_helpers_follow_the_same_rules_as_the_pure_ones() {
+        let at_the_top = map_of(&[
+            (KEY_AUTO_CONTINUE_MAX_ROUNDS, json!(8)),
+            (KEY_AUTO_CONTINUE, json!(true)),
+        ]);
+        assert_eq!(
+            auto_continue_rounds_from(&at_the_top),
+            8,
+            "上限边界值 8 必须能用（读写两侧共用同一对范围常量）"
+        );
+        assert!(auto_continue_from(&at_the_top), "文件写了 true 就必须是开");
+
+        let off = map_of(&[
+            (KEY_AUTO_CONTINUE, json!(false)),
+            (KEY_AUTO_CONTINUE_MAX_ROUNDS, json!(1)),
+        ]);
+        assert!(!auto_continue_from(&off));
+        assert_eq!(auto_continue_rounds_from(&off), 1, "下限边界值 1 必须能用");
+
+        // 类型写坏的那一项等于「没配」：越界 / 字符串都不许留下一个可感的值
+        let junk = map_of(&[(KEY_AUTO_CONTINUE_MAX_ROUNDS, json!(0)), (KEY_AUTO_CONTINUE, json!("true"))]);
+        assert_eq!(
+            auto_continue_rounds_from(&junk),
+            resolve_rounds(None, env_auto_continue_max_rounds()),
+            "文件里的 0 不可用，落点必须与「文件没这项」逐字相同"
+        );
+        assert_eq!(
+            auto_continue_from(&junk),
+            resolve_auto_continue(None, env_auto_continue()),
+            "文件里的字符串 true 不可用，落点必须与「文件没这项」逐字相同"
+        );
+    }
+}

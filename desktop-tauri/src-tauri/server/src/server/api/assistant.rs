@@ -230,7 +230,6 @@ pub async fn chat(State(state): State<ServerState>, body: Bytes) -> Response {
         &requested_model,
         &model,
         "",
-        "",
         true,
     );
     if let Some(token) = cancellation::register(&telemetry_id) {
@@ -255,7 +254,7 @@ pub async fn chat(State(state): State<ServerState>, body: Bytes) -> Response {
             // 尊重模型启停：助手用的是「已启用的模型」，用户关掉的模型不该
             // 因为助手而继续消耗额度（与生产请求同一道门禁）
             ignore_model_gate: false,
-            proxy_override: None,
+            route_session: None,
         })
         .await;
 
@@ -273,7 +272,6 @@ pub async fn chat(State(state): State<ServerState>, body: Bytes) -> Response {
                 raw_request: None,
                 raw_response: None,
                 is_test: true,
-                client: String::new(),
             };
             // 记账移交给响应流（它与流的生命周期同长）；守卫不再兜底
             guard.handoff();
@@ -290,7 +288,11 @@ pub async fn chat(State(state): State<ServerState>, body: Bytes) -> Response {
         // 固定要求了流式，聚合体这条理论上到不了；真到了就按 JSON 原样回，
         // 前端对非 SSE 响应也有一套降级（把整段当一条 assistant 消息）
         Ok(ForwardOutcome::Completion { body }) => {
-            let raw_response = pipeline::capture_raw_json(&body);
+            let raw_response = if crate::server::core::debug_traffic::enabled() {
+                serde_json::to_vec(&body).ok().and_then(|bytes| pipeline::raw_body_text(&bytes))
+            } else {
+                None
+            };
             pipeline::record_entry(
                 &RecordContext {
                     stats: state.request_stats(),
@@ -303,7 +305,6 @@ pub async fn chat(State(state): State<ServerState>, body: Bytes) -> Response {
                     raw_request: None,
                     raw_response,
                     is_test: true,
-                    client: String::new(),
                 },
                 None,
             );
@@ -325,7 +326,6 @@ pub async fn chat(State(state): State<ServerState>, body: Bytes) -> Response {
                     raw_request: None,
                     raw_response: None,
                     is_test: true,
-                    client: String::new(),
                 },
                 Some(message.clone()),
             );
