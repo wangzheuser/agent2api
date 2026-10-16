@@ -35,7 +35,7 @@
 //! （切片 7 之后的路由扩展），照同样的分工：新文件 + `http::router` 里登记，
 //! 并保持与 Node 版一致的分组（需鉴权的一律挂 `protected`）。
 
-pub mod accounts;
+pub mod accounts;`r`n pub mod assistant;
 pub mod account_selection_api;
 // `/api/accounts/usage` 的查询与结果组装（从 accounts.rs 拆出：余额能力从
 // 「只服务 workbuddy」扩到四家混查时新增，见该文件模块头）
@@ -43,7 +43,7 @@ pub mod accounts_usage;
 pub mod accounts_growth;
 // 整库备份 / 恢复（设置页调用的受保护管理接口；核心实现见 `db::backup`）。
 pub mod backup_api;
-pub mod auto_checkin;
+pub mod auto_checkin;`r`n pub mod auto_continue;
 pub mod billing;
 pub mod captcha;
 pub mod chat;
@@ -117,3 +117,4 @@ pub mod zcode_captcha;
 pub mod zcode_claim;
 // 活动套餐验证码池的补货节奏设置。
 pub mod zcode_captcha_pool;
+
