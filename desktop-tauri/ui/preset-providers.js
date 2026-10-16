@@ -40,6 +40,17 @@
    *   account  该家账号的默认取值（表单里的初始勾选态，用户可改）：
    *            · noAuth —— 「该上游无需鉴权」预勾选（无需 API Key 的家里预勾上；
    *              用户一填 Key 就自动取消，见 add-custom-provider.tsx）
+   *   placeholder  Base URL 输入框的占位提示（自建面板没有固定地址时给一句
+   *            「填你自己的站点」；缺省按协议算的那句，见 add-custom-provider）
+   *   balance  该家的**余额查询方案**（`{ scheme }`，取值与后端
+   *            `custom_providers::BALANCE_SCHEMES` 逐字一致）：创建时随记录写入
+   *            `balanceScheme`，后端据此选查询链路；界面按方案渲染要补的凭证
+   *            输入框（方案与字段说明见 ui-islands 的 balance-query.tsx）。
+   *            没有这个键的家 = 不查余额（手工新建的家也一样）。
+   *
+   * 六种方案分别对应：sub2api / new_api / deepseek / opencode（OpenCode Go）/
+   * sensenova（商汤日日新）/ zhipu（智谱）。**方案不是用户选的**，是这张卡
+   * 「这一家是谁」的派生事实 —— 所以它写在这里，不在表单里给下拉。
    *
    * ── quirks 的取值（抄自 9Router 各家适配器，后端 customProviders 记录的字段）──
    *   urlSuffix          原样追加到出站 URL 的查询串（GLM / MiniMax 的
@@ -101,17 +112,29 @@
       key: 'deepseek', name: 'DeepSeek', icon: 'deepseek.png',
       protocol: P.openai, baseUrl: 'https://api.deepseek.com',
       hint: wbI18n.t('Anthropic 兼容端点在 https://api.deepseek.com/anthropic（协议换 anthropic 时填它）'),
+      // 余额查询方案（后端 custom_providers::BALANCE_SCHEME_DEEPSEEK）：
+      // 用该账号的 API Key 打 {base}/user/balance，**不需要额外配置** ——
+      // 表单里因此不会多出任何输入框（见 ui-islands 的 balance-query）
+      balance: { scheme: 'deepseek' },
     },
     {
       key: 'glm', name: 'GLM Coding', icon: 'glm.png',
       protocol: P.anthropic, baseUrl: 'https://api.z.ai/api/anthropic',
       hint: wbI18n.t('国际版 z.ai 的 Coding 套餐；OpenAI 兼容地址为 https://api.z.ai/api/coding/paas/v4'),
       quirks: { urlSuffix: '?beta=true', headers: { ...ANTHROPIC_BETA_HEADERS } },
+      // 智谱国际站余额查询（后端 BALANCE_SCHEME_ZHIPU_ZAI）：用该账号的 API Key
+      // 现场铸 SIGN 签名打 api.z.ai 的账户报告接口（美元），**不需要额外配置**
+      //（国内站 glm-cn 走的是另一条控制台令牌链路，两个方案不是一回事）
+      balance: { scheme: 'zhipu_zai' },
     },
     {
       key: 'glm-cn', name: 'GLM 中国', icon: 'glm-cn.png',
       protocol: P.openai, baseUrl: 'https://open.bigmodel.cn/api/coding/paas/v4',
       hint: wbI18n.t('智谱 bigmodel.cn 的 Coding 套餐，Key 在 open.bigmodel.cn/usercenter/apikeys'),
+      // 智谱余额查询（后端 BALANCE_SCHEME_ZHIPU）：打 bigmodel.cn **控制台**
+      // 账户余额（人民币元），用的是控制台令牌而不是这里的 API Key ——
+      // 表单里会出现一个「访问令牌」输入框（见 balance-query 的方案说明）
+      balance: { scheme: 'zhipu' },
     },
     {
       key: 'minimax', name: 'Minimax Coding', icon: 'minimax.png',
@@ -175,13 +198,21 @@
       // 免费档的，Go 面拒绝被塞桩工具）。见后端 emulation 的「Go 面」一节。
       protocol: P.openai, baseUrl: 'https://opencode.ai/zen/go/v1',
       hint: wbI18n.t('同地址换 anthropic 协议即走它的 Claude 兼容端点。转发必须填 OpenCode Go 的 API Key（订阅制；获取模型清单不需要 Key，但发请求上游会回 401「Missing API key」）'),
+      // OpenCode Go 余额查询（后端 BALANCE_SCHEME_OPENCODE）：用该账号的
+      // API Key 打 {base}/v1/usage，读滚动 / 每周 / 每月三个窗口的剩余百分比，
+      // **不需要额外配置**（免费档 OpenCode Zen 不在这一列：它没有余额接口）
+      balance: { scheme: 'opencode' },
     },
     {
       key: 'opencode-zen', name: 'OpenCode Zen', icon: 'opencode-zen.png',
-      protocol: P.openai, baseUrl: 'https://opencode.ai/zen/v1',
+      // 端点 2026-10 换过：旧的 /zen/v1 已废弃（打它一律 403 FreeTierError），
+      // 当前是 /inference/v1。存量记录里写着的旧值由后端读侧自动迁移
+      // （custom_providers::migrate_base_url），不必手改。
+      protocol: P.openai, baseUrl: 'https://opencode.ai/inference/v1',
       hint: wbI18n.t('免费模型不用填 Key（默认勾上「该上游无需鉴权」，网关自动用匿名凭证）；付费模型则填 Zen 的 API Key。免费档上游只认官方客户端形态，已默认开启「伪装 OpenCode 官方客户端」'),
-      // 免费档的三道校验（匿名凭证 / 会话头 / 请求体形态）由该开关统一补齐，
-      // 见后端 providers::custom::emulation 的模块头（含实测记录）
+      // 免费档的四道校验（匿名凭证 / 四个会话头 / 不带 request·project 头 /
+      // 请求体形态）由该开关统一补齐，见后端 providers::custom::emulation
+      // 的模块头（含 2026-10-14 对着官方客户端 v2.0.27 的实测记录）
       clientEmulation: 'opencode',
       account: { noAuth: true },
     },

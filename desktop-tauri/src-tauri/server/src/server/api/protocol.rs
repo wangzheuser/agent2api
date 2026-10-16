@@ -38,6 +38,7 @@ use crate::server::core::key_scope::{KeyScope, RoutingPrincipal};
 use crate::server::core::upstream::route_session::RouteSession;
 use crate::server::core::protocol::{anthropic, responses};
 use crate::server::core::upstream::cancellation;
+use crate::server::core::upstream::continuation::{self, Continuation};
 use crate::server::core::upstream::usage::RequestTelemetry;
 use crate::server::core::upstream::{ForwardOutcome, ForwardRequest};
 use crate::server::errors::GatewayError;
@@ -49,17 +50,21 @@ use super::pipeline::{
     self, error_response, json_response, record_early_failure, sse_response, RecordContext,
 };
 
-/// 把请求体解析成 JSON 对象（失败给 400 + 记账）
+/// 把请求体解析成 JSON 对象（失败给 400 + 记账）。
+///
+/// `client` 由调用方从请求头判好带入（早失败也要能看出「是谁发来的」，
+/// 见 `record_early_failure` 的说明）。
 fn parse_object(
     state: &ServerState,
     started_at: i64,
     path: &str,
     body: &Bytes,
+    client: &str,
 ) -> Result<Value, Response> {
     let parsed = serde_json::from_slice::<Value>(body).ok();
     let Some(payload) = parsed.filter(Value::is_object) else {
         let error = GatewayError::bad_request("请求体必须是 JSON 对象");
-        record_early_failure(state, started_at, "", "", &error);
+        record_early_failure(state, started_at, "", "", client, &error);
         logging::verbose("[Model]", &format!("← POST {path} 请求体不是 JSON 对象"));
         return Err(error.payload_response());
     };
@@ -87,6 +92,20 @@ async fn forward_chat(
     route_session: Option<RouteSession>,
     telemetry: Arc<RequestTelemetry>,
 ) -> Result<ForwardOutcome, GatewayError> {
+    // 自动续写的上下文（开关 `autoContinue` **默认关**，关着时不做任何 clone）。
+    // 放在这条公共前半段里是有意的：两个协议入口都走这里，而此刻 `payload`
+    // 已经是 **Chat 形态**（`chat_from_responses` / `chat_from_anthropic` 之后），
+    // 续写要追加的 assistant / user 两个回合只在 Chat 形态上有定义 ——
+    // 到下游协议那层再拼就把同一条判据写成了两份。
+    let continuation = continuation::plan().map(|max_rounds| Continuation {
+        service: state.upstream().clone(),
+        base_body: payload.clone(),
+        stream,
+        client_headers: client_headers.clone(),
+        telemetry: telemetry.clone(),
+        allowed_providers: scope.clone(),
+        max_rounds,
+    });
     let outcome = state
         .upstream()
         .forward(ForwardRequest {
@@ -102,9 +121,21 @@ async fn forward_chat(
             // 关闭的模型对生产请求保持「模型已在网关中关闭」（`ignore_model_gate`
             // 是模型测试的直达跳，见 `ForwardRequest` 的说明）
             ignore_model_gate: false,
+            proxy_override: None,
         })
         .await;
-    outcome
+    // 续写包装：流式在下游状态机接手之前把整条流换掉（终止帧必须在
+    // `ResponsesStream` / `AnthropicStream` 看到它之前就压住，否则机器会提前
+    // 收尾、后续轮的内容整段被丢）；非流式则在这里把聚合体问完整。
+    match (continuation, outcome) {
+        (Some(context), Ok(ForwardOutcome::Stream { status, stream })) => {
+            Ok(ForwardOutcome::Stream { status, stream: context.stream(stream) })
+        }
+        (Some(context), Ok(ForwardOutcome::Completion { body })) => {
+            Ok(ForwardOutcome::Completion { body: context.complete(body).await })
+        }
+        (_, result) => result,
+    }
 }
 
 // ─── POST /v1/responses ─────────────────────────────────────
@@ -123,8 +154,10 @@ pub async fn responses_endpoint(
     let scope = key_scope.map(|Extension(scope)| scope);
     let principal = principal.map(|Extension(principal)| principal);
     let started_at = logging::now_ms();
+    // 请求来源客户端（UA 识别，见 `core::client`）：早失败路径与收尾记账共用
+    let client = crate::server::core::client::classify(&pipeline::user_agent_of(&headers));
     let path = "/v1/responses";
-    let raw = match parse_object(&state, started_at, path, &body) {
+    let raw = match parse_object(&state, started_at, path, &body, &client) {
         Ok(value) => value,
         Err(response) => return response,
     };
@@ -143,7 +176,7 @@ pub async fn responses_endpoint(
         Ok(body) => body,
         Err(message) => {
             let error = GatewayError::bad_request(message);
-            record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), &client_reasoning, &error);
+            record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), &client_reasoning, &client, &error);
             return error.payload_response();
         }
     };
@@ -153,7 +186,7 @@ pub async fn responses_endpoint(
         .unwrap_or(false)
     {
         let error = GatewayError::bad_request("input 必须能转换成对话消息");
-        record_early_failure(&state, started_at, "", &client_reasoning, &error);
+        record_early_failure(&state, started_at, "", &client_reasoning, &client, &error);
         return error.payload_response();
     }
 
@@ -162,7 +195,7 @@ pub async fn responses_endpoint(
     let requested_model = match pipeline::resolve_model(&state, &mut chat_body, scope.as_ref()) {
         Ok(model) => model,
         Err(error) => {
-            record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), &client_reasoning, &error);
+            record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), &client_reasoning, &client, &error);
             return error.payload_response();
         }
     };
@@ -193,6 +226,7 @@ pub async fn responses_endpoint(
         &requested_model,
         &client_model,
         &client_reasoning,
+        &client,
         // 真实流量：不是模型测试（见 `RecordContext::is_test`）
         false,
     );
@@ -230,12 +264,15 @@ pub async fn responses_endpoint(
         client_model,
         client_reasoning,
         status: 200,
-        // 下游原始请求体：客户端发来的那一份（协议翻译前）。响应侧非流式
-        // 在聚合完成后补，流式由 RecordingStream 在流结束时定稿
-        raw_request: pipeline::raw_body_text(&body),
+        // 下游原始请求体：客户端发来的那一份（协议翻译前）——仅调试模式
+        // 开启时采集（`capture_raw_body`）。响应侧非流式在聚合完成后补，
+        // 流式由 RecordingStream 在流结束时定稿
+        raw_request: pipeline::capture_raw_body(&body),
         raw_response: None,
         // 真实流量：不是模型测试（见 `RecordContext::is_test`）
         is_test: false,
+        // 来源客户端：入口判好带进来（见 `RecordContext::client`）
+        client: client.clone(),
     };
 
     match outcome {
@@ -267,9 +304,10 @@ pub async fn responses_endpoint(
             collect_stream(source, &mut |chunk| collector.push(chunk)).await;
             collector.finish();
             let body = collector.into_response(&model, &request);
-            // 响应正文在记账前定稿（完整 JSON 文本；序列化失败给 None）
+            // 响应正文在记账前定稿（完整 JSON 文本；序列化失败或调试模式
+            // 关着给 None，见 `capture_raw_json`）
             let context = RecordContext {
-                raw_response: serde_json::to_string(&body).ok(),
+                raw_response: pipeline::capture_raw_json(&body),
                 ..context
             };
             pipeline::record_entry(&context, None);
@@ -283,7 +321,7 @@ pub async fn responses_endpoint(
             // 有状态适配器可能直接给 Completion）。照样翻译，不丢请求。
             let response = responses::responses_from_chat(&chat, &requested_model, &original);
             let context = RecordContext {
-                raw_response: serde_json::to_string(&response).ok(),
+                raw_response: pipeline::capture_raw_json(&response),
                 ..context
             };
             pipeline::record_entry(&context, None);
@@ -323,8 +361,10 @@ pub async fn messages_endpoint(
     let scope = key_scope.map(|Extension(scope)| scope);
     let principal = principal.map(|Extension(principal)| principal);
     let started_at = logging::now_ms();
+    // 请求来源客户端（UA 识别，见 `core::client`）：早失败路径与收尾记账共用
+    let client = crate::server::core::client::classify(&pipeline::user_agent_of(&headers));
     let path = "/v1/messages";
-    let raw = match parse_object(&state, started_at, path, &body) {
+    let raw = match parse_object(&state, started_at, path, &body, &client) {
         Ok(value) => value,
         Err(response) => return response,
     };
@@ -336,7 +376,7 @@ pub async fn messages_endpoint(
         Ok(body) => body,
         Err(message) => {
             let error = GatewayError::bad_request(message);
-            record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), "", &error);
+            record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), "", &client, &error);
             return anthropic_error_response(&error);
         }
     };
@@ -347,7 +387,7 @@ pub async fn messages_endpoint(
     let requested_model = match pipeline::resolve_model(&state, &mut chat_body, scope.as_ref()) {
         Ok(model) => model,
         Err(error) => {
-            record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), &client_reasoning, &error);
+            record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), &client_reasoning, &client, &error);
             return anthropic_error_response(&error);
         }
     };
@@ -377,6 +417,7 @@ pub async fn messages_endpoint(
         &requested_model,
         &client_model,
         &client_reasoning,
+        &client,
         // 真实流量：不是模型测试（见 `RecordContext::is_test`）
         false,
     );
@@ -414,12 +455,15 @@ pub async fn messages_endpoint(
         client_model,
         client_reasoning,
         status: 200,
-        // 下游原始请求体：客户端发来的那一份（协议翻译前）。响应侧非流式
-        // 在聚合完成后补，流式由 RecordingStream 在流结束时定稿
-        raw_request: pipeline::raw_body_text(&body),
+        // 下游原始请求体：客户端发来的那一份（协议翻译前）——仅调试模式
+        // 开启时采集（`capture_raw_body`）。响应侧非流式在聚合完成后补，
+        // 流式由 RecordingStream 在流结束时定稿
+        raw_request: pipeline::capture_raw_body(&body),
         raw_response: None,
         // 真实流量：不是模型测试（见 `RecordContext::is_test`）
         is_test: false,
+        // 来源客户端：入口判好带进来（见 `RecordContext::client`）
+        client: client.clone(),
     };
 
     match outcome {
@@ -448,9 +492,10 @@ pub async fn messages_endpoint(
             collect_stream(source, &mut |chunk| collector.push(chunk)).await;
             collector.finish();
             let body = collector.into_response(&model);
-            // 响应正文在记账前定稿（完整 JSON 文本；序列化失败给 None）
+            // 响应正文在记账前定稿（完整 JSON 文本；序列化失败或调试模式
+            // 关着给 None，见 `capture_raw_json`）
             let context = RecordContext {
-                raw_response: serde_json::to_string(&body).ok(),
+                raw_response: pipeline::capture_raw_json(&body),
                 ..context
             };
             pipeline::record_entry(&context, None);
@@ -462,7 +507,7 @@ pub async fn messages_endpoint(
             pipeline::fill_usage_from_telemetry(&mut chat, &context.telemetry);
             let response = anthropic::anthropic_from_chat(&chat, &requested_model);
             let context = RecordContext {
-                raw_response: serde_json::to_string(&response).ok(),
+                raw_response: pipeline::capture_raw_json(&response),
                 ..context
             };
             pipeline::record_entry(&context, None);

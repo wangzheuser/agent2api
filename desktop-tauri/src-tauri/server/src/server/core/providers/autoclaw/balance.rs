@@ -143,6 +143,8 @@ pub(super) async fn query_usage(
         .get("wallets")
         .cloned()
         .unwrap_or_else(|| Value::Array(Vec::new()));
+    // 逐份明细只读上面这份 `points`（钱包清单 + 即将过期），不再打一次上游接口
+    let credits = credit_rows_from(&points);
     let mut raw = Map::new();
     raw.insert(
         "points".to_string(),
@@ -176,14 +178,22 @@ pub(super) async fn query_usage(
             }
         }
     }
-    Ok(json!({
+    let mut document = json!({
         "available": available,
         // AutoClaw 的资产口径就是它自己的「积分」
         "unit": "积分",
         "wallets": wallets,
         "subscription": subscription,
         "raw": Value::Object(raw),
-    }))
+    });
+    // `credits[]` 只在非空时挂：空数组**整个不写这个键** —— 界面按「键在不在 +
+    // 长度」决定要不要给这一格挂「可点开」的交互，给一个空数组会点出一个空框
+    if !credits.is_empty() {
+        if let Some(object) = document.as_object_mut() {
+            object.insert("credits".to_string(), Value::Array(credits));
+        }
+    }
+    Ok(document)
 }
 
 /// 查询积分钱包（源实现 `queryPoints`：v2 主链路 → v1 兜底 → expiring 附加）。

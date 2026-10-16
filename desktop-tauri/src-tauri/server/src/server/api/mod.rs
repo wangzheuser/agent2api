@@ -44,6 +44,10 @@ pub mod accounts_growth;
 // 整库备份 / 恢复（设置页调用的受保护管理接口；核心实现见 `db::backup`）。
 pub mod backup_api;
 pub mod auto_checkin;
+// 长度截断的自动续写（开关 + 轮数上限）：`GET/PUT /api/auto-continue`。
+// 判据与执行链在 `core::upstream::continuation`，这里只是那两个数的读写入口；
+// 独立成文件而不是塞进 config_api —— 理由见该模块头。
+pub mod auto_continue;
 pub mod billing;
 pub mod captcha;
 pub mod chat;

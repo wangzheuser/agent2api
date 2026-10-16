@@ -6,8 +6,9 @@
  * 是六项；账号维度由本弹窗的「测试账号」多选覆盖 —— 那是同一个动作的另一个参数，不是另一件事。
  *
  * ── 两层：参数在下、结果在上 ──────────────────────────────────
- *   1. **参数层**（外层 Dialog）：目标行 + 系统提示词 / 用户提示词 / 思考等级 / 流式 / 测试账号。
- *      默认值刻意取「最小请求」——用户提示词「你好」、流式开、思考等级跟随映射；
+ *   1. **参数层**（外层 Dialog）：目标行 + 系统提示词 / 用户提示词 / 对话协议 / 测试节点 /
+ *      思考等级 / 流式 / 测试账号。默认值刻意取「最小请求」——用户提示词「你好」、流式开、
+ *      协议 OpenAI Chat Completions、节点跟随账号配置、思考等级跟随映射；
  *   2. **结果层**（内层 Dialog，按账号分块）：测试中 / 一成一败 / 全部失败三态都住在这一层。
  *
  * 内层是**嵌在外层 DialogContent 的 children 里**的（照 add-account-modal.tsx 的双层形态）：
@@ -21,9 +22,9 @@
  * 账号**钉住**再走 `UpstreamService::forward` —— token 刷新、出站脱敏、提示词模式、思考等级注入、
  * 请求日志与调试报文全都覆盖到，所以结论与生产一致。也因此**会消耗少量额度**，且每次测试都带
  * 「测试」来源标记记入请求日志（报表统计里排除，见后端 `is_test`）——这句压成一行常驻在参数弹窗
- * 底部（额度必须看得见），其余解释各归其位：目标行 / 流式 / 账号的口径进 ⓘ（tip-q + Tooltip），
- * 「留空则…」进 placeholder，页脚旁白与标题里重复的模型 ID 一律不摆。文案精简的对照与去向见
- * prototype/model-test-lite.html。
+ * 底部（额度必须看得见），其余解释各归其位：目标行 / 协议 / 节点 / 流式 / 账号的口径进 ⓘ
+ * （tip-q + Tooltip），「留空则…」进 placeholder，页脚旁白与标题里重复的模型 ID 一律不摆。
+ * 文案精简的对照与去向见 prototype/model-test-lite.html。
  *
  * ── 中止：没有 abort 桥，靠同一个关联 id ──────────────────────
  * 桌面壳的桥（`invoke('api_request')`）**没有 abort**：一次已经在跑的调用取消不掉。所以 id 由
@@ -47,7 +48,9 @@ import {
 import {
   DEFAULT_PROVIDER_ID, byPriorityOrder, displayNameOf, isRateLimited, positionMap, providerFeatures,
 } from './accounts-domain'
-import type { AccountRecord } from './accounts-shared'
+import {
+  POOL_VALUE_PREFIX, poolItemLabel, type AccountRecord, type PoolItem,
+} from './accounts-shared'
 import * as customSource from './models-custom-source'
 import type { ManageModel } from './models-custom-source'
 import { levels as reasoningLevels } from './models-reasoning'
@@ -70,6 +73,10 @@ type TestModelRequest = {
   /** 本次指定的思考等级；空 = 不写进请求体（映射上绑的等级因此照常生效） */
   reasoning?: string
   stream?: boolean
+  /** 本次测试使用的网关对话协议（chat_completions / responses / anthropic） */
+  protocol?: string
+  /** 本次测试临时指定的出网节点（空 = 跟随账号配置，direct = 直连，pool:<id> = 代理池节点） */
+  proxy?: string
   /** 前端生成的关联 id（请求日志那一行的 id，也是中止用的把手） */
   test_id?: string
 }
@@ -83,6 +90,8 @@ type TestModelResponse = {
   reasoning?: string
   provider?: string
   model?: string
+  protocol?: string
+  proxy?: string | null
   account_id?: string | null
   account_name?: string | null
   upstream_model?: string | null
@@ -126,9 +135,14 @@ type WindowBridge = {
     testModel(payload: TestModelRequest): Promise<TestModelResponse | null | undefined>
     /** 「终止请求」：按关联 id 置位取消令牌（测试的中止走它，见模块头） */
     terminateStatsRequest?(id: string): Promise<unknown>
+    /** 代理池列表（「网络代理」页维护的命名出口节点） */
+    getProxyPool?(): Promise<{ items?: PoolItem[] } | null | undefined>
   }
   wbApp?: {
     getState?: () => { accounts?: { accounts?: AccountRecord[] } } | null | undefined
+  }
+  wbProviders?: {
+    PROTOCOL_OPTIONS?: Array<{ value: string; label: string }>
   }
 }
 
@@ -319,6 +333,10 @@ export function ModelTestDialog({ target, onClose }: { target: ModelTestTarget; 
 
   const [systemPrompt, setSystemPrompt] = React.useState('')
   const [prompt, setPrompt] = React.useState(DEFAULT_PROMPT)
+  const [protocol, setProtocol] = React.useState('chat_completions')
+  const [proxy, setProxy] = React.useState('')
+  const [pool, setPool] = React.useState<PoolItem[] | null>(null)
+  const [poolError, setPoolError] = React.useState('')
   const [reasoning, setReasoning] = React.useState('')
   const [stream, setStream] = React.useState(true)
   /**
@@ -339,6 +357,29 @@ export function ModelTestDialog({ target, onClose }: { target: ModelTestTarget; 
 
   const running = slots.some(slot => slot.state === 'running')
   const now = useClock(running)
+
+  /** 打开弹窗时读取一次代理池列表（供「测试节点」下拉使用） */
+  React.useEffect(() => {
+    let alive = true
+    void (async () => {
+      try {
+        const getPool = bridge().workbuddyDesktop?.getProxyPool
+        if (typeof getPool !== 'function') throw new Error(t('当前环境不支持代理池'))
+        const data = await getPool()
+        if (!alive) return
+        if (!data || typeof data !== 'object' || !Array.isArray(data.items)) {
+          throw new Error(t('代理池响应异常'))
+        }
+        setPool(data.items)
+        setPoolError('')
+      } catch (error) {
+        if (!alive) return
+        setPool([])
+        setPoolError(errorMessage(error))
+      }
+    })()
+    return () => { alive = false }
+  }, [])
 
   /** 中止在途请求：seq 自增（作废回调）+ 逐个置位取消令牌，然后清空槽位回到参数层 */
   const abort = React.useCallback((quiet = false) => {
@@ -365,6 +406,8 @@ export function ModelTestDialog({ target, onClose }: { target: ModelTestTarget; 
       system_prompt: systemPrompt.trim(),
       reasoning,
       stream,
+      protocol,
+      ...(proxy ? { proxy } : {}),
       test_id: slot.testId,
     }
     const settle = (patch: Partial<Slot>): void => {
@@ -525,7 +568,8 @@ export function ModelTestDialog({ target, onClose }: { target: ModelTestTarget; 
     const reply = String(result?.reply ?? '')
     const reasoningText = String(result?.reasoning ?? '')
     const foldKey = `think-${slot.testId}`
-    // 「上游 xxx」只在实际模型与被测名不同（映射改名）时才有信息量，同名不重复念一遍
+    // 「上游 xxx」只在实际模型与被测名不同（映射改名）时才有信息量，同名不重复念一遍；
+    // 协议与节点在显式切换时一并标出，便于对照本次测试条件
     const metaLine = [
       result?.upstream_model && result.upstream_model !== target.id ? `上游 ${result.upstream_model}` : '',
       result?.upstream_reasoning ? `思考等级 ${result.upstream_reasoning}` : '',

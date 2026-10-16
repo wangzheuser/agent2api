@@ -77,15 +77,16 @@ type ProviderFeatures = {
   usageDetail?: boolean
   /**
    * 余额格的读数旁边要不要挂「积分明细」入口（逐份积分包：面额 / 已用 / 剩余 +
-   * 领取 → 到期）—— 只有 WorkBuddy 两家与 Trae。
+   * 领取 → 到期）—— 已登记的有 WorkBuddy 两家、Trae、OfficeAce、AutoClaw 两家、
+   * ZCode 两家、Qoder 两家、Loomy、小浣熊。
    *
    * 与 `usageDetail` 的差别是**动不动排版**：那个会把这格换成「套餐徽标 + 读数
    * 按钮」的整套两行形态（CodeArts 的余额是两台网关的加总，一行分不出权益差别，
-   * 所以值得换）；这两家的读数本身（WorkBuddy 的「可用 N」、Trae 的套餐名 +
+   * 所以值得换）；这些家的读数本身（单行读数的「可用 N」、主额度桶的套餐名 +
    * 进度条 + 剩 x / 共 y）已经回答了用户最常问的那句，明细是**加一层**而不是
-   * 换一层 —— 换过去 Trae 那格会丢掉进度条。
+   * 换一层 —— 换过去主额度桶那格会丢掉进度条。
    *
-   * 判据同样按能力位而不是形状探测：后端 `credits[]` 是这两家（以及以后愿意
+   * 判据同样按能力位而不是形状探测：后端 `credits[]` 是这些家（以及以后愿意
    * 照这个行形状出数据的家）的**承诺** —— 点开一定有逐份读数，不是点开一个空框。
    */
   creditDetail?: boolean
@@ -151,8 +152,11 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   //   **每天一份新套餐**（plan_id 带日期段），领过之后按钮当天显示「今日已领」、
   //   次日自动恢复 —— 见 `claimedToday`。
   // expiry 取 expiresAt 是给 add_zcode_account 的契约（落账号时要写访问令牌的过期时间）
-  zcode: { usage: true, claim: true, planChannel: true, edition: true, identifier: 'userId', expiry: 'expiresAt' },
-  'zcode-intl': { usage: true, claim: true, planChannel: true, edition: true, identifier: 'userId', expiry: 'expiresAt' },
+  // `creditDetail: true` —— 逐额度桶一行（总量 / 已用 / 剩余，认得出归属时还带套餐名）；
+  //   纯比例窗口（监控通道那条链）只有 `remainingPercent`、三个数全缺，整行跳过
+  //   （见 zcode::balance 的 credits_of）—— 那一档和现在一样不出入口。两个地区都要登记。
+  zcode: { usage: true, creditDetail: true, claim: true, planChannel: true, edition: true, identifier: 'userId', expiry: 'expiresAt' },
+  'zcode-intl': { usage: true, creditDetail: true, claim: true, planChannel: true, edition: true, identifier: 'userId', expiry: 'expiresAt' },
   // CodeArts（华为云 AI 代码助手）。各位各有出处，别照着别家抄：
   // `usage: true` —— 余额是**两份账**（订阅统计 + 福利网关，见 providers::codearts::balance），
   //   界面上「读到 0」与「没读到」必须能分开，后端因此把失败的一侧写进 statisticsError /
@@ -189,7 +193,9 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   // `edition: false` —— 单一入口（手机验证码登录），没有国际版/地区概念。
   // `expiry: 'expiresAt'` —— 落账号时按登录时刻 + 14 天估算（上游没有续期接口，
   //   过期只能重新登录；这一列对它是「什么时候该重登」的提示）。
-  loomy: { usage: true, edition: false, identifier: 'userId', expiry: 'expiresAt' },
+  // `creditDetail: true` —— 双账户各一行（永久积分 / 每日赠送积分），后者标 `daily`
+  //   → 界面写「每日重置」而不是到期（读到 0 也不折进「已用完」，明天回满）。
+  loomy: { usage: true, creditDetail: true, edition: false, identifier: 'userId', expiry: 'expiresAt' },
   // KukuAI（百度文库库库 AI）。各位各有出处：
   // `usage: true` —— 余额/积分查询（GET /bizapi/gfpro/getgfvipremain 的
   //   totalPoint，见后端 providers::kuku::balance）。
@@ -211,7 +217,20 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   // `identifier: 'id'` —— 账号标识渲染的是**账号 id**（`officeace-<hash>`，
   //   由网关基址 + app key 派生），不是任何凭据本身：面板上显示 `modelAppKey`
   //   会把网关 key 露在界面上（`identifierOf` 读的是字段**值**，不只是标签）。
-  officeace: { usage: true, edition: false, identifier: 'id', expiry: 'expiresAt' },
+  // `creditDetail: true` —— 逐条套餐配额 + 逐条奖励活动各一行（奖励活动含已过期的
+  //   —— 弹层把它与「已用完」一起收进末尾折叠组），另加一条联网搜索（单位「次」，
+  //   与文档级的「积分」不同）。
+  officeace: { usage: true, creditDetail: true, edition: false, identifier: 'id', expiry: 'expiresAt' },
+  // Antigravity（Google AI IDE）。各位各有出处：
+  // `usage: true` —— 额度是**两个模型组 × 两个窗口**（5 小时 / 每周）的剩余比例，
+  //   见后端 providers::antigravity::balance（retrieveUserQuotaSummary）；
+  //   上游只给比例、没有绝对数，钱包行走纯比例读数（`remainingPercent` +
+  //   `balanceView`），余额列显示「最紧张的窗口」，悬停列出全部窗口与重置时刻。
+  // `edition: false` —— 单一入口（Google OAuth 粘贴 / 网页登录），没有地区概念。
+  // `identifier: 'userId'` —— 身份键存的就是 email（见 account_store::antigravity_accounts 模块头）。
+  // `expiry: ''` —— refresh token 不过期、access token 自动续期，这一列对它没有可显示的事实
+  //   （与 kuku 同一处置：界面不渲染「有效期」）。
+  antigravity: { usage: true, edition: false, identifier: 'userId', expiry: '' },
 }
 
 /**
@@ -309,9 +328,22 @@ export function tokenExpiryOf(account: AccountRecord | null | undefined): number
   return expiryMillis(account?.[key])
 }
 
-/** 该账号所属 provider 是否有余额概念（没有就不渲染余额按钮，也不参与批量查询） */
+/**
+ * 该账号所属 provider 是否有余额概念（没有就不渲染余额按钮，也不参与批量查询）。
+ *
+ * 内置家走能力表（`usage` 位）；**自定义家（含「预置 API」卡片建的那些）不走表**
+ * —— 它们的能力来自**提供商记录里的余额方案**，由后端注入成账号公开形态上的
+ * `balanceQuery.scheme`（六种方案见 `providers::custom::balance` 与
+ * `balance-query.tsx`）：有方案 = 能查余额。
+ *
+ * 「有方案但凭证没配」**照样算有**：后端那次查询回的是「未配置」的中性提示
+ * （不是红色失败），按钮与「查询设置」段都得在，用户才有地方去补 —— 与
+ * CatPaw / ZCode 的「未配置也给入口」同一取舍。
+ */
 export function supportsUsage(account: AccountRecord | null | undefined): boolean {
-  return providerFeatures(providerOf(account)).usage
+  const provider = providerOf(account)
+  if (provider.startsWith('custom-')) return Boolean(account?.balanceQuery?.scheme)
+  return providerFeatures(provider).usage
 }
 
 /* ─── 每账号的余额查询设置（账号设置弹窗「查询设置」段共用）─── */
@@ -1089,10 +1121,14 @@ export function visibleAccounts(
 }
 
 /**
- * 分段计数：某分段显示的数字 = 「其余维度保持当前选择、本维度取该值」的账号数。
- * 「可见列表」与「分段计数」共用这一份口径 —— 否则徽标数字与点进去看到的结果会各算各的。
- * 提供商那一维不给自己算分段（它是下拉，数字直接写在选项里，见 accounts-page），
- * 但**要进其余分段的取景框**：切了家之后，状态 / 限额徽标就该跟着只数这一家。
+ * 分段计数：状态与限额按「两级筛选」各管一段 ——
+ *   · 状态段的数字 = 全量（提供商 + 搜索取景后），不受限额档位影响：状态是
+ *     一级筛选，它要回答「现在一共有多少账号」，数字必须恒定；
+ *   · 限额段的数字 = 状态收窄后的范围（提供商 + 搜索 + 状态档），再按
+ *     正常 / 已限流分档：限额是二级筛选，它数的是「这一级里还有多少」。
+ * 徽标与点进去看到的行数仍然一致（状态段在限额=全部时所见即徽标；限额段
+ * 在当前状态档下所见即徽标），而「全部」恒等于家底总数，切限额不再让状态
+ * 的数字跟着变。
  */
 export function filterCounts(
   all: AccountRecord[] | null | undefined,
@@ -1104,7 +1140,6 @@ export function filterCounts(
   const scope = (except: 'enabled' | 'limit') => list.filter(account =>
     matchProvider(account, filter)
     && (except === 'enabled' || matchEnabled(account, filter))
-    && (except === 'limit' || matchLimit(account, filter, usageOf, tokenUsageOf))
     && matchQuery(account, filter))
 
   const forEnabled = scope('enabled')

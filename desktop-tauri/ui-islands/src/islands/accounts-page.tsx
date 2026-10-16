@@ -242,7 +242,16 @@ function AccountsPage() {
     if (from < 0) return
     const moved = group.members[from]
     const rest = group.members.filter((_, position) => position !== from)
-    const to = Math.max(0, Math.min(rest.length, drop.index))
+    // 落点下标来自**渲染出来的**那些行（筛选 / 搜索 / 分页会把组内的行裁掉一部分），
+    // 而重排要的是完整 members —— 按锚点换算：插到第 N 个渲染行之前 = 完整 members
+    // 里那行所在的下标之前；N 等于渲染行数 = 插到组尾（被裁掉的行留在原处）。
+    // 渲染行从 dragRef 取（而不是 group.accounts 的全量可见行）：分页把一组的行切成
+    // 两页时，DOM 里只有本页那一段，锚点必须按「真画出来的行」数，否则错一位。
+    // 与组顺位分支（displayed → all）同一个手法：可见与全量的映射是确定的，错不了位。
+    const visible = dragRef.current.renderedRows.get(drop.provider) || []
+    const anchor = drop.index < visible.length ? visible[drop.index] : null
+    const at = anchor === null ? -1 : rest.findIndex(account => account.id === anchor)
+    const to = anchor === null || at < 0 ? rest.length : at
     if (to === from) return
     const nextMembers = [...rest.slice(0, to), moved, ...rest.slice(to)]
     const next = current.map(item => item.provider === drop.provider ? { ...item, members: nextMembers } : item)

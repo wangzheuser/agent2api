@@ -5,7 +5,7 @@
  * renderProviderCards / newCardHtml 与 mountAddProviderUi 里注入的那段骨架。
  *
  * 卡片网格与卡片的类名（.add-provider-grid / .add-provider-card / .add-provider-logo…）
- * 原样保留：那是布局性的成套样式（两列网格 + 固定高度滚动 + 卡片三行排版），
+ * 原样保留：那是布局性的成套样式（四列网格 + 固定高度滚动 + 卡片三行排版），
  * 组件库没有对应件，重写成 Tailwind 只会把一份已经调好的像素预算再抄一遍。
  * 控件（分段、搜索框）走组件库。
  */
@@ -13,7 +13,7 @@
 import * as React from 'react'
 import { DialogSection, InputGroup, InputGroupAddon, InputGroupInput, SegmentedControl } from '@ui'
 
-import { accountCountOf, shared } from './add-account-bridge'
+import { accountCountOf, existingCustomOfPreset, matchesPresetName, shared } from './add-account-bridge'
 import type { CustomProviderRecord } from './add-account-bridge'
 import { WORKBUDDY_ENTRY_LABEL, WORKBUDDY_PROVIDER } from './add-account-configs'
 import { ADD_SEG_CLASS } from './add-provider-blocks'
@@ -91,6 +91,10 @@ export const PROVIDER_ICONS: Record<string, string> = {
   // （`res-static.hc-cdn.cn/.../OfficeAce/新图标.png`，176×176 RGBA，
   // 归一成 256×256 入库 —— 与系统里显示的应用图标为同一形象）
   officeace: 'assets/providers/officeace.png',
+  // OrcaTerm（腾讯云遨驰终端桌面客户端）：取自官方 PWA 图标
+  // （`cloudcache.tencent-cloud.com/qcloud/orcaterm/pwa/icon/orcaterm_192x192.png`，
+  // 与客户端 / 官网显示的应用图标为同一形象）
+  orcaterm: 'assets/providers/orcaterm.png',
 }
 
 type CardItem = {
@@ -112,23 +116,31 @@ type CardItem = {
 function providerCards(accountType: AccountType): CardItem[] {
   const providers = shared().wbProviders
   if (accountType === TYPE_PRESET) {
-    const customNames = new Set((providers?.customList?.() || []).map(item => item.name || ''))
-    return (shared().wbPresetProviders?.list || [])
-      .filter(preset => !customNames.has(preset.name))
-      .map(preset => ({
+    // 模板卡不因「已建过」从列表里消失（那会让用户以为模板只能用一次）：
+    // 建过的卡继续常驻，点它落到「加入已有」模式（见 add-account-modal 的
+    // pick），账号数显示在卡片第二行 —— 形态与 Agent 段的卡片一致。
+    return (shared().wbPresetProviders?.list || []).map(preset => {
+      const built = existingCustomOfPreset(preset)
+      return {
         id: PRESET_CARD_PREFIX + preset.key,
         label: preset.name,
-        count: 0,
+        count: built ? accountCountOf(built.id) : 0,
         preset: true,
-      }))
+        builtId: built?.id || '',
+      }
+    })
   }
   if (accountType === TYPE_CUSTOM) {
-    return (providers?.customList?.() || []).map((provider: CustomProviderRecord) => ({
-      id: provider.id,
-      label: provider.name || provider.id,
-      count: accountCountOf(provider.id),
-      custom: true,
-    }))
+    // 预置模板同名的家不重复出现（口径见 matchesPresetName）：预置家改了名
+    // （不再对应任何模板）后会重新回到这一段，从这里继续加账号不受影响。
+    return (providers?.customList?.() || [])
+      .filter((provider: CustomProviderRecord) => !matchesPresetName(provider))
+      .map((provider: CustomProviderRecord) => ({
+        id: provider.id,
+        label: provider.name || provider.id,
+        count: accountCountOf(provider.id),
+        custom: true,
+      }))
   }
   const list = providers?.all?.() || []
   // WorkBuddy 这张卡与它的弹窗标题用**中性品牌名**（不带地区）而不是注册名：
@@ -188,6 +200,8 @@ function Logo({ item }: { item: CardItem }): React.ReactElement {
 /**
  * 卡片正文第二行（meta）。三段各说各的动作，徽章不再出现 —— 分段已经把类型
  * 分开了，整段都是同一类，再给每张卡挂一枚「预置 / 自定义」徽章只是噪音。
+ * 预置卡分两种：没建过的是「按模板新建」，已建过的是「给那家接着加账号」——
+ * 后者与「自定义」段的卡片做的是同一件事，因此文案同一口径（账号数 + 点击添加）。
  */
 function cardMeta(item: CardItem): string {
   if (item.preset) return '点开即预填，填 Key 接入'
