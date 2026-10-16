@@ -108,6 +108,20 @@ class MergeFlowTests(unittest.TestCase):
             with self.subTest(names=names), self.assertRaises(ValueError):
                 flow.seal(self.root, self.path, self.record, names)
 
+    def test_required_override_cannot_shrink_plan(self):
+        flow.overlap(self.root, self.path, self.record)
+        flow.plan(self.root, self.path, self.record)
+        self.run_check()
+        with self.assertRaisesRegex(ValueError, '不得缩减计划必需验收项'):
+            flow.seal(self.root, self.path, self.record, ['business'])
+
+    def test_check_rejects_legacy_seal_with_reduced_gates(self):
+        self.run_check()
+        flow.seal(self.root, self.path, self.record, ['business'])
+        flow.plan(self.root, self.path, self.record)
+        with self.assertRaisesRegex(ValueError, '不得缩减计划必需验收项'):
+            flow.check(self.root, self.record)
+
     def test_new_and_unstaged_source_rejected(self):
         (self.root / 'new.py').write_text('new = True', encoding='utf-8')
         with self.assertRaisesRegex(ValueError, '新文件'):
@@ -244,8 +258,9 @@ class MergeFlowTests(unittest.TestCase):
         flow.plan(self.root, path, record)
         self.assertEqual(record['plan']['overlap_unresolved'], ['source.py'])
         self.assertEqual(self.run_check_for(record, path), 0)
+        flow.execute(self.root, path, record, 'impact-review', '.', [sys.executable, '-c', 'assert True'])
         with self.assertRaisesRegex(ValueError, '重复功能决策'):
-            flow.seal(self.root, path, record, ['business'])
+            flow.seal(self.root, path, record, ['business', 'impact-review'])
 
     def run_check_for(self, record, path, code='assert True'):
         return flow.execute(self.root, path, record, 'business', '.', [sys.executable, '-c', code])
@@ -256,7 +271,8 @@ class MergeFlowTests(unittest.TestCase):
         flow.plan(self.root, path, record)
         self.assertEqual(record['overlap']['unresolved'], [])
         self.assertEqual(self.run_check_for(record, path), 0)
-        flow.seal(self.root, path, record, ['business'])
+        flow.execute(self.root, path, record, 'impact-review', '.', [sys.executable, '-c', 'assert True'])
+        flow.seal(self.root, path, record, ['business', 'impact-review'])
         (self.root / 'source.py').write_text('candidate = True\n', encoding='utf-8')
         self.git('add', 'source.py')
         with self.assertRaisesRegex(ValueError, '重复功能分析'):

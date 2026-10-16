@@ -1183,3 +1183,19 @@ mod route_strategy_tests {
     }
 }
 
+
+pub const KEY_AUTO_CONTINUE: &str = "autoContinue";
+
+pub const KEY_AUTO_CONTINUE_MAX_ROUNDS: &str = "autoContinueMaxRounds";
+
+pub const DEFAULT_AUTO_CONTINUE_MAX_ROUNDS: i64 = 3;
+
+pub const AUTO_CONTINUE_MIN_ROUNDS: i64 = 1;
+
+pub const AUTO_CONTINUE_MAX_ROUNDS: i64 = 8;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AutoContinuePatch {
+    pub enabled: Option<bool>,
+    pub max_rounds: Option<i64>,
+}
