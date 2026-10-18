@@ -138,7 +138,7 @@ pub(super) async fn login(
     let state = random_hex()?;
     // 不自动跟转的出口：这条链路的每一步都要自己读 Location / Set-Cookie
     // （见 `egress::client_without_redirects`）
-    let client = egress::client_without_redirects(proxy);
+    let client = egress::client_without_redirects(proxy)?;
     let mut jar = CookieJar::default();
 
     // 1) 发起授权，跟随跳转直到页面停在登录页，取 login_challenge

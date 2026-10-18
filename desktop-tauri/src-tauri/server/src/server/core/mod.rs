@@ -57,6 +57,8 @@
 pub mod account_store;
 pub mod account_transfer;
 pub mod api_keys;
+pub mod crypto;
+pub mod legacy_api_key;
 pub mod auth;
 pub mod auth_http;
 pub mod auto_checkin;
@@ -85,6 +87,8 @@ pub mod protocol;
 pub mod providers;
 pub mod proxies;
 pub mod proxy_pool;
+pub mod proxy_settings;
+pub mod proxy_rotate;
 pub mod reward_profiles;
 pub mod routing;
 pub mod sanitize;

@@ -432,4 +432,3 @@ pub fn sync_facts() {
         .collect();
     *slot = facts;
 }
-

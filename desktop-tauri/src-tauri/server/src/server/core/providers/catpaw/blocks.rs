@@ -32,6 +32,7 @@ use serde_json::{json, Map, Value};
 use crate::server::errors::GatewayError;
 
 use super::fingerprint::js_truthy;
+use super::models::MAX_JSON_NESTING_DEPTH;
 
 /// 图片 URL / Data URL 的长度上限（照抄原实现 `MAX_IMAGE_URL_LENGTH`，8MB）。
 ///
@@ -337,16 +338,17 @@ fn invalid_arguments(index: usize) -> GatewayError {
     ))
 }
 
-/// 递归校验一个 JSON 值（原实现 `validateJsonValue`）：嵌套深度 ≤ 12，
-/// 且不含 `__proto__` / `constructor` / `prototype` 这类危险键。
+/// 递归校验一个 JSON 值（原实现 `validateJsonValue`）：嵌套深度受限
+/// （见 [`MAX_JSON_NESTING_DEPTH`]），且不含 `__proto__` / `constructor` /
+/// `prototype` 这类危险键。
 ///
 /// Rust 侧本来就没有原型污染问题，但**深嵌套与危险键在工具参数里没有正当
 /// 用途**，而它们会被原样转发给上游模型；保持与原实现相同的拒绝口径，
-/// 可以避免「Node 版拒绝、Rust 版放行」的行为漂移。深度口径照抄
-/// （从 0 起算，> 12 判超限）。
+/// 可以避免「Node 版拒绝、Rust 版放行」的行为漂移。深度口径从 0 起算，
+/// 唯一偏离原实现的地方是上限值：12 太严，见 [`MAX_JSON_NESTING_DEPTH`]。
 fn validate_json_value(value: &Value, index: usize) -> Result<(), GatewayError> {
     fn walk(value: &Value, depth: usize, index: usize) -> Result<(), GatewayError> {
-        if depth > 12 {
+        if depth > MAX_JSON_NESTING_DEPTH {
             return Err(GatewayError::bad_request(format!(
                 "assistant.tool_calls[{index}].function.arguments 嵌套过深"
             )));

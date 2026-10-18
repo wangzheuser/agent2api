@@ -190,6 +190,21 @@ fn is_available(account: &Value) -> bool {
         .unwrap_or(true)
 }
 
+/// 这条会话是不是企业版账号（`account.enterpriseId` 非空）。
+///
+/// 企业版没有个人成长 / 补偿体系：上游对签到、活动补偿这类个人计费端点
+/// 固定回 400 code 10001（参考实现 workbuddy2api-panel 的 A/B 实测，
+/// 2026-10-07）。活动补偿那一步据此直接跳过，省一次注定失败的请求 ——
+/// 判据只此一份，与 `AuthService`「enterpriseId 为 null 就不显示企业标记」
+/// 同一口径（空串按个人版处理）。
+fn is_enterprise_session(session: &Value) -> bool {
+    session
+        .get("account")
+        .and_then(|account| account.get("enterpriseId"))
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.is_empty())
+}
+
 /// 账号列表快照（`store.listAccounts().accounts`）
 fn accounts_of(store: &AccountStore) -> Vec<Value> {
     store
@@ -666,6 +681,39 @@ pub(crate) fn checkin_completed_today(claim: &Value) -> bool {
     message.contains("已签到") || message.contains("已领取")
 }
 
+/// 行的 `activity` 段是否携带「活跃上报成功」读数（`report.succeeded`）。
+///
+/// WorkBuddy 国际版每日活跃的构成：活跃上报（`/v2/report`）点亮成长中心
+/// 连登；「当日活跃」计数的判定通道是网页会话（[`web_conversation_ok`]，
+/// issue #277）。领取依赖上游活动开放。
+pub fn activity_report_ok(row: &Value) -> bool {
+    row.get("activity")
+        .and_then(|activity| activity.get("report"))
+        .and_then(|report| report.get("succeeded"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// 行的 `activity` 段是否携带「网页会话建成」读数（`webConversation.succeeded`）。
+///
+/// 上游把「当日活跃」（每日 30 积分的判定）记在网页通道的 agent 会话上
+/// （issue #277 的抓包结论，见 `billing::activity::create_web_conversation`）。
+pub fn web_conversation_ok(row: &Value) -> bool {
+    row.get("activity")
+        .and_then(|activity| activity.get("webConversation"))
+        .and_then(|web| web.get("succeeded"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// 签到完成只认领取确认；活跃链路单独展示，不能提前压掉领取重试。
+pub fn day_completed(row: &Value) -> bool {
+    row.get("claim")
+        .map(checkin_completed_today)
+        .unwrap_or(false)
+
+}
+
 /// 这条领取结果是「中性未领取」—— 不是成功、不是已签、也不是失败，而是
 /// 「此刻没有可领的活动」。Qoder 国际版的活动窗口每天 10:00（UTC+8）才开，
 /// 定时签到在这个窗口之前跑完时结果必然长这样；自动签到调度据此判断
@@ -716,11 +764,9 @@ pub async fn run_checkin(
         // 写盘失败只记日志、不改签到结果 —— 上游那边积分已经领到了，
         // 因为一次落盘失败就把成功的签到报成失败是本末倒置。
         if let Some(account_id) = row.get("id").and_then(Value::as_str) {
-            let completed = row
-                .get("claim")
-                .map(checkin_completed_today)
-                .unwrap_or(false);
-            if completed && !store.mark_checkin(account_id, logging::now_ms()) {
+            // 判据是 [`day_completed`]（领取确认完成，活跃不计入）——
+            // 与台账的 outcome 判定同源；判据只此一份，别在这里再写一份。
+            if day_completed(&row) && !store.mark_checkin(account_id, logging::now_ms()) {
                 logging::verbose(
                     "[Accounts]",
                     &format!("账号 {account_id} 的签到时间未能落盘（账号可能已被删除）"),
@@ -729,9 +775,12 @@ pub async fn run_checkin(
         }
         results.push(row);
     }
-    // 「真实领取」与「今日已领取」都表示本日签到已完成；只有活跃保活不计入
-    // succeeded，避免把普通签到时间与活跃任务混为一谈 —— 保活读数单独统计在
-    // `active`（`activity.pokeSucceeded`），它的成功不落 `checkinAt`。
+    // 「真实领取」与「今日已领取」都表示本日成功领到分，计入 succeeded；
+    // 活跃链路（保活对话 / 活跃上报 / 网页会话）单独统计在 `active` ——
+    // 它不产生「领取」，不并入 succeeded，免得把两类事混成一个数。
+    // 注意 succeeded 只是这行日志的计数：落 `checkinAt` 的判据是
+    // [`day_completed`] 只接受领取确认；活跃另外展示。前者计量
+    // 「真领到的分」，后者回答「今天是否已完成」。
     let succeeded = results
         .iter()
         .filter(|item| {

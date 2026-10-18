@@ -775,6 +775,11 @@ impl AccountStore {
             // serde_json 的序列化键序由插入序决定，与 JS 的对象字面量序一致。
             let before = value_or_nullish(record.get("proxy"), Value::Null);
             if next != before {
+                if crate::server::core::proxies::is_rotate_config(&next)
+                    && !crate::server::core::custom_providers::is_opencode_zen_account(
+                        &record.provider(), record.get("baseUrl").and_then(Value::as_str)) {
+                    return Err(AccountStoreError::bad_request("轮询出网只对 OpenCode Zen 账号开放"));
+                }
                 record.set_proxy(next.clone());
                 let label = if next.is_null() {
                     "代理 → 无代理（直连）".to_string()

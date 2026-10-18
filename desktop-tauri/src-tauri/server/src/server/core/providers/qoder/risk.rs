@@ -408,20 +408,31 @@ struct CacheEntry {
 
 static CACHE: Mutex<Option<HashMap<String, CacheEntry>>> = Mutex::new(None);
 
-fn persisted_identity_path(region: Region) -> PathBuf {
-    crate::server::config::config_dir()
-        .join("qoder-umid")
-        .join(format!("identity-{}.json", region.id()))
+fn identity_cache_key(region: Region, uid: &str) -> String {
+    let digest = sha2::Sha256::digest(uid.as_bytes());
+    let account = digest.iter().take(12).map(|byte| format!("{byte:02x}")).collect::<String>();
+    format!("{}:{}", region.id(), account)
 }
 
-fn load_persisted_identity(region: Region, now: i64) -> Option<RiskIdentity> {
-    let text = std::fs::read_to_string(persisted_identity_path(region)).ok()?;
+fn persisted_identity_path(region: Region, uid: &str) -> PathBuf {
+    let cache_key = identity_cache_key(region, uid);
+    let account = cache_key
+        .split_once(':')
+        .map(|(_, value)| value)
+        .unwrap_or("unknown");
+    crate::server::config::config_dir()
+        .join("qoder-umid")
+        .join(format!("identity-{}-{}.json", region.id(), account))
+}
+
+fn load_persisted_identity(region: Region, uid: &str, now: i64) -> Option<RiskIdentity> {
+    let text = std::fs::read_to_string(persisted_identity_path(region, uid)).ok()?;
     let saved = serde_json::from_str::<PersistedIdentity>(&text).ok()?;
     (now.saturating_sub(saved.at) < RISK_TTL_MS).then_some(saved.identity)
 }
 
-fn persist_identity(region: Region, identity: &RiskIdentity, at: i64) {
-    let path = persisted_identity_path(region);
+fn persist_identity(region: Region, uid: &str, identity: &RiskIdentity, at: i64) {
+    let path = persisted_identity_path(region, uid);
     let Some(parent) = path.parent() else { return };
     if std::fs::create_dir_all(parent).is_err() {
         return;
@@ -472,7 +483,7 @@ pub async fn identity(region: Region, uid: &str) -> Option<RiskIdentity> {
     if uid.is_empty() {
         return None;
     }
-    let key = region.id().to_string();
+    let key = identity_cache_key(region, uid);
     let now = logging::now_ms();
     if let Ok(guard) = CACHE.lock() {
         if let Some(entry) = guard.as_ref().and_then(|map| map.get(&key)) {
@@ -481,7 +492,7 @@ pub async fn identity(region: Region, uid: &str) -> Option<RiskIdentity> {
             }
         }
     }
-    if let Some(value) = load_persisted_identity(region, now) {
+    if let Some(value) = load_persisted_identity(region, uid, now) {
         if let Ok(mut guard) = CACHE.lock() {
             guard.get_or_insert_with(HashMap::new).insert(key, CacheEntry { value: value.clone(), at: now });
         }
@@ -507,7 +518,7 @@ pub async fn identity(region: Region, uid: &str) -> Option<RiskIdentity> {
         );
         return None;
     };
-    persist_identity(region, &value, now);
+    persist_identity(region, uid, &value, now);
     if let Ok(mut guard) = CACHE.lock() {
         guard.get_or_insert_with(HashMap::new).insert(key, CacheEntry { value: value.clone(), at: now });
     }
@@ -779,7 +790,7 @@ impl<R: std::io::Read> BytesToVec for flate2::read::GzDecoder<R> {
 
 #[cfg(test)]
 mod tests {
-    use super::{majority_identity, RiskIdentity};
+    use super::{identity_cache_key, majority_identity, persisted_identity_path, RiskIdentity};
 
     fn identity(brand: &str, vm_type_code: i64) -> RiskIdentity {
         RiskIdentity {
@@ -809,6 +820,19 @@ mod tests {
         .expect("legacy identity should deserialize");
         assert_eq!(value.vm_is_vm, None);
         assert_eq!(value.vm_brand, None);
+    }
+
+    #[test]
+    fn risk_identity_cache_isolated_per_account_and_region() {
+        let cn_a = identity_cache_key(super::Region::Cn, "account-a");
+        let cn_b = identity_cache_key(super::Region::Cn, "account-b");
+        let intl_a = identity_cache_key(super::Region::Global, "account-a");
+        assert_ne!(cn_a, cn_b);
+        assert_ne!(cn_a, intl_a);
+        assert!(persisted_identity_path(super::Region::Cn, "account-a")
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("identity-cn-") && name.ends_with(".json")));
     }
 }
 

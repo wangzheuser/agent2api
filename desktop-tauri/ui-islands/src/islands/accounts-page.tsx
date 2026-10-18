@@ -147,6 +147,19 @@ function AccountsPage() {
   // —— 缓存每次 bump 后这里重算
   const counts = segmentCounts(usageEntryOf, tokenUsageOf)
   const visible = visibleList(usageEntryOf, tokenUsageOf)
+  /**
+   * 提供商下拉的选项：`全部（N）` + 每一家（含 0 条的家 —— 清单要完整）。
+   * 数字是**家底的读数**（这家名下有几个账号），不随另外两档分段收窄：
+   * 它与分段徽标回答的不是同一个问题 ——「这一家里有多少个」而不是「点进去能看到几条」，
+   * 于是「哪家有账号、各有多少」不切页就能看到（家数动态，这也是它用下拉不用分段的原因）。
+   */
+  const providerOptions = [{ value: 'all', label: t('全部（{n}）', { n: all.length }) }]
+    .concat(providerSummaryList().map(item => ({ value: item.id, label: t('{label}（{count}）', { label: t(item.label), count: item.count }) })))
+  /** 真正会渲染出来的行（组序 → 组内序）。全选 / 计数 / 分页都以它为基准：
+   *  被隐藏的组（一个启用的都没有）不该算进「当前看到的这些」—— 否则「全选（8 个）」
+   *  会连看不见的行一起勾上，数字也对不上。分段计数（工具条那几枚徽标）另一回事：
+   *  它说的是「一共有多少个」，不该被显示规则影响。 */
+  const shown = groups.flatMap(group => group.accounts)
   const seatMap = seats()
   const columns = visibleColumns()
   /**
@@ -246,8 +259,10 @@ function AccountsPage() {
     if (to === from) return
     const nextMembers = [...rest.slice(0, to), moved, ...rest.slice(to)]
     const next = current.map(item => item.provider === drop.provider ? { ...item, members: nextMembers } : item)
-    void reorderQueue(next.flatMap(item => item.members.map(account => account.id)),
-      t('{name} 移到 {group} 组内第 {rank} 位', { name: String(moved.name || moved.id), group: group.label, rank: to + 1 }))
+    const queue = next.flatMap(item => item.members.map(account => account.id))
+    void reorderQueue(queue, t('{name} 移到 {group} 组内第 {rank} 位', {
+      name: String(moved.name || moved.id), group: t(group.label), rank: to + 1,
+    }))
   }, [])
   React.useEffect(() => { dragHandlers.current = { locked, lockReason, onDrop } })
   React.useEffect(() => {
@@ -297,8 +312,6 @@ function AccountsPage() {
     }
   }
 
-  const providerOptions = [{ value: 'all', label: `全部（${all.length}）` }]
-    .concat(summaries.map(item => ({ value: item.id, label: `${item.label}（${item.count}）` })))
 
   return (
     <>

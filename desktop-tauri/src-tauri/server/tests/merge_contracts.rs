@@ -482,7 +482,12 @@ fn workbuddy_split_migration_preserves_ids_credentials_and_unknown_fields() {
                 .unwrap()
             })
             .unwrap();
-        let data: Value = serde_json::from_str(&raw).unwrap();
+        let plaintext = if agent2api_server::server::core::crypto::is_envelope(&raw) {
+            String::from_utf8(agent2api_server::server::core::crypto::open(
+                &raw, agent2api_server::server::core::crypto::SecretScope::Accounts,
+            ).unwrap()).unwrap()
+        } else { raw };
+        let data: Value = serde_json::from_str(&plaintext).unwrap();
         assert_eq!(projection, provider);
         assert_eq!(data["provider"], provider);
         assert_eq!(data["id"], id);

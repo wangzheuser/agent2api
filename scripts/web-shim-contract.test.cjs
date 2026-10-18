@@ -26,6 +26,26 @@ function fixture(respond, auth) {
   return { bridge: window.workbuddyDesktop, calls, popup, storage };
 }
 
+test('proxy settings switches and kernel lifecycle use real gateway routes', async () => {
+  const f = fixture(() => [200, { success: true, data: {} }]);
+  for (const [method, url, verb, payload] of [
+    ['getProxySettings', '/api/proxies/settings', 'GET'],
+    ['saveProxySettings', '/api/proxies/settings', 'POST', { testUrl: 'http://127.0.0.1/' }],
+    ['setProxyPoolItemEnabled', '/api/proxies/pool/enable', 'POST', { id: 'fixture', enabled: false }],
+    ['cancelKernelDownload', '/api/subscriptions/kernel/download/cancel', 'POST'],
+    ['stopKernel', '/api/subscriptions/kernel/stop', 'POST'],
+    ['removeKernel', '/api/subscriptions/kernel/remove', 'POST'],
+  ]) {
+    const start = f.calls.length;
+    await f.bridge[method](payload);
+    const call = f.calls.slice(start).find(call => call.url === url);
+    assert.ok(call, method);
+    assert.equal(call.url, url);
+    assert.equal(call.init.method, verb);
+    if (payload) assert.deepEqual(JSON.parse(call.init.body), payload);
+  }
+});
+
 test('remote callback preserves state and posts only to the gateway', async () => {
   const f = fixture(() => [200, { success: true, data: { accepted: true } }]);
   await f.bridge.submitLoginCallback('state-fixture', 'http://127.0.0.1:1234/callback?code=fixture');

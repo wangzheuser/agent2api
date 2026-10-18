@@ -389,6 +389,9 @@ pub(super) async fn drive_stream(
                 finished = true;
             }
             Some(Ok(chunk)) => {
+                if let Some(capture) = ctx.telemetry.as_ref().and_then(|telemetry| telemetry.capture()) {
+                    capture.push(&chunk);
+                }
                 for event in reader.push(&chunk) {
                     if let Err(error) = handle_event(&mut translator, event, &mut pending) {
                         outcome = Err(error);
@@ -456,6 +459,9 @@ pub(super) async fn drive_aggregate(
                 finished = true;
             }
             Some(Ok(chunk)) => {
+                if let Some(capture) = ctx.telemetry.as_ref().and_then(|telemetry| telemetry.capture()) {
+                    capture.push(&chunk);
+                }
                 for event in reader.push(&chunk) {
                     if let Err(error) = handle_event(&mut translator, event, &mut pending) {
                         outcome = Err(error);

@@ -254,6 +254,7 @@ pub struct TurnTranslator {
     order: Vec<String>,
     /// 最近一个事件（usage 从它取）
     latest: Option<Value>,
+    latest_usage: Option<Value>,
     /// 最近一条 assistant 消息（收尾时组装 OpenAI 消息）
     last_message: Option<Value>,
     /// 是否收到过 `message.finished === true`
@@ -278,6 +279,7 @@ impl TurnTranslator {
             tools: Map::new(),
             order: Vec::new(),
             latest: None,
+            latest_usage: None,
             last_message: None,
             completed: false,
             choice,
@@ -290,6 +292,18 @@ impl TurnTranslator {
         event: &Value,
         pending: &mut Vec<Bytes>,
     ) -> Result<(), CatPawError> {
+        if let Some(usage) = event.get("usage").filter(|v| v.is_object())
+            .or_else(|| event.pointer("/contextInfo/usage").filter(|v| v.is_object())) {
+            let retained = self.latest_usage.get_or_insert_with(|| json!({}));
+            // 分片只更新实际提供的计数，零占位不能清除此前有效值。
+            for (snake, camel) in [("prompt_tokens", "promptTokens"), ("completion_tokens", "completionTokens"), ("total_tokens", "totalTokens")] {
+                if let Some(value) = number_of(usage.get(snake)).or_else(|| number_of(usage.get(camel))) {
+                    if value > 0 || (value == 0 && retained.get(snake).is_none()) {
+                        retained[snake] = json!(value);
+                    }
+                }
+            }
+        }
         self.latest = Some(event.clone());
         if let Some(error) = response_error(event) {
             return Err(error);
@@ -336,7 +350,7 @@ impl TurnTranslator {
             reasoning: extract_reasoning(&message),
             tool_calls: calls,
             message,
-            raw: self.latest.clone().unwrap_or(Value::Null),
+            raw: self.final_raw(),
         })
     }
 
@@ -410,12 +424,18 @@ impl TurnTranslator {
 
     /// 本轮 usage（已按 §9.3 修正；上游没给就是三个 0）
     fn final_usage(&self) -> Value {
-        self.latest
-            .as_ref()
-            .and_then(usage_from_response)
+        usage_from_response(&self.final_raw())
             .unwrap_or_else(|| {
                 json!({ "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 })
             })
+    }
+
+    fn final_raw(&self) -> Value {
+        let mut raw = self.latest.clone().unwrap_or_else(|| json!({}));
+        if let (Some(object), Some(usage)) = (raw.as_object_mut(), &self.latest_usage) {
+            object.insert("usage".to_string(), usage.clone());
+        }
+        raw
     }
 
     /// 事件里的 conversationId（写回注册表与诊断用）
@@ -699,8 +719,8 @@ pub fn extract_reasoning(message: &Value) -> String {
 /// `total - completion` 会是负数或偏小值，取 prompt 原值比取负数稳。
 pub fn usage_from_response(data: &Value) -> Option<Value> {
     let usage = data
-        .get("usage")
-        .or_else(|| data.pointer("/contextInfo/usage"))?;
+        .get("usage").filter(|v| v.is_object())
+        .or_else(|| data.pointer("/contextInfo/usage").filter(|v| v.is_object()))?;
     if !usage.is_object() {
         return None;
     }
@@ -729,4 +749,34 @@ pub fn usage_from_response(data: &Value) -> Option<Value> {
 fn number_of(value: Option<&Value>) -> Option<i64> {
     let value = value?;
     value.as_i64().or_else(|| value.as_f64().map(|number| number.round() as i64))
+}
+
+#[cfg(test)]
+mod usage_tail_tests {
+    use super::*;
+
+    #[test]
+    fn partial_usage_preserves_fields_across_aliases_and_context() {
+        let mut translator = TurnTranslator::new("fixture", "model", true, super::super::tools::ToolChoice::Auto);
+        let mut pending = Vec::new();
+        translator.consume(&json!({"usage":{"promptTokens":7,"completionTokens":3,"totalTokens":10}}), &mut pending).unwrap();
+        translator.consume(&json!({"usage":{"completion_tokens":5}}), &mut pending).unwrap();
+        assert_eq!(translator.final_usage(), json!({"prompt_tokens":7,"completion_tokens":5,"total_tokens":12}));
+        translator.consume(&json!({"usage":null,"contextInfo":{"usage":{"totalTokens":12}}}), &mut pending).unwrap();
+        assert_eq!(translator.final_usage(), json!({"prompt_tokens":7,"completion_tokens":5,"total_tokens":12}));
+        assert_eq!(usage_from_response(&translator.final_raw()), Some(translator.final_usage()));
+        assert_eq!(usage_from_response(&json!({"usage":null,"contextInfo":{"usage":{"completionTokens":5}}})).unwrap()["completion_tokens"], 5);
+    }
+
+    #[test]
+    fn terminal_heartbeat_and_zero_placeholder_preserve_real_usage() {
+        let mut translator = TurnTranslator::new("fixture", "model", true, super::super::tools::ToolChoice::Auto);
+        let mut pending = Vec::new();
+        translator.consume(&json!({"usage":{"promptTokens":7,"completionTokens":3,"totalTokens":10}}), &mut pending).unwrap();
+        translator.consume(&json!({"status":"completed"}), &mut pending).unwrap();
+        assert_eq!(translator.final_usage()["total_tokens"], 10);
+        translator.consume(&json!({"usage":{"promptTokens":0,"completionTokens":0,"totalTokens":0}}), &mut pending).unwrap();
+        assert_eq!(translator.final_usage()["prompt_tokens"], 7);
+        assert_eq!(usage_from_response(&translator.final_raw()).unwrap()["completion_tokens"], 3);
+    }
 }

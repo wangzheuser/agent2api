@@ -13,6 +13,8 @@
 //! 它的所有失败都收敛为结果字段，不让自动签到任务因为上游活动开关而中断）。
 
 use serde_json::{json, Map, Value};
+use crate::server::core::upstream::request::new_request_id;
+use super::request::{BILLING_REPORT_ACTIVITY, GROWTH_STREAK_STATUS};
 
 use crate::server::core::endpoints::RESPONSE_CODE_OK;
 use crate::server::logging;
@@ -422,6 +424,7 @@ impl BillingService {
         } else {
             (None, None, None)
         };
+        let report = if mode != WorkbuddyActivity::Claim { self.report_chat_activity(session).await } else { Value::Null };
         let poke_succeeded = web.as_ref().map(|result| result.success);
         let balance_after = self.log_workbuddy_activity_balance(session, "执行后").await;
         let balance_delta = balance_before
@@ -464,6 +467,7 @@ impl BillingService {
                 "statusAvailable": if mode == WorkbuddyActivity::Keepalive { Value::Null } else { json!(status_available) },
                 "pokeSucceeded": poke_succeeded,
                 "apiPokeSucceeded": api_poke_succeeded,
+                "report": report,
                 "pokeModel": poke_model,
                 "web": web,
                 "balanceBefore": balance_before,
@@ -477,6 +481,130 @@ impl BillingService {
     /// 记录活跃保活前后的积分快照，便于核对活动奖励是否入账。
     ///
     /// 余额查询是旁路诊断动作：失败只记录日志，不改变活跃任务的结果。
+    async fn report_chat_activity(&self, session: &Value) -> Value {
+        let uid = session
+            .get("account")
+            .and_then(|account| account.get("uid"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if uid.is_empty() {
+            return json!({
+                "succeeded": false,
+                "streakDays": Value::Null,
+                "msg": "会话缺少账号 uid，无法上报活跃",
+            });
+        }
+        let conversation_id = format!("agent2api-{}", new_request_id());
+        let now = logging::now_ms();
+        let event = json!({
+            "eventCode": "chat_request_send",
+            "timestamp": now,
+            "reportDelay": 0,
+            "mode": "craft",
+            "conversationId": conversation_id,
+            "requestId": conversation_id,
+            "inputLength": 12,
+            "requestModelId": "deepseek-v4.1-flash",
+            "requestModelName": "DeepSeek V4.1 Flash",
+            "isPlan": false,
+            "isAutoExecuteTerminal": false,
+            "isAutoModify": false,
+            "codebaseEnable": false,
+            "maxToken": 0,
+            "maxSteps": 0,
+            "temperature": 0,
+            "maxRetries": 0,
+            "mentionContexts": [],
+            "knowledgeId": [],
+            "knowledgeName": [],
+            "codebaseId": "",
+            "mentionContextCount": 0,
+            "command": "",
+            "expertId": "",
+            "recommendId": "",
+            "skillId": "",
+            "skillCount": 0,
+            "totalCount": 0,
+            "fileUri": "",
+            "presentAt": now,
+            "traceId": "",
+            "rootRequestId": conversation_id,
+            "parentConversationId": conversation_id,
+            "agentName": "default",
+            "agentType": "conversation",
+            "userId": uid,
+        });
+        let body = json!([event]);
+        let result = self
+            .call_billing(
+                BILLING_REPORT_ACTIVITY,
+                CallOptions {
+                    session: Some(session),
+                    body: Some(&body),
+                    expect_code_ok: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+        let succeeded = match &result {
+            Ok(_) => true,
+            Err(error) => {
+                logging::verbose(
+                    "[Checkin]",
+                    &format!("WorkBuddy 国际版活跃上报失败: {}", error.message),
+                );
+                false
+            }
+        };
+        // 回读连登天数（只读 oracle）：上报 200 ≠ 计分，闭环验证用。
+        let streak_days = if succeeded {
+            match self.read_growth_streak(session).await {
+                Ok(days) => Some(days),
+                Err(error) => {
+                    logging::verbose(
+                        "[Checkin]",
+                        &format!("WorkBuddy 国际版连登回读失败（上报本身已成功）: {}", error.message),
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let streak_text = streak_days
+            .map(|days| format!("，连登 {days} 天"))
+            .unwrap_or_default();
+        json!({
+            "succeeded": succeeded,
+            "streakDays": streak_days.map(Value::from).unwrap_or(Value::Null),
+            "msg": if succeeded {
+                format!("活跃上报成功{streak_text}")
+            } else {
+                "活跃上报失败".to_string()
+            },
+        })
+    }
+
+    async fn read_growth_streak(&self, session: &Value) -> Result<i64, BillingError> {
+        let result = self
+            .call_billing(
+                GROWTH_STREAK_STATUS,
+                CallOptions {
+                    session: Some(session),
+                    expect_code_ok: true,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        Ok(result
+            .data
+            .get("streak")
+            .and_then(|streak| streak.get("days"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0))
+    }
+
     async fn log_workbuddy_activity_balance(&self, session: &Value, phase: &str) -> Option<Value> {
         let account = session
             .get("account")

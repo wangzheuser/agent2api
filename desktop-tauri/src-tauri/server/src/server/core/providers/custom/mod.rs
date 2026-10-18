@@ -8,6 +8,9 @@ use crate::server::core::key_scope::{self, KeyScope};
 use crate::server::core::models::{list_item, model_id};
 
 pub mod emulation;
+pub mod balance;
+pub mod balance_parse;
+pub mod sensenova_auth;
 pub mod forward;
 
 pub(crate) fn catalog_providers(store: &AccountStore) -> Vec<(String, Vec<Value>)> {

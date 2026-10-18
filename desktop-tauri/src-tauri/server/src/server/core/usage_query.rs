@@ -152,7 +152,8 @@ async fn query_usage_for(store: &AccountStore, account: &Value, manual: bool) ->
     // 凭证与 provider 都从目标集合里的账号对象读，**不回读账号文件**：
     // 20 个账号并发时那次回读会变成 20 次整库读盘，而答案已在手上。
     // `hasCredentials` 是 store 逐条给出的统一判据（缺省视为有）。
-    let has_credentials = account.get("hasCredentials").and_then(Value::as_bool) != Some(false);
+    let has_credentials = account.get("hasCredentials").and_then(Value::as_bool) != Some(false)
+        || account.pointer("/balanceQuery/scheme").is_some();
     let outcome = if has_credentials {
         let provider_id = account
             .get("provider")
@@ -216,6 +217,11 @@ async fn query_usage_inner(
     provider_id: &str,
     id: &str,
 ) -> Result<Value, UsageFailure> {
+    if crate::server::core::custom_providers::is_custom_provider_id(provider_id) {
+        return crate::server::core::providers::custom::balance::query_usage(store, id)
+            .await
+            .map_err(|error| UsageFailure::Request(error.message, error.code));
+    }
     // 注册表里没有的 id（前端比后端新、或手改过的账号文件）：明确报「未知的
     // 提供商」，不猜成任何一家（与全仓的 provider 口径一致）
     let Some(kind) = crate::server::core::providers::kind_from_id(provider_id) else {
@@ -265,6 +271,9 @@ fn supports_usage(account: &Value) -> bool {
         .get("provider")
         .and_then(Value::as_str)
         .unwrap_or(crate::server::core::providers::DEFAULT_PROVIDER_ID);
+    if crate::server::core::custom_providers::is_custom_provider_id(provider_id) {
+        return crate::server::core::providers::custom::balance::supports_usage(provider_id);
+    }
     crate::server::core::providers::kind_from_id(provider_id)
         .map(|kind| adapter_for(kind).supports_usage())
         .unwrap_or(false)
@@ -563,5 +572,4 @@ pub fn snapshot(store: &AccountStore) -> Value {
         "tokenAt": now,
         "tokenUsage": token_usage,
     })
-
 }

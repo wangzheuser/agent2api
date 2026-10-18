@@ -63,6 +63,45 @@ pub const KEY_DEBUG_DIR: &str = "debugDir";
 /// `resolve_account_proxy`），这里只存取。
 pub const KEY_UPDATE_PROXY: &str = "updateProxy";
 
+/// 「加入 beta 版」开关（config.json 键，**缺省 = 关**）。
+///
+/// 开启后「检查更新」改问 GitHub 的 Release **列表**，把预发布版（beta）一并
+/// 纳入候选、取版本号最高的一个；关闭时仍问 `/releases/latest`（GitHub 自己
+/// 排除预发布与草稿）。检查结果同时喂给面板、侧栏徽标与下载安装包三条路，
+/// 所以拨一下开关不用重启，下一次检查就换通道（含定时任务）。
+///
+/// **默认关**：beta 版由 beta 分支构建、可能不稳定，只有明确想尝鲜的人才会打开
+/// （与 `debugMode` 同一取向 —— 默认关的代价只是「功能对没打开的人不存在」）。
+///
+/// 与之配套的一条约定：**beta 版的版本号必须与 tag 一致**（tag `v3.1.0-beta.1`
+/// 就要把应用版本写成 `3.1.0-beta.1`），否则版本比较会把「当前 beta」判成比
+/// 「待装的 beta」新，通道打开也收不到更新 —— 比较规则见
+/// `core::update::version` 的预发布段处理。
+pub const KEY_UPDATE_BETA: &str = "updateBeta";
+
+/// 代理内核（mihomo）的**存放目录**（config.json 键）。
+///
+/// 值是**绝对路径**；缺省 / 空串 / 相对路径（读侧视为写坏）都回落
+/// `{config_dir}/proxy-kernel` —— 与 `logDir` 那几个键同一口径。
+/// 目录由内核下载弹窗选择（「网络代理」页 →「下载内核」），里面放二进制、
+/// `config.yaml`、`kernel-state.json`（节点 → 端口映射）与 provider 缓存，
+/// **整份都跟着这个键走**：改目录 = 换一整套内核数据的位置。
+/// 所以它只在「未安装」时可改（弹窗只在此时出现）—— 已装之后改键会让
+/// `installed()` 指向一个空目录，界面上看着像「内核没装」而旧文件仍在原处。
+pub const KEY_KERNEL_DIR: &str = "kernelDir";
+
+/// 代理内核的**下载出网线路**（config.json 键，缺省 = 默认链）。
+///
+/// 形状与 `updateProxy` 完全相同（归一后的账号代理配置对象 / null），
+/// 归一与解析复用同一套实现。**与 `updateProxy` 是两个独立的键**：下载内核
+/// 走哪条线路与「软件更新」走哪条线路是两件事（前者是订阅功能的前置条件，
+/// 后者是壳自己的更新），互不覆盖。
+///
+/// 缺省（未设置 / null）= 默认链：直连失败自动借 Clash 混合端口重试一次
+/// （见 `core::sub_kernel::download` 的出口候选）。**显式选定后只走选的那条**
+/// —— 用户专门选了出口，静默改走别的（尤其改走直连）会让失败信息变得不可信。
+pub const KEY_KERNEL_PROXY: &str = "kernelProxy";
+
 /// GitHub 令牌的密文信封（config.json 键，**存的不是明文**）。
 ///
 /// 值是 `core::update::token` 用 AES-256-GCM 加密出来的 `enc1:<base64>` 信封，
@@ -88,6 +127,18 @@ pub const KEY_DEBUG_MODE: &str = "debugMode";
 /// 上游，那正是模板句被误拦（400 code=11128）的原因。
 /// 转发层逐请求读快照，改完下一个请求立即生效，不重启进程。
 pub const KEY_SANITIZE_FINGERPRINTS: &str = "sanitizeBlacklistFingerprints";
+
+/// 开发者角色兼容开关（config.json 键，设置页「网关 → 开发者角色兼容」）。
+///
+/// 开启后转发层在每次出站前把请求 `messages` 里 `role: "developer"` 的消息
+/// 改写为 `role: "system"`（OpenAI 新版 API 用 developer 取代 system 承载
+/// 指令），兼容不认识 developer 角色的 OpenAI 兼容上游 —— 自定义提供商是
+/// 请求体原样透传的，不归一的话这类消息会原样发出去被上游 400。
+/// **默认开启**（与 OmniProxy 同默认）：改写语义无损（两类角色在 OpenAI 语义
+/// 上等价），而默认关会让发 developer 角色的客户端一上来就撞不认识它的上游。
+/// 转发层逐请求读快照，改完下一个请求立即生效，不重启进程。
+/// 转换实施点见 `core::upstream::payload`（send_body 的角色归一层）。
+pub const KEY_DEVELOPER_ROLE_COMPAT: &str = "developerRoleCompat";
 
 /// **Cline 转发头的逐键覆盖**（config.json 键）。
 ///

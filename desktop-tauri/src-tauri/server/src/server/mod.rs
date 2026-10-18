@@ -366,6 +366,7 @@ impl ServerState {
         // 与任务状态同为「kv 固定键 + 整份读写」的形态，把同一个 `Db` 传进去。
         // 它不参与启动预热，位置只要求早于任何一次 `/api/proxies/pool*` 请求。
         core::proxy_pool::install(db.clone());
+        core::proxy_settings::install(db.clone());
         // 订阅存储（「订阅」区块维护的订阅链接）：同一个 `Db`（与 proxyPool
         // 同一形态）。位置只要求早于任何一次 `/api/subscriptions*` 请求。
         core::subscriptions::install(db.clone());
@@ -466,6 +467,7 @@ impl ServerState {
         // 的其余部分（日志、模型目录、健康检查、配置页）不依赖账号，让它们继续
         // 可用比整体拒绝启动更有用 —— 用户能在界面上看到那条 ❌ 日志并处理磁盘问题。
         let store = AccountStore::with_db(db.clone());
+        core::sub_kernel::install_store(Some(store.clone()));
         let context = core::endpoints::default_context();
         let auth = AuthService::new(store.clone(), context);
         let login = LoginService::new(auth.clone(), store.clone());

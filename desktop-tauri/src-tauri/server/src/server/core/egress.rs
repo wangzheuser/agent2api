@@ -452,7 +452,8 @@ pub async fn test_connectivity(
 
 /// 用默认超时与默认目标测试出口（路由层的入口）
 pub async fn test_proxy(proxy: Option<&ResolvedProxy>) -> ConnectivityResult {
-    test_connectivity(proxy, DEFAULT_TEST_TIMEOUT_MS, None).await
+    let url = crate::server::core::proxy_settings::test_url();
+    test_connectivity(proxy, DEFAULT_TEST_TIMEOUT_MS, url.as_deref()).await
 }
 
 /// 错误链的可读描述（对照 Node 版 `proxyErrorDetail`）。

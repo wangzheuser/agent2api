@@ -107,6 +107,7 @@ pub mod loomy_accounts;
 pub mod minimax_code_accounts;
 pub mod monkeycode_accounts;
 pub mod officeace_accounts;
+pub mod orcaterm_accounts;
 pub mod priority;
 pub mod qoder_accounts;
 pub mod raccoon_accounts;

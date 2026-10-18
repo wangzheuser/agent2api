@@ -84,6 +84,7 @@ fn autoclaw_catalog_state(region: AutoclawRegion) -> (bool, i64) {
 /// Cline 的池）各不相同，抄一份就是一处会漂移的知识。
 pub(crate) fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
     match kind {
+        ProviderKind::OrcaTerm => (false, 0),
         // WorkBuddy 的两个地区各有自己的目录实例与缓存槽（见
         // `providers::workbuddy::region` 的模块头）：这一处也是两家分开的
         // 语义来源之一 —— 界面「更新日期」列因此如实显示各自那次拉取。

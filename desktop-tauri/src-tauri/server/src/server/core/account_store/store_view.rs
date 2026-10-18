@@ -30,6 +30,32 @@ use crate::server::core::proxies::describe_account_proxy;
 use crate::server::core::custom_providers;
 
 impl AccountStore {
+pub fn referenced_pool_ids(&self) -> std::collections::HashSet<String> {
+        let _guard = self.guard();
+        let state = self.load(&_guard);
+        let mut ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for record in &state.accounts {
+            let proxy = record.proxy();
+            // 原始形态优先；带 `config` 包装的（老版本落库的展示形态）取里层
+            let config = proxy
+                .get("config")
+                .filter(|value| value.is_object())
+                .unwrap_or(&proxy);
+            if config.get("source").and_then(Value::as_str) == Some("pool") {
+                if let Some(id) = config
+                    .get("proxyId")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                {
+                    ids.insert(id.to_string());
+                }
+            }
+            if crate::server::core::proxies::is_rotate_config(config) {
+                ids.extend(crate::server::core::proxy_rotate::candidate_ids(config));
+            }
+        }
+        ids
+    }
     // ─── 公开形态 ────────────────────────────────────────────
 
     /// 记录 → 公开形态（对照 Node 版 `toPublicAccount`，字段逐个对齐）。
@@ -308,6 +334,8 @@ impl AccountStore {
             // 之类与它无关的空字段，而「刷新 Token」按钮靠的 hasRefreshToken
             // 只是**恰好**在兜底形状里也算得出来 —— 那不是设计，是巧合。
             self.to_officeace_public_account(record)
+        } else if record.provider() == super::orcaterm_accounts::ORCATERM_PROVIDER_ID {
+            self.to_orcaterm_public_account(record)
         } else if record
             .provider()
             .starts_with(crate::server::core::custom_providers::ID_PREFIX)
@@ -510,6 +538,9 @@ impl AccountStore {
         if let Some(base_url) = fields.get("baseUrl") {
             public.insert("baseUrl".to_string(), base_url.clone());
         }
+        if let Some(scheme) = custom_providers::balance_scheme_of(&record.provider()) {
+            public.insert("balanceQuery".to_string(), balance_query_public(fields, &scheme));
+        }
         public.insert("source".to_string(), Value::String(record.source()));
         public.insert("priority".to_string(), Value::from(record.priority()));
         public.insert("enabled".to_string(), Value::Bool(record.enabled()));
@@ -569,4 +600,25 @@ fn low_balance_public(provider: &str, value: Option<&Value>) -> Value {
         "disable" => json!({ "mode": "disable", "threshold": threshold }),
         _ => json!({ "mode": "off", "threshold": 0.0 }),
     }
+}
+
+fn balance_query_public(fields: &Map<String, Value>, scheme: &str) -> Value {
+    let query = fields.get("balanceQuery").and_then(Value::as_object);
+    let text_of = |key: &str| {
+        query
+            .and_then(|map| map.get(key))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string()
+    };
+    let configured = |key: &str| !text_of(key).is_empty();
+    json!({
+        "scheme": scheme,
+        "userId": text_of("userId"),
+        "username": text_of("username"),
+        "hasAccessToken": configured("accessToken"),
+        "hasPassword": configured("password"),
+        "hasToken": configured("token"),
+    })
 }

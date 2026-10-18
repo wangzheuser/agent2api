@@ -135,6 +135,12 @@ pub struct RuntimeConfig {
     /// 请求就生效，不重启进程），从 `Value` 里翻一次要处理类型判定，解析一次存
     /// 下来最省事 —— 这条判定在转发热路径上。
     sanitize_fingerprints: bool,
+    /// 开发者角色兼容开关（设置页「网关 → 开发者角色兼容」）。
+    ///
+    /// 与 `sanitize_fingerprints` 同一理由：转发层**每次发送前**都要判一次
+    /// （改完开关下一个请求就生效，不重启进程），解析一次存下来最省事。
+    /// 语义与默认值见 `KEY_DEVELOPER_ROLE_COMPAT`。
+    developer_role_compat: bool,
     /// **Cline 转发头的逐键覆盖**（设置页「Cline 伪装头」）。
     ///
     /// 存的只是**用户改过的键**（覆盖表），默认值硬编码在
@@ -184,6 +190,28 @@ pub struct RuntimeConfig {
     /// `core::proxies::resolve_account_proxy`（同一条路）。低频字段（每次
     /// 检查 / 下载发起时读一次），不值得为它发明解析层，存原始值即可。
     update_proxy: Option<Value>,
+    /// 「加入 beta 版」开关（`updateBeta`：缺省关）。
+    ///
+    /// 开启后更新检查改问 `/releases` 列表、自己挑一版：**当前跑 beta 版的人只看
+    /// 预发布**（同核心号的转正版不算更新，不会自动切回正式版），跑正式版的人
+    /// 预发布一并参与（仓库没有 beta 时照旧收正式版更新）。关闭时走
+    /// `/releases/latest`（GitHub 自己排除预发布）—— 且与当前版本做语义化比较，
+    /// 所以「从 beta 版关掉开关」不会被降级到更低的正式版。与 `update_proxy` 同为
+    /// 低频字段（每次检查发起时读一次），解析一次存下来 —— 判据与代价口径见
+    /// `core::update::check` 的通道分支与 `core::update::version::pick_listed_release`。
+    update_beta: bool,
+    /// 代理内核的存放目录（`kernelDir`：None = 用默认 `{config_dir}/proxy-kernel`）。
+    ///
+    /// 与 `log_dir` 同形（存原始字符串，解析时要求绝对路径），区别是**它有一个
+    /// 活着的写入口**（内核下载弹窗选目录）—— 数据目录那几个键的写入口随迁移
+    /// 一起退役了，这个键则要长期可改（内核可以放到别的盘上，几十 MB 的二进制
+    /// 与 provider 缓存没必要占系统盘）。
+    kernel_dir: Option<String>,
+    /// 代理内核的下载出网线路（`kernelProxy`：None = 默认链）。
+    ///
+    /// 与 `update_proxy` 同一形状、同一解析路径，只是**另一个键**：下载内核与
+    /// 软件更新各走各的线路，互不覆盖（理由见 `KEY_KERNEL_PROXY` 的说明）。
+    kernel_proxy: Option<Value>,
     /// GitHub 令牌的**密文信封**（`githubToken`：None = 未在界面保存）。
     ///
     /// 注意这里从配置里读出来的就已经是 `enc1:` 信封，**明文永远不进
@@ -229,6 +257,11 @@ impl RuntimeConfig {
     /// 出站指纹脱敏是否开启（转发层每次发送前判一次，见字段说明）
     pub fn sanitize_fingerprints(&self) -> bool {
         self.sanitize_fingerprints
+    }
+
+    /// 开发者角色兼容是否开启（转发层每次发送前判一次，见字段说明）
+    pub fn developer_role_compat(&self) -> bool {
+        self.developer_role_compat
     }
 
     /// 网关面（`/v1/*`）跨域访问是否开启（CORS 中间件逐请求判一次，见字段说明）
@@ -281,7 +314,8 @@ impl RuntimeConfig {
     /// 掩码后的 API Key，格式照抄 server.mjs 920 行：前 6 后 4。
     /// 短 key 会前后重叠 —— Node 的 slice(0,6)/slice(-4) 也是这样，保持一致。
     pub fn masked_api_key(&self) -> Option<String> {
-        let key = self.api_key.as_ref().filter(|key| !key.is_empty())?;
+        let stored = self.api_key.as_ref().filter(|key| !key.is_empty())?;
+        let key = crate::server::core::api_keys::stored_plaintext(stored);
         let head: String = key.chars().take(6).collect();
         let total = key.chars().count();
         let tail: String = key.chars().skip(total.saturating_sub(4)).collect();
@@ -469,6 +503,15 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
             .get(KEY_SANITIZE_FINGERPRINTS)
             .and_then(Value::as_bool)
             .unwrap_or(true),
+        // 只有字面 `false` 算关闭：**默认开**（缺失 → true）。改写语义无损
+        // （developer 与 system 在 OpenAI 语义上等价），而默认关会让发 developer
+        // 角色的客户端（新版 OpenAI SDK、Claude Code 等）一上来就撞不认识该角色
+        // 的上游 —— 与 sanitize_fingerprints 同一取向：默认关的代价落在用户的
+        // 第一次真实请求上。
+        developer_role_compat: raw
+            .get(KEY_DEVELOPER_ROLE_COMPAT)
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
         // Cline 伪装头覆盖表：只收 string → string 的项（手改库写出数字/布尔
         // 值的项直接忽略 —— 头值只会是文本），缺失 = 全默认
         cline_upstream_headers: cline_headers_from(&raw),
@@ -513,6 +556,21 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
         // 更新出网线路：null / 缺省都不进字段（None = 直连）
         update_proxy: raw
             .get(KEY_UPDATE_PROXY)
+            .filter(|value| !value.is_null())
+            .cloned(),
+        // 只有字面 `true` 算开启：**默认关**。beta 版由 beta 分支构建、可能不稳定，
+        // 默认开的代价落在「用户没要求却被换到 beta 通道」上（与 debug_mode 同一
+        // 取向：默认关只是让功能对没打开的人不存在）。理由见 KEY_UPDATE_BETA。
+        update_beta: raw
+            .get(KEY_UPDATE_BETA)
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        // 内核存放目录：空串 / 相对路径在**读**的时候才判（`kernel_dir()` 的
+        // resolve_dir 同一口径），这里只去掉空串
+        kernel_dir: string_field(&raw, KEY_KERNEL_DIR),
+        // 内核下载线路：与 update_proxy 同一处理（null / 缺省 = 默认链）
+        kernel_proxy: raw
+            .get(KEY_KERNEL_PROXY)
             .filter(|value| !value.is_null())
             .cloned(),
         // GitHub 令牌信封：空串按未设置处理（手改库写出的空值不该被当成密文）
@@ -1103,6 +1161,16 @@ pub fn save_raw(raw: &Map<String, Value>) -> bool {
 /// 设置 API Key：`None` 表示删除（对应 Node 版 `body.apiKey === null` 分支）。
 /// 返回是否写盘成功；无论成功与否内存快照都已更新（本次运行立即生效）。
 pub fn set_api_key(api_key: Option<String>) -> bool {
+    let api_key = match api_key {
+        Some(key) => match crate::server::core::crypto::seal(key.as_bytes(), crate::server::core::crypto::SecretScope::Accounts) {
+            Ok(envelope) => Some(envelope),
+            Err(error) => {
+                crate::server::logging::log("[Config]", &format!("API Key 加密失败，配置未修改: {error}"));
+                return false;
+            }
+        },
+        None => None,
+    };
     update(|config| match api_key.clone() {
         Some(key) => {
             config.raw.insert("apiKey".to_string(), Value::String(key.clone()));
@@ -1554,6 +1622,21 @@ pub fn set_sanitize_fingerprints(enabled: bool) -> bool {
     })
 }
 
+// ─── 开发者角色兼容（developerRoleCompat）────────────────────
+
+/// 写入开发者角色兼容开关。
+///
+/// 与 `set_debug_mode` 同一模式：内存快照与 raw 底稿一起改 —— 前者让下一个请求
+/// 立刻用新值（转发层逐请求读快照），后者保证写盘时不吃掉 config.json 里的
+/// 其它字段。返回是否落盘成功（失败时内存仍已更新，见调用点）。
+pub fn set_developer_role_compat(enabled: bool) -> bool {
+    update(|config| {
+        config
+            .raw
+            .insert(KEY_DEVELOPER_ROLE_COMPAT.to_string(), Value::Bool(enabled));
+        config.developer_role_compat = enabled;
+    })
+}
 
 // ─── Cline 伪装头覆盖表（clineUpstreamHeaders）────────────────
 
@@ -1672,6 +1755,112 @@ pub fn set_update_proxy(proxy: Option<Value>) -> bool {
                 // 配置里不留没意义的空值（读侧也按缺省 = 直连处理）
                 config.raw.remove(KEY_UPDATE_PROXY);
                 config.update_proxy = None;
+            }
+        }
+    })
+}
+
+// ─── 「加入 beta 版」开关（updateBeta）──────────────────────────
+
+/// 只取「加入 beta 版」开关的轻量读取（**不克隆整份 raw**）。
+///
+/// 每次更新检查发起时读一次（低频），未初始化时给 false（正式通道）——
+/// 与缺省一致，理由见 `KEY_UPDATE_BETA`。
+pub fn update_beta() -> bool {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.update_beta;
+        }
+    }
+    false
+}
+
+/// 写入「加入 beta 版」开关（设置页「更新设置」弹窗里的那一枚）。
+///
+/// 与 `set_sanitize_fingerprints` 同一模式：内存立即生效（下一次检查就换通道，
+/// 含定时任务，不必重启进程），写盘时不吃掉其它字段。
+///
+/// **不动已经缓存的检查结果与排期**：换通道之后要不要立刻重查由调用方决定
+/// （界面拨完开关会主动查一次，见 update-settings.tsx），后端只负责回答
+/// 「下一次检查按哪个通道看」；排期与失败冷却都与通道无关（那条冷却记的是
+/// GitHub 配额桶的恢复时刻，见 core::update::check 的说明）。
+pub fn set_update_beta(enabled: bool) -> bool {
+    update(|config| {
+        config
+            .raw
+            .insert(KEY_UPDATE_BETA.to_string(), Value::Bool(enabled));
+        config.update_beta = enabled;
+    })
+}
+
+// ─── 代理内核：存放目录与下载线路（kernelDir / kernelProxy）──────
+
+/// 内核存放目录的**原始配置值**（未设置 / 空串给 None）。
+///
+/// 解析（要求绝对路径、否则回落默认目录）在 `core::sub_kernel::kernel_dir`：
+/// 那里才是「内核目录到底在哪」的唯一答案，本函数只把用户填的东西原样交出去
+/// —— 两处各解析一遍就会有两套口径。
+pub fn kernel_dir_raw() -> Option<String> {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.kernel_dir.clone();
+        }
+    }
+    None
+}
+
+/// 写入内核存放目录（None = 恢复默认目录，连键一起删）。
+///
+/// 值由调用方先判（`api::subscriptions` 要求绝对路径）—— 与
+/// `set_update_proxy` 同一取向：写侧拦「明显写错」，读侧再兜一次底
+/// （手改库写进相对路径时回落默认目录，而不是让内核装到某个相对路径上）。
+pub fn set_kernel_dir(dir: Option<String>) -> bool {
+    update(move |config| {
+        let cleaned = dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string);
+        match cleaned {
+            Some(value) => {
+                config.raw.insert(KEY_KERNEL_DIR.to_string(), Value::String(value.clone()));
+                config.kernel_dir = Some(value);
+            }
+            None => {
+                config.raw.remove(KEY_KERNEL_DIR);
+                config.kernel_dir = None;
+            }
+        }
+    })
+}
+
+/// 只取内核下载线路的轻量读取（**不克隆整份 raw**，与 `update_proxy` 同形）。
+/// 未初始化时给 None（默认链）。
+pub fn kernel_proxy() -> Option<Value> {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.kernel_proxy.clone();
+        }
+    }
+    None
+}
+
+/// 写入内核下载线路（None = 默认链：直连失败借 Clash 混合端口重试一次）。
+///
+/// 值由调用方先归一（`api::subscriptions` 走 `normalize_account_proxy`）。
+/// 解析失败（选中的出口后来被删 / 被禁）**由下载侧直接报错**，不像更新那样
+/// 悄悄回落 —— 用户在这个弹窗里专门选了一条线路，静默改走直连会让
+/// 「下载失败：无法连接 GitHub」这条信息把人引向错误的方向。
+pub fn set_kernel_proxy(proxy: Option<Value>) -> bool {
+    update(move |config| {
+        match proxy.clone() {
+            Some(value) => {
+                config.raw.insert(KEY_KERNEL_PROXY.to_string(), value);
+                config.kernel_proxy = proxy.clone();
+            }
+            None => {
+                config.raw.remove(KEY_KERNEL_PROXY);
+                config.kernel_proxy = None;
             }
         }
     })

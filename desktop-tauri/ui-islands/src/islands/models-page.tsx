@@ -1100,7 +1100,7 @@ function MappingDialog({ context, onClose }: { context: MappingContext; onClose:
     const options = providerOptions()
     for (const id of [context.provider, provider]) {
       if (id && !options.some(item => item.id === id)) {
-        options.push({ id, label: shared().wbProviders?.labelOf?.(id) || id })
+        options.push({ id, label: t(shared().wbProviders?.labelOf?.(id) || id) })
       }
     }
     return options
@@ -1154,8 +1154,8 @@ function MappingDialog({ context, onClose }: { context: MappingContext; onClose:
       const suffix = level ? ` · 思考等级 ${level}` : ''
       // 展示名走注册表 / 自定义目录：直接印 provider id 时，自定义家会显示成一串
       // custom-3f2a91b04c7e，用户认不出是哪一家
-      const label = shared().wbProviders?.labelOf?.(provider) || provider
-      toast(editing ? `✅ 已更新 ${wanted} 的思考等级` : `✅ 已添加映射 ${wanted} → ${target}（${label}）${suffix}`)
+      const label = t(shared().wbProviders?.labelOf?.(provider) || provider)
+      toast(editing ? t('✅ 已更新 {name} 的思考等级', { name: wanted }) : t('✅ 已添加映射 {name} → {target}（{label}）{suffix}', { name: wanted, target, label, suffix }))
     } catch (error) {
       setStatus(`保存失败：${errorMessage(error)}`)
       setSaving(false)
@@ -1317,7 +1317,7 @@ function CustomModelDialog({ initial, onClose }: { initial: CustomModelContext; 
   const choices = (() => {
     const options = customProviderOptions()
     if (provider && !options.some(item => item.id === provider)) {
-      options.push({ id: provider, label: shared().wbProviders?.labelOf?.(provider) || provider })
+      options.push({ id: provider, label: t(shared().wbProviders?.labelOf?.(provider) || provider) })
     }
     return options
   })()

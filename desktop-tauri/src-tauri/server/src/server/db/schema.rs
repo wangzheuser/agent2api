@@ -53,7 +53,7 @@
 //! 当前配置项（`apiKeys` / `modelRules` / `logRetentionDays` / `debugMode` /
 //! `sanitizeBlacklistFingerprints` / `promptMode` / `promptFile` /
 //! `scheduledTasks` / `autoCheckin` / `locale` / `lastRequestModel` /
-//! `providerRoute` / `updateProxy` / 三个 `*Dir` / 三个 `*RetentionDays` /
+//! `providerRoute` / `updateProxy` / `updateBeta` / 三个 `*Dir` / 三个 `*RetentionDays` /
 //! 三个 `retry*` / 六条 `scheduledTasks.*` 子键 / 三个 `*Imported` 标记 /
 //! 旧字段 `apiKey`）与固定键**无冲突**，逐项核对过（全仓 `update_raw_field` /
 //! `raw.insert` / `KEY_*` 常量的取值集合 vs 下面的 `RESERVED_KV_KEYS`）。
@@ -79,6 +79,7 @@ use rusqlite::Connection;
 /// 清单里可能有**没有使用方常量**的项（如遗留的 `desensitize`）：那些是
 /// 「功能已删、数据留着」的键，登记它们的唯一目的就是让配置写入别去动它。
 pub const RESERVED_KV_KEYS: &[&str] = &[
+    "proxySettings",
     // 账号优先级的全局作用域（core::account_store::sql）
     "priorityScope",
     // 事件日志的下一个 id 水位（logs_store::sql）
@@ -236,7 +237,7 @@ pub fn is_reserved(key: &str) -> bool {
 /// 上游把该索引编号为 v9，本地发布线已占用 v9-v11，故以新版本追加。
 /// 版本 13：requests 路由回放字段。
 /// 版本 14：补回合并时丢失的签到记录表；兼容已到 v13 但缺表的存量库。
-pub const SCHEMA_VERSION: i64 = 14;
+pub const SCHEMA_VERSION: i64 = 16;
 
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
@@ -660,6 +661,26 @@ CREATE INDEX IF NOT EXISTS idx_checkin_records_outcome ON checkin_records(outcom
 CREATE INDEX IF NOT EXISTS idx_checkin_records_provider ON checkin_records(provider);
 ";
 
+/// 版本 15：requests 补两条索引（schema v15）。
+///
+/// 与 v9 同一形态（既有表加索引，`CREATE INDEX IF NOT EXISTS`，幂等靠版本号）。
+/// 两条索引各自的来历与代价见 [`SCHEMA_VERSION`] 的 v15 段。
+///
+/// `idx_requests_summary` 的列序 = `sql::SUMMARY_COLUMNS` 的列序**加前缀
+/// `ts, is_test`**：`ts` 在最前才能支撑 `WHERE ts >= ? AND ts <= ?` 的范围扫描，
+/// `is_test` 紧随其后是为了在索引内就过滤掉模型测试行（不必回表才知道要丢）。
+/// 其余 5 列（`model` / `upstream_model` / `total_tokens` / `cache_read_tokens`
+/// / `prompt_tokens`）就是报表要读的全部内容 —— 少一列就要回表，多一列白占
+/// 空间与写入开销。
+const V15_SCHEMA: &str = "
+-- ── requests 补 status 索引（schema v15）─────────────────────
+CREATE INDEX IF NOT EXISTS idx_requests_status ON requests(status);
+-- ── requests 补报表窄列覆盖索引（schema v15）─────────────────
+CREATE INDEX IF NOT EXISTS idx_requests_summary ON requests(
+  ts, is_test, model, upstream_model, total_tokens, cache_read_tokens, prompt_tokens
+);
+";
+
 /// 把库升到 [`SCHEMA_VERSION`]（幂等：已是最新版时什么都不做）。
 ///
 /// 返回 `rusqlite::Result` 而不是本模块自造的字符串错误：调用方 `Db::open`
@@ -668,6 +689,7 @@ CREATE INDEX IF NOT EXISTS idx_checkin_records_provider ON checkin_records(provi
 /// 错误类型（含 SQLite 的错误码与消息）才说得清是哪一步坏的。
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     let current: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    // 账号与网关 Key 的密文兼容由存储边界处理；DDL 不读取或改写密文内容。
     if current >= SCHEMA_VERSION {
         // 版本比本二进制新（用户从新版回退到旧版）：**不报错、也不动库**。
         // 报错会让旧版直接起不来（用户只是想回退一次），而「降级 schema」
@@ -766,6 +788,24 @@ fn apply_version(conn: &Connection, version: i64) -> rusqlite::Result<()> {
         // v14：补回签到记录表；兼容合并后已到 v13 但表缺失的存量库。
         14 => conn.execute_batch(V14_SCHEMA),
 
+        15 => conn.execute_batch(V15_SCHEMA),
+        16 => {
+            // 两条v14/v15历史按实际结构补齐；不重定义已发布迁移。
+            apply_version(conn, 10)?;
+            apply_version(conn, 11)?;
+            for (name, ddl) in [
+                ("route", "ALTER TABLE requests ADD COLUMN route TEXT NOT NULL DEFAULT '';"),
+                ("client", "ALTER TABLE requests ADD COLUMN client TEXT NOT NULL DEFAULT '';"),
+            ] {
+                let exists: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('requests') WHERE name=?1)",
+                    [name], |row| row.get(0),
+                )?;
+                if !exists { conn.execute_batch(ddl)?; }
+            }
+            conn.execute_batch(V14_SCHEMA)?;
+            conn.execute_batch(V15_SCHEMA)
+        },
         _ => Ok(()),
     }
 }

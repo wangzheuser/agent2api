@@ -71,6 +71,9 @@ pub(crate) fn run(store: &AccountStore) {
     //   ③ Cline 拆池改名（`provider: "cline"` + `pool` → cline-free / cline-pass）
     //   ④ WorkBuddy 拆家（`provider: "workbuddy"` + `edition: "intl"` → workbuddy-intl）
     store.migrate_startup();
+    store.encrypt_legacy_accounts();
+    crate::server::core::api_keys::encrypt_legacy_keys();
+    crate::server::core::legacy_api_key::encrypt_legacy_api_key();
     // 模型规则的同一轮迁移（见模块头的顺序说明）：它改的是 `kv` 里的
     // `modelRules`，所以必须读**已经导入过配置**的那份快照。
     if let Some(summary) = model_rules::migrate_cline_split() {

@@ -126,6 +126,7 @@ pub mod loomy;
 pub mod minimax_code;
 pub mod monkeycode;
 pub mod officeace;
+pub mod orcaterm;
 pub mod onboarding_memory;
 /// **本地就绪闸门**：一条通道在「还没出本机就注定发不出去」时，让选路绕开它
 /// （当前唯一的用户是 ZCode 活动套餐的令牌池，判据与取舍见模块头）。
@@ -374,6 +375,7 @@ pub enum ProviderKind {
     /// 不需要 CodeArts 那种会话闸门。凭据两层：网关 Basic（不过期，转发用）
     /// 与控制面临时 AK/SK（2 小时，额度/签到用）。
     OfficeAce,
+    OrcaTerm,
 }
 
 /// 一个提供商的静态元数据。
@@ -481,6 +483,7 @@ pub const PROVIDERS: &[ProviderMeta] = &[
     // glm-5.3 / deepseek-v4-flash-0731 / kimi-k2.6 …），注册表顺序决定目录
     // 合并时同名模型先归谁家 —— 放在末尾即「同名时优先已有各家」。
     ProviderMeta { id: "officeace", label: "OfficeAce 果办" },
+    ProviderMeta { id: "orcaterm", label: "OrcaTerm" },
 ];
 
 /// provider id 在注册表里的下标（未知 id → None）。
@@ -566,6 +569,7 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
         "commandcode" => Some(ProviderKind::CommandCode),
         "antigravity" => Some(ProviderKind::Antigravity),
         "officeace" => Some(ProviderKind::OfficeAce),
+        "orcaterm" => Some(ProviderKind::OrcaTerm),
         // 走到这里 = 上面的注册表判定已放行、这个 match 却没有对应分支：
         // 只可能是有人给 `PROVIDERS` 加了条目忘了加这里。开发期喊出来；
         // release 返回 None（见上：宁可为「未知」，不可误认成别家）。
@@ -609,6 +613,7 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
         ProviderKind::CommandCode => "commandcode",
         ProviderKind::Antigravity => "antigravity",
         ProviderKind::OfficeAce => "officeace",
+        ProviderKind::OrcaTerm => "orcaterm",
     }
 }
 

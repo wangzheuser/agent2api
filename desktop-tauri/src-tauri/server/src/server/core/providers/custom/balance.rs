@@ -390,6 +390,8 @@ async fn query_sensenova(
             &credential.account_id,
             &result.access_token,
             result.expires_at_ms,
+            username,
+            &query.password,
         ) {
             logging::verbose(
                 "[Usage]",

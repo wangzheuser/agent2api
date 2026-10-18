@@ -1,3 +1,4 @@
+import { t } from '../i18n'
 /**
  * Agent2API · 「添加账号」弹窗：自定义提供商（新建 / 加入已有）。
  *
@@ -372,8 +373,8 @@ export function CustomProviderBlock({
           <NoAuthCheckbox
             checked={existingNoAuth}
             note={existingNoAuth
-              ? '已声明无需鉴权：账号会被正常选路，出网时不带任何鉴权头'
-              : '同一家可以混着放：有 Key 的账号与无鉴权账号各按各的规则走'}
+              ? t('已声明无需鉴权：账号会被正常选路，出网时不带任何鉴权头')
+              : t('同一家可以混着放：有 Key 的账号与无鉴权账号各按各的规则走；无需鉴权的账号也能并存多条（各自可配不同的出网代理）')}
             onChange={toggleNoAuth(EXISTING_NOAUTH_ID, setExistingNoAuth)}
           />
           <div className='add-field'>
@@ -443,6 +444,7 @@ async function submitCreate(context: FootContext): Promise<void> {
     if (quirks.headers && Object.keys(quirks.headers).length) payload.headers = { ...quirks.headers }
     if (quirks.anthropicToolType) payload.anthropicToolType = quirks.anthropicToolType
     if (preset?.rewardProfile) payload.rewardProfile = preset.rewardProfile
+    if (preset?.balance?.scheme) payload.balanceScheme = preset.balance.scheme
     // 客户端形态伪装（OpenCode 免费档）：只有预置清单声明了的家才有，
     // 建完可在账号设置的「提供商」一段里改
     if (preset?.clientEmulation) payload.clientEmulation = preset.clientEmulation
@@ -485,13 +487,21 @@ async function submitExisting(context: FootContext): Promise<void> {
     try {
       const data = (await shared().wbProviders?.customRequest?.(
         'POST', '/api/accounts', payload,
-      )) as { account?: { name?: string } } | null
+      )) as { account?: { name?: string }; created?: boolean } | null
       clearFields([EXISTING_APIKEY_ID, EXISTING_REWARD_CREDENTIAL_ID, EXISTING_NAME_ID])
       writeNoAuthDraft(EXISTING_NOAUTH_ID, false)
       const label = data?.account?.name
         || customList().find(item => item.id === providerId)?.name
         || ''
-      await afterCustomAdd(`✅ 账号已添加${label ? `：${label}` : ''}`)
+      // 后端的幂等合并只剩「同一把 Key 重复添加」一种（id 由 key 派生，见后端
+      // account_id_for；无需鉴权账号每次添加都是新的一条，同家可并存多条）。
+      // 合并时 created=false，这次提交更新的是已有账号 —— 提示必须照实说
+      // 「已更新」，照搬「已添加」会让人以为列表会多出一条（实测反馈过的误导）。
+      const suffix = label ? `：${label}` : ''
+      const message = data?.created !== false
+        ? t('✅ {label}账号已添加{name}', { label: '', name: suffix })
+        : t('✅ 已更新已有账号{name}（同一把 API Key 只保留一条，重复添加会合并）', { name: suffix })
+      await afterCustomAdd(message)
     } catch (error) {
       showSubmitError(context, error)
     }

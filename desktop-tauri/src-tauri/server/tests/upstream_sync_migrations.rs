@@ -497,6 +497,7 @@ fn upstream_sync_v11_failure_rolls_back_columns_and_version_then_retries() {
     let mut requests_after = requests.clone();
     for row in &mut requests_after {
         row.push(Value::Null); // v13 adds nullable requests.route.
+        row.push(Value::Text(String::new())); // v16 adds requests.client without changing existing values.
     }
     assert_eq!(
         rows(&conn, "SELECT * FROM requests ORDER BY row_id"),

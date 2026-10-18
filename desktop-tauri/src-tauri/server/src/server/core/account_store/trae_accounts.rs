@@ -177,6 +177,44 @@ impl AccountStore {
         Ok(CredentialWrite::Written)
     }
 
+    /// 签到设备 generation。0 表示参考实现的默认设备号。
+    pub fn trae_checkin_generation(&self, account_id: &str) -> u64 {
+        if account_id.trim().is_empty() {
+            return 0;
+        }
+        let guard = self.guard();
+        self.record_by_id(&guard, account_id)
+            .filter(|record| record.provider() == PROVIDER_ID)
+            .and_then(|record| record.get("checkinGeneration").cloned())
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0)
+    }
+
+    /// 9074 后轮换签到设备号；下一次签到才使用新 generation。
+    pub fn bump_trae_checkin_generation(&self, account_id: &str) -> u64 {
+        if account_id.trim().is_empty() {
+            return 0;
+        }
+        let guard = self.guard();
+        let Some(mut record) = self
+            .record_by_id(&guard, account_id)
+            .filter(|record| record.provider() == PROVIDER_ID)
+        else {
+            return 0;
+        };
+        let next = record
+            .get("checkinGeneration")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0)
+            .saturating_add(1);
+        record.set("checkinGeneration", Value::from(next));
+        record.set_updated_at(logging::now_ms());
+        match self.with_conn(&guard, |conn| sql::update_in_place(conn, &record)) {
+            Ok(()) => next,
+            Err(_) => 0,
+        }
+    }
+
     /// 公开形态（进面板账号列表与 `/api/accounts`）。
     pub fn to_trae_public_account(&self, record: &StoredAccount) -> Value {
         let credential = Credential::from_payload(&record.to_value()).ok();
@@ -344,6 +382,37 @@ mod tests {
         assert!(matches!(stale, CredentialWrite::Stale), "手里那份已过期时必须拒写");
         let after = store.trae_account_record(account.get("id").and_then(Value::as_str).unwrap()).expect("要能读回");
         assert_eq!("A2", after.get("accessToken").and_then(Value::as_str).unwrap(), "拒写要保持第一次的结果");
+    }
+
+    #[test]
+    fn checkin_generation_defaults_to_zero_and_bumps_once_per_busy_result() {
+        let (store, _db) = store("checkin-generation");
+        let account = store.add_trae_account(&credential("u-5", "A1", "R1"), None, "web").expect("首次要能落");
+        let id = account.get("id").and_then(Value::as_str).unwrap();
+
+        assert_eq!(0, store.trae_checkin_generation(id));
+        assert_eq!(1, store.bump_trae_checkin_generation(id));
+        assert_eq!(1, store.trae_checkin_generation(id));
+        assert_eq!(2, store.bump_trae_checkin_generation(id));
+        assert_eq!(0, store.trae_checkin_generation("missing"));
+    }
+
+    #[test]
+    fn successful_checkin_is_visible_in_the_public_account() {
+        let (store, _db) = store("checkin-at");
+        let account = store.add_trae_account(&credential("u-6", "A1", "R1"), None, "web").expect("首次要能落");
+        let id = account.get("id").and_then(Value::as_str).unwrap();
+        assert!(store.mark_checkin(id, 1_900_000_000_000));
+
+        let accounts = store.list_accounts()["accounts"]
+            .as_array()
+            .expect("快照里有 accounts 数组")
+            .clone();
+        let public = accounts
+            .iter()
+            .find(|account| account.get("id").and_then(Value::as_str) == Some(id))
+            .expect("公开列表里要能找到刚签到的账号");
+        assert_eq!(Some(1_900_000_000_000), public.get("checkinAt").and_then(Value::as_i64));
     }
 
     #[test]

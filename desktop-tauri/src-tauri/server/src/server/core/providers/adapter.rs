@@ -1151,6 +1151,7 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         // （Basic 网关凭据；账号管理走手工导入 / 自助 OAuth，见
         // `officeace/mod.rs` 的模块头）
         ProviderKind::OfficeAce => &super::officeace::adapter::OFFICEACE_ADAPTER,
+        ProviderKind::OrcaTerm => &super::orcaterm::adapter::ORCATERM_ADAPTER,
     }
 }
 
@@ -1235,6 +1236,7 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         // OfficeAce：远程目录（`GET {网关}/v1/models`）+ 有转发能力，
         // 进本列表才会被后台目录刷新调度
         ProviderKind::OfficeAce,
+        ProviderKind::OrcaTerm,
     ]
 }
 

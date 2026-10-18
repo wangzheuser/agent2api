@@ -908,8 +908,10 @@ async fn attempt_queue(
         let started_at = logging::now_ms();
         let mut refreshed = false;
         // 第三个元素是上游响应的协议（适配器在构造请求时给出）：chat 之外
-        // 还要在下面套一层响应翻译，见 `UpstreamResponse` 的说明
-        let (response, wire_model, response_protocol) = loop {
+        // 还要在下面套一层响应翻译，见 `UpstreamResponse` 的说明。第四个元素是
+        // Antigravity 请求信封里的会话键（签名缓存兜底档的写入键，issue #291；
+        // 其余家是空串 —— 提取见循环内唯一那条成功 break）
+        let (response, wire_model, response_protocol, antigravity_session) = loop {
             // 发送体在这一轮发送前取一次（同一家同池同降级状态下复用缓存项）：
             // 借用在本次迭代内有效，`continue`（401 刷新 / 内容拦截补救）时
             // 重新取 —— 于是「换了 body 的那次重试」拿到的一定是新的一份。
@@ -1001,6 +1003,7 @@ async fn attempt_queue(
             }
             // 序列化失败只可能是内部数据坏了（适配器给出的 body 里含不可序列化的
             // 值），按 500 收敛。同样要先给明细定稿（理由同上一条）。
+            let antigravity_session = plan.body.get("request").and_then(|v| v.get("sessionId")).and_then(Value::as_str).unwrap_or("").to_string();
             let payload = match serde_json::to_string(&plan.body) {
                 Ok(payload) => payload,
                 Err(error) => {
@@ -1079,7 +1082,7 @@ async fn attempt_queue(
                     // 口径，见 `RequestEntry::is_success` 的说明。
                     ctx.telemetry
                         .finish_last_attempt(Some(i64::from(response.status)), None);
-                    break (response, wire_model, plan.response);
+                    break (response, wire_model, plan.response, antigravity_session);
                 }
                 Err(failure) => {
                     // ── 手动终止优先于一切重试动作 ────────────────────────
@@ -1439,7 +1442,7 @@ async fn attempt_queue(
                 crate::server::core::providers::adapter::UpstreamResponse::CommandCodeNdjson =>
                     Box::pin(super::translate::CommandCodeToChatStream::from_stream(response.stream, &wire_model)),
                 crate::server::core::providers::adapter::UpstreamResponse::AntigravityGemini =>
-                    Box::pin(super::translate::AntigravityToChatStream::from_stream(response.stream, &wire_model)),
+                    Box::pin(super::translate::AntigravityToChatStream::from_stream(response.stream, &wire_model, &antigravity_session)),
                 _ => unreachable!("response protocol matched above"),
             };
             if ctx.stream {

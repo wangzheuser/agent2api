@@ -120,9 +120,9 @@ async fn call(
     let status = response.status().as_u16();
     let text = response.text().await.unwrap_or_default();
     // 401/403 = 控制面临时凭据失效（约 2 小时过期），要用户重新登录，与网络错误区分开
-    if status == 401 || status == 403 {
+    if control_credentials_expired(status, &text) {
         return Err(GatewayError::with_status(
-            i32::from(status),
+            401,
             "OfficeAce 控制面凭据已失效（临时 AK/SK 会过期）：请重新登录一次",
         ));
     }
@@ -134,6 +134,28 @@ async fn call(
     }
     serde_json::from_str::<Value>(&text)
         .map_err(|_| GatewayError::with_status(502, "OfficeAce 订阅接口响应不是合法 JSON"))
+}
+
+fn control_credentials_expired(status: u16, body: &str) -> bool {
+    status == 401 || status == 403 || (status == 400
+        && serde_json::from_str::<Value>(body).ok()
+            .and_then(|value| value.get("error_code").and_then(Value::as_str).map(str::to_owned))
+            .as_deref() == Some("APIG.0602"))
+}
+
+#[cfg(test)]
+mod expiry_tests {
+    use super::*;
+
+    #[test]
+    fn expired_control_token_400_enters_existing_single_refresh_path() {
+        assert!(control_credentials_expired(400, r#"{"error_code":"APIG.0602"}"#));
+        assert!(control_credentials_expired(401, ""));
+        assert!(control_credentials_expired(403, ""));
+        assert!(!control_credentials_expired(400, r#"{"error_code":"APIG.1009"}"#));
+        assert!(!control_credentials_expired(400, "invalid json"));
+        assert!(!control_credentials_expired(500, r#"{"error_code":"APIG.0602"}"#));
+    }
 }
 
 /// 读订阅快照（套餐 + 积分账本 + 奖励活动）。

@@ -84,7 +84,9 @@ impl Client {
                 .map_err(|_| GrowthError::new(502, "账号代理配置无效"))?;
             let client = egress::client_without_redirects(proxy.as_ref())
                 .map_err(|_| GrowthError::new(502, "成长中心客户端创建失败"))?;
-            let domain = if web {
+            let domain = if matches!(path, "/billing/meter/claim-gift" | "/billing/meter/claim-compensation") {
+                "https://www.codebuddy.cn"
+            } else if web {
                 "https://www.workbuddy.cn"
             } else {
                 "https://copilot.tencent.com"

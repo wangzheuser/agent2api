@@ -485,6 +485,35 @@ impl AccountStore {
     /// `save_state` 只对 `data` 真的变了的行发 UPDATE，因此「已经迁移过的库」
     /// 每次启动是零次写入（`provider_added == 0 && assignments.is_empty()
     /// && !scope_migrated && cline_renamed == 0` 的早退分支连事务都不开）。
+    pub fn encrypt_legacy_accounts(&self) {
+        let _guard = self.guard();
+        // 用 `with_conn_mut` 而不是 `with_conn`：整批加密要在一个事务里
+        // （见 `sql::encrypt_legacy_rows` 的说明），而事务需要可变的连接借用。
+        match self.with_conn_mut(&_guard, |conn| sql::encrypt_legacy_rows(conn)) {
+            // 0 条 = 库里没有明文行（全新库 / 已迁过的库），不记日志
+            Ok(0) => {}
+            Ok(count) => {
+                logging::log(
+                    "[Accounts]",
+                    &format!("🔒 已加密 {count} 个历史账号的凭证"),
+                );
+            }
+            Err(error) => {
+                // 这条日志必须在 `with_conn_mut` **之外**打：记日志本身要写库
+                // （logs 表），而 `with_conn_mut` 持着那条唯一的数据库连接 ——
+                // 在它内部再记日志就是「自己等自己」的硬死锁（`std` 的 Mutex
+                // 不可重入，release 构建还是 panic=abort）。
+                logging::log(
+                    "[Accounts]",
+                    &format!(
+                        "⚠️  历史账号凭证加密未完成（下次启动会自动重试，本次账号照常可用）: {error}"
+                    ),
+                );
+            }
+        }
+    }
+
+
     pub fn migrate_startup(&self) -> Value {
         let _guard = self.guard();
         let mut state = self.load(&_guard);

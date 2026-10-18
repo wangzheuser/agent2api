@@ -240,6 +240,7 @@ fn item_of(object: &Map<String, Value>) -> Value {
         "headers": headers_of(object.get("headers")),
         "anthropicToolType": tool_type_of(object.get("anthropicToolType")),
         "rewardProfile": reward_profile_of(object.get("rewardProfile")),
+        "balanceScheme": balance_scheme_of_record(object),
         "clientEmulation": client_emulation_of(object.get("clientEmulation")),
     })
 }
@@ -559,6 +560,7 @@ pub fn create(payload: &Value) -> Result<Value, String> {
         "headers": validate_headers(object.get("headers"))?,
         "anthropicToolType": validate_tool_type(object.get("anthropicToolType"))?,
         "rewardProfile": validate_reward_profile(object.get("rewardProfile"))?,
+        "balanceScheme": validate_balance_scheme(object.get("balanceScheme"))?,
         "clientEmulation": validate_client_emulation(object.get("clientEmulation"))?,
     });
     let mut items = read_items();
@@ -629,6 +631,9 @@ pub fn update(id: &str, payload: &Value) -> Result<Value, String> {
             "anthropicToolType".to_string(),
             Value::String(validate_tool_type(Some(value))?),
         );
+    }
+    if let Some(value) = object.get("balanceScheme") {
+        merged.insert("balanceScheme".to_string(), Value::String(validate_balance_scheme(Some(value))?));
     }
     if let Some(value) = object.get("rewardProfile") {
         merged.insert(
@@ -1324,3 +1329,177 @@ fn validate_client_emulation(value: Option<&Value>) -> Result<String, String> {
         "clientEmulation 只支持 \"{CLIENT_EMULATION_OPENCODE}\"（留空表示不伪装上游客户端）"
     ))
 }
+
+pub fn is_opencode_zen_account(provider_id: &str, base_url_override: Option<&str>) -> bool {
+    let Some(provider) = get(provider_id) else {
+        return false;
+    };
+    let emulation = provider
+        .get("clientEmulation")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if !emulation.eq_ignore_ascii_case(CLIENT_EMULATION_OPENCODE) {
+        return false;
+    }
+    let base_url = base_url_override
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            provider
+                .get("baseUrl")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    !base_url.trim().is_empty()
+        && !base_url.trim().trim_end_matches('/').eq_ignore_ascii_case("https://opencode.ai/zen/go/v1")
+}
+
+
+fn balance_scheme_of_record(object: &Map<String, Value>) -> String {
+    let stored = object
+        .get("balanceScheme")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| BALANCE_SCHEMES.iter().any(|scheme| *scheme == *text));
+    if let Some(scheme) = stored {
+        return scheme.to_string();
+    }
+    infer_balance_scheme(
+        object
+            .get("baseUrl")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or(""),
+    )
+    .unwrap_or("")
+    .to_string()
+}
+
+
+fn infer_balance_scheme(base_url: &str) -> Option<&'static str> {
+    let host = base_url
+        .split("://")
+        .nth(1)
+        .unwrap_or("")
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .split('@')
+        .next_back()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    let matches = |suffix: &str| host == suffix || host.ends_with(&format!(".{suffix}"));
+    if matches("api.deepseek.com") {
+        return Some(BALANCE_SCHEME_DEEPSEEK);
+    }
+    // OpenCode 的 Go 面（订阅制）才有 `/v1/usage`；免费档（Zen）没有余额接口，
+    // 但两者同域 —— 方案本身只决定「打哪个路径」，免费档查了会失败并如实报错，
+    // 不影响转发。客户端形态伪装与方案互不相干（见 `is_opencode_go_endpoint`）。
+    if matches("opencode.ai") {
+        return Some(BALANCE_SCHEME_OPENCODE);
+    }
+    // 智谱两站：国内站走 bigmodel.cn **控制台**的令牌，国际站（z.ai）用账号
+    // 的 API Key 铸 SIGN 签名（见 providers::custom::balance 的模块头）。
+    // 两站同一条账户报告接口，但鉴权与币种不同，因此是两个方案。
+    if matches("bigmodel.cn") {
+        return Some(BALANCE_SCHEME_ZHIPU);
+    }
+    if matches("z.ai") {
+        return Some(BALANCE_SCHEME_ZHIPU_ZAI);
+    }
+    if matches("sensenova.cn") {
+        return Some(BALANCE_SCHEME_SENSENOVA);
+    }
+    None
+}
+
+
+pub fn balance_scheme_of(provider_id: &str) -> Option<String> {
+    let id = provider_id.trim();
+    if id.is_empty() {
+        return None;
+    }
+    let snapshot = config::current();
+    let scheme = (|| {
+        let raw = snapshot.raw();
+        let items = raw.get(KEY_CUSTOM_PROVIDERS)?.as_array()?;
+        let item = items
+            .iter()
+            .find(|item| item.get("id").and_then(Value::as_str) == Some(id))?
+            .as_object()?;
+        let scheme = balance_scheme_of_record(item);
+        (!scheme.is_empty()).then_some(scheme)
+    })();
+    scheme
+}
+
+
+fn validate_balance_scheme(value: Option<&Value>) -> Result<String, String> {
+    let Some(value) = value else { return Ok(String::new()) };
+    let text = value.as_str().unwrap_or("").trim();
+    if text.is_empty() {
+        return Ok(String::new());
+    }
+    if let Some(scheme) = BALANCE_SCHEMES.iter().find(|scheme| **scheme == text) {
+        return Ok((*scheme).to_string());
+    }
+    Err(format!(
+        "balanceScheme 只支持 {}（留空表示不查询余额）",
+        BALANCE_SCHEMES.join(" / ")
+    ))
+}
+
+
+pub fn is_opencode_go_endpoint(base_url: &str) -> bool {
+    base_url
+        .trim()
+        .trim_end_matches('/')
+        .eq_ignore_ascii_case(OPENCODE_GO_BASE_URL)
+}
+
+
+pub fn migrate_base_url(raw: &str, is_opencode: bool) -> String {
+    let text = raw.trim();
+    if is_opencode && text.trim_end_matches('/').eq_ignore_ascii_case(LEGACY_OPENCODE_BASE_URL) {
+        return OPENCODE_BASE_URL.to_string();
+    }
+    text.to_string()
+}
+
+pub const BALANCE_SCHEME_SUB2API: &str = "sub2api";
+
+pub const BALANCE_SCHEME_NEW_API: &str = "new_api";
+
+pub const BALANCE_SCHEME_DEEPSEEK: &str = "deepseek";
+
+pub const BALANCE_SCHEME_OPENCODE: &str = "opencode";
+
+pub const BALANCE_SCHEME_SENSENOVA: &str = "sensenova";
+
+pub const BALANCE_SCHEME_ZHIPU: &str = "zhipu";
+
+pub const BALANCE_SCHEME_ZHIPU_ZAI: &str = "zhipu_zai";
+
+pub const BALANCE_SCHEMES: &[&str] = &[
+    BALANCE_SCHEME_SUB2API,
+    BALANCE_SCHEME_NEW_API,
+    BALANCE_SCHEME_DEEPSEEK,
+    BALANCE_SCHEME_OPENCODE,
+    BALANCE_SCHEME_SENSENOVA,
+    BALANCE_SCHEME_ZHIPU,
+    BALANCE_SCHEME_ZHIPU_ZAI,
+];
+
+pub const LEGACY_OPENCODE_BASE_URL: &str = "https://opencode.ai/zen/v1";
+
+pub const OPENCODE_BASE_URL: &str = "https://opencode.ai/inference/v1";
+
+pub const OPENCODE_GO_BASE_URL: &str = "https://opencode.ai/zen/go/v1";

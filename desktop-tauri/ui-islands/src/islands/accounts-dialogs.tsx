@@ -1,3 +1,5 @@
+import { MultiSelect } from '../../../ui-kit/src'
+import { BalanceQuerySection, balanceSpecOf, balanceFieldConfigured, balanceQueryDraftOf, readBalanceQueryChanges } from './balance-query'
 /**
  * 账号的两个弹窗：**账号设置**与**批量操作**（替换 ui/account-panel.js + ui/proxy-form.js）。
  *
@@ -87,13 +89,18 @@ function labelOf(account: AccountLike | null | undefined): string {
 export type ProxyPayload =
   | null
   | { source: 'pool'; proxyId: string }
+  | { source: 'rotate'; all: boolean; proxyIds?: string[] }
   | { source: 'clash'; listenerUid: string }
   | { source: 'custom'; protocol: 'http' | 'socks5'; host: string; port: number; username: string; password: string }
 
 export type ProxyDraft = {
-  mode: 'none' | 'pool' | 'clash' | 'custom'
+  mode: 'none' | 'pool' | 'rotate' | 'clash' | 'custom'
   /** 池条目 id（mode === 'pool'） */
   proxyId: string
+  /** 轮询档：true = 池里全部启用的出口（"全部"，默认档；false = 只在 rotateIds 里轮） */
+  rotateAll: boolean
+  /** 轮询档：指定要轮询的池条目 id（rotateAll 为 true 时不用） */
+  rotateIds: string[]
   listenerUid: string
   protocol: 'http' | 'socks5'
   host: string
@@ -106,9 +113,15 @@ export type ProxyDraft = {
 export function draftOfProxy(proxy: AccountRecord['proxy']): ProxyDraft {
   const source = proxy?.config?.source || proxy?.source
   const config = proxy?.config || null
+  const rotate = source === 'rotate'
   return {
-    mode: source === 'pool' ? 'pool' : source === 'clash' ? 'clash' : source === 'custom' ? 'custom' : 'none',
+    mode: source === 'pool' ? 'pool'
+      : rotate ? 'rotate'
+        : source === 'clash' ? 'clash' : source === 'custom' ? 'custom' : 'none',
     proxyId: source === 'pool' ? String(config?.proxyId || '') : '',
+    // `all` 缺键按「全部」读（后端同一个口径：那是这一档的默认语义）
+    rotateAll: rotate ? config?.all !== false : true,
+    rotateIds: rotate && Array.isArray(config?.proxyIds) ? config.proxyIds.map(String) : [],
     listenerUid: config?.source === 'clash' || source === 'clash' ? String(config?.listenerUid || '') : '',
     protocol: config?.protocol === 'socks5' ? 'socks5' : 'http',
     host: config?.host || '',
@@ -122,17 +135,23 @@ export function draftOfProxy(proxy: AccountRecord['proxy']): ProxyDraft {
 export function readProxyDraft(draft: ProxyDraft): ProxyPayload {
   if (draft.mode === 'none') return null
   if (draft.mode === 'pool') {
-    if (!draft.proxyId) throw new Error('请先选择已保存的代理')
+    if (!draft.proxyId) throw new Error(t('请先选择已保存的代理'))
     return { source: 'pool', proxyId: draft.proxyId }
   }
+  if (draft.mode === 'rotate') {
+    // 「全部」不写 proxyIds：池里以后新增的出口自动进轮询（后端归一也是这个形状）
+    if (draft.rotateAll) return { source: 'rotate', all: true }
+    if (!draft.rotateIds.length) throw new Error(t('轮询至少要选择一条代理（或改选「全部」）'))
+    return { source: 'rotate', all: false, proxyIds: [...draft.rotateIds] }
+  }
   if (draft.mode === 'clash') {
-    if (!draft.listenerUid) throw new Error('请先选择 Clash Verge 出口')
+    if (!draft.listenerUid) throw new Error(t('请先选择 Clash Verge 出口'))
     return { source: 'clash', listenerUid: draft.listenerUid }
   }
   const host = draft.host.trim()
   const port = Number(draft.port)
-  if (!host) throw new Error('请填写代理主机地址')
-  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('代理端口必须是 1-65535 的整数')
+  if (!host) throw new Error(t('请填写代理主机地址'))
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(t('代理端口必须是 1-65535 的整数'))
   return {
     source: 'custom',
     protocol: draft.protocol === 'socks5' ? 'socks5' : 'http',
@@ -317,8 +336,51 @@ export function ProxyForm({
               : pool === null
                 ? '正在读取代理列表…'
                 : pool.length
-                  ? '地址与端口由「网络代理」页管理：那边改一次、测一次，所有引用它的账号一起生效'
-                  : '「网络代理」页还没有出口 —— 去那里新增，或点「同步 Clash Verge」把 Clash 的出口导进来'}
+                  ? t('地址与端口由「网络代理」页管理：那边改一次、测一次，所有引用它的账号一起生效')
+                  : t('「网络代理」页还没有出口 —— 去那里新增，或在「订阅管理」里点「同步 Clash Verge」把 Clash 的出口导进来')}
+          </div>
+        </div>
+      ) : null}
+
+      {draft.mode === 'rotate' ? (
+        <div className='mt-3'>
+          {/* 「全部」是默认档：勾上 = 池里每个启用的出口轮流使用（新加的出口
+              自动进轮询，不必回来改这条账号）。取消勾选才出现多选。
+              这一行刻意**不走 .field-row**：账号设置弹窗里它的直接 label 子元素
+              会被 `.acct-dlg-main .field-row > label` 强制成 76px 定宽字段标签，
+              「全部代理节点（推荐）」比 76px 长，nowrap 溢出会压住后面的说明
+              （实测叠字）—— 所以用普通 flex 行，文案跟在复选框后面自然排 */}
+          <div className='flex flex-wrap items-center gap-x-2.5 gap-y-1'>
+            <Checkbox id={`${idPrefix}-rotate-all`} checked={draft.rotateAll}
+              aria-label={t('轮询全部代理节点')}
+              onCheckedChange={value => set({ rotateAll: value === true })} />
+            <label htmlFor={`${idPrefix}-rotate-all`} className='cursor-pointer text-xs text-subtle'>
+              {t('全部代理节点（推荐）')}
+            </label>
+            <span className='detail'>
+              {t('「网络代理」页里每个启用的出口轮流使用；之后新加的出口自动加入')}
+            </span>
+          </div>
+          {!draft.rotateAll ? (
+            <div className='field-row mt-2.5'>
+              <label htmlFor={`${idPrefix}-rotate-exits`}>{t('轮询的代理')}</label>
+              <MultiSelect id={`${idPrefix}-rotate-exits`}
+                value={draft.rotateIds}
+                onValueChange={values => set({ rotateIds: values.map(String) })}
+                options={(pool ?? []).map(item => ({ value: item.id, label: poolItemLabel(item) }))}
+                placeholder={t('选择要轮询的代理（可多选）')}
+                aria-label={t('轮询的代理')} />
+              <Button variant='outline' size='sm' onClick={() => loadPool(true)}>{t('重新读取')}</Button>
+            </div>
+          ) : null}
+          <div className='detail mt-1.5'>
+            {poolError
+              ? t('读取失败：{error}', { error: poolError })
+              : pool === null
+                ? t('正在读取代理列表…')
+                : pool.length
+                  ? t('每条请求换一个出口（按顺序轮流），上游看到的 IP 因此是变化的；出口的地址与端口由「网络代理」页管理')
+                  : t('「网络代理」页还没有出口 —— 去那里新增，或在「订阅管理」里点「同步 Clash Verge」把 Clash 的出口导进来')}
           </div>
         </div>
       ) : null}
@@ -362,9 +424,9 @@ export function ProxyForm({
                   : 'Clash Verge 里还没有配置混合监听器或节点端口'}
           </div>
           <p className='detail mt-1.5'>
-            这是既有配置（直接引用 Clash 出口，不经过代理池）。推荐改用上面的
-            <b>「已保存的代理」</b>：到「网络代理」页点「同步 Clash Verge」把出口
-            导进池后即可选 —— 那样能集中测试、也能被多个账号共用。
+            {t('这是既有配置（直接引用 Clash 出口，不经过代理池）。推荐改用上面的')}
+            <b>{t('「已保存的代理」')}</b>
+            {t('：到「网络代理」页的「订阅管理」里点「同步 Clash Verge」把出口导进池后即可选 —— 那样能集中测试、也能被多个账号共用。')}
           </p>
         </div>
       ) : null}
@@ -460,10 +522,10 @@ function PlanChannelField({
         </SelectTrigger>
         <SelectContent>
           <SelectItem value={ZCODE_PLAN_CODING}>
-            编码套餐（Coding Plan）— 走开放平台端点，用自己订阅的额度
+            {t('编码套餐（Coding Plan）— 走开放平台端点，消耗开放平台的额度（订阅套餐 / 资源包 / 充值余额）')}
           </SelectItem>
           <SelectItem value={ZCODE_PLAN_START}>
-            活动套餐（Start Plan）— 走官方活动端点，用活动里领到的额度
+            {t('套餐池（Start Plan）— 走 zcode.z.ai 端点，消耗 ZCode 套餐池的额度（新用户体验额度 / 活动领取）')}
           </SelectItem>
         </SelectContent>
       </Select>
@@ -645,6 +707,7 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
   const [name, setName] = React.useState(account?.name || '')
   const [proxyDraft, setProxyDraft] = React.useState<ProxyDraft>(() => draftOfProxy(account?.proxy))
   const [balanceToken, setBalanceToken] = React.useState('')
+  const [balanceQueryDraft, setBalanceQueryDraft] = React.useState<Record<string, string>>(() => balanceQueryDraftOf(account?.balanceQuery))
   // ZCode 的「使用哪个套餐」草稿（非 ZCode 账号恒为空串，那一段也不渲染）
   const [planChannel, setPlanChannel] = React.useState(() => zcodePlanOf(account))
   const [busy, setBusy] = React.useState(false)
@@ -852,6 +915,7 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
         enabled,
         proxy,
         ...balancePatch,
+        ...(readBalanceQueryChanges(target.balanceQuery?.scheme, balanceQueryDraft) ? { balanceQuery: readBalanceQueryChanges(target.balanceQuery?.scheme, balanceQueryDraft) } : {}),
         ...planPatch,
         ...credentialPatch,
         ...concPatch,
@@ -981,6 +1045,20 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
                       onToggleNoAuth={setNoAuthDraft}
                       onClear={() => void clearApiKey()}
                       clearBusy={busy} />
+                  ) : null}
+                  {balanceSpecOf(target.balanceQuery?.scheme) ? (
+                    <BalanceQuerySection spec={balanceSpecOf(target.balanceQuery?.scheme)!}
+                      values={balanceQueryDraft} configured={Object.fromEntries(balanceSpecOf(target.balanceQuery?.scheme)!.fields.map(field => [field.key, balanceFieldConfigured(target.balanceQuery, field)]))}
+                      onValue={(key, value) => setBalanceQueryDraft(prev => ({ ...prev, [key]: value }))}
+                      clearBusy={busy}
+                      onClear={key => {
+                        setBusy(true)
+                        void shared().workbuddyDesktop?.updateAccount?.(id, { balanceQuery: { [key]: null } })
+                          .then(() => { setBalanceQueryDraft(prev => ({ ...prev, [key]: '' })); void shared().wbApp?.refresh?.() })
+                          .catch((error: Error) => setStatus(error.message))
+                          .finally(() => setBusy(false))
+                      }}
+                      idPrefix='account-balance-query' />
                   ) : null}
                   {supportsPlanChannel(target) ? (
                     <PlanChannelField plan={planChannel} hasJwt={account.canClaim === true}

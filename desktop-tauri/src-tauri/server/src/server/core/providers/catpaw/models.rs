@@ -28,6 +28,18 @@ use serde_json::Value;
 
 use crate::server::errors::GatewayError;
 
+/// 入站 JSON 的嵌套深度上限（`validate_json_value` 系列共用）。
+///
+/// 原 Node 实现写死 12 层，但真实客户端的工具 schema 会合法地超过这个值
+/// —— 例如 Codex 的 `exec` / `shell` 类工具，
+/// `parameters.properties.target.anyOf[0].properties.environment.anyOf[1]
+/// .properties.startingState.anyOf[0].additionalProperties` 就已经 12 层开外，
+/// 于是被误判成「嵌套过深」直接 400。
+///
+/// 这里放宽到 64：既覆盖真实 schema 的深度，又远低于 `serde_json` 默认
+/// 递归解析上限（128），保留「拒绝病态深嵌套」的防护意图。
+pub const MAX_JSON_NESTING_DEPTH: usize = 64;
+
 /// 协议层错误（客户端可见文案 + 上游业务码）
 #[derive(Clone, Debug)]
 pub struct CatPawError {

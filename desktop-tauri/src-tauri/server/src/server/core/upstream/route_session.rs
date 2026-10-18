@@ -138,16 +138,9 @@ mod tests {
 
     #[test]
     fn route_session_configured_key_identity_is_not_permission_or_secret() {
-        use crate::server::core::api_keys::ApiKeyEntry;
-        let mut entry = ApiKeyEntry {
-            id: "entry-a".into(),
-            name: "fixture".into(),
-            key: "fixture-secret-a".into(),
-            enabled: true,
-            created_at: 0,
-            allowed_providers: vec!["workbuddy".into()],
-            allowed_models: vec!["glm".into()],
-        };
+        let mut entry = crate::server::core::api_keys::entries_from(
+            json!({"apiKeys":[{"id":"entry-a","name":"fixture","key":"fixture-secret-a","enabled":true,"createdAt":0,"allowedProviders":["workbuddy"],"allowedModels":["glm"]}]}).as_object().unwrap()
+        ).remove(0);
         let body = json!({"conversation_id":"session", "model":"glm"});
         let initial = session(&body, &RoutingPrincipal::from_entry(&entry));
         entry.id = "entry-b".into();

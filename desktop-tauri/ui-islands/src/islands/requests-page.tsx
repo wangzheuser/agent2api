@@ -1,3 +1,4 @@
+import { t } from '../i18n'
 import * as React from 'react'
 import { flushSync } from 'react-dom'
 import { createRoot } from 'react-dom/client'
@@ -546,9 +547,9 @@ function countRetries(entry: RequestEntry): number {
   }, 0)
 }
 
-/** 提供商展示名：providers.js 目录 → 原样回显 id（行内那一列还优先用后端给的 providerLabel） */
+/** 提供商展示名：providers.js 目录（注册名）→ 查词典 → 原样回显 id（行内那一列还优先用后端给的 providerLabel） */
 function providerLabelOf(id: string): string {
-  return shared().wbProviders?.labelOf?.(id) || id
+  return t(shared().wbProviders?.labelOf?.(id) || id)
 }
 
 /** 行 key 的去重：ts 在同一毫秒可能重复（并发请求），重复的补一个序号后缀，避免 React 报重复 key */
@@ -580,7 +581,7 @@ async function refreshFilterOptions(): Promise<void> {
   try {
     const filters = await shared().workbuddyDesktop?.getStatsRequestFilters()
     const providers: ProviderOption[] = (Array.isArray(filters?.providers) ? filters.providers : [])
-      .map(item => ({ value: String(item?.id || ''), label: String(item?.label || item?.id || '') }))
+      .map(item => ({ value: String(item?.id || ''), label: t(String(item?.label || item?.id || '')) }))
       .filter(item => item.value)
     const models: string[] = (Array.isArray(filters?.models) ? filters.models : [])
       .map(name => String(name || ''))
@@ -731,7 +732,8 @@ function requestCell(entry: RequestEntry, column: VisibleColumn): React.ReactNod
     case 'target': {
       const id = String(entry.provider ?? '').trim()
       const fromBackend = String(entry.providerLabel ?? '').trim()
-      const provider = fromBackend || (id ? providerLabelOf(id) : '')
+      // 后端给的是注册名（「WorkBuddy 国内版」这类），与目录侧一样要过一遍词典
+      const provider = fromBackend ? t(fromBackend) : (id ? providerLabelOf(id) : '')
       // 账号为空 = 请求在选定账号之前就失败了（后端契约：无账号时给空串），显式给破折号而不是留空
       return (
         <span key={key} className={className}>

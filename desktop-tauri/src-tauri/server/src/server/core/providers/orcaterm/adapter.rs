@@ -136,6 +136,19 @@ impl ProviderAdapter for OrcatermAdapter {
         })
     }
 
+    /// 支持**网页登录**：打开官方 Web 控制台（`orcaterm.cloud.tencent.com/terminal`），
+    /// 用户在里面微信扫码登录，登录成功后壳侧读登录窗口的 `ot_session`
+    /// Cookie 交回网关（见 `login.rs` 模块头）。
+    fn supports_web_login(&self) -> bool {
+        true
+    }
+
+    /// 构造控制台地址 + 一次性 state（`login.rs`）。
+    fn build_login_url(&self) -> Option<(String, String)> {
+        let state = super::login::new_login_state();
+        Some((super::login::build_login_url(&state), state))
+    }
+
     /// 支持续期：上游有 `OAuthRefreshToken`（2026-10-16 实测，见
     /// `credentials.rs` 模块头）。
     fn supports_refresh(&self) -> bool {

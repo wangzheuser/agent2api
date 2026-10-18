@@ -72,14 +72,18 @@ pub async fn post_config(State(_state): State<ServerState>, body: Bytes) -> Resp
         match value {
             // null → 删除 key（对应 Node 版 delete config.apiKey + opts.apiKey = null）
             Value::Null => {
-                config::set_api_key(None);
+                if !config::set_api_key(None) {
+                    return errors::management_error(500, "API Key 保存失败");
+                }
                 logging::log("[Config]", "API Key 已清除，接口恢复免鉴权（仅监听 127.0.0.1）");
             }
             Value::String(text) => {
                 if text.chars().count() < MIN_API_KEY_LENGTH {
                     return errors::management_error(400, API_KEY_TOO_SHORT);
                 }
-                config::set_api_key(Some(text.clone()));
+                if !config::set_api_key(Some(text.clone())) {
+                    return errors::management_error(500, "API Key 加密或保存失败");
+                }
                 // 不打印 key 本身（日志会被导出与截图），只说明已更新
                 logging::log("[Config]", "✅ API Key 已更新，客户端需带 Authorization: Bearer <key>");
             }

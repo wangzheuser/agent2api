@@ -42,6 +42,7 @@ export type CustomProviderRecord = {
 }
 
 export type PresetRecord = {
+  balance?: { scheme: string }
   key: string
   name: string
   protocol?: string

@@ -133,7 +133,7 @@ export function GroupBandRow({ group, collapsed, colSpan }: {
             {icon ? <img src={icon} alt='' loading='lazy' />
               : <span className='grp-logo-txt'>{String(group.label || '?').trim().slice(0, 1).toUpperCase()}</span>}
           </span>
-          <span className='grp-name'>{group.label}</span>
+          <span className='grp-name'>{t(group.label)}</span>
           <span className='grp-stat'>{t('{total} 个账号 · 启用 {enabled} · 禁用 {disabled}{limited}', {
             total: group.members.length,
             enabled: group.enabled,

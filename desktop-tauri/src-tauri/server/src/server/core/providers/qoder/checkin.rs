@@ -468,7 +468,7 @@ fn no_claim(region: Region, claimed: bool, risk_note: Option<String>) -> Value {
         }
         return json!({
             "success": false,
-            "msg": "上游暂未给该账号下发每日积分活动（官方活动窗口每天 10:00 开启，若今天已在 Qoder 客户端领过则活动行会消失）。明天 10 点后再试",
+            "msg": "上游暂未给该账号下发每日积分活动；国际版按设备每天限领一次，本机其他账号可能已占用今日名额。若确认未领取，请在官方活动窗口（北京时间 10:00 后）重试",
         });
     }
     // 中国版没有活动是账号侧状态（实测 Free 套餐账号如此，Pro/试用账号才有），
@@ -512,5 +512,13 @@ mod tests {
             "c1",
             STATUS_CLAIMED
         ));
+    }
+
+    #[test]
+    fn intl_no_claim_explains_shared_device_daily_limit() {
+        let result = no_claim(Region::Global, false, None);
+        let message = result.get("msg").and_then(Value::as_str).unwrap_or("");
+        assert!(message.contains("按设备每天限领一次"));
+        assert!(message.contains("其他账号可能已占用"));
     }
 }

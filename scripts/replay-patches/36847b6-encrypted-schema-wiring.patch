@@ -1,0 +1,45 @@
+diff --git a/desktop-tauri/src-tauri/server/tests/merge_contracts.rs b/desktop-tauri/src-tauri/server/tests/merge_contracts.rs
+index dd73cb07..a862b5bc 100644
+--- a/desktop-tauri/src-tauri/server/tests/merge_contracts.rs
++++ b/desktop-tauri/src-tauri/server/tests/merge_contracts.rs
+@@ -482,7 +482,12 @@ fn workbuddy_split_migration_preserves_ids_credentials_and_unknown_fields() {
+                 .unwrap()
+             })
+             .unwrap();
+-        let data: Value = serde_json::from_str(&raw).unwrap();
++        let plaintext = if agent2api_server::server::core::crypto::is_envelope(&raw) {
++            String::from_utf8(agent2api_server::server::core::crypto::open(
++                &raw, agent2api_server::server::core::crypto::SecretScope::Accounts,
++            ).unwrap()).unwrap()
++        } else { raw };
++        let data: Value = serde_json::from_str(&plaintext).unwrap();
+         assert_eq!(projection, provider);
+         assert_eq!(data["provider"], provider);
+         assert_eq!(data["id"], id);
+diff --git a/desktop-tauri/src-tauri/server/tests/session_affinity.rs b/desktop-tauri/src-tauri/server/tests/session_affinity.rs
+index 98024902..17d976e6 100644
+--- a/desktop-tauri/src-tauri/server/tests/session_affinity.rs
++++ b/desktop-tauri/src-tauri/server/tests/session_affinity.rs
+@@ -660,8 +660,8 @@ async fn session_affinity_real_forward_protocols_lifecycle_and_strategy_rollback
+             stats: state.request_stats(),
+             telemetry: telemetry.clone(),
+             started_at: logging::now_ms(),
+-            model: model.clone(),
+-            client_model: model.clone(),
++            model: model.to_string(),
++            client_model: model.to_string(),
+             client_reasoning: String::new(),
+             status: 200,
+             raw_request: None,
+diff --git a/desktop-tauri/src-tauri/server/tests/upstream_sync_migrations.rs b/desktop-tauri/src-tauri/server/tests/upstream_sync_migrations.rs
+index bf736c2d..7190ca1c 100644
+--- a/desktop-tauri/src-tauri/server/tests/upstream_sync_migrations.rs
++++ b/desktop-tauri/src-tauri/server/tests/upstream_sync_migrations.rs
+@@ -497,6 +497,7 @@ fn upstream_sync_v11_failure_rolls_back_columns_and_version_then_retries() {
+     let mut requests_after = requests.clone();
+     for row in &mut requests_after {
+         row.push(Value::Null); // v13 adds nullable requests.route.
++        row.push(Value::Text(String::new())); // v16 adds requests.client without changing existing values.
+     }
+     assert_eq!(
+         rows(&conn, "SELECT * FROM requests ORDER BY row_id"),

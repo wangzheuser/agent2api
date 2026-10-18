@@ -26,6 +26,8 @@ export type ProxyConfig = {
     source?: string
     listenerUid?: string
     /** `source === 'pool'` 时的池条目 id（见 PoolItem） */
+    all?: boolean
+    proxyIds?: string[]
     proxyId?: string
     protocol?: string
     host?: string
@@ -93,6 +95,7 @@ export type TokenReading = {
  * 只能按动态键读。
  */
 export type AccountRecord = {
+  balanceQuery?: import('./balance-query').BalanceQueryPublic
   id: string
   provider?: string
   name?: string

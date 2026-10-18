@@ -59,7 +59,13 @@
    *                      · Anthropic-Beta —— 启用 interleaved-thinking 等 beta
    *                        特性，Claude 兼容的 coding 端点按 9Router 同款下发；
    *                      · OpenRouter 的 HTTP-Referer / X-Title —— 它的推荐
-   *                        标识头（缺了不影响转发，照抄保持同款行为）。
+   *                        标识头（缺了不影响转发，照抄保持同款行为）；
+   *                      · Cline Pass 的一组 Cline 客户端伪装头 —— 它的上游按
+   *                        客户端形态校验（`X-CLIENT-TYPE: cline-sdk` 是硬门槛，
+   *                        缺了一律 403），取值抄自后端 Cline 适配器的
+   *                        DEFAULT_HEADERS（providers/cline/headers.rs，与 Agent
+   *                        内置家发出去的是同一套）。**不要抄别的网关的客户端值**
+   *                        （如 9Router 的 9router 头）—— 上游认的是 Cline 客户端。
    *   anthropicToolType  "custom" = 发 anthropic 上游时给每个工具补 type
    *                      （MiniMax 的 Claude 兼容端点拒绝无 type 的工具；
    *                      注意 DeepSeek 恰好相反、拒绝 type:"custom"，而本网关
@@ -217,10 +223,69 @@
       account: { noAuth: true },
     },
     {
+      // Cline Pass 是订阅制 coding 套餐，与上面两张 OpenCode 卡同类，按语义插在
+      // 它们后面（末尾那三家是「后到居后」追加的，见那一段的说明）。key 写
+      // `clinepass` 而不是 Agent 内置家的 `cline-pass`：预置卡的 key 只是模板
+      // 标记（卡片上是 `preset:clinepass`），与内置家的 provider id 是两个命名
+      // 空间，别混用 —— 那家的 OAuth 添加入口已从 Agent 段收起，只剩这张卡。
+      // 图标：复用 Agent 段那张 Cline 品牌图 cline.png（与内置家 cline-free /
+      // cline-pass 同一张图，卡片视觉一致）。
+      key: 'clinepass', name: 'Cline Pass', icon: 'cline.png',
+      protocol: P.openai, baseUrl: 'https://api.cline.bot/api/v1',
+      hint: wbI18n.t('Cline Pass 的 API Key 在 app.cline.bot 获取（订阅制）；端点为 OpenAI 兼容，模型清单以 Cline 控制台为准，模型名在模型管理里按裸名添加（如 glm-5.2 / kimi-k2.7-code / deepseek-v4-pro）；上游按客户端形态校验，所需的客户端请求头已随卡预置'),
+      // 请求头抄自本网关 Cline 适配器的官方客户端形态（后端 providers/cline/
+      // headers.rs 的 DEFAULT_HEADERS，与 Agent 内置家 cline-pass 发出去的是同
+      // 一套）：上游按客户端形态校验，X-CLIENT-TYPE: cline-sdk 是硬门槛（缺了
+      // 免费池一律 403），其余版本 / 平台头让请求更贴近官方 CLI。**不要抄别的
+      // 网关（如 9Router）的 9router 客户端值** —— 那家的伪装头只适用它自己。
+      quirks: {
+        headers: {
+          'User-Agent': 'Cline/3.0.62',
+          'HTTP-Referer': 'https://cline.bot',
+          'X-Title': 'Cline',
+          'X-IS-MULTIROOT': 'false',
+          'X-CLIENT-TYPE': 'cline-sdk',
+          'X-CLIENT-VERSION': '3.0.62',
+          'X-PLATFORM': 'terminal',
+          'X-PLATFORM-VERSION': '3.0.62',
+          'X-CORE-VERSION': '0.0.70',
+        },
+      },
+    },
+    {
       key: 'ollama-local', name: 'Ollama（本地）', icon: 'ollama-local.png',
       protocol: P.openai, baseUrl: 'http://localhost:11434/v1',
       hint: wbI18n.t('本机 Ollama 的 OpenAI 兼容端点，无需 API Key（默认已勾上「该上游无需鉴权」，鉴权头一个都不发）'),
       account: { noAuth: true },
+    },
+    // ── 自建聚合面板与商汤日日新（随余额查询一起接入）─────────────
+    // 这三家排在末尾：既有的卡片顺序不动（用户对第 1 步的网格已有肌肉记忆），
+    // 新卡按「后到居后」追加。sub2api / NewAPI 是**自建**面板，没有固定
+    // baseUrl —— 预置卡只预填名称 / 协议，地址由用户自己填（`placeholder`
+    // 是给那个输入框的提示，见 add-custom-provider 的预填逻辑）。
+    // 三家的 `balance.scheme` 见文件头的字段说明。
+    // 图标出处：sub2api 取官方仓库（Wei-Shaw/sub2api）的 assets/logo.svg 栅格化；
+    // NewAPI 取官方仓库（QuantumNous/new-api）的 web/public/logo.png；
+    // 商汤日日新取官网 www.sensenova.cn 的 icon.png（商汤品牌方格标）。
+    {
+      key: 'sub2api', name: 'Sub2API', icon: 'sub2api.png',
+      protocol: P.openai, baseUrl: '',
+      placeholder: 'https://你的 Sub2API 站点地址（OpenAI 兼容填到 /v1）',
+      hint: wbI18n.t('自建聚合面板：填你自己的站点地址。余额查询用该账号的 API Key 打 {base}/v1/usage，不需要额外配置'),
+      balance: { scheme: 'sub2api' },
+    },
+    {
+      key: 'newapi', name: 'NewAPI', icon: 'newapi.png',
+      protocol: P.openai, baseUrl: '',
+      placeholder: 'https://你的 NewAPI 站点地址（OpenAI 兼容填到 /v1）',
+      hint: wbI18n.t('自建聚合面板：填你自己的站点地址；余额查询要另填 NewAPI 的个人访问令牌（见下方「余额查询」一段）'),
+      balance: { scheme: 'new_api' },
+    },
+    {
+      key: 'sensenova', name: '商汤日日新', icon: 'sensenova.png',
+      protocol: P.openai, baseUrl: 'https://api.sensenova.cn/compatible-mode/v1',
+      hint: wbI18n.t('商汤日日新的 OpenAI 兼容端点；余额查询走控制台账号密码（见下方「余额查询」一段）'),
+      balance: { scheme: 'sensenova' },
     },
     {
       key: 'astudio', name: 'AStudio',

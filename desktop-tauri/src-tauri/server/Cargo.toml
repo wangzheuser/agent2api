@@ -1,6 +1,6 @@
 [package]
 name = "agent2api-server"
-version = "3.0.7"
+version = "3.0.8"
 description = "Agent2API 网关本体 — 多提供商本地网关（桌面端与 headless 服务器共用）"
 authors = ["aimod-cc"]
 edition = "2021"
@@ -123,10 +123,6 @@ rqrr = "0.11"
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
     "Win32_Security_Cryptography",
-    # KukuAI 会话换发（providers/kuku/engine.rs）：LoadLibrary 引擎 DLL +
-    # 枚举注册表卸载项定位客户端安装目录
-    "Win32_System_LibraryLoader",
-    "Win32_System_Registry",
 ] }
 
 [dev-dependencies]

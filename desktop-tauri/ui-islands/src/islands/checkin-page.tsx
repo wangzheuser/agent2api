@@ -68,11 +68,11 @@ const CHECKIN_TAB_OPTIONS = [
 
 /* ─── 小组件 ───────────────────────────────── */
 
-/** 新手福利分组的提供商展示名（缺省回落 provider id 本身） */
+/** 新手福利分组的提供商展示名（缺省回落 provider id 本身）；名字进词典，非中文界面才翻得动 */
 function onboardingProviderLabel(provider: string): string {
-  return provider === 'raccoon' ? '小浣熊' : provider === 'loomy' ? 'Loomy'
+  return t(provider === 'raccoon' ? '小浣熊' : provider === 'loomy' ? 'Loomy'
     : provider === 'codearts' ? 'CodeArts'
-    : provider === 'officeace' ? 'OfficeAce 果办' : provider
+    : provider === 'officeace' ? 'OfficeAce 果办' : provider)
 }
 
 function useCheckinStore(): CheckinStore {

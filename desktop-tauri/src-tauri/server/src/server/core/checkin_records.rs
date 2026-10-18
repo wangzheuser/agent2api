@@ -35,7 +35,9 @@ use serde_json::{json, Value};
 
 use crate::server::config;
 use crate::server::core::beijing;
-use crate::server::core::billing::checkin::{checkin_completed_today, claim_pending};
+use crate::server::core::billing::checkin::{
+    checkin_completed_today, claim_pending,
+};
 use crate::server::db::Db;
 use crate::server::logging;
 

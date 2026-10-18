@@ -275,7 +275,12 @@ pub(super) async fn turn_request(
         .post(&url)
         .timeout(Duration::from_millis(SSE_TIMEOUT_MS))
         .body(payload);
-    for (key, value) in request_headers(&ctx.credentials, "text/event-stream") {
+    let headers = request_headers(&ctx.credentials, "text/event-stream");
+    let capture = ctx.telemetry.as_ref().and_then(|telemetry| telemetry.capture());
+    if let Some(capture) = &capture {
+        capture.reset_request(&url, "catpaw", &headers, body);
+    }
+    for (key, value) in headers {
         builder = builder.header(key, value);
     }
     if let Some(telemetry) = &ctx.telemetry {
@@ -289,8 +294,14 @@ pub(super) async fn turn_request(
         ))
     })?;
     let status = response.status().as_u16();
+    if let Some(capture) = &capture {
+        capture.attach_response(status, response.headers());
+    }
     if !(200..300).contains(&status) {
         let text = response.text().await.unwrap_or_default();
+        if let Some(capture) = &capture {
+            capture.push(text.as_bytes());
+        }
         logging::log(
             "[CatPaw]",
             &format!("上游 turn HTTP {status} conversationId={}", short_id(&ctx.conversation_id)),

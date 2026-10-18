@@ -299,10 +299,15 @@ pub async fn fetch_user_info(
             other => other.to_string(),
         })
         .unwrap_or_else(|| credentials.user_id.clone());
-    let nickname = response
-        .get("nickName")
-        .or_else(|| response.get("username"))
-        .and_then(Value::as_str)
+    // 展示名按「第一个非空的候选」取：上游这三段的**存在性并不稳定** ——
+    // 微信登录的账号实测是 `nickName: ""` + `username: "一颗苹果"`（2026-10-16），
+    // 只按 `or_else` 取键会在 nickName 为空串时停住，把昵称丢成空
+    // （症状是账号名退化成 `账号 orcaterm-…`）。
+    let nickname = ["nickName", "username", "displayName"]
+        .iter()
+        .filter_map(|key| response.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .find(|value| !value.is_empty())
         .unwrap_or("")
         .to_string();
     Ok((user_id, nickname))

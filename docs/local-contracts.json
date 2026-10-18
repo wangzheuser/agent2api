@@ -2402,6 +2402,52 @@
           "name": "restored_management_routes_preserve_auth_validation_and_selection"
         }
       ]
+    },
+    {
+      "id": "catpaw-partial-usage",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "CatPaw 分片用量逐字段保留，缺失及零占位不覆盖真实计数，顶层 null 回退 contextInfo。",
+      "source_commits": [
+        "36847b6f11a902af011753d83be128b907af100c"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/providers/catpaw/openai.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/catpaw/openai.rs",
+          "name": "server::core::providers::catpaw::openai::usage_tail_tests::terminal_heartbeat_and_zero_placeholder_preserve_real_usage",
+          "id": "catpaw-partial-usage-0"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/catpaw/openai.rs",
+          "name": "server::core::providers::catpaw::openai::usage_tail_tests::partial_usage_preserves_fields_across_aliases_and_context",
+          "id": "catpaw-partial-usage-1"
+        }
+      ]
+    },
+    {
+      "id": "officeace-control-token-expiry",
+      "level": "P1",
+      "status": "必须保留",
+      "behavior": "OfficeAce 控制面 HTTP400 APIG.0602 按凭证失效进入已有刷新路径，其它400及500不误判。",
+      "source_commits": [
+        "36847b6f11a902af011753d83be128b907af100c"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/providers/officeace/subscription.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/officeace/subscription.rs",
+          "name": "server::core::providers::officeace::subscription::expiry_tests::expired_control_token_400_enters_existing_single_refresh_path",
+          "id": "officeace-control-token-expiry-0"
+        }
+      ]
     }
   ],
   "replay_patches": [
@@ -2500,6 +2546,26 @@
       "reason": "ForwardRequest 新增可选会话上下文；原始指定账号测试仍传 None，不改变输入及断言。",
       "review": "独立 architect_review 对照基线检查：补丁仅为 pinned 测试增加 route_session: None，保留原始断言。",
       "base_ref": "cdfa29251b790908d14f7e43b59872c518e74119"
+    },
+    {
+      "base_ref": "36847b6f11a902af011753d83be128b907af100c",
+      "path": "scripts/replay-patches/36847b6-encrypted-schema-wiring.patch",
+      "files": [
+        {
+          "path": "desktop-tauri/src-tauri/server/tests/merge_contracts.rs",
+          "sha256": "e5991b545e4e3e6314254bd65a202383058df8ad8993b70da3bb45801098a2d3"
+        },
+        {
+          "path": "desktop-tauri/src-tauri/server/tests/session_affinity.rs",
+          "sha256": "e546927f869c272af10f7973272db03f42441b48ff651b9984cb185f59ab2d67"
+        },
+        {
+          "path": "desktop-tauri/src-tauri/server/tests/upstream_sync_migrations.rs",
+          "sha256": "576f94819172fab797cf4c375b02a7b77f4a80e82fdf0e465da7e52ea635d4c7"
+        }
+      ],
+      "reason": "适配enc1存储解码、新client列默认值与String所有权；保留原输入及全部业务断言。",
+      "review": "candidate_review独立逐文件审阅2026-10-18：仅等价接线，原样失败保留，适配标注ADAPTED_REPLAY。"
     }
   ]
 }
