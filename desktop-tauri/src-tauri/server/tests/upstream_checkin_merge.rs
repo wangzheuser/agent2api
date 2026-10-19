@@ -380,43 +380,69 @@ fn workbuddy_keepalive_preserves_h_region_headers_proxy_and_minimal_body() {
             Some("WorkBuddy"),
             "{provider:?}/{edition}"
         );
-        let product = if international {
-            "WorkBuddy AI"
-        } else {
-            "WorkBuddy"
-        };
-        assert_eq!(
-            header(&request, "X-IDE-Name"),
-            Some(product),
-            "{provider:?}/{edition}"
-        );
+        // 5.8.4 对齐后的统一头族（2026-10 渠道校验，commit 3b9609eb 口径）：
+        // X-Product 是产品族 `SaaS`，X-IDE-Name 与 X-IDE-Type 同为 `WorkBuddy`；
+        // 两地区共用同一头族，地区差异只落在 UA / X-IDE-Version。
         assert_eq!(
             header(&request, "X-Product"),
-            Some(product),
+            Some("SaaS"),
             "{provider:?}/{edition}"
         );
-        if international {
-            assert_eq!(header(&request, "X-Agent-Intent"), None);
-            assert_eq!(header(&request, "X-Agent-Purpose"), Some("conversation"));
-            assert_eq!(header(&request, "Origin"), Some("https://www.workbuddy.ai"));
-            assert_eq!(
-                header(&request, "Referer"),
-                Some("https://www.workbuddy.ai/")
-            );
-            assert_eq!(header(&request, "X-Requested-With"), Some("XMLHttpRequest"));
-            let request_id = header(&request, "X-Request-ID").unwrap();
-            assert!(!request_id.is_empty());
-            assert_eq!(
-                header(&request, "X-Conversation-Message-ID"),
-                Some(request_id)
-            );
-            assert_eq!(header(&request, "X-Root-Request-ID"), Some(request_id));
+        assert_eq!(
+            header(&request, "X-IDE-Name"),
+            Some("WorkBuddy"),
+            "{provider:?}/{edition}"
+        );
+        let (ua, ide_version) = if international {
+            ("WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0", "5.8.4")
         } else {
-            assert_eq!(header(&request, "X-Agent-Intent"), Some("craft"));
-            for key in ["X-Agent-Purpose", "Origin", "Referer", "X-Requested-With"] {
-                assert_eq!(header(&request, key), None, "{key}");
-            }
-        }
+            ("WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1", "5.5.4")
+        };
+        assert_eq!(
+            header(&request, "User-Agent"),
+            Some(ua),
+            "{provider:?}/{edition}"
+        );
+        assert_eq!(
+            header(&request, "X-IDE-Version"),
+            Some(ide_version),
+            "{provider:?}/{edition}"
+        );
+        assert_eq!(header(&request, "X-Agent-Intent"), Some("craft"));
+        assert_eq!(header(&request, "X-Agent-Purpose"), Some("conversation"));
+        // Origin / Referer 跟随会话生效端点（fixture 端点归一到根）
+        assert_eq!(header(&request, "Origin"), Some("https://fixture.invalid"));
+        assert_eq!(header(&request, "Referer"), Some("https://fixture.invalid/"));
+        assert_eq!(header(&request, "X-Requested-With"), Some("XMLHttpRequest"));
+        // 会话头族：一轮 id 成对（Conversation-Request/Root-Request）、单次请求
+        // id 成对（Request/Conversation-Message），会话 id 独立；X-Session-ID
+        // 不再发送（官方对话请求不带它）
+        assert_eq!(
+            header(&request, "X-Session-ID"),
+            None,
+            "X-Session-ID 已按 5.8.4 抓包移除"
+        );
+        let round = header(&request, "X-Conversation-Request-ID").unwrap();
+        assert!(!round.is_empty());
+        assert_eq!(header(&request, "X-Root-Request-ID"), Some(round));
+        let message_id = header(&request, "X-Request-ID").unwrap();
+        assert!(!message_id.is_empty());
+        assert_eq!(
+            header(&request, "X-Conversation-Message-ID"),
+            Some(message_id)
+        );
+        assert_ne!(round, message_id, "轮 id 与单次请求 id 独立生成");
+        let conversation = header(&request, "X-Conversation-ID").unwrap();
+        assert!(!conversation.is_empty());
+        assert_ne!(conversation, round, "会话 id 与轮 id 独立生成");
+        // 链路头族（5.8.4 对话请求随带的观测头）
+        let trace = header(&request, "X-Trace-ID").unwrap();
+        let span = header(&request, "X-B3-SpanId").unwrap();
+        let expected_traceparent = format!("00-{trace}-{span}-01");
+        assert_eq!(
+            header(&request, "traceparent"),
+            Some(expected_traceparent.as_str())
+        );
         let proxy = request.proxy.as_ref().expect("保活必须沿用账号代理");
         assert_eq!(proxy.source, "custom");
         assert_eq!(proxy.protocol, "socks5");
