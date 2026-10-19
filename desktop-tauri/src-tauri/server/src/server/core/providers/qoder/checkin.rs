@@ -43,6 +43,22 @@
 //! 全局停用（对未领取的日子也回 409 且不发积分）。因此这里**只读活动列表**，
 //! 一次都不碰 legacy。
 //!
+//! ── 盲发直领兜底（2026-10-19 引入，依据社区实测证据）───────────
+//! 活动列表端点按**请求形态**分桶投放：同一账号、同一时刻，带完整设备风控头
+//! 的请求形态可能看不到 `CLAIMABLE` 行，最小头（只带鉴权四件套）形态却能看
+//! 到（smart-open/TraeWorkAssistant `qoder_checkin.rs` 2026-10-14 探针实证；
+//! 且 **claim 端点不受列表过滤约束** —— 幂等，重复领取回 `replayed=true`）。
+//! 因此「列表里没有可领行」不能判定「领不到」：本实现把成功领取过的活动 id
+//! 记入本地学习表（`campaign_ids`：campaign id 全局有效、与账号无关，随活动
+//! 批次轮换 —— 过期 id 直领返回 409 `CAMPAIGN_NOT_ACTIVE`，据此从表里剔除），
+//! 列表无可领行时对「列表里非 CLAIMED 的 CLAIM_BENEFIT 行 + 学习表候选」
+//! **盲发直领**。每个账号都用**自己的**设备身份发起（`machine::device_id` 按
+//! 账号分配、永不轮换；本机 UMID 组件产出的风控三件套为真值形状）——上游若
+//! 按 `Cosy-MachineId` 判设备名额，各账号互不占用；被 409 明确拒绝时如实
+//! 记录并保持 `deviceLimited` 语义。缺 UMID 组件时盲发退化为最小头形态，
+//! 这正是社区实证可领的请求形状（bzym2/QoderGateway 实证服务端对
+//! machine_token 无强绑定校验；caigee-cmd/cli2api 最小头直连签到互证）。
+//!
 //! ── 没有签到活动的账号 ─────────────────────────────────────
 //! 中国版 Free 套餐实测没有活动下发（Pro/试用才有）：返回一条中性结果
 //! （`success:false` + 说明），不是错误 —— 上游给不给活动是账号侧的状态。
@@ -75,6 +91,276 @@ const STATUS_CLAIMED: &str = "CLAIMED";
 const RESULT_ALREADY_CLAIMED: &str = "ALREADY_CLAIMED";
 /// 上游没给 `benefit.amount` 时的缺省奖励额（实测就是 100）
 const DEFAULT_REWARD: f64 = 100.0;
+/// 上游 409 的「活动批次已过期」业务码（活动批次轮换，id 需重学）
+const CAMPAIGN_NOT_ACTIVE_TAG: &str = "CAMPAIGN_NOT_ACTIVE";
+/// 盲发直领的候选上限（防上游异常返回一大串活动时打爆请求）
+const BLIND_CLAIM_MAX: usize = 5;
+/// 本地学习表每地区保留的候选条数
+const CAMPAIGN_ID_KEEP: usize = 5;
+/// 学习表条目过期时长（活动批次一批只有数日窗口，过期 id 直领会 409）
+const CAMPAIGN_ID_TTL_MS: i64 = 14 * 24 * 60 * 60 * 1000;
+
+// ─── 盲发候选的本地学习表 ───────────────────────────────────
+//
+// 依据（见模块头）：campaign id 全局有效、与账号无关，claim 幂等；列表可能被
+// 上游按请求形态分桶隐藏。把每次成功领取的 id 记下来，其它账号（或下一次
+// 运行）即使列表里看不到活动，也能凭学到的 id 直接领取。
+//
+// 落盘形态 `{config_dir}/qoder-campaign-ids.json`：
+// ```json
+// {"version":1,"regions":{"cn":[{"id":"…","at":1790000000000}],"global":[…]}}
+// ```
+// 只保留最近 `CAMPAIGN_ID_KEEP` 条、丢弃 `CAMPAIGN_ID_TTL_MS` 之前的条目
+// （活动批次一批只有数日窗口，过期 id 直领会 409，留着的意义是让那次 409
+// 换来「上游还在发同一批」的确认 —— 14 天足够覆盖）。
+mod campaign_ids {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    use serde::{Deserialize, Serialize};
+
+    use super::endpoints::Region;
+    use super::{CAMPAIGN_ID_KEEP, CAMPAIGN_ID_TTL_MS};
+
+    const CURRENT_VERSION: u32 = 1;
+
+    #[derive(Serialize, Deserialize)]
+    struct Entry {
+        id: String,
+        /// 学习时间（毫秒）
+        at: i64,
+    }
+
+    #[derive(Serialize, Deserialize, Default)]
+    struct File {
+        #[serde(default)]
+        version: u32,
+        #[serde(default)]
+        regions: BTreeMap<String, Vec<Entry>>,
+    }
+
+    fn key(region: Region) -> String {
+        region.id().to_string()
+    }
+
+    fn load(path: &Path) -> File {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<File>(&text).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(path: &Path, file: &mut File) {
+        file.version = CURRENT_VERSION;
+        let Some(parent) = path.parent() else { return };
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+        // 临时名必须唯一：并发签到会同时写（与 machine.rs 的台账同一手法）
+        static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let base = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("qoder-campaign-ids.json");
+        let temp = parent.join(format!("{base}.{}.{seq}.tmp", std::process::id()));
+        let Ok(text) = serde_json::to_vec_pretty(file) else { return };
+        if std::fs::write(&temp, text).is_err() {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600));
+        }
+        #[cfg(windows)]
+        if path.exists() {
+            let _ = std::fs::remove_file(path);
+        }
+        let _ = std::fs::rename(temp, path);
+    }
+
+    fn prune(entries: &mut Vec<Entry>, now: i64) {
+        entries.retain(|entry| !entry.id.trim().is_empty() && now.saturating_sub(entry.at) < CAMPAIGN_ID_TTL_MS);
+        // 新学习的放最前（remember 插头部），保序去重后截断
+        let mut seen: Vec<String> = Vec::new();
+        entries.retain(|entry| {
+            if seen.contains(&entry.id) {
+                return false;
+            }
+            seen.push(entry.id.clone());
+            true
+        });
+        entries.truncate(CAMPAIGN_ID_KEEP);
+    }
+
+    /// 读一个地区的候选（新→旧；过期条目在读取时顺带剔除并回写）。
+    pub fn candidates_at(path: &Path, region: Region, now: i64) -> Vec<String> {
+        let mut file = load(path);
+        let ids: Vec<String>;
+        let changed = match file.regions.get_mut(&key(region)) {
+            Some(entries) => {
+                let before = entries.len();
+                prune(entries, now);
+                ids = entries.iter().map(|entry| entry.id.clone()).collect();
+                entries.len() != before
+            }
+            None => {
+                ids = Vec::new();
+                false
+            }
+        };
+        if changed {
+            save(path, &mut file);
+        }
+        ids
+    }
+
+    /// 记住一次成功领取的活动 id（去重、置顶、截断）。
+    pub fn remember_at(path: &Path, region: Region, campaign_id: &str, now: i64) {
+        let campaign_id = campaign_id.trim();
+        if !super::is_safe_campaign_id(campaign_id) {
+            return;
+        }
+        let mut file = load(path);
+        let entries = file.regions.entry(key(region)).or_default();
+        entries.retain(|entry| entry.id != campaign_id);
+        entries.insert(0, Entry { id: campaign_id.to_string(), at: now });
+        prune(entries, now);
+        save(path, &mut file);
+    }
+
+    /// 剔除一个过期候选（409 CAMPAIGN_NOT_ACTIVE 后调用）。
+    pub fn forget_at(path: &Path, region: Region, campaign_id: &str) {
+        let mut file = load(path);
+        let Some(entries) = file.regions.get_mut(&key(region)) else { return };
+        let before = entries.len();
+        entries.retain(|entry| entry.id != campaign_id);
+        if entries.len() != before {
+            save(path, &mut file);
+        }
+    }
+
+    fn path() -> std::path::PathBuf {
+        crate::server::config::config_dir().join("qoder-campaign-ids.json")
+    }
+
+    pub fn candidates(region: Region) -> Vec<String> {
+        candidates_at(&path(), region, crate::server::logging::now_ms())
+    }
+
+    pub fn remember(region: Region, campaign_id: &str) {
+        remember_at(&path(), region, campaign_id, crate::server::logging::now_ms());
+    }
+
+    pub fn forget(region: Region, campaign_id: &str) {
+        forget_at(&path(), region, campaign_id);
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn temp_path(name: &str) -> std::path::PathBuf {
+            let mut path = std::env::temp_dir();
+            path.push(format!("qoder-campaign-ids-{}-{}.json", std::process::id(), name));
+            let _ = std::fs::remove_file(&path);
+            path
+        }
+
+        #[test]
+        fn remember_candidates_forget_roundtrip() {
+            let path = temp_path("roundtrip");
+            remember_at(&path, Region::Global, "id-2", 1_000);
+            remember_at(&path, Region::Global, "id-1", 2_000);
+            remember_at(&path, Region::Global, "id-1", 3_000); // 去重 + 置顶 + 刷新时间
+            assert_eq!(candidates_at(&path, Region::Global, 4_000), vec!["id-1", "id-2"]);
+            // 地区隔离
+            assert!(candidates_at(&path, Region::Cn, 4_000).is_empty());
+            forget_at(&path, Region::Global, "id-1");
+            assert_eq!(candidates_at(&path, Region::Global, 4_000), vec!["id-2"]);
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn expired_entries_dropped_and_capacity_capped() {
+            let path = temp_path("expire");
+            let ttl = CAMPAIGN_ID_TTL_MS;
+            remember_at(&path, Region::Global, "old", 1_000);
+            remember_at(&path, Region::Global, "fresh", 1_000 + ttl - 1);
+            assert_eq!(candidates_at(&path, Region::Global, 1_000 + ttl), vec!["fresh"]);
+            for index in 0..(CAMPAIGN_ID_KEEP + 3) {
+                remember_at(&path, Region::Global, &format!("n{index}"), 2_000 + ttl + index as i64);
+            }
+            let kept = candidates_at(&path, Region::Global, 9_000 + ttl);
+            assert_eq!(kept.len(), CAMPAIGN_ID_KEEP);
+            assert_eq!(kept[0], format!("n{}", CAMPAIGN_ID_KEEP + 2));
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn unsafe_ids_never_persisted() {
+            let path = temp_path("unsafe");
+            remember_at(&path, Region::Global, "../evil?", 1_000);
+            remember_at(&path, Region::Global, "  ", 1_000);
+            remember_at(&path, Region::Global, "", 1_000);
+            assert!(candidates_at(&path, Region::Global, 2_000).is_empty());
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// campaignId 会进 URL 路径，只放行 [A-Za-z0-9_-]（TWA 同款白名单）。
+/// 学习表与盲发候选共用同一道闸。
+fn is_safe_campaign_id(id: &str) -> bool {
+    let id = id.trim();
+    !id.is_empty()
+        && id.len() <= 128
+        && id.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+}
+
+/// 往候选表追加一个活动 id（安全白名单 + 去重）
+fn push_candidate(out: &mut Vec<String>, id: &str) {
+    let id = id.trim();
+    if is_safe_campaign_id(id) && !out.iter().any(|existing| existing == id) {
+        out.push(id.to_string());
+    }
+}
+
+/// 收集盲发直领候选：**列表里非 CLAIMED 的 CLAIM_BENEFIT 行**（两种请求形态
+/// 都收 —— 上游按形态分桶，主形态看不到的行副形态可能看得到）+ **学习表候选**。
+/// 保持顺序（列表行优先、学习表其次）、路径安全白名单去重、截断到
+/// [`BLIND_CLAIM_MAX`]。可见的 `CLAIMABLE` 行不走这里（正常路径已领取）。
+fn blind_candidates(
+    list: &Value,
+    alt_list: Option<&Value>,
+    learned: &[String],
+    now: i64,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for source in [Some(list), alt_list].into_iter().flatten() {
+        for row in source.get("campaigns").and_then(Value::as_array).into_iter().flatten() {
+            if row.get("actionType").and_then(Value::as_str) != Some(ACTION_CLAIM_BENEFIT) {
+                continue;
+            }
+            if !campaign_is_active(row, now) {
+                continue;
+            }
+            // 本账号已领过的行不是候选（那走 `claimed` → alreadyCompleted）
+            if row.get("claimStatus").and_then(Value::as_str) == Some(STATUS_CLAIMED) {
+                continue;
+            }
+            if let Some(id) = row.get("campaignId").and_then(Value::as_str) {
+                push_candidate(&mut out, id);
+            }
+        }
+    }
+    for id in learned {
+        push_candidate(&mut out, id);
+    }
+    out.truncate(BLIND_CLAIM_MAX);
+    out
+}
 
 /// Qoder 的每日签到（中国版直领；国际版带设备风控身份两段拉取）。
 ///
@@ -107,6 +393,8 @@ pub async fn claim_daily_checkin(
 
     // ── 国际版：先拿顶层 uid，叠风控头重拉一次（中国版不需要）────
     // 401 重拉后的重试同样要叠头 —— 那时令牌换了，但流程不变。
+    // 首段（最小头）列表以 `alt_list` 传给收尾：上游按请求形态分桶时，
+    // 它可能给出风控头形态看不到的活动行（盲发候选的一部分）。
     let mut headers = endpoints::sash_headers(&credentials.access_token);
     let mut risk_note: Option<String> = None;
     if region == Region::Global {
@@ -119,13 +407,13 @@ pub async fn claim_daily_checkin(
             credentials = refresh::ensure_fresh(store, region, account_id, true).await?;
             let third = fetch_campaigns(&credentials, proxy.as_ref()).await?;
             let third = intl_refetch(&credentials, proxy.as_ref(), third).await?;
-            return claim_from(store, region, account_id, credentials, proxy, third, risk_note).await;
+            return claim_from(store, region, account_id, credentials, proxy, third, Some(&list), risk_note).await;
         }
         let second = auth::payload(second, "签到活动查询（风控重拉）")?;
-        return claim_from(store, region, account_id, credentials, proxy, second, risk_note).await;
+        return claim_from(store, region, account_id, credentials, proxy, second, Some(&list), risk_note).await;
     }
 
-    claim_from(store, region, account_id, credentials, proxy, list, risk_note).await
+    claim_from(store, region, account_id, credentials, proxy, list, None, risk_note).await
 }
 
 /// 国际版的活动列表重取（叠风控头）。首段的 `uid` 缺失（上游没给）时按空
@@ -160,6 +448,7 @@ async fn claim_from(
     mut credentials: Credentials,
     proxy: Option<ResolvedProxy>,
     list: Value,
+    alt_list: Option<&Value>,
     risk_note: Option<String>,
 ) -> Result<Value, GatewayError> {
     let display = account_id;
@@ -181,7 +470,15 @@ async fn claim_from(
         }
         match row.get("claimStatus").and_then(Value::as_str) {
             Some(STATUS_CLAIMABLE) if claimable.is_none() => claimable = Some(row),
-            Some(STATUS_CLAIMED) => claimed = true,
+            Some(STATUS_CLAIMED) => {
+                claimed = true;
+                // 本账号已领过的行 = 今日活动 id 的最佳学习源（cpa-multi-plugins /
+                // TWA 实证：已领 grant 无条件展示，campaign id 全局有效、与账号
+                // 无关）—— 记入学习表，让列表被分桶隐藏的其它账号也能直领。
+                if let Some(id) = row.get("campaignId").and_then(Value::as_str) {
+                    campaign_ids::remember(region, id);
+                }
+            }
             _ => {}
         }
     }
@@ -198,8 +495,80 @@ async fn claim_from(
         ),
     );
 
+    // 国际版风控头用的账号 uid（活动列表顶层字段；中国版不需要风控头）
+    let risk_uid = if region == Region::Global {
+        Some(list.get("uid").and_then(Value::as_str).unwrap_or("").trim().to_string())
+    } else {
+        None
+    };
+
     let Some(target) = claimable else {
-        // 「没有可领活动」的归因：本设备今天是否已经被**另一个账号**领走。
+        // ── 盲发直领兜底（依据见模块头）─────────────────────────
+        // 「列表里没有 CLAIMABLE 行」≠「领不到」：上游按请求形态分桶隐藏活动行，
+        // 且 claim 端点不受列表过滤约束（幂等）。候选 = 两种形态的列表里非
+        // CLAIMED 的 CLAIM_BENEFIT 行 + 本地学习表（成功领取过的 id）。
+        let learned = campaign_ids::candidates(region);
+        let candidates = blind_candidates(&list, alt_list, &learned, now);
+        let mut blind_note: Option<String> = None;
+        if !candidates.is_empty() {
+            logging::log(
+                "[Checkin]",
+                &format!(
+                    "Qoder 盲发直领（账号={}，地区={}，候选={}）",
+                    display,
+                    region.label(),
+                    candidates.join(",")
+                ),
+            );
+            let mut failures: Vec<String> = Vec::new();
+            for campaign_id in &candidates {
+                match claim_one(
+                    store,
+                    region,
+                    account_id,
+                    &mut credentials,
+                    proxy.as_ref(),
+                    campaign_id,
+                    risk_uid.as_deref(),
+                )
+                .await
+                {
+                    Ok(value) => {
+                        let success = value.get("success").and_then(Value::as_bool) == Some(true);
+                        let already =
+                            value.get("alreadyCompleted").and_then(Value::as_bool) == Some(true);
+                        if success || already {
+                            return Ok(value);
+                        }
+                        // 未完成/未确认：记失败，试下一个候选
+                        let message = value.get("msg").and_then(Value::as_str).unwrap_or("未完成");
+                        failures.push(format!("{campaign_id}：{}", truncate_str(message, 80)));
+                    }
+                    Err(error) => {
+                        let stale = error.status_code == 409
+                            && error.message.contains(CAMPAIGN_NOT_ACTIVE_TAG);
+                        let blocked = error.status_code == 409;
+                        failures.push(format!("{campaign_id}：{}", truncate_str(&error.message, 80)));
+                        if stale {
+                            // 活动批次已轮换：从学习表剔除，试下一个候选
+                            campaign_ids::forget(region, campaign_id);
+                            continue;
+                        }
+                        if blocked {
+                            // 设备/风控明确拒绝（同一身份再试别的候选没有意义）
+                            break;
+                        }
+                        // 5xx / 网络：试下一个候选
+                    }
+                }
+            }
+            blind_note = Some(format!(
+                "已按学到的活动 id 盲发直领 {} 个候选，均未成功（{}）",
+                candidates.len(),
+                truncate_str(&failures.join("；"), 200)
+            ));
+        }
+        // 「盲发也没领到」的归因：本设备今天是否已经被**另一个账号**领走。
         // 只有国际版存在设备级名额（实测：第一个账号领取后，其它账号的活动行
         // 整条消失；国内版是按账号发放，两个账号当天都能领到）。
         let holder = if region == Region::Global {
@@ -212,7 +581,7 @@ async fn claim_from(
         } else {
             None
         };
-        return Ok(no_claim(region, claimed, risk_note, holder));
+        return Ok(no_claim(region, claimed, risk_note, holder, blind_note));
     };
     let campaign_id = target
         .get("campaignId")
@@ -224,7 +593,39 @@ async fn claim_from(
             "Qoder 签到活动缺少活动标识，无法领取",
         ));
     }
+    claim_one(
+        store,
+        region,
+        account_id,
+        &mut credentials,
+        proxy.as_ref(),
+        campaign_id,
+        risk_uid.as_deref(),
+    )
+    .await
+}
 
+/// 截断一段文本（错误摘要 / 候选归因用，避免日志与文案爆炸）
+fn truncate_str(text: &str, limit: usize) -> String {
+    text.chars().take(limit).collect()
+}
+
+/// 领取单个活动并确认（正常可见路径与盲发兜底共用）。
+///
+/// 返回签到结果 JSON（success / alreadyCompleted / …，形状见 [`claim_daily_checkin`]）；
+/// `Err` 表示传输层 / 上游拒绝（HTTP 非 2xx），错误信息带响应体摘要 —— 盲发候选
+/// 的 409 `CAMPAIGN_NOT_ACTIVE`（活动批次轮换）与 409 其它（设备/风控拒绝）靠它
+/// 区分。成功时把活动 id 记入本地学习表（`campaign_ids`），国际版另落设备台账。
+async fn claim_one(
+    store: &AccountStore,
+    region: Region,
+    account_id: &str,
+    credentials: &mut Credentials,
+    proxy: Option<&ResolvedProxy>,
+    campaign_id: &str,
+    risk_uid: Option<&str>,
+) -> Result<Value, GatewayError> {
+    let display = account_id;
     let url = format!(
         "{}{}/{}/claim",
         region.open_api(),
@@ -233,11 +634,10 @@ async fn claim_from(
     );
     let mut headers = endpoints::sash_headers(&credentials.access_token);
     if region == Region::Global {
-        let uid = list.get("uid").and_then(Value::as_str).unwrap_or("").trim().to_string();
-        let (augmented, _) = risk::augment_headers(headers, region, &uid).await;
+        let (augmented, _) = risk::augment_headers(headers, region, risk_uid.unwrap_or("")).await;
         headers = augmented;
     }
-    let mut claim = claim_campaign(&url, &credentials, proxy.as_ref(), &headers).await?;
+    let mut claim = claim_campaign(&url, credentials, proxy, &headers).await?;
     // 上游并发/重放时给 409 + `{"result":"ALREADY_CLAIMED"}`（参考实现实测），
     // 那不是失败，是「今天已经领过了」。
     if !claim.ok
@@ -258,17 +658,29 @@ async fn claim_from(
         }));
     }
     if claim.status == 401 && credentials.can_refresh() {
-        credentials = refresh::ensure_fresh(store, region, account_id, true).await?;
+        *credentials = refresh::ensure_fresh(store, region, account_id, true).await?;
         // 重签一个新头束（令牌换了，旧头的 Bearer 已失效）
         let mut fresh_headers = endpoints::sash_headers(&credentials.access_token);
         if region == Region::Global {
-            let uid = list.get("uid").and_then(Value::as_str).unwrap_or("").trim().to_string();
-            let (augmented, _) = risk::augment_headers(fresh_headers, region, &uid).await;
+            let (augmented, _) =
+                risk::augment_headers(fresh_headers, region, risk_uid.unwrap_or("")).await;
             fresh_headers = augmented;
         }
-        claim = claim_campaign(&url, &credentials, proxy.as_ref(), &fresh_headers).await?;
+        claim = claim_campaign(&url, credentials, proxy, &fresh_headers).await?;
     }
-    let body = auth::payload(claim, "签到领取")?;
+    if !claim.ok {
+        // 带响应体摘要（TWA describe_blind_failure 同款）：让 409 的两种业务
+        // 形态在错误信息里可读、可分类。
+        let head = response_head(&claim);
+        return Err(GatewayError::with_status(
+            i32::from(claim.status),
+            format!("Qoder 签到领取失败（HTTP {}）{head}", claim.status),
+        ));
+    }
+    let body = claim
+        .payload
+        .filter(Value::is_object)
+        .ok_or_else(|| GatewayError::with_status(502, "Qoder 签到领取未返回有效 JSON 对象"))?;
     let claim_body = nested_data(&body);
 
     if claim_body.get("status").and_then(Value::as_str) != Some(STATUS_CLAIMED) {
@@ -312,12 +724,11 @@ async fn claim_from(
     // 国际版确认也必须带同一套风控头；普通请求只返回 VIEW_DETAILS，
     // 会把已成功领取误判成「领取后状态未确认」。
     let confirmed = if region == Region::Global {
-        let uid = list.get("uid").and_then(Value::as_str).unwrap_or("").trim().to_string();
         let (confirmed_headers, _) =
-            risk::augment_headers(endpoints::sash_headers(&credentials.access_token), region, &uid).await;
-        fetch_campaigns_with(&credentials, proxy.as_ref(), &confirmed_headers).await?
+            risk::augment_headers(endpoints::sash_headers(&credentials.access_token), region, risk_uid.unwrap_or("")).await;
+        fetch_campaigns_with(credentials, proxy, &confirmed_headers).await?
     } else {
-        fetch_campaigns(&credentials, proxy.as_ref()).await?
+        fetch_campaigns(credentials, proxy).await?
     };
     let confirmed = auth::payload(confirmed, "签到领取确认")?;
     if !campaign_status(nested_data(&confirmed), campaign_id, STATUS_CLAIMED) {
@@ -351,6 +762,8 @@ async fn claim_from(
         Some(days) if days > 0.0 => format!("获得 {reward} credits，{days} 天有效"),
         _ => format!("获得 {reward} credits"),
     };
+    // 学习表：两种形态都看不到活动行的账号（或下次运行）凭这个 id 直领
+    campaign_ids::remember(region, campaign_id);
     // 台账只记国际版：国内版按账号发放，同设备多账号本来都能领到，
     // 记了反而会让下一个账号被误判成「名额被占」。
     if region == Region::Global {
@@ -374,6 +787,14 @@ async fn claim_from(
         "rewardPoints": reward,
         "unit": "credits",
     }))
+}
+
+/// 409/4xx/5xx 响应体摘要（错误信息用；JSON 取其紧凑文本，非 JSON 给占位）
+fn response_head(response: &ApiResponse) -> String {
+    match response.payload.as_ref() {
+        Some(payload) => truncate_str(&serde_json::to_string(payload).unwrap_or_default(), 160),
+        None => "上游未返回 JSON".to_string(),
+    }
 }
 
 /// 活动列表（默认头束：`forceRefresh` 拿实时 `claimStatus`）。
@@ -473,12 +894,25 @@ fn campaign_timestamp(value: Option<&Value>) -> Option<i64> {
 }
 
 /// 「这次没领到」的结果：区分「今天已领」「没有可领的活动」「缺风控身份」
-/// 与「本设备名额已被另一个账号领走」。
+/// 「本设备名额已被另一个账号领走」与「盲发直领也被上游拒绝」。
 ///
 /// `holder` 是本设备今日领取者的账号哈希前缀（只有国际版会有：实测国际版的
 /// 每日活动按设备发放，第一个账号领取后其它账号的活动行整条消失；国内版按账号
 /// 发放，同设备两个账号当天都能领到）。
-fn no_claim(region: Region, claimed: bool, risk_note: Option<String>, holder: Option<String>) -> Value {
+///
+/// `blind_note` 是盲发直领兜底的失败摘要（候选 id 直领也全被拒绝时带上，
+/// 让用户知道「不只是列表看不到，是直领也被拒」）。
+fn no_claim(
+    region: Region,
+    claimed: bool,
+    risk_note: Option<String>,
+    holder: Option<String>,
+    blind_note: Option<String>,
+) -> Value {
+    let with_note = |msg: String| match blind_note.as_deref() {
+        Some(note) if !note.is_empty() => format!("{msg}；{note}"),
+        _ => msg,
+    };
 
     if claimed {
         return json!({
@@ -489,25 +923,26 @@ fn no_claim(region: Region, claimed: bool, risk_note: Option<String>, holder: Op
     }
     if region == Region::Global {
         // 国际版：要么缺 UMID 组件（风控头没带上，上游不下发积分活动），
-        // 要么本设备今日名额已被别的账号用掉，要么窗口还没开。
+        // 要么本设备今日名额已被别的账号用掉（盲发直领同样被 409 拒绝），
+        // 要么窗口还没开。
         if let Some(holder) = holder {
             return json!({
                 "success": false,
                 "deviceLimited": true,
-                "msg": format!(
+                "msg": with_note(format!(
                     "本设备今日的国际版名额已被另一个账号（#{holder}）领取：Qoder 国际版按设备每天只发一个账号的积分活动，换设备或用该账号明天再领；本账号今天不会再自动重试"
-                ),
+                )),
             });
         }
         if let Some(note) = risk_note {
             return json!({
                 "success": false,
-                "msg": format!("未领取：{note}。国际版签到需要本机安装 Qoder 客户端或 qodercli（Linux 可在签到中心一键安装组件）"),
+                "msg": with_note(format!("未领取：{note}。国际版签到需要本机安装 Qoder 客户端或 qodercli（Linux 可在签到中心一键安装组件）")),
             });
         }
         return json!({
             "success": false,
-            "msg": "上游暂未给该账号下发每日积分活动；国际版按设备每天限领一次，本机其他账号可能已占用今日名额。若确认未领取，请在官方活动窗口（北京时间 10:00 后）重试",
+            "msg": with_note("上游暂未给该账号下发每日积分活动；国际版按设备每天限领一次，本机其他账号可能已占用今日名额。若确认未领取，请在官方活动窗口（北京时间 10:00 后）重试".to_string()),
         });
     }
     // 中国版没有活动是账号侧状态（实测 Free 套餐账号如此，Pro/试用账号才有），
@@ -515,7 +950,7 @@ fn no_claim(region: Region, claimed: bool, risk_note: Option<String>, holder: Op
 
     json!({
         "success": false,
-        "msg": "当前没有可领取的签到活动",
+        "msg": with_note("当前没有可领取的签到活动".to_string()),
     })
 }
 
@@ -555,7 +990,7 @@ mod tests {
 
     #[test]
     fn intl_no_claim_explains_shared_device_daily_limit() {
-        let result = no_claim(Region::Global, false, None, None);
+        let result = no_claim(Region::Global, false, None, None, None);
         let message = result.get("msg").and_then(Value::as_str).unwrap_or("");
         assert!(message.contains("按设备每天限领一次"));
         assert!(message.contains("其他账号可能已占用"));
@@ -563,14 +998,69 @@ mod tests {
 
     #[test]
     fn intl_no_claim_names_the_device_holder() {
-        let result = no_claim(Region::Global, false, None, Some("a1b2c3".to_string()));
+        let result = no_claim(Region::Global, false, None, Some("a1b2c3".to_string()), None);
         assert_eq!(result.get("deviceLimited").and_then(Value::as_bool), Some(true));
         let message = result.get("msg").and_then(Value::as_str).unwrap_or("");
         assert!(message.contains("#a1b2c3"));
         assert!(message.contains("不会再自动重试"));
         // 国内版不会带设备名额语义
-        let cn = no_claim(Region::Cn, false, None, Some("a1b2c3".to_string()));
+        let cn = no_claim(Region::Cn, false, None, Some("a1b2c3".to_string()), None);
         assert!(cn.get("deviceLimited").is_none());
         assert!(cn.get("msg").and_then(Value::as_str).unwrap_or("").contains("没有可领取"));
+    }
+
+    #[test]
+    fn no_claim_appends_blind_note_to_every_failure_branch() {
+        let note = Some("已按学到的活动 id 盲发直领 2 个候选，均未成功".to_string());
+        for region in [Region::Global, Region::Cn] {
+            let result = no_claim(region, false, None, None, note.clone());
+            let message = result.get("msg").and_then(Value::as_str).unwrap_or("");
+            assert!(message.contains("盲发直领"), "地区 {} 的失败文案要带盲发摘要", region.label());
+        }
+        // 已领取分支不受影响（幂等回放就绪时盲发摘要没有信息量）
+        let claimed = no_claim(Region::Global, true, None, None, note);
+        assert_eq!(claimed.get("msg").and_then(Value::as_str), Some("今日已领取"));
+    }
+
+    #[test]
+    fn blind_candidates_collect_list_rows_and_learned_ids() {
+        let now = 1_700_000_000;
+        let list = json!({"campaigns": [
+            {"campaignId": "c-visible", "actionType": "CLAIM_BENEFIT", "claimStatus": "CLAIMABLE", "startAt": now - 10, "endAt": now + 10},
+            {"campaignId": "c-hidden", "actionType": "CLAIM_BENEFIT", "startAt": now - 10, "endAt": now + 10},
+            {"campaignId": "c-done", "actionType": "CLAIM_BENEFIT", "claimStatus": "CLAIMED", "startAt": now - 10, "endAt": now + 10},
+            {"campaignId": "c-stale", "actionType": "CLAIM_BENEFIT", "claimStatus": "CLAIMABLE", "endAt": now - 1},
+            {"campaignId": "c-promo", "actionType": "VIEW_DETAILS", "claimStatus": "CLAIMABLE"}
+        ]});
+        let learned = vec!["c-learned".to_string(), "c-visible".to_string()];
+        let out = blind_candidates(&list, None, &learned, now);
+        // 主列表的 CLAIMABLE 行在实际链路里由正常路径领取（走不到盲发），但
+        // 收进来无害（claim 幂等）——副形态（alt_list）的 CLAIMABLE 行正是
+        // 盲发要救的对象。CLAIMED / 过期 / 非签到类 / 重复项被排除。
+        assert_eq!(out, vec!["c-visible", "c-hidden", "c-learned"]);
+    }
+
+    #[test]
+    fn blind_candidates_merge_alt_list_and_reject_unsafe_ids() {
+        let now = 1_700_000_000;
+        let list = json!({"campaigns": []});
+        let alt = json!({"campaigns": [
+            {"campaignId": "../evil", "actionType": "CLAIM_BENEFIT"},
+            {"campaignId": "alt-row", "actionType": "CLAIM_BENEFIT", "claimStatus": "PENDING"}
+        ]});
+        let learned = vec!["ok-id_1".to_string()];
+        let out = blind_candidates(&list, Some(&alt), &learned, now);
+        assert_eq!(out, vec!["alt-row", "ok-id_1"]);
+    }
+
+    #[test]
+    fn blind_candidates_are_capped() {
+        let now = 1_700_000_000;
+        let rows: Vec<Value> = (0..10)
+            .map(|index| json!({"campaignId": format!("id{index}"), "actionType": "CLAIM_BENEFIT"}))
+            .collect();
+        let list = json!({ "campaigns": rows });
+        let out = blind_candidates(&list, None, &[], now);
+        assert_eq!(out.len(), BLIND_CLAIM_MAX);
     }
 }

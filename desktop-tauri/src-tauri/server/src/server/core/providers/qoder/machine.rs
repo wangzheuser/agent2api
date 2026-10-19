@@ -237,9 +237,15 @@ pub fn device_id(region: Region, uid: &str) -> Result<String, GatewayError> {
 /// 2026-10-19 实测：国际版每日活动按设备发放，第一个账号领取后同设备其它账号的
 /// 活动行整条消失；直接对已领活动 id 发 claim 返回 409 `campaign is not available
 /// for claim`。社区实现（smart-open/TraeWorkAssistant `tasks/qoder_device.rs`）声称
-/// 服务端对 `machine_token` 无强绑定、可按账号现场生成。两者要靠「名额重置后」的
-/// 对照实验才能判定，所以默认关闭：先用 `scripts/qoder-device-experiment.mjs` 跑
-/// B（真实身份）vs D（合成身份），确认合成身份能另开一份名额再打开。
+/// 服务端对 `machine_token` 无强绑定、可按账号现场生成——其依据（bzym2/QoderGateway
+/// `src/qoder2api/auth.py new_machine`：machine_id 账号级持久、machine_token/type
+/// 每会话现场随机，服务端实测放行）来自国际站 COSY/网关域，**不是** sash 活动域；
+/// 而 TWA 在 sash 域的探针发现派生/伪造三件套会被上游归入不信任分桶（列表无
+/// CLAIMABLE、claim 503/BLOCKED）。两者要靠「名额重置后」的对照实验才能判定，
+/// 所以默认关闭：先用 `scripts/qoder-device-experiment.mjs` 跑 B（真实身份）vs
+/// D（合成身份），确认合成身份能另开一份名额再打开。即便合成身份不被活动域
+/// 接受，`checkin.rs` 的盲发直领兜底（学习 campaign id 后每账号直领）也不依赖
+/// 这个开关 —— 它用本机真值三件套 + 按账号的 `device_id` 完成「每账号一台设备」。
 pub fn synthetic_identity_enabled() -> bool {
     std::env::var("AGENT2API_QODER_SYNTHETIC_IDENTITY")
         .map(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
