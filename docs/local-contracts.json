@@ -935,6 +935,107 @@
       ]
     },
     {
+      "id": "qoder-intl-device-quota",
+      "level": "P1",
+      "status": "必须保留",
+      "behavior": "国际版每日积分按设备发放：领取成功后写设备台账（只落账号哈希，保留最近 14 天）；同设备其它账号当日归因为「名额已被占用」并停止自动重试，不冒充窗口未开；批量签到按最久未签到轮换，国内版不写不读台账、不受影响；设备身份按账号持久分配，缺失账号身份时退回设备级。",
+      "source_commits": [
+        "15a54a2431cbb34818001d576d28dc2d082b83af"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/device_claims.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/checkin.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/billing/checkin.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/machine.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/billing/checkin.rs",
+          "name": "server::core::billing::checkin::tests::qoder_intl_rotation_prefers_the_account_that_waited_longest",
+          "id": "case-58f4d1452d29"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/billing/checkin.rs",
+          "name": "server::core::billing::checkin::tests::qoder_intl_rotation_keeps_other_providers_untouched",
+          "id": "case-80bbffeab694"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/billing/checkin.rs",
+          "name": "server::core::billing::checkin::tests::qoder_intl_rotation_is_stable_without_timestamps",
+          "id": "case-fbbeffe4b82d"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/checkin.rs",
+          "name": "server::core::providers::qoder::checkin::tests::intl_no_claim_names_the_device_holder",
+          "id": "case-3fa45489685b"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/device_claims.rs",
+          "name": "server::core::providers::qoder::device_claims::tests::entry_key_isolated_by_region_device_and_date",
+          "id": "case-4c305e6976af"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/device_claims.rs",
+          "name": "server::core::providers::qoder::device_claims::tests::claim_matches_only_the_same_account",
+          "id": "case-e21e979294a9"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/device_claims.rs",
+          "name": "server::core::providers::qoder::device_claims::tests::roundtrip_via_file",
+          "id": "case-f222bb4108ac"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/device_claims.rs",
+          "name": "server::core::providers::qoder::device_claims::tests::prune_keeps_recent_days",
+          "id": "case-0bbe6f405c70"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/machine.rs",
+          "name": "server::core::providers::qoder::machine::tests::device_id_is_stable_for_same_account",
+          "id": "case-6101c1d52eca"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/machine.rs",
+          "name": "server::core::providers::qoder::machine::tests::device_id_differs_per_account_and_region",
+          "id": "case-e77f0448a405"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/machine.rs",
+          "name": "server::core::providers::qoder::machine::tests::device_id_survives_reload_from_disk",
+          "id": "case-97ea9057bc8b"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/machine.rs",
+          "name": "server::core::providers::qoder::machine::tests::device_key_never_contains_raw_uid",
+          "id": "case-03baf5944b65"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/machine.rs",
+          "name": "server::core::providers::qoder::machine::tests::synthetic_identity_matches_component_formats",
+          "id": "case-6eb85f41a054"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/machine.rs",
+          "name": "server::core::providers::qoder::machine::tests::synthetic_identity_is_stable_and_account_scoped",
+          "id": "case-9c8484b0db83"
+        }
+      ]
+    },
+    {
       "id": "zcode-claim-egress",
       "level": "P0",
       "status": "必须保留",
