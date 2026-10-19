@@ -22,8 +22,15 @@ prototype/
 Acankao/
 desktop-tauri/web
 
+# Qoder 国际版设备身份对照实验脚本（只在本机对着运行库跑，不入库）
+/scripts/qoder-device-experiment.mjs
+/scripts/qoder-device-experiment.cmd
+/scripts/qoder-device-probe.mjs
+/scripts/qoder-split-instances.mjs
+
 # 运行日志与截图产物
 logs/
+errors.log
 desktop-tauri/window-shot.png
 
 # 本地文档目录（发布说明草稿等，只在本机留存，不入库）

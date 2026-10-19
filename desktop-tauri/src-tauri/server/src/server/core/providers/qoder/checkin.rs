@@ -63,7 +63,7 @@ use crate::server::logging;
 
 use super::credentials::Credentials;
 use super::endpoints::Region;
-use super::{auth, endpoints, refresh, risk};
+use super::{auth, device_claims, endpoints, machine, refresh, risk};
 
 /// 活动类型：可领取权益（促销类活动是 `VIEW_DETAILS`，不是签到，不能领）
 const ACTION_CLAIM_BENEFIT: &str = "CLAIM_BENEFIT";
@@ -143,6 +143,15 @@ async fn intl_refetch(
     auth::payload(second, "签到活动查询（风控重拉）")
 }
 
+/// 台账用的**设备级**标识：同一台机器上的所有账号共用这一个值。
+///
+/// 不能用 `machine::device_id(region, uid)` —— 那是按账号派生的**请求头** id，
+/// 拿它当台账键会让「账号 A 今天领过」的记录对账号 B 永远不可见，
+/// 设备名额归因（以及「今天别再重试」的判定）就彻底失效了。
+fn device_key() -> Option<String> {
+    machine::machine_id().ok()
+}
+
 /// 活动列表解析 + 领取（两个地区共用的收尾）。
 async fn claim_from(
     store: &AccountStore,
@@ -190,8 +199,20 @@ async fn claim_from(
     );
 
     let Some(target) = claimable else {
-        return Ok(no_claim(region, claimed, risk_note));
-
+        // 「没有可领活动」的归因：本设备今天是否已经被**另一个账号**领走。
+        // 只有国际版存在设备级名额（实测：第一个账号领取后，其它账号的活动行
+        // 整条消失；国内版是按账号发放，两个账号当天都能领到）。
+        let holder = if region == Region::Global {
+            match device_key() {
+                Some(device) => device_claims::today(region, &device)
+                    .filter(|claim| !device_claims::claimed_by(claim, account_id))
+                    .map(|claim| claim.account.chars().take(6).collect::<String>()),
+                None => None,
+            }
+        } else {
+            None
+        };
+        return Ok(no_claim(region, claimed, risk_note, holder));
     };
     let campaign_id = target
         .get("campaignId")
@@ -330,6 +351,13 @@ async fn claim_from(
         Some(days) if days > 0.0 => format!("获得 {reward} credits，{days} 天有效"),
         _ => format!("获得 {reward} credits"),
     };
+    // 台账只记国际版：国内版按账号发放，同设备多账号本来都能领到，
+    // 记了反而会让下一个账号被误判成「名额被占」。
+    if region == Region::Global {
+        if let Some(device) = device_key() {
+            device_claims::record(region, &device, account_id, campaign_id);
+        }
+    }
     logging::log(
         "[Checkin]",
         &format!(
@@ -444,8 +472,13 @@ fn campaign_timestamp(value: Option<&Value>) -> Option<i64> {
     }
 }
 
-/// 「这次没领到」的结果：区分「今天已领」「没有可领的活动」与「缺风控身份」。
-fn no_claim(region: Region, claimed: bool, risk_note: Option<String>) -> Value {
+/// 「这次没领到」的结果：区分「今天已领」「没有可领的活动」「缺风控身份」
+/// 与「本设备名额已被另一个账号领走」。
+///
+/// `holder` 是本设备今日领取者的账号哈希前缀（只有国际版会有：实测国际版的
+/// 每日活动按设备发放，第一个账号领取后其它账号的活动行整条消失；国内版按账号
+/// 发放，同设备两个账号当天都能领到）。
+fn no_claim(region: Region, claimed: bool, risk_note: Option<String>, holder: Option<String>) -> Value {
 
     if claimed {
         return json!({
@@ -456,10 +489,16 @@ fn no_claim(region: Region, claimed: bool, risk_note: Option<String>) -> Value {
     }
     if region == Region::Global {
         // 国际版：要么缺 UMID 组件（风控头没带上，上游不下发积分活动），
-        // 要么组件在但活动列表里此刻没有积分活动。10router 作者也在国际版
-        // 上观察到「长期只回 VIEW_DETAILS 促销」（见它的 qoderCheckin.js），
-        // 官方文档确认每日 100 Credits 的窗口每天 10:00（UTC+8）开启 ——
-        // 文案如实说明现状与时机，不要暗示「已经领过」。
+        // 要么本设备今日名额已被别的账号用掉，要么窗口还没开。
+        if let Some(holder) = holder {
+            return json!({
+                "success": false,
+                "deviceLimited": true,
+                "msg": format!(
+                    "本设备今日的国际版名额已被另一个账号（#{holder}）领取：Qoder 国际版按设备每天只发一个账号的积分活动，换设备或用该账号明天再领；本账号今天不会再自动重试"
+                ),
+            });
+        }
         if let Some(note) = risk_note {
             return json!({
                 "success": false,
@@ -516,9 +555,22 @@ mod tests {
 
     #[test]
     fn intl_no_claim_explains_shared_device_daily_limit() {
-        let result = no_claim(Region::Global, false, None);
+        let result = no_claim(Region::Global, false, None, None);
         let message = result.get("msg").and_then(Value::as_str).unwrap_or("");
         assert!(message.contains("按设备每天限领一次"));
         assert!(message.contains("其他账号可能已占用"));
+    }
+
+    #[test]
+    fn intl_no_claim_names_the_device_holder() {
+        let result = no_claim(Region::Global, false, None, Some("a1b2c3".to_string()));
+        assert_eq!(result.get("deviceLimited").and_then(Value::as_bool), Some(true));
+        let message = result.get("msg").and_then(Value::as_str).unwrap_or("");
+        assert!(message.contains("#a1b2c3"));
+        assert!(message.contains("不会再自动重试"));
+        // 国内版不会带设备名额语义
+        let cn = no_claim(Region::Cn, false, None, Some("a1b2c3".to_string()));
+        assert!(cn.get("deviceLimited").is_none());
+        assert!(cn.get("msg").and_then(Value::as_str).unwrap_or("").contains("没有可领取"));
     }
 }

@@ -55,6 +55,7 @@ pub mod checkin;
 pub mod context;
 pub mod credentials;
 pub mod cosy;
+mod device_claims;
 pub mod endpoints;
 pub mod errors;
 mod machine;

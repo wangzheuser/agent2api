@@ -539,15 +539,38 @@ pub async fn augment_headers(
     uid: &str,
 ) -> (Vec<(String, String)>, Option<String>) {
     headers.push(("Cosy-Version".to_string(), client_version(region)));
+
+    // 实验开关：按账号合成整套身份（默认关闭）。打开后不再依赖本机 UMID 组件，
+    // 每个账号呈现一份稳定但**非本机真实**的设备身份。开关的判定依据与风险见
+    // `machine::synthetic_identity_enabled` 的说明 —— 必须先跑对照实验确认
+    // 合成身份能另开一份设备名额，否则只会得到「列表里没有可领活动」。
+    if machine::synthetic_identity_enabled() && !uid.trim().is_empty() {
+        headers.push(("Cosy-MachineOS".to_string(), machine_os()));
+        if let Ok(id) = machine::device_id(region, uid) {
+            headers.push(("Cosy-MachineId".to_string(), id));
+        }
+        if let Some(host) = machine_hostname() {
+            headers.push(("Cosy-MachineHostname".to_string(), host));
+        }
+        let (token, code, kind) = machine::synthetic_identity(region, uid);
+        headers.push(("Cosy-MachineToken".to_string(), token));
+        headers.push(("Cosy-MachineCode".to_string(), code));
+        headers.push(("Cosy-MachineType".to_string(), kind));
+        logging::verbose("[Qoder]", &format!("使用按账号合成的设备身份（地区={}，账号={}）", region.label(), &uid[..uid.len().min(8)]));
+        return (headers, None);
+    }
+
     match identity(region, uid).await {
         Some(risk) => {
             // 参考 qoder2api-hub：只有官方 UMID 生成的真实身份可用时才发
             // cosy-machine* 头。缺少真实身份时发送半套/派生头会让上游静默
             // 过滤可领取活动，表现为 HTTP 200 但列表里没有 CLAIM_BENEFIT。
             headers.push(("Cosy-MachineOS".to_string(), machine_os()));
-            // 与 COSY 签名头同一个机器标识（`machine::machine_id`：优先复用
-            // 客户端/qodercli 落盘的 id，否则在网关数据目录持久化一个）
-            if let Ok(id) = machine::machine_id() {
+            // 设备标识按**账号**绑定（`machine::device_id`：一次分配、落盘持久、
+            // 永不轮换）。同一台机器上的多个账号因此各自呈现一台稳定设备，
+            // 而不是共用同一个 id 被上游当成同一台设备（国际版每设备每日只下发
+            // 一个账号的积分活动）。拿不到账号身份时退回设备级 machine_id。
+            if let Ok(id) = machine::device_id(region, uid) {
                 headers.push(("Cosy-MachineId".to_string(), id));
             }
             if let Some(host) = machine_hostname() {

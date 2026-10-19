@@ -256,13 +256,43 @@ pub fn resolve_checkin_targets(
     }
     let available: Vec<Value> = all.into_iter().filter(is_available).collect();
     let total = available.len();
-    let eligible: Vec<Value> = available
+    let mut eligible: Vec<Value> = available
         .into_iter()
         .filter(|account| supports_checkin(account) || supports_reward_checkin(store, account))
         .filter(|account| matches_provider_filter(account, providers))
         .collect();
+    rotate_qoder_intl(&mut eligible);
     let skipped = total - eligible.len();
     Ok((eligible, skipped))
+}
+
+/// Qoder 国际版的**设备名额轮换**。
+///
+/// ── 为什么必须排序（2026-10-19 实测）────────────────────────
+/// 国际版的每日 100 Credits 按**设备**发放：一台设备一天只会给一个账号下发
+/// 可领取活动，第一个领取的账号拿到 `CLAIMED`，其它账号的活动行**整条消失**。
+/// 批量签到如果按固定优先级顺序跑，排在前面的账号每天都会先抢到名额，
+/// 排在后面的账号**永远领不到** —— 这不是「限制」而是调度缺陷。
+///
+/// 这里把国际版账号按「最久没签到」排到前面（`checkinAt` 升序，从未签到 = 0
+/// 最先），于是设备名额在账号之间轮换：今天 A、明天 B、后天 C。
+/// 其它提供商不受影响（保持原有相对顺序）。
+///
+/// 单账号手动签到（`resolve_checkin_targets` 的 `id` 分支）不经过这里，
+/// 用户点哪个就签哪个。
+fn rotate_qoder_intl(eligible: &mut [Value]) {
+    eligible.sort_by_key(|account| {
+        let intl = provider_of(account) == "qoder-intl";
+        // 国际版优先（先抢当天设备名额），组内按 checkinAt 升序轮换
+        let last = account.get("checkinAt").and_then(Value::as_i64).unwrap_or(0);
+        let priority = account.get("priority").and_then(Value::as_i64).unwrap_or(0);
+        if intl {
+            (0u8, last, priority)
+        } else {
+            // 非国际版不参与轮换：用固定键保持它们原有的相对顺序
+            (1u8, 0, 0)
+        }
+    });
 }
 
 /// 单个账号签到。已签到（上游非 0 code）不算错误，原样返回结果 ——
@@ -725,6 +755,10 @@ pub fn claim_pending(claim: &Value) -> bool {
     if checkin_completed_today(claim) {
         return false;
     }
+    // 「本设备今日名额已被别的账号用掉」= 今天这个账号注定领不到，重试只会打上游
+    if claim.get("deviceLimited").and_then(Value::as_bool) == Some(true) {
+        return false;
+    }
     // error 字段非空 = 执行出错（网络 / 凭证），那不是「等窗口」能解决的
     if claim.get("error").and_then(Value::as_str).is_some_and(|text| !text.trim().is_empty()) {
         return false;
@@ -844,6 +878,45 @@ pub async fn run_checkin(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qoder_intl_rotation_prefers_the_account_that_waited_longest() {
+        let mut rows = vec![
+            json!({"id": "intl-a", "provider": "qoder-intl", "priority": 10, "checkinAt": 1_700_000_000_000i64}),
+            json!({"id": "intl-b", "provider": "qoder-intl", "priority": 11, "checkinAt": 0}),
+            json!({"id": "intl-c", "provider": "qoder-intl", "priority": 12, "checkinAt": 1_600_000_000_000i64}),
+            json!({"id": "cn-1", "provider": "qoder", "priority": 1}),
+        ];
+        rotate_qoder_intl(&mut rows);
+        let order: Vec<&str> = rows.iter().filter_map(|row| row.get("id").and_then(Value::as_str)).collect();
+        // 从未签到的最先，其次是最久没签到的；国内版保持原顺序
+        assert_eq!(order, vec!["intl-b", "intl-c", "intl-a", "cn-1"]);
+    }
+
+    #[test]
+    fn qoder_intl_rotation_keeps_other_providers_untouched() {
+        let mut rows = vec![
+            json!({"id": "wb-1", "provider": "workbuddy", "priority": 5}),
+            json!({"id": "wb-2", "provider": "workbuddy", "priority": 9}),
+            json!({"id": "intl-a", "provider": "qoder-intl", "priority": 1, "checkinAt": 5}),
+        ];
+        rotate_qoder_intl(&mut rows);
+        let order: Vec<&str> = rows.iter().filter_map(|row| row.get("id").and_then(Value::as_str)).collect();
+        // 国际版优先抢设备名额；其它提供商相对顺序不变
+        assert_eq!(order, vec!["intl-a", "wb-1", "wb-2"]);
+    }
+
+    #[test]
+    fn qoder_intl_rotation_is_stable_without_timestamps() {
+        let mut rows = vec![
+            json!({"id": "intl-a", "provider": "qoder-intl", "priority": 20}),
+            json!({"id": "intl-b", "provider": "qoder-intl", "priority": 10}),
+        ];
+        rotate_qoder_intl(&mut rows);
+        let order: Vec<&str> = rows.iter().filter_map(|row| row.get("id").and_then(Value::as_str)).collect();
+        // 都没签过 → 按优先级
+        assert_eq!(order, vec!["intl-b", "intl-a"]);
+    }
 
     #[test]
     fn workbuddy_international_is_included_in_checkin_targets() {
