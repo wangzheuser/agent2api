@@ -132,7 +132,15 @@ pub fn list_item(model: &Value, provider_id: &str) -> Value {
 ///
 /// `count` 就是 data 的长度（单家路径 = 目录条数，聚合路径 = 合并去重后的条数）。
 /// 先取长度再移动 data：`json!` 会把 Vec 移进值里，之后再 borrow 是编译错误。
-pub fn list_response_from(data: Vec<Value>, source: &str, last_refreshed_at: i64) -> Value {
+pub fn list_response_from(mut data: Vec<Value>, source: &str, last_refreshed_at: i64) -> Value {
+    // 对外展示名使用最终请求 ID，避免客户端隐藏提供商前缀；不修改上游目录。
+    for item in &mut data {
+        if let Some(object) = item.as_object_mut() {
+            if let Some(id) = object.get("id").and_then(Value::as_str).map(str::to_owned) {
+                object.insert("name".to_string(), Value::String(id));
+            }
+        }
+    }
     let count = data.len();
     json!({
         "object": "list",
@@ -226,4 +234,34 @@ pub fn suggest_from(
     scored.sort_by(|a, b| a.1.cmp(&b.1).then(b.2.cmp(&a.2)));
     scored.truncate(limit);
     scored.into_iter().map(|(id, _, _)| id).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn public_model_names_match_final_ids_without_changing_metadata() {
+        let data = vec![
+            json!({"id": "cline-free/minimax-m3.1-flash", "name": "Minimax M3.1 Flash",
+                "owned_by": "cline-free", "maxInputTokens": 1000000, "is_default": true}),
+            json!({"id": "cline-free/mimo-v2.6-flash", "name": "Mimo V2.6 Flash",
+                "owned_by": "cline-free"}),
+            json!({"id": "custom/model", "name": "Friendly custom model", "owned_by": "custom"}),
+            json!({"id": "mapped/model", "name": "mapped/model", "is_default": false}),
+            json!({"id": "provider/unnamed", "owned_by": "provider"}),
+        ];
+        let body = list_response_from(data.clone(), "aggregate", 123);
+        let mut expected = data.clone();
+        for item in &mut expected {
+            item["name"] = item["id"].clone();
+        }
+        assert_eq!(body, json!({
+            "object": "list",
+            "data": expected,
+            "meta": {"source": "aggregate", "lastRefreshedAt": 123, "count": data.len()},
+        }));
+        assert_eq!(data[0]["name"], "Minimax M3.1 Flash");
+        assert_eq!(list_response_from(vec![], "builtin", 0)["data"], json!([]));
+    }
 }

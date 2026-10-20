@@ -2,6 +2,26 @@
   "schema_version": 1,
   "contracts": [
     {
+      "id": "public-model-name-matches-id",
+      "level": "P1",
+      "status": "必须保留",
+      "behavior": "对外模型列表中内置、自定义及别名条目的 name 与最终 id 完全一致，缺少 name 时补齐；保留提供商、能力、默认标记和列表元数据，不修改管理页读取的上游目录名称。",
+      "source_commits": [
+        "3d5105e4b1e78bd96c420df2649331f213b283f8"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/models/shape.rs"
+      ],
+      "tests": [
+        {
+          "id": "case-public-model-name-matches-id",
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/models/shape.rs",
+          "name": "server::core::models::shape::tests::public_model_names_match_final_ids_without_changing_metadata"
+        }
+      ]
+    },
+    {
       "id": "anthropic-stream-usage",
       "level": "P0",
       "status": "必须保留",
