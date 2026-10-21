@@ -632,6 +632,12 @@ fn credit_pack_of(item: &Value) -> Value {
     let mut row = Map::new();
     let name = item.get("name").and_then(Value::as_str).unwrap_or("").trim().to_string();
     row.insert("name".to_string(), Value::String(name));
+    // 发放核验需要稳定的资源身份和商品码，不能从展示名猜奖励类型。
+    for key in ["id", "packageCode"] {
+        if let Some(value) = item.get(key).filter(|value| !value.is_null()) {
+            row.insert(key.to_string(), value.clone());
+        }
+    }
     // 三个数：上游给什么写什么，缺失**不写键**（写成 0 就是那个「读一个不存在的
     // 字段、渲染成剩余 0」的事故）
     for (from, to) in [("total", "total"), ("used", "used"), ("left", "remain")] {

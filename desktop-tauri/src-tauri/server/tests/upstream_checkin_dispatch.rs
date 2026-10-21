@@ -6,6 +6,7 @@ use agent2api_server::server::{
         auth::AuthService,
         auto_checkin,
         billing::{checkin, BillingService},
+        checkin_records,
     },
     db::Db,
 };
@@ -39,7 +40,8 @@ async fn loomy_and_workbuddy_dispatch_preserve_completion_and_failures() {
     std::env::set_var("AGENT2API_PROXY_HOME", &dir);
     let db = Db::open(&dir.join("fixture.db")).unwrap();
     config::init(Some(db.clone()));
-    let store = AccountStore::with_db(Some(db));
+    checkin_records::install(Some(db.clone()));
+    let store = AccountStore::with_db(Some(db.clone()));
     let billing = BillingService::new(AuthService::for_store(store.clone()));
     let loomy = MockUpstream::spawn(vec![
         (
@@ -141,7 +143,55 @@ async fn loomy_and_workbuddy_dispatch_preserve_completion_and_failures() {
         assert_eq!(request.path, "/v2/billing/meter/daily-checkin");
     }
     wb.assert_drained();
+    let records = checkin_records::query(&Default::default(), 100, 0);
+    assert_eq!(records["total"], 4, "批量入口每个账号只落一条明细");
+    let latest = checkin_records::latest_by_account();
+    assert_eq!(latest["user-done"]["outcome"], "already");
+    assert_eq!(latest["user-expired"]["outcome"], "failed");
+    assert_eq!(latest["user-done"]["source"], "manual");
+    assert_eq!(latest["user-done"]["provider"], "workbuddy");
+    assert_eq!(latest["user-done"]["reason"], "fixture-workbuddy");
     assert_workbuddy_http200_completion(&store, &billing).await;
+    assert_activity_ledger(&db);
+    let reopened = rusqlite::Connection::open_with_flags(
+        dir.join("fixture.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ).unwrap();
+    let count: i64 = reopened.query_row("SELECT COUNT(*) FROM checkin_records", [], |row| row.get(0)).unwrap();
+    assert_eq!(json!(count), checkin_records::query(&Default::default(), 100, 0)["total"]);
+}
+
+fn assert_activity_ledger(db: &Db) {
+    let activity = json!({
+        "id": "fixture-intl", "name": "International",
+        "claim": {"success": false, "msg": "活跃保活完成"},
+        "activity": {"pokeSucceeded": true}
+    });
+    checkin_records::record_activity(&activity, "workbuddy-intl", "keepalive");
+    let latest = checkin_records::latest_by_account();
+    assert_eq!(latest["fixture-intl"]["outcome"], "pending");
+    assert_eq!(latest["fixture-intl"]["ok"], false);
+    assert_eq!(latest["fixture-intl"]["keptActive"], true);
+    assert_eq!(latest["fixture-intl"]["activityCompletedToday"], true);
+
+    let claim = json!({"id": "fixture-intl", "claim": {"success": false, "msg": "当前没有可领取的奖励"}});
+    checkin_records::record_activity(&claim, "workbuddy-intl", "claim");
+    let latest = checkin_records::latest_by_account();
+    assert_eq!(latest["fixture-intl"]["keptActive"], false);
+    assert_eq!(latest["fixture-intl"]["activityCompletedToday"], true, "只领取不能覆盖当天保活事实");
+    assert_eq!(latest["fixture-intl"]["reason"], "手动领取活动");
+
+    let mut failure = activity.clone();
+    failure["claim"] = json!({"status": "auth_expired", "msg": "登录态已过期"});
+    checkin_records::record_activity(&failure, "workbuddy-intl", "keepalive");
+    assert_eq!(checkin_records::latest_by_account()["fixture-intl"]["outcome"], "failed");
+    assert_eq!(checkin_records::latest_by_account()["fixture-intl"]["error"], "登录态已过期");
+
+    db.with_mut(|conn| conn.execute(
+        "UPDATE checkin_records SET date = '2000-01-01' WHERE account_id = 'fixture-intl'", [],
+    ).unwrap()).unwrap();
+    assert_eq!(checkin_records::latest_by_account()["fixture-intl"]["activityCompletedToday"], false);
+    assert_eq!(checkin_records::latest_by_account()["fixture-intl"]["outcome"], "failed");
 }
 
 // 沿用本测试进程唯一的 config / SQLite fixture，避免另一个测试初始化全局配置。
@@ -177,6 +227,9 @@ async fn assert_workbuddy_http200_completion(store: &AccountStore, billing: &Bil
         .await
         .unwrap();
         assert_eq!(result["total"], 1);
+        let latest = checkin_records::latest_by_account();
+        assert_eq!(latest[&id]["source"], "single");
+        assert_eq!(latest[&id]["outcome"], if completed { "already" } else { "failed" });
         assert_eq!(result["succeeded"], if completed { 1 } else { 0 });
         let row = &result["results"][0];
         assert_eq!(row["id"], id);

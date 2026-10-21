@@ -787,12 +787,20 @@ pub async fn run_checkin(
     providers: &[String],
     id: Option<&str>,
     reason: &str,
-    _source: &str,
+    source: &str,
 ) -> Result<Value, CheckinError> {
     let (targets, skipped) = resolve_checkin_targets(store, providers, id)?;
     let mut results = Vec::with_capacity(targets.len());
     for account in &targets {
         let row = checkin_for(store, billing, account).await;
+        // 所有签到入口（定时、补签、批量、单账号）共用这一处逐账号记账。
+        // 写盘失败只记日志，不改变上游执行结果。
+        crate::server::core::checkin_records::record_row(
+            &row,
+            row.get("provider").and_then(Value::as_str).unwrap_or(""),
+            source,
+            reason,
+        );
         // 落签到时间：手动单签与定时签到走的是**这一段**（两条链都调本函数），
         // 所以账号页的「已签到」在两种路径下都会亮起来，不需要各自记一次。
         // 写盘失败只记日志、不改签到结果 —— 上游那边积分已经领到了，

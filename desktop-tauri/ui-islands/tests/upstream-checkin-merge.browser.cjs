@@ -39,6 +39,15 @@ window.fixture = {
   singleRow:{id:'L',claim:{status:'auth_expired',msg:'登录态已过期'},activity:{pokeSucceeded:true}},
   batchResult:{succeeded:1,total:3,failedCount:0,completedAccountIds:['L']}
 };
+if (location.hash === '#persisted') {
+  Object.assign(fixture.snapshot.daily.providers[0].accounts[0], {
+    activityCompletedToday:true,
+    lastAttempt:{ts:Date.now()-1000,outcome:'pending',keptActive:true,message:'持久化保活记录'},
+    reward:{status:'verified_resource',amount:30,attribution:'unconfirmed',queriedAt:Date.now(),
+      resources:[{resourceId:'fixture-grant',packageCode:'activity',amount:30,grantAt:Date.now()-3600000,
+        firstObservedAt:Date.now(),observation:'baseline',grantReason:'official activity'}]}
+  });
+}
 window.wbApp = {
   currentPage:'checkin',getState:()=>({accounts:{accounts:[]}}),
   toast(message){document.getElementById('fixture-toast').textContent=message},
@@ -78,8 +87,10 @@ async function run() {
     page.setDefaultTimeout(10_000)
     page.on('pageerror', error => errors.push(error.message))
 
-    async function reset() {
-      await page.goto(pathToFileURL(fixtureFile).href)
+    async function reset(hash = '') {
+      // 仅改变 fragment 不会重跑 fixture 脚本，先清空上一页的内存状态。
+      await page.goto('about:blank')
+      await page.goto(pathToFileURL(fixtureFile).href + hash)
       await page.getByRole('heading', { name: '每日签到', exact: true }).waitFor()
       assert.deepEqual(await page.evaluate(() => fixture.calls.query), [])
       assert.deepEqual(await page.evaluate(() => fixture.calls.claim), [])
@@ -187,6 +198,48 @@ async function run() {
     assert.match(await page.locator('#fixture-toast').innerText(), /1 个失败/)
     await assertNoOnboarding()
     checks.push('partially failed batch never automatically claims onboarding even with completed IDs')
+
+    await reset('#persisted')
+    for (let iteration = 0; iteration < 2; iteration++) {
+      if (iteration) {
+        await page.reload()
+        await page.getByRole('heading', { name: '每日签到', exact: true }).waitFor()
+      }
+      const persisted = await expand('WorkBuddy 国际版')
+      const restored = persisted.getByRole('row').filter({ hasText: '国际账号 A' })
+      await restored.getByRole('status').filter({ hasText: '持久化保活记录' }).waitFor()
+      assert.match(await restored.innerText(), /已确认积分包发放：30 积分/)
+      assert.match(await restored.innerText(), /与本次执行的归因未确认/)
+      assert.doesNotMatch(await restored.getByRole('status').innerText(), /已到账|签到成功/)
+      assert.equal(await restored.getByText('活跃保活完成', { exact: true }).count(), 1)
+      assert.match(await persisted.locator('.ck-prov-count').innerText(), /1 已完成保活/)
+      assert.deepEqual(await page.evaluate(() => fixture.calls.activity), [])
+      await assertNoOnboarding()
+    }
+    checks.push('persisted activity and unconfirmed resource evidence survive a full page reload without actions')
+
+    await page.evaluate(async () => {
+      const account = fixture.snapshot.daily.providers[0].accounts[0]
+      account.lastAttempt = null
+      account.reward.snapshotStatus = 'failed'
+      await wbCheckinPanel.load()
+    })
+    const historyOnly = page.getByRole('row').filter({ hasText: '国际账号 A' })
+    await historyOnly.getByText('最近查询失败，保留历史证据', { exact: true }).waitFor()
+    assert.equal(await historyOnly.getByRole('status').count(), 0)
+    await historyOnly.locator('summary').click()
+    await historyOnly.getByText('fixture-grant · activity', { exact: true }).waitFor()
+    assert.match(await historyOnly.innerText(), /历史基线/)
+    assert.deepEqual(await page.evaluate(() => fixture.calls.activity), [])
+    checks.push('independent reward history remains visible without an execution and after a failed refresh')
+
+    await page.setViewportSize({ width: 390, height: 844 })
+    const scroll = historyOnly.locator('xpath=../..').locator('..')
+    assert.equal(await scroll.evaluate(element => getComputedStyle(element).overflowX), 'auto')
+    assert.ok(await scroll.evaluate(element => element.clientWidth <= document.documentElement.clientWidth))
+    await historyOnly.locator('summary').scrollIntoViewIfNeeded()
+    assert.match(await historyOnly.innerText(), /归因未确认/)
+    checks.push('mobile reward history uses a bounded horizontally scrollable table')
 
     assert.deepEqual(errors, [], '真实 ui.js 不得产生页面异常')
     assert.deepEqual(nonLocalRequests, [], 'fixture 只允许本地 file 资源')

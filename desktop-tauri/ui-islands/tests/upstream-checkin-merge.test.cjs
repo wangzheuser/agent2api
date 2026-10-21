@@ -20,7 +20,8 @@ before(async context => {
         export * from './checkin-state'
         export { lowBalanceBlockedOf, lowBalanceOf, defaultLowBalanceMode } from './accounts-domain'
         export { BUILTIN_CONFIGS, methodsOf } from './add-account-configs'
-        export { AccountRows } from './checkin-page'
+        export { AccountRows, GroupBadge } from './checkin-page'
+        export { outcomeView } from './checkin-records-tab'
       `,
       resolveDir: root,
       sourcefile: 'checkin-merge-fixture.ts',
@@ -35,7 +36,11 @@ before(async context => {
           path: args.path, external: true,
         }))
         builder.onLoad({ filter: /[\\/]checkin-page\.tsx$/ }, args => ({
-          contents: fs.readFileSync(args.path, 'utf8') + '\nexport { AccountRows }\n',
+          contents: fs.readFileSync(args.path, 'utf8') + '\nexport { AccountRows, GroupBadge }\n',
+          loader: 'tsx',
+        }))
+        builder.onLoad({ filter: /[\\/]checkin-records-tab\.tsx$/ }, args => ({
+          contents: fs.readFileSync(args.path, 'utf8') + '\nexport { outcomeView }\n',
           loader: 'tsx',
         }))
       },
@@ -284,6 +289,110 @@ test('WorkBuddy international page retains all three explicit activity modes', a
   }
   assert.deepEqual(f.calls.checkin, [])
   assert.deepEqual(f.calls.activity, [['A', 'keepalive'], ['A', 'claim'], ['A', 'full']])
+})
+
+test('persisted activity result is visible without a manual click', async () => {
+  const f = await fixture()
+  const account = {
+    id: 'A',
+    name: 'A',
+    available: true,
+    checkedInToday: false,
+    checkinAt: null,
+    activityCompletedToday: true,
+    reward: { status: 'unverified' },
+    lastAttempt: {
+      accountId: 'A',
+      accountName: 'A',
+      date: '2026-10-21',
+      ts: Date.now(),
+      outcome: 'pending',
+      message: '仅执行保活，未领取奖励',
+      keptActive: true,
+    },
+  }
+  const markup = renderToStaticMarkup(f.api.AccountRows({
+    group: { id: 'workbuddy-intl', label: 'WorkBuddy 国际版', totalCount: 1, doneCount: 0, accounts: [account] },
+  }))
+  assert.match(markup, /活跃保活完成/)
+  assert.match(markup, /积分到账待核验/)
+  assert.match(markup, /role="status"/)
+})
+
+test('newer scheduled result replaces old in-memory result without hiding reward evidence', async () => {
+  const f = await fixture({ row: { id: 'A', activity: { pokeSucceeded: true } } })
+  await f.api.signSingleAccount('A', 'keepalive')
+  const group = { id: 'workbuddy-intl', totalCount: 1, doneCount: 0, accounts: [{
+    id: 'A', activityCompletedToday: true,
+    reward: { status: 'verified_resource', amount: 30 },
+    lastAttempt: {
+      ts: Date.now() + 1000, outcome: 'failed', error: 'scheduled failure',
+    },
+  }] }
+  const markup = renderToStaticMarkup(f.api.AccountRows({ group }))
+  assert.match(markup, /scheduled failure/)
+  assert.match(markup, /已确认积分包发放：30 积分/)
+  assert.match(markup, /与本次执行的归因未确认/)
+  assert.match(markup, /text-destructive/)
+  assert.match(markup, /活跃保活完成/)
+  assert.doesNotMatch(markup, /签到成功|已到账/)
+  assert.match(renderToStaticMarkup(f.api.GroupBadge({ group })), /活跃保活完成/)
+})
+
+test('old persisted activity and message-less pending results never become completed today', async () => {
+  const f = await fixture()
+  for (const keptActive of [true, false]) {
+    const markup = renderToStaticMarkup(f.api.AccountRows({
+      group: { id: 'workbuddy-intl', accounts: [{
+        id: 'A', activityCompletedToday: false,
+        lastAttempt: { ts: 1, date: '1970-01-01', outcome: 'pending', keptActive },
+      }] },
+    }))
+    assert.match(markup, /待签/)
+    assert.doesNotMatch(markup, />已完成</)
+  }
+})
+
+test('unavailable credit snapshot stays unverified and never invents arrival', async () => {
+  const f = await fixture()
+  const markup = renderToStaticMarkup(f.api.AccountRows({
+    group: { id: 'workbuddy-intl', accounts: [{
+      id: 'A', reward: { status: 'unavailable' }, lastAttempt: { ts: 1, keptActive: true, outcome: 'pending' },
+    }] },
+  }))
+  assert.match(markup, /积分到账待核验/)
+  assert.doesNotMatch(markup, /已到账|签到成功/)
+})
+
+test('reward history without any execution survives failed refresh and shows baseline separately', async () => {
+  const f = await fixture()
+  const markup = renderToStaticMarkup(f.api.AccountRows({
+    group: { id: 'workbuddy-intl', accounts: [{
+      id: 'A', lastAttempt: null,
+      reward: { status: 'verified_resource', amount: 30.5, snapshotStatus: 'failed', queriedAt: 1000, resources: [{
+        resourceId: 'grant-fixture', packageCode: 'activity', amount: 30.5, grantAt: 500,
+        firstObservedAt: 1000, observation: 'baseline', grantReason: '<script>not-html</script>',
+      }] },
+    }] },
+  }))
+  assert.match(markup, /已确认积分包发放：30.5 积分/)
+  assert.match(markup, /归因未确认/)
+  assert.match(markup, /最近查询失败，保留历史证据/)
+  assert.match(markup, /历史基线/)
+  assert.match(markup, /grant-fixture/)
+  assert.match(markup, /&lt;script&gt;/)
+  assert.doesNotMatch(markup, /role="status"|签到成功|今日已领|<script>/)
+})
+
+test('record labels separate keepalive from confirmed claims including legacy keepalive rows', async () => {
+  const f = await fixture()
+  for (const row of [
+    { keptActive: true, outcome: 'pending' },
+    { keptActive: true, outcome: 'success', source: 'activity', reason: '手动保活' },
+  ]) assert.equal(f.api.outcomeView(row).label, '活跃完成，奖励待核验')
+  assert.equal(f.api.outcomeView({ keptActive: true, outcome: 'success' }).label, '成功领取')
+  assert.equal(f.api.outcomeView({ keptActive: true, outcome: 'already' }).label, '今日已领')
+  assert.equal(f.api.outcomeView({ keptActive: true, outcome: 'failed' }).label, '失败')
 })
 
 for (const [name, row, reject] of [

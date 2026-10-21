@@ -566,7 +566,15 @@
       ],
       "implementation": [
         "desktop-tauri/src-tauri/server/src/server/core/auto_checkin.rs",
-        "desktop-tauri/src-tauri/server/src/server/core/billing/checkin.rs"
+        "desktop-tauri/src-tauri/server/src/server/core/billing/checkin.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/checkin_records.rs",
+        "desktop-tauri/src-tauri/server/src/server/api/checkin_center.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/usage_records.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/usage_records/activity_rewards.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/billing/usage.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/providers/workbuddy/adapter.rs",
+        "desktop-tauri/ui-islands/src/islands/checkin-page.tsx",
+        "desktop-tauri/ui-islands/src/islands/checkin-records-tab.tsx"
       ],
       "tests": [
         {
@@ -592,6 +600,81 @@
           "path": "desktop-tauri/src-tauri/server/src/server/core/billing/checkin.rs",
           "name": "server::core::billing::checkin::tests::activity_keepalive_does_not_mark_regular_checkin",
           "id": "case-d3c40ac5c396"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/api/checkin_center.rs",
+          "name": "server::api::checkin_center::tests::reward_evidence_requires_matching_identity_fresh_snapshot_and_resource",
+          "id": "case-checkin-resource-identity"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/api/checkin_center.rs",
+          "name": "server::api::checkin_center::tests::reward_evidence_does_not_infer_credit_from_balance_or_unrelated_packages",
+          "id": "case-checkin-resource-not-balance"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/workbuddy/adapter.rs",
+          "name": "server::core::providers::workbuddy::adapter::tests::usage_document_keeps_credit_details_with_legacy_summary",
+          "id": "case-checkin-normalized-credit-pack"
+        },
+        {
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/upstream-checkin-merge.test.cjs",
+          "name": "persisted activity result is visible without a manual click",
+          "id": "case-checkin-persisted-activity"
+        },
+        {
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/upstream-checkin-merge.test.cjs",
+          "name": "newer scheduled result replaces old in-memory result without hiding reward evidence",
+          "id": "case-checkin-latest-result"
+        },
+        {
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/upstream-checkin-merge.test.cjs",
+          "name": "record labels separate keepalive from confirmed claims including legacy keepalive rows",
+          "id": "case-checkin-keepalive-not-claim"
+        }
+      ]
+    },
+    {
+      "id": "workbuddy-intl-reward-ledger",
+      "level": "P1",
+      "status": "必须保留",
+      "behavior": "国际版积分包观察历史独立于执行台账，复用余额查询按账号身份、资源和发放时刻去重；首次完整快照建立历史基线，失败、过期及后续执行不抹掉已观察证据，不用余额差或时间接近推断领奖归因。",
+      "source_commits": ["c890246"],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/usage_records.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/usage_records/activity_rewards.rs",
+        "desktop-tauri/src-tauri/server/src/server/api/checkin_center.rs",
+        "desktop-tauri/ui-islands/src/islands/checkin-page.tsx"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/usage_records/activity_rewards.rs",
+          "name": "server::core::usage_records::activity_rewards::tests::reward_ledger_retains_baseline_deduplicates_and_preserves_consumed_resources",
+          "id": "case-checkin-reward-ledger-dedup"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/usage_records/activity_rewards.rs",
+          "name": "server::core::usage_records::activity_rewards::tests::reward_ledger_rejects_incomplete_or_unidentified_evidence",
+          "id": "case-checkin-reward-ledger-validation"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/usage_records/activity_rewards.rs",
+          "name": "server::core::usage_records::activity_rewards::tests::reward_ledger_sqlite_preserves_history_across_failure_restart_and_identity_change",
+          "id": "case-checkin-reward-ledger-persistence"
+        },
+        {
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/upstream-checkin-merge.test.cjs",
+          "name": "reward history without any execution survives failed refresh and shows baseline separately",
+          "id": "case-checkin-independent-reward-history"
         }
       ]
     },

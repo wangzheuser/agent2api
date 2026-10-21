@@ -690,26 +690,9 @@ impl AutoCheckin {
         let active = number("active");
         let total = number("total");
         let skipped = number("skipped");
-        // 失败明细：`名字（错误）`，名字缺失时退到 id，再退到「未知账号」
-        let failures: Vec<String> = result
-            .get("results")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| {
-                        let error = item.get("error").and_then(Value::as_str)?;
-                        let name = item
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .filter(|text| !text.is_empty())
-                            .or_else(|| item.get("id").and_then(Value::as_str))
-                            .unwrap_or("未知账号");
-                        Some(format!("{name}（{error}）"))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        // 统一读取顶层 error 与 claim.msg，避免 WorkBuddy 国际版把失败放在
+        // 嵌套 claim 后被批次摘要静默吞掉。
+        let failures = failed_account_labels(result);
         let summary = json!({
             "at": logging::now_ms(),
             "date": today,

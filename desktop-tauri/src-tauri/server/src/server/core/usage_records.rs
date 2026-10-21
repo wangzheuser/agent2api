@@ -29,6 +29,9 @@ use crate::server::core::account_store::store_util::js_truthy;
 use crate::server::db::Db;
 use crate::server::logging;
 
+#[path = "usage_records/activity_rewards.rs"]
+pub(crate) mod activity_rewards;
+
 /// 旧 kv 快照键（全局「定时查询积分」时代的存放处）。
 /// 保留在 `db::schema::RESERVED_KV_KEYS` 里：迁移中断（导入失败不删键）时，
 /// 配置写入的「删除已不存在的键」不能把它误清 —— 那是唯一还能重试的来源。
@@ -180,7 +183,24 @@ pub fn identity(account: &Value) -> String {
 pub(crate) fn write_result_in(conn: &rusqlite::Connection, account: &Value, outcome: &UsageOutcome, queried_at: i64, attempted_at: i64, current_run: bool) -> rusqlite::Result<bool> {
     let Some(id) = account.get("id").and_then(Value::as_str) else { return Ok(false) };
     let identity = identity(account);
-    let usage = outcome.usage.as_ref().map(Value::to_string);
+    let mut usage = outcome.usage.clone();
+    if activity_rewards::is_international(account) {
+        if let Some(usage) = usage.as_mut() {
+            let previous = conn.query_row(
+                &format!("SELECT {RECORD_COLUMNS} FROM account_usage_records WHERE account_id=?1 AND identity=?2"),
+                params![id, identity], row_to_record,
+            ).optional()?;
+            // 首次升级时把旧的成功快照作为基线，避免把历史积分包当成本轮新增。
+            let previous = previous.and_then(|record| record.usage.map(|mut usage| {
+                if usage.get("activityRewards").is_none() {
+                    activity_rewards::reconcile(None, &mut usage, record.last_success_at);
+                }
+                usage
+            }));
+            activity_rewards::reconcile(previous.as_ref(), usage, queried_at);
+        }
+    }
+    let usage = usage.as_ref().map(Value::to_string);
     let (remaining, unlimited) = outcome.usage.as_ref().map(extract_remaining).unwrap_or((None, false));
     let written = conn.execute(
         "INSERT INTO account_usage_records

@@ -28,6 +28,7 @@
 //! 与 `core::usage_records` 同一条：`Db::with*` 拿的是全局唯一的连接锁，
 //! `logging::log` 要往同一个库写 `logs` 表 —— 闭包里打日志会当场死锁。
 
+use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 use rusqlite::params;
@@ -135,6 +136,12 @@ pub fn record_activity(row: &Value, provider: &str, mode: &str) {
         _ => "手动活动",
     };
     let claim = row.get("claim").cloned().unwrap_or(Value::Null);
+    if row.get("error").and_then(Value::as_str).is_some_and(|text| !text.trim().is_empty())
+        || claim.get("status").and_then(Value::as_str) == Some("auth_expired")
+    {
+        record_row(row, provider, "activity", reason);
+        return;
+    }
     let kept_active = row
         .get("activity")
         .and_then(|activity| activity.get("pokeSucceeded"))
@@ -142,7 +149,9 @@ pub fn record_activity(row: &Value, provider: &str, mode: &str) {
         .unwrap_or(false);
     let (outcome, error, ok) = if mode == "keepalive" {
         match kept_active {
-            true => (OUTCOME_SUCCESS, None, true),
+            // 保活完成只证明执行通道成功；国际版奖励由上游异步结算，
+            // 不能把它写成「成功领取」。
+            true => (OUTCOME_PENDING, None, false),
             false => (
                 OUTCOME_FAILED,
                 Some(
@@ -381,23 +390,7 @@ pub fn query(query: &Query, limit: usize, offset: usize) -> Value {
             let mut statement = conn.prepare(&sql_rows)?;
             let rows = statement.query_map(
                 rusqlite::params_from_iter(params_from_json(&filter_params)),
-                |row| {
-                    Ok(json!({
-                        "rowId": row.get::<_, i64>("row_id")?,
-                        "ts": row.get::<_, i64>("ts")?,
-                        "date": row.get::<_, String>("date")?,
-                        "source": row.get::<_, String>("source")?,
-                        "reason": row.get::<_, String>("reason")?,
-                        "accountId": row.get::<_, String>("account_id")?,
-                        "accountName": row.get::<_, String>("account_name")?,
-                        "provider": row.get::<_, String>("provider")?,
-                        "outcome": row.get::<_, String>("outcome")?,
-                        "ok": row.get::<_, i64>("ok").unwrap_or(0) != 0,
-                        "message": row.get::<_, Option<String>>("message")?,
-                        "error": row.get::<_, Option<String>>("error")?,
-                        "keptActive": row.get::<_, i64>("kept_active").unwrap_or(0) != 0,
-                    }))
-                },
+                row_value,
             )?;
             let records: Vec<Value> = rows.filter_map(|item| item.ok()).collect();
             Ok(json!({ "records": records, "total": total }))
@@ -405,6 +398,64 @@ pub fn query(query: &Query, limit: usize, offset: usize) -> Value {
         .and_then(|result| result.ok())
         .unwrap_or_else(|| json!({ "records": [], "total": 0 }));
     loaded
+}
+
+/// 每个账号最近一次执行结果，供签到中心刷新后恢复“上次执行结果”。
+///
+/// 这里只读已有台账，不访问上游；没有记录的账号不出现在返回 map 中。
+pub fn latest_by_account() -> BTreeMap<String, Value> {
+    let Some(db) = database() else {
+        return BTreeMap::new();
+    };
+    let sql = "
+        SELECT records.*, latest.activity_completed_today
+        FROM checkin_records AS records
+        JOIN (
+            SELECT MAX(row_id) AS latest_id,
+                   MAX(CASE WHEN date = ?1 AND kept_active = 1 THEN 1 ELSE 0 END)
+                       AS activity_completed_today
+            FROM checkin_records
+            GROUP BY account_id
+        ) AS latest ON records.row_id = latest.latest_id
+        ORDER BY row_id DESC
+    ";
+    db.with(|conn| {
+        let Ok(mut statement) = conn.prepare(sql) else {
+            return BTreeMap::new();
+        };
+        let Ok(rows) = statement.query_map([beijing::today_key()], |row| {
+            let mut value = row_value(row)?;
+            value["activityCompletedToday"] = json!(row.get::<_, i64>("activity_completed_today")? != 0);
+            Ok(value)
+        }) else {
+            return BTreeMap::new();
+        };
+        rows.filter_map(|item| {
+            let value = item.ok()?;
+            let account_id = value.get("accountId").and_then(Value::as_str)?;
+            Some((account_id.to_string(), value))
+        })
+        .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn row_value(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+    Ok(json!({
+        "rowId": row.get::<_, i64>("row_id")?,
+        "ts": row.get::<_, i64>("ts")?,
+        "date": row.get::<_, String>("date")?,
+        "source": row.get::<_, String>("source")?,
+        "reason": row.get::<_, String>("reason")?,
+        "accountId": row.get::<_, String>("account_id")?,
+        "accountName": row.get::<_, String>("account_name")?,
+        "provider": row.get::<_, String>("provider")?,
+        "outcome": row.get::<_, String>("outcome")?,
+        "ok": row.get::<_, i64>("ok").unwrap_or(0) != 0,
+        "message": row.get::<_, Option<String>>("message")?,
+        "error": row.get::<_, Option<String>>("error")?,
+        "keptActive": row.get::<_, i64>("kept_active").unwrap_or(0) != 0,
+    }))
 }
 
 /// 按筛选条件删除（「清空筛选结果」）；无筛选条件的调用**必须**由 API 层

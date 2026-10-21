@@ -3,13 +3,13 @@ import * as React from 'react'
 import { Badge, Button, Progress, SegmentedControl, Spinner } from '@ui'
 import { PROVIDER_ICONS } from './add-provider-pick'
 import { formatTime, shared, type OnboardingTask } from './accounts-shared'
-import { claimedPlanIdsToday } from './accounts-domain'
+import { beijingDay, claimedPlanIdsToday } from './accounts-domain'
 import {
   claimOnboarding, getCheckinStore, groupTone, loadCheckinCenter, nextScheduleRun,
   onboardingExpanded, queryOnboarding, runAllCheckin, setCheckinTab, showCheckinTab,
   signSingleAccount, subscribeCheckinStore, toggleOnboardingExpand, toggleProviderExpand,
   growthExpanded, queryGrowth, runGrowth, runGrowthSchool, runGrowthTravel, toggleGrowthExpand,
-  type CheckinProviderGroup, type CheckinStore, type CheckinTab,
+  type CheckinProviderGroup, type CheckinRecordRow, type CheckinStore, type CheckinTab,
 } from './checkin-state'
 import { ScheduleTab } from './checkin-schedule-tab'
 import { RecordsTab } from './checkin-records-tab'
@@ -43,7 +43,7 @@ import { t } from '../i18n'
  */
 const PROVIDER_DESC: Record<string, string> = {
   workbuddy: t('腾讯每日签到接口 · 仅国内版'),
-  'workbuddy-intl': t('每日活跃任务 · 领取才加积分，保活只维持活跃 · 两者可分开执行'),
+  'workbuddy-intl': t('每日活跃任务 · 保活不等于奖励到账，发放以积分包记录为准'),
   raccoon: t('桌面端每日积分链路'),
   autoclaw: t('官方客户端的每日签到任务'),
   'autoclaw-intl': t('与国内版同一套任务接口 · 站点不同'),
@@ -83,6 +83,10 @@ function useCheckinStore(): CheckinStore {
 
 /** 提供商行的状态徽章（全部已签 / 部分 / 待签 / 无账号） */
 function GroupBadge({ group }: { group: CheckinProviderGroup }) {
+  if (group.id === 'workbuddy-intl' && group.accounts.some(account => account.activityCompletedToday)) {
+    const allActive = group.accounts.every(account => account.activityCompletedToday)
+    return <Badge variant='warning' shape='tag'>{allActive ? t('活跃保活完成') : t('部分保活完成')}</Badge>
+  }
   const tone = groupTone(group)
   if (tone === 'none') return <Badge variant='outline' shape='tag'>{t('无账号')}</Badge>
   if (tone === 'done') return <Badge variant='success' shape='tag'>{t('已签')}</Badge>
@@ -101,36 +105,62 @@ function ProviderLogo({ id, label }: { id: string; label: string }) {
   )
 }
 
+function resultFromRecord(record: CheckinRecordRow | null | undefined): {
+  kind: 'active' | 'failed' | 'done'
+  message: string
+  at: number
+} | undefined {
+  if (!record) return undefined
+  const failed = Boolean(record.error) || record.outcome === 'failed'
+  const baseMessage = record.error || record.message || (record.keptActive ? t('活跃保活完成')
+    : failed ? t('执行失败') : record.outcome === 'pending' ? t('未领取奖励') : t('已完成'))
+  return {
+    kind: failed ? 'failed' : record.keptActive ? 'active' : 'done',
+    message: baseMessage,
+    at: Number(record.ts) || 0,
+  }
+}
+
 /** 展开区里的账号明细行（每日签到） */
 function AccountRows({ group }: { group: CheckinProviderGroup }) {
   const { signing, singleResults } = getCheckinStore()
+  const dailyActivity = group.id === 'workbuddy-intl'
   // 在途判定按 `${id}:${mode}`：三颗按钮各自的转圈互不牵连
   const busy = (id: string, mode: string) => signing.has(`${id}:${mode}`)
   return (
+    <div className='overflow-x-auto'>
     <table className='ck-table'>
       <thead>
         <tr>
           <th>{t('账号')}</th>
-          <th>{t('今日签到')}</th>
-          <th>{t('上次签到时间')}</th>
+          <th>{dailyActivity ? t('今日执行') : t('今日签到')}</th>
+          <th>{dailyActivity ? t('上次领取确认') : t('上次签到时间')}</th>
           <th>{t('上次执行结果')}</th>
+          {dailyActivity ? <th>{t('积分到账与归因')}</th> : null}
           <th aria-label={t('操作')} />
         </tr>
       </thead>
       <tbody>
         {group.accounts.map(account => {
-          // WorkBuddy 国际版执行的是「每日活跃任务」：三颗按钮对应三档手动粒度
-          // （保活 / 领取 / 保活+领取）—— 领取才会加积分，保活只维持活跃，
-          // 分开是当初一颗按钮混做两件事留下的教训。
+          // WorkBuddy 国际版执行的是每日活跃任务：三颗按钮对应三档手动粒度。
+          // 活跃执行、显式领取和上游异步发放是三件事，页面分别展示。
           // 判据用**分组 id** 而不是账号的 `edition`：Qoder 国际版拆家后公开
           // 形态同样带 `edition: "intl"`，按 edition 判会把它的账号派去
           // WorkBuddy 的日活接口（上游稳定 400「该账号不是 WorkBuddy 国际版
           // 账号」）。只有 `workbuddy-intl` 这一组执行日活链。
-          const dailyActivity = group.id === 'workbuddy-intl'
-          const result = singleResults.get(account.id)
-          // 国际版网页会话完成后，奖励由上游异步结算，不能写入普通 checkinAt。
-          // 当前会话仍应明确显示已完成活跃，避免把成功的网页任务误显示成待签。
-          const activityCompleted = dailyActivity && result?.kind === 'active'
+          const manualResult = singleResults.get(account.id)
+          const persistedResult = resultFromRecord(account.lastAttempt)
+          const result = manualResult && (!persistedResult || manualResult.at >= persistedResult.at)
+            ? manualResult : persistedResult
+          const reward = account.reward
+          const rewardMessage = reward?.status === 'verified_resource'
+            ? t('已确认积分包发放：{amount} 积分', { amount: String(reward.amount ?? '—') })
+            : t('积分到账待核验')
+          // 会话完成不证明奖励资格，不能写入普通 checkinAt。
+          // 持久化台账中的当天保活结果也要恢复，避免刷新后重新显示待签。
+          const activityCompleted = dailyActivity
+            && (account.activityCompletedToday === true
+              || (result === manualResult && result?.kind === 'active' && beijingDay(result.at) === beijingDay()))
           return (
             <tr key={account.id}>
               <td>{account.name || account.id}</td>
@@ -150,13 +180,38 @@ function AccountRows({ group }: { group: CheckinProviderGroup }) {
                   </div>
                 ) : <span className='text-subtle'>—</span>}
               </td>
+              {dailyActivity ? (
+                <td className='text-subtle'>
+                  <div>{rewardMessage}</div>
+                  <div>{t('与本次执行的归因未确认')}</div>
+                  {reward?.snapshotStatus === 'failed'
+                    ? <div>{t('最近查询失败，保留历史证据')}</div>
+                    : reward?.snapshotStatus === 'incomplete'
+                    ? <div>{t('当前明细不完整，未确认新增发放')}</div> : null}
+                  {reward?.queriedAt ? <div className='text-xs'>{t('上次完整核验：{time}', { time: formatTime(reward.queriedAt) })}</div> : null}
+                  {reward?.resources?.length ? (
+                    <details>
+                      <summary className='cursor-pointer'>{t('发放记录（{n}）', { n: reward.resources.length })}</summary>
+                      {reward.resources.map(resource => (
+                        <div key={`${resource.resourceId}:${resource.grantAt}`} className='my-2 max-w-sm whitespace-normal break-words text-xs'>
+                          <div>{String(resource.amount ?? '—')} · {resource.grantAt ? formatTime(resource.grantAt) : '—'}</div>
+                          <div>{resource.observation === 'baseline' ? t('历史基线') : t('基线后首次观察')} · {resource.firstObservedAt ? formatTime(resource.firstObservedAt) : '—'}</div>
+                          <div>{resource.grantReason || t('上游未提供发放原因')}</div>
+                          <div>{resource.resourceId} · {resource.packageCode}</div>
+                          {resource.expireAt ? <div>{t('到期：{time}', { time: formatTime(resource.expireAt) })}</div> : null}
+                        </div>
+                      ))}
+                    </details>
+                  ) : null}
+                </td>
+              ) : null}
               <td className='text-right'>
                 {dailyActivity ? (
                   <span className='inline-flex items-center gap-1'>
                     <Button
                       size='sm' variant='ghost'
                       disabled={busy(account.id, 'keepalive')}
-                      title={t('用免费模型维持账号活跃 · 不领取奖励')}
+                      title={t('执行保活对话，可能消耗积分；不确认奖励资格')}
                       onClick={() => void signSingleAccount(account.id, 'keepalive')}
                     >
                       {busy(account.id, 'keepalive') ? t('保活中…') : t('保活')}
@@ -164,7 +219,7 @@ function AccountRows({ group }: { group: CheckinProviderGroup }) {
                     <Button
                       size='sm' variant='ghost'
                       disabled={busy(account.id, 'claim')}
-                      title={t('探测活动并领取日活奖励 · 不做保活')}
+                      title={t('仅尝试领取接口；国际版日活自动结算不依赖此操作')}
                       onClick={() => void signSingleAccount(account.id, 'claim')}
                     >
                       {busy(account.id, 'claim') ? t('领取中…') : t('领取')}
@@ -196,6 +251,7 @@ function AccountRows({ group }: { group: CheckinProviderGroup }) {
         })}
       </tbody>
     </table>
+    </div>
   )
 }
 
@@ -224,7 +280,9 @@ function ProviderRow({ group, expanded }: { group: CheckinProviderGroup; expande
         </div>
         <div className='ck-prov-right'>
           <span className='ck-prov-count'>
-            {hasAccounts ? t('{total} 账号 · {done} 已签', { total: group.totalCount, done: group.doneCount }) : '—'}
+            {hasAccounts ? group.id === 'workbuddy-intl'
+              ? t('{total} 账号 · {done} 已完成保活', { total: group.totalCount, done: group.accounts.filter(account => account.activityCompletedToday).length })
+              : t('{total} 账号 · {done} 已签', { total: group.totalCount, done: group.doneCount }) : '—'}
           </span>
           <GroupBadge group={group} />
           {hasAccounts ? <span className='ck-chev' aria-hidden>›</span> : null}
@@ -747,7 +805,7 @@ function CenterTab({ store }: { store: CheckinStore }) {
 
       {/* ── 任务面板（单列；设置与记录各自成页）── */}
       <div className='ck-main'>
-        <section className='panel'>
+        <section className='panel min-w-0'>
           <div className='panel-head'>
             <h2>{t('每日签到')}</h2>
             <span className='panel-sub'>{t('点击行展开账号明细 · 单账号签到不受范围限制')}</span>

@@ -54,6 +54,8 @@ use crate::server::core::auto_checkin::{self, CHECKIN_PROVIDERS};
 use crate::server::core::beijing;
 use crate::server::core::billing::checkin;
 use crate::server::core::checkin_history;
+use crate::server::core::checkin_records;
+use crate::server::core::usage_records;
 use crate::server::http::ok_json;
 use crate::server::ServerState;
 
@@ -92,6 +94,38 @@ fn out_of_scope_reason(account: &Value) -> &'static str {
     "没有签到链路"
 }
 
+/// 到账记录独立于执行台账：后续失败、重试、积分包过期都不抹掉历史证据。
+fn reward_evidence(account: &Value, usage_record: &usage_records::UsageRecord) -> Value {
+    if usage_record.identity != usage_records::identity(account)
+        || usage_record.last_success_at <= 0
+    {
+        return json!({ "status": "unavailable", "queriedAt": 0 });
+    }
+    let Some(usage) = usage_record.usage.as_ref() else {
+        return json!({ "status": "unavailable", "queriedAt": 0 });
+    };
+    let ledger = usage_records::activity_rewards::ledger(usage, usage_record.last_success_at);
+    let resources = ledger["resources"].as_array().cloned().unwrap_or_default();
+    let queried_at = ledger["checkedAt"].as_i64().unwrap_or(0);
+    let mut result = json!({
+        "status": if resources.is_empty() { "unverified" } else { "verified_resource" },
+        "attribution": "unconfirmed",
+        "baselineAt": ledger["baselineAt"],
+        "queriedAt": queried_at,
+        "snapshotStatus": if usage_record.error.is_some() { "failed" }
+            else if queried_at != usage_record.last_success_at || queried_at <= 0 { "incomplete" }
+            else { "complete" },
+        "lastAttemptAt": usage_record.last_attempt_at,
+        "resources": resources,
+    });
+    if let Some(latest) = result["resources"].as_array().and_then(|rows| rows.first()).cloned() {
+        for key in ["amount", "grantAt", "packageCode", "grantReason", "resourceId", "firstObservedAt", "observation"] {
+            if let Some(value) = latest.get(key) { result[key] = value.clone(); }
+        }
+    }
+    result
+}
+
 /// 签到中心的聚合快照（不发任何上游请求 —— 资格类状态由前端按需惰性查询）
 pub async fn get_center(State(state): State<ServerState>) -> Response {
     let accounts: Vec<Value> = state
@@ -101,6 +135,8 @@ pub async fn get_center(State(state): State<ServerState>) -> Response {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    // 只读本地台账，让定时执行结果在刷新 / 重启后仍能回到账号行。
+    let latest_attempts = checkin_records::latest_by_account();
 
     // ── 每日签到分组：提供商 ∈ CHECKIN_PROVIDERS 且 supports_checkin ──
     // 按 CHECKIN_PROVIDERS 的注册顺序分桶（界面行序稳定）；范围外账号按
@@ -120,8 +156,19 @@ pub async fn get_center(State(state): State<ServerState>) -> Response {
             .position(|id| *id == group)
             .filter(|_| checkin::supports_checkin(account) || checkin::supports_reward_checkin(state.store(), account));
         if let Some(index) = slot {
+            let account_id = account_text(account, "id");
+            let last_attempt = latest_attempts
+                .get(&account_id)
+                .cloned()
+                .unwrap_or(Value::Null);
+            let reward = usage_records::activity_rewards::is_international(account)
+                .then(|| reward_evidence(account, &usage_records::load(&account_id)));
+            let activity_completed_today = last_attempt
+                .get("activityCompletedToday")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             buckets[index].push(json!({
-                "id": account_text(account, "id"),
+                "id": account_id,
                 "name": Value::from(account_text(account, "name")),
                 "available": account.get("available").and_then(Value::as_bool).unwrap_or(true),
                 "checkinAt": account.get("checkinAt").cloned().unwrap_or(Value::Null),
@@ -132,6 +179,9 @@ pub async fn get_center(State(state): State<ServerState>) -> Response {
                 // 「领日活」（活跃保活），按钮文案与提示要跟国内版的「签到」分开
                 "provider": provider,
                 "edition": account.get("edition").cloned().unwrap_or(Value::Null),
+                "lastAttempt": last_attempt,
+                "reward": reward,
+                "activityCompletedToday": activity_completed_today,
             }));
         } else {
             let label = crate::server::core::providers::label_of(&provider);
@@ -272,4 +322,84 @@ pub async fn get_center(State(state): State<ServerState>) -> Response {
         "keepalive": crate::server::core::billing::keepalive::state(),
         "history": checkin_history::list(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::core::billing::commodity;
+
+    #[test]
+    fn reward_evidence_requires_matching_identity_fresh_snapshot_and_resource() {
+        let account = json!({"id": "fixture-intl", "provider": "workbuddy-intl"});
+        let mut record = usage_records::UsageRecord {
+            identity: usage_records::identity(&account),
+            queried_at: 3000,
+            last_success_at: 3000,
+            last_attempt_at: 3000,
+            usage: Some(json!({"creditDetails": {"complete": true}, "credits": crate::server::core::billing::credit_packs_from(&json!({"resources": [
+                {"id": "first", "packageCode": commodity::codes::ACTIVITY, "createAt": 1200, "total": 30},
+                {"id": "second", "packageCode": commodity::codes::BONUS_INTL, "createAt": 2000, "total": 30}
+            ]}))})),
+            error: None,
+            code: None,
+            remaining: Some(60.0),
+            unlimited: false,
+        };
+        let evidence = reward_evidence(&account, &record);
+        assert_eq!(evidence["status"], "verified_resource");
+        assert_eq!(evidence["amount"], 30);
+        assert_eq!(evidence["grantAt"], 2000);
+        assert_eq!(evidence["attribution"], "unconfirmed");
+        assert_eq!(evidence["queriedAt"], 3000);
+        assert_eq!(evidence["resources"].as_array().unwrap().len(), 2);
+        assert_eq!(evidence["observation"], "baseline");
+
+        record.identity = "different-account".into();
+        assert_eq!(reward_evidence(&account, &record)["status"], "unavailable");
+        record.identity = usage_records::identity(&account);
+        record.last_success_at = 900;
+        record.error = Some("query failed".into());
+        assert_eq!(reward_evidence(&account, &record)["status"], "unverified");
+        record.last_success_at = 3000;
+        // 查询失败保留旧快照，只能标记旧快照时刻，不能冒充刚核验。
+        record.queried_at = 4000;
+        let evidence = reward_evidence(&account, &record);
+        assert_eq!(evidence["queriedAt"], 3000);
+        assert_eq!(evidence["status"], "verified_resource");
+        assert_eq!(evidence["snapshotStatus"], "failed");
+        record.usage = None;
+        assert_eq!(reward_evidence(&account, &record)["status"], "unavailable");
+    }
+
+    #[test]
+    fn reward_evidence_does_not_infer_credit_from_balance_or_unrelated_packages() {
+        let account = json!({"id": "fixture-intl"});
+        let mut record = usage_records::UsageRecord {
+            identity: usage_records::identity(&account),
+            queried_at: 3000,
+            last_success_at: 3000,
+            last_attempt_at: 3000,
+            usage: None,
+            error: None,
+            code: None,
+            remaining: Some(9999.0),
+            unlimited: false,
+        };
+        for usage in [
+            json!({"totalLeft": 9999}),
+            json!({"credits": []}),
+            json!({"credits": [{"packageCode": "subscription", "grantAt": 2000, "total": 30}]}),
+            json!({"credits": [{"packageCode": commodity::codes::BONUS_INTL, "grantAt": 999, "total": 30}]}),
+            json!({"credits": [{"packageCode": commodity::codes::BONUS_INTL, "grantAt": 4000, "total": 30}]}),
+            json!({"credits": [{"packageCode": commodity::codes::BONUS_INTL, "total": 30}]}),
+            json!({"credits": [{"packageCode": commodity::codes::BONUS_INTL, "grantAt": 2000, "total": 0}]}),
+            json!({"credits": [{"name": "Bonus Pack", "grantAt": 2000, "total": 30}]}),
+        ] {
+            let mut usage = usage;
+            usage["creditDetails"] = json!({"complete": true});
+            record.usage = Some(usage);
+            assert_eq!(reward_evidence(&account, &record)["status"], "unverified");
+        }
+    }
 }

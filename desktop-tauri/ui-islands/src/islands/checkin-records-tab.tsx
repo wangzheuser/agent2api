@@ -122,6 +122,14 @@ const OUTCOME_VIEW: Record<string, { label: string; variant: 'success' | 'brand'
   failed: { label: '失败', variant: 'destructive' },
 }
 
+function outcomeView(row: CheckinRecordRow): { label: string; variant: 'success' | 'brand' | 'warning' | 'destructive' } {
+  if (row.keptActive && row.outcome !== 'failed'
+    && (row.outcome === 'pending' || (row.source === 'activity' && row.reason === '手动保活'))) {
+    return { label: '活跃完成，奖励待核验', variant: 'warning' }
+  }
+  return OUTCOME_VIEW[row.outcome ?? ''] ?? { label: row.outcome || '—', variant: 'warning' }
+}
+
 /** 触发来源的界面文案（source 由后端给，值集合见 core::checkin_records 的模块头） */
 const SOURCE_LABEL: Record<string, string> = {
   schedule: '定时',
@@ -197,7 +205,7 @@ function recordCell(row: CheckinRecordRow, column: RecordColumn & { align: Align
         </td>
       )
     case 'outcome': {
-      const outcome = OUTCOME_VIEW[row.outcome ?? ''] ?? { label: row.outcome || '—', variant: 'outline' as const }
+      const outcome = outcomeView(row)
       return (
         <td key={column.key} className={className}>
           <Badge variant={outcome.variant} shape='tag'>{outcome.label}</Badge>

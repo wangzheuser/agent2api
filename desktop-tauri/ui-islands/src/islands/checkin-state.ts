@@ -29,7 +29,13 @@ export type CheckinAccountRow = {
   available: boolean
   checkinAt: number | null
   checkedInToday: boolean
-  /** cn / intl（缺失 null）：WorkBuddy 国际版在这张表里执行的是「领日活」 */
+  /** 最近一次本地执行台账，刷新页面 / 重启后仍可见 */
+  lastAttempt?: CheckinRecordRow | null
+  /** 独立于执行记录的积分包观察历史。 */
+  reward?: RewardEvidence | null
+  /** 当天是否有国际版活跃保活完成记录，与最后一次领取结果独立 */
+  activityCompletedToday?: boolean
+  /** cn / intl（缺失 null）：WorkBuddy 国际版执行状态与奖励到账分开。 */
   edition?: string | null
 }
 
@@ -118,6 +124,25 @@ export type CheckinRecordRow = {
   error?: string | null
   /** 国际版保活成功 */
   keptActive?: boolean
+}
+
+export type RewardResource = {
+  resourceId?: string | number
+  packageCode?: string
+  amount?: number | string | null
+  grantAt?: number | null
+  expireAt?: number | null
+  grantReason?: string | null
+  firstObservedAt?: number | null
+  observation?: 'baseline' | 'newly_observed'
+  attribution?: string
+}
+
+export type RewardEvidence = RewardResource & {
+  status?: 'verified_resource' | 'unverified' | 'unavailable' | string
+  queriedAt?: number | null
+  snapshotStatus?: 'complete' | 'incomplete' | 'failed'
+  resources?: RewardResource[]
 }
 
 export type CheckinCenterSnapshot = {

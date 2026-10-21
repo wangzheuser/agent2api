@@ -700,9 +700,7 @@ fn usage_document(usage: &Value) -> Value {
         usage.get("creditDetails").cloned().unwrap_or(Value::Null),
     );
     let packs = crate::server::core::billing::credit_packs_from(usage);
-    if !packs.is_empty() {
-        object.insert("credits".to_string(), Value::Array(packs));
-    }
+    object.insert("credits".to_string(), Value::Array(packs));
     if let Some(subscription) = subscription_of(usage) {
         object.insert("subscription".to_string(), subscription);
     }
@@ -1064,13 +1062,17 @@ mod tests {
         });
         let usage = json!({
             "kind": "personal",
-            "resources": [{"left": 12.5, "packageCode": "trial"}],
+            "resources": [{"id": "fixture-resource", "left": 12.5, "packageCode": "trial", "createAt": 1_799_999_000_000i64}],
             "creditDetails": details,
         });
         let document = usage_document(&usage);
         assert_eq!(document["totalLeft"], 12);
         assert_eq!(document["creditDetails"]["fetchedAt"], 1_800_000_000_000i64);
         assert!(document["credits"].is_array());
+        assert_eq!(document["credits"][0]["id"], "fixture-resource");
+        assert_eq!(document["credits"][0]["packageCode"], "trial");
+        assert_eq!(document["credits"][0]["grantAt"], 1_799_999_000_000i64);
+        assert!(document["credits"][0].get("createAt").is_none());
     }
 
     #[test]
