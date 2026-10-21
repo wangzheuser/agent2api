@@ -381,8 +381,7 @@ export function defaultLowBalanceMode(_provider: string | undefined | null): Low
  * - **CodeArts → Token 自然日 950 万，跳过**：这家的余额读数常判不出
  *   （免费版账号没有积分类计量表，额度全在福利 token 池），余额规则形同虚设；
  *   「过了 0 点额度就回来」正是它的额度形态，按自然日 Token 判定才兜得住。
- * - **Cline 免费池 → 无规则**（原「不处理」缺省的理由不变）。
- * - **其余 → 余额 < 1 跳过**（历史缺省不变）。
+ * - **其余 provider → 无规则**：余额限制需要显式配置。
  */
 export function defaultLimiters(provider: string | undefined | null): LimiterRule[] {
   if (provider === 'codearts') {
@@ -391,9 +390,7 @@ export function defaultLimiters(provider: string | undefined | null): LimiterRul
       reset: 'daily', enabled: true,
     }]
   }
-  if (provider === 'cline-free') return []
   return []
-
 }
 
 /**
@@ -421,8 +418,11 @@ function limiterRuleValid(rule: unknown): rule is LimiterRule {
   const data = rule as Record<string, unknown>
   if (data.type !== 'balance' && data.type !== 'token') return false
   if (data.action !== 'skip' && data.action !== 'disable') return false
-  const threshold = Number(data.threshold)
-  if (!Number.isFinite(threshold) || threshold <= 0) return false
+  const threshold = data.threshold
+  if (data.inclusive !== undefined && typeof data.inclusive !== 'boolean') return false
+  if (data.inclusive && data.type !== 'balance') return false
+  if (typeof threshold !== 'number' || !Number.isFinite(threshold) || threshold < 0 ||
+    (threshold === 0 && !(data.type === 'balance' && data.inclusive))) return false
   if (data.type === 'token' && data.reset !== 'daily') {
     // 固定周期要求合法周期；自然日没有周期长度，免校验
     const period = Number(data.period)
@@ -507,7 +507,7 @@ export function tokenReadingForRule(
  * 这条账号此刻是否应因「余额不足」被跳过（余额列徽章的判据）。
  *
  * 与后端选路过滤（`limiter::balance_skip_blocked`）同一口径：任一启用的余额
- * skip 规则满足「最近一次读数判得出数字且严格小于阈值（等于仍可用）」即拦。
+ * skip 规则命中即拦；旧规则严格小于，积分保底规则可包含等于阈值。
  * `entry` 是余额缓存的读数（`usageEntryOf` 的结果）—— 判不出（未查询 / 失败行
  * / unlimited / 数字缺失）一律放行：跳过是对「这个账号没钱」的断言，拿不出
  * 证据就不亮徽章。
@@ -517,7 +517,7 @@ export function balanceBlockedOf(
   entry: UsageEntry,
 ): boolean {
   const rules = limitersOf(account).filter(rule =>
-    rule.type === 'balance' && rule.action === 'skip' && rule.enabled !== false && rule.threshold > 0)
+    rule.type === 'balance' && rule.action === 'skip' && rule.enabled !== false)
   if (!rules.length) return false
   if (!entry || typeof entry !== 'object') return false
   const data = entry as Record<string, unknown>
@@ -527,10 +527,10 @@ export function balanceBlockedOf(
   // 「没有积分类读数」（CodeArts 免费版账号的统计里没有积分类计量表、available
   // 为 null，额度全在福利 token 池）判成「余额为 0」—— 徽章亮起来、用户去查一个
   // 不存在的问题，而它恰恰违反了上面「拿不出证据就不亮徽章」的口径。
-  const raw = data.totalLeft ?? data.available
+  const raw = 'totalLeft' in data ? data.totalLeft : data.available
   if (raw === null || raw === undefined || raw === '') return false
-  const remaining = Number(raw)
-  return Number.isFinite(remaining) && rules.some(rule => remaining < rule.threshold)
+  return typeof raw === 'number' && Number.isFinite(raw) &&
+    rules.some(rule => raw < rule.threshold || (rule.inclusive === true && raw === rule.threshold))
 }
 
 /** 旧余额徽章入口，保留给现有面板；实现统一走限制器判定。 */

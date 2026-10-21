@@ -184,7 +184,7 @@ fn database() -> Result<&'static Db, String> {
         .ok_or_else(|| "任务状态数据库不可用，未发送后台请求".to_string())
 }
 
-fn read_states(conn: &rusqlite::Connection) -> Result<HashMap<String, TaskState>, String> {
+pub(crate) fn read_states(conn: &rusqlite::Connection) -> Result<HashMap<String, TaskState>, String> {
     let text: Option<String> = conn
         .query_row("SELECT value FROM kv WHERE key = ?1", [KV_KEY], |row| row.get(0))
         .optional()

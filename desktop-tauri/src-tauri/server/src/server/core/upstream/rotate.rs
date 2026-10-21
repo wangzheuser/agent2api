@@ -64,19 +64,16 @@ pub(super) async fn session_for(
     provider: &str,
     account_id: Option<&str>,
 ) -> Result<Value, GatewayError> {
-    // 取到实际会话后再核对一次，也覆盖账号删除后的默认会话与并发身份替换。
-    let checked = |session: Value| {
-        if provider == "workbuddy" && crate::server::core::workbuddy_policy::RoutePolicy::load()
-            .blocked_reason(&session, "", logging::now_ms()).is_some() {
-            Err(GatewayError::with_status(503, "WorkBuddy 积分保底生效或余额待刷新，当前会话已暂停转发"))
-        } else { Ok(session) }
-    };
     if let Some(id) = account_id {
         if let Some(entry) = service.store.get_session_by_id(id) {
-            return checked(entry.session);
+            return Ok(entry.session);
         }
-        // 指定账号在两次读盘之间被删掉：回落到该 provider 的默认登录态
-        // （对应 Node 的 `?? await requireSession()`）
+        // 账号删除后不能借用默认账号绕过限制器或指定账号测试。
+        return Err(GatewayError::with_status(503, "所选账号已不存在或没有可用登录态，请重试"));
+    }
+    let accounts = accounts_in_providers(service, &[provider], None);
+    if !filter_limiter_blocked(&accounts, None).1.is_empty() {
+        return Err(GatewayError::with_status(503, "限制器已排除账号，不能回退到默认登录态"));
     }
     let session = service
         .auth
@@ -84,7 +81,7 @@ pub(super) async fn session_for(
         .await
         .map_err(|error| error.to_gateway_error())?;
     match session {
-        Some(session) if has_access_token(&session) => checked(session),
+        Some(session) if has_access_token(&session) => Ok(session),
         _ => Err(GatewayError::with_status(
             401,
             "当前没有可用登录态：请先在桌面端完成登录",
@@ -196,12 +193,9 @@ pub(super) async fn select_target_account(
         excluded.push(id);
     }
 
-    let policy = crate::server::core::workbuddy_policy::RoutePolicy::load();
-    let policy_blocked = accounts.iter().any(|account| policy.blocked_reason(account, &keys.for_account(account), now).is_some());
     let enabled: Vec<Value> = candidates
         .iter()
         .filter(|account| !matches!(account.get("enabled"), Some(Value::Bool(false))))
-        .filter(|account| policy.blocked_reason(account, &keys.for_account(account), now).is_none())
         .cloned()
         .collect();
     if enabled.is_empty() {
@@ -222,7 +216,7 @@ pub(super) async fn select_target_account(
         }
         return Err(GatewayError::with_status(
             503,
-            if policy_blocked { "WorkBuddy 积分保底生效或余额待刷新，无可用账号转发" } else { "所有账号均已禁用，无账号可转发：请在账号页启用至少一个账号" },
+            "所有账号均已禁用，无账号可转发：请在账号页启用至少一个账号",
         ));
     }
 
@@ -283,9 +277,6 @@ pub(super) async fn select_target_account(
     // 有账号被保底排除时，绝不通过默认登录态重新借到受保护账号。
     if !balance_blocked_ids.is_empty() {
         return Err(GatewayError::with_status(503, "余额不足账号已排除，没有未尝试的可用账号"));
-    }
-    if policy_blocked {
-        return Err(GatewayError::with_status(503, "WorkBuddy 积分保底生效或余额待刷新，无可用账号转发"));
     }
     Ok(RouteTarget {
         provider: providers.first().copied().unwrap_or_default().to_string(),
@@ -602,29 +593,44 @@ fn filter_limiter_blocked(
 #[cfg(test)]
 mod policy_tests {
     use super::*;
-    use crate::server::core::{account_store::AccountStore, auth::AuthService, task_state, workbuddy_policy};
+    use crate::server::core::{account_store::AccountStore, auth::AuthService, task_state};
     use serde_json::json;
 
     #[tokio::test]
     async fn credit_floor_blocks_normal_cooldown_squeeze_and_default_session_routes() {
-        let (db, _temp) = crate::server::db::test_temp::TempDb::open("workbuddy-policy-routing");
+        const TEST: &str = "server::core::upstream::rotate::policy_tests::credit_floor_blocks_normal_cooldown_squeeze_and_default_session_routes";
+        const CHILD: &str = "AGENT2API_CREDIT_FLOOR_TEST_CHILD";
+        if std::env::var(CHILD).as_deref() != Ok("1") {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, "1")
+                .env("AGENT2API_PROXY_HOME", std::env::temp_dir().join(format!("credit-floor-{}", std::process::id())))
+                .output().unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let (db, _temp) = crate::server::db::test_temp::TempDb::open("generic-balance-routing");
         task_state::install(Some(db.clone()));
         crate::server::core::usage_records::install(Some(db.clone()));
+        crate::server::core::limiter::install(Some(db.clone()));
         let store = AccountStore::with_db(Some(db));
         let add = |uid: &str| store.add_account(&json!({"account":{"uid":uid},"auth":{"accessToken":"fixture-token"},"edition":"cn"}),Some(uid),Some("workbuddy")).unwrap();
         let a = add("policy-route-a"); let b = add("policy-route-b");
         let a_id = a["id"].as_str().unwrap(); let b_id = b["id"].as_str().unwrap();
-        let identity_a = workbuddy_policy::identity(&a).unwrap();
-        let identity_b = workbuddy_policy::identity(&b).unwrap();
         let service = UpstreamService::new(store.clone(),AuthService::for_store(store.clone()));
         let keys = routing::CooldownKeys::new("fixture-model");
         let initial = select_target_account(&service,&["workbuddy"],&keys,&[],None,None).await.unwrap();
         assert_eq!(initial.account_id.as_deref(),Some(a_id));
-        workbuddy_policy::patch_policy(a_id,&identity_a,&json!({"creditFloor":10})).unwrap();
         let now = logging::now_ms();
-        let usage = json!({"creditDetails":{"kind":"personal","complete":true,"remaining":10,"fetchedAt":now,"segments":[]}});
-        workbuddy_policy::observe_usage(&a,&usage);
-        assert!(matches!(session_for(&service,"workbuddy",Some(a_id)).await,Err(error) if error.status_code==503));
+        store.update_account(a_id,&json!({"limiters":[{"type":"balance","action":"skip","threshold":10,"inclusive":true,"enabled":true}]})).unwrap();
+        let account = store.list_accounts()["accounts"].as_array().unwrap().iter().find(|account| account["id"] == a_id).unwrap().clone();
+        let outcome = crate::server::core::usage_records::UsageOutcome { usage:Some(json!({"totalLeft":10})),error:None,code:None };
+        assert!(crate::server::core::usage_records::write_result(&account,&outcome,now));
+        assert!(matches!(session_for(&service,"workbuddy",None).await,Err(error) if error.status_code==503));
+        assert!(session_for(&service,"workbuddy",Some(a_id)).await.is_ok());
+        let pinned = select_target_account(&service,&["workbuddy"],&keys,&[],Some(a_id),None).await.unwrap();
+        assert_eq!(pinned.account_id.as_deref(),Some(a_id));
         let normal = select_target_account(&service,&["workbuddy"],&keys,&[],None,None).await.unwrap();
         assert_eq!(normal.account_id.as_deref(),Some(b_id));
         store.mark_rate_limited(b_id,"fixture-model",429,None,Some((now+60_000) as f64),"fixture cooldown");
@@ -635,27 +641,22 @@ mod policy_tests {
         connection.rebind(Some(b_id.to_string()));
         let squeezed = select_target_account(&service,&["workbuddy"],&keys,&[],None,None).await.unwrap();
         assert_eq!(squeezed.account_id.as_deref(),Some(b_id));
-        // 唯一未受保护的账号已经试过时，旧逻辑会返回默认会话，借回 A。
+        // 唯一未受保护的账号已经试过时，不能绕过限制器借回 A。
         let failed = select_target_account(&service,&["workbuddy"],&keys,&[b_id.to_string()],None,None).await;
         assert!(matches!(failed,Err(error) if error.status_code==503));
-        workbuddy_policy::patch_policy(b_id,&identity_b,&json!({"creditFloor":0})).unwrap();
-        let all_blocked = select_target_account(&service,&["workbuddy"],&keys,&[],None,None).await;
-        assert!(matches!(all_blocked,Err(error) if error.status_code==503));
-        workbuddy_policy::patch_policy(a_id,&identity_a,&json!({"creditFloor":null})).unwrap();
+        let (account_b, _) = store.update_account(b_id,&json!({"limiters":[{"type":"balance","action":"skip","threshold":0,"inclusive":true}]})).unwrap();
+        let zero = crate::server::core::usage_records::UsageOutcome { usage:Some(json!({"totalLeft":0})),error:None,code:None };
+        assert!(crate::server::core::usage_records::write_result(&account_b,&zero,now+1));
+        assert!(matches!(select_target_account(&service,&["workbuddy"],&keys,&[],None,None).await,Err(error) if error.status_code==503));
+        assert!(pick_next_account(&service,&["workbuddy"],&keys,&[],None).is_none());
+        store.clear_rate_limit(b_id,"fixture-model");
+        store.update_account(a_id,&json!({"limiters":[]})).unwrap();
         let restored = select_target_account(&service,&["workbuddy"],&keys,&[],None,None).await.unwrap();
         assert_eq!(restored.account_id.as_deref(),Some(a_id));
-
-        // 新的低余额策略与本地积分保底共存，指定账号测试仍只使用指定账号。
-        workbuddy_policy::patch_policy(b_id,&identity_b,&json!({"creditFloor":null})).unwrap();
-        store.update_account(a_id,&json!({"lowBalance":{"mode":"skip","threshold":1}})).unwrap();
-        let account = store.list_accounts()["accounts"].as_array().unwrap().iter().find(|account| account["id"] == a_id).unwrap().clone();
-        let zero = crate::server::core::usage_records::UsageOutcome { usage: Some(json!({"totalLeft":0})), error:None, code:None };
-        assert!(crate::server::core::usage_records::write_result(&account,&zero,now));
-        let low = select_target_account(&service,&["workbuddy"],&keys,&[],None,None).await.unwrap();
-        assert_eq!(low.account_id.as_deref(),Some(b_id));
         let pinned = select_target_account(&service,&["workbuddy"],&keys,&[],Some(a_id),None).await.unwrap();
         assert_eq!(pinned.account_id.as_deref(),Some(a_id));
-        assert!(matches!(select_target_account(&service,&["workbuddy"],&keys,&[b_id.to_string()],None,None).await,Err(error) if error.status_code==503));
+        store.remove_account(a_id).unwrap();
+        assert!(matches!(session_for(&service,"workbuddy",Some(a_id)).await,Err(error) if error.status_code==503));
     }
 }
 

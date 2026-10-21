@@ -667,7 +667,7 @@ impl AccountStore {
             if record.fields() != snapshot.fields() || !super::super::task_state::owns_run(&tx, ownership.0, ownership.1) { return Ok((false, None)); }
             if !usage_records::write_result_in(&tx, &current, outcome, queried_at, attempted_at, true)? { return Ok((false, None)); }
             let remaining = outcome.usage.as_ref().and_then(|usage| usage_records::extract_remaining(usage).0);
-            let disable = record.enabled() && remaining.zip(usage_records::low_balance_disable_threshold(&current)).is_some_and(|(value, threshold)| value < threshold);
+            let disable = record.enabled() && remaining.is_some_and(|value| limiter::balance_disable_hit(&current, value));
             if disable {
                 record.set_enabled(false);
                 record.set_updated_at(logging::now_ms());
@@ -859,7 +859,7 @@ impl AccountStore {
                 .map_err(AccountStoreError::bad_request)?;
             let next = limiter::rules_to_json(&next_rules);
             let current = limiter::effective_rules_json_in(record.fields());
-            if next != current {
+            if next != current || record.get("limiters").is_none() {
                 record.set("limiters", next);
                 changes.push(limiter::describe_rules(&next_rules));
                 record.set("lowBalance", Self::legacy_low_balance_of(&next_rules));

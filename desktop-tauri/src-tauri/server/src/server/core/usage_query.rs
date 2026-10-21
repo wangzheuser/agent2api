@@ -182,9 +182,7 @@ async fn query_usage_for(store: &AccountStore, account: &Value, manual: bool) ->
         code: row.get("code").and_then(Value::as_str).map(str::to_string),
     };
     let written = store.commit_usage_result(account, &outcome, queried_at, attempted_at, guard.ownership());
-    if written {
-        super::workbuddy_policy::observe_usage(account, &row["usage"]);
-    } else {
+    if !written {
         row["usage"] = Value::Null;
         row["error"] = json!("账号已改变或结果保存失败，请重新查询");
     }

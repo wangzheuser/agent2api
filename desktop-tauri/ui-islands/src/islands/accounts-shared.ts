@@ -61,6 +61,8 @@ export type LimiterRule = {
   action: 'skip' | 'disable'
   /** 阈值：余额与余额列同一数字口径；Token 原始个数（界面以「万」输入） */
   threshold: number
+  /** 余额规则包含等于阈值（积分保底）；缺省为严格小于 */
+  inclusive?: boolean
   /**
    * 仅「固定周期」的 Token 规则：重置周期（整数秒，30 分钟 ~ 24 小时，
    * 对齐自然时间的固定窗口）；自然日规则不带这个键。

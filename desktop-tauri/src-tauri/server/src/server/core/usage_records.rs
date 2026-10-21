@@ -295,55 +295,13 @@ pub fn query_interval_of(account: &Value) -> Option<i64> {
     (settings["enabled"] == true).then(|| settings["interval"].as_i64().unwrap_or(600))
 }
 
-/// 「余额不足自动禁用」档的阈值。仅 `lowBalance.mode == "disable"` 的账号有值
-/// —— **缺省（无配置）不启用禁用**：自动禁用是不自动恢复的硬动作，缺省必须是
-/// 用户显式选过才会发生；缺省档为关闭。
-/// 阈值非法（非正 / 非有限数）一律 None —— 判不出就放行，不猜。
-
-pub fn low_balance_disable_threshold(account: &Value) -> Option<f64> {
-    crate::server::core::limiter::balance_disable_threshold(account)
-}
-
-/// 账号是否应因「余额不足」在选路时被跳过（软跳过档）。
-///
-/// 条件：处理方式为 `skip` + 阈值合法 + 内存事实里有这个账号的读数且**严格小于**
-/// 阈值（等于阈值仍可用）。缺省不处理，显式 skip 才参与过滤。
-/// 判不出的情况 —— 显式 off、无读数、unlimited、账号已删 —— 一律放行：
-/// 跳过是对「这个账号此刻没钱」的断言，断言拿不出证据就不能拦请求。
+/// 转发、路由预览和会话预览共用限制器；未知或身份不匹配的余额不参与判定。
 pub fn balance_blocked(account: &Value, facts: &HashMap<String, BalanceFact>) -> bool {
-    let provider = account.get("provider").and_then(Value::as_str).unwrap_or("");
-    let default_mode = default_low_balance_mode(provider);
-    let (mode, threshold) = match account.get("lowBalance") {
-        // 缺省关闭，显式选择后才参与余额过滤
-        None => (default_mode, DEFAULT_LOW_BALANCE_THRESHOLD),
-        Some(config) => {
-            let mode = config
-                .get("mode")
-                .and_then(Value::as_str)
-                .unwrap_or(default_mode);
-            let threshold = valid_threshold(config.get("threshold"))
-                .unwrap_or(DEFAULT_LOW_BALANCE_THRESHOLD);
-            (mode, threshold)
-        }
-    };
-    if mode != "skip" {
-        return false;
-    }
-    let Some(id) = account.get("id").and_then(Value::as_str) else {
+    let Some(id) = account.get("id").and_then(Value::as_str) else { return false };
+    let Some(fact) = facts.get(id).filter(|fact| fact.identity == identity(account)) else {
         return false;
     };
-    let Some(fact) = facts.get(id) else {
-        return false;
-    };
-    fact.identity == identity(account) && matches!(fact.remaining, Some(remaining) if remaining < threshold)
-}
-
-/// 阈值的合法性口径：有限且 > 0。DB / JSON 里可能有手工脏值，宁可放行也不猜。
-fn valid_threshold(value: Option<&Value>) -> Option<f64> {
-    value
-        .and_then(Value::as_f64)
-        .filter(|threshold| threshold.is_finite() && *threshold > 0.0)
-
+    crate::server::core::limiter::balance_skip_blocked(account, fact.remaining)
 }
 
 // ─── 旧 kv 快照的一次性迁移 ─────────────────────────────────

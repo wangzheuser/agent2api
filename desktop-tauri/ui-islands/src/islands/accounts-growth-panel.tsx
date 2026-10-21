@@ -27,7 +27,6 @@ export function GrowthResultView({ result, namesHidden = false }: { result: Grow
 
 export function WorkBuddyPolicyPanel({ account }: { account: AccountRecord }) {
   const [policy, setPolicy] = React.useState<WorkBuddyPolicy | null>(null)
-  const [floor, setFloor] = React.useState('')
   const [busy, setBusy] = React.useState(false)
   const [message, setMessage] = React.useState('')
   const mounted = React.useRef(true)
@@ -39,24 +38,26 @@ export function WorkBuddyPolicyPanel({ account }: { account: AccountRecord }) {
     setBusy(true); setMessage('')
     try {
       const result = await growthApi().getWorkBuddyPolicy(account.id)
-      if (current()) { setPolicy(result); setFloor(result.creditFloor === null ? '' : String(result.creditFloor)) }
+      if (current()) setPolicy(result)
     } catch (error) { if (current()) setMessage(errorText(error)) }
     finally { if (current()) setBusy(false) }
   }
   async function save(event: React.FormEvent) {
     event.preventDefault()
     if (!policy || busy) return
-    const value = floor.trim() === '' ? null : Number(floor)
-    if (value !== null && (!Number.isFinite(value) || value < 0)) { setMessage('保底积分应为空或非负数。'); return }
     setBusy(true); setMessage('')
     try {
-      const result = await growthApi().updateWorkBuddyPolicy(account.id, { autoGrowth: policy.autoGrowth, autoTravel: policy.autoTravel, creditFloor: value, selection: policy.selection, expectedIdentity: policy.identity })
+      const result = await growthApi().updateWorkBuddyPolicy(account.id, {
+        autoGrowth: policy.autoGrowth,
+        autoTravel: policy.autoTravel,
+        expectedIdentity: policy.identity,
+      })
       if (current()) { setPolicy(result); setMessage('设置已保存。自动福利还需在定时任务页开启福利巡检。') }
     } catch (error) { if (current()) setMessage(errorText(error)) }
     finally { if (current()) setBusy(false) }
   }
   return <details className='growth-policy' onToggle={event => { if (event.currentTarget.open) void load() }}>
-    <summary>积分保底、自动福利与选号策略</summary>
+    <summary>自动福利设置</summary>
     {busy && !policy && <p role='status' className='credits-note'>正在读取策略…</p>}
     {message && <p role='status' className='credits-note'>{message}</p>}
     {!policy && !busy && message && <Button variant='outline' onClick={() => void load()}>重试策略查询</Button>}
@@ -65,14 +66,7 @@ export function WorkBuddyPolicyPanel({ account }: { account: AccountRecord }) {
         <label><input type='checkbox' checked={policy.autoGrowth} disabled={busy} onChange={event => setPolicy({ ...policy, autoGrowth: event.target.checked })} /> 自动领取已完成奖励</label>
         <label><input type='checkbox' checked={policy.autoTravel} disabled={busy} onChange={event => setPolicy({ ...policy, autoTravel: event.target.checked })} /> 自动猫猫旅行</label>
       </div>}
-      <label>账号保底积分 <input type='number' min='0' step='any' placeholder='留空关闭' value={floor} disabled={busy} onChange={event => setFloor(event.target.value)} /></label>
-      <p className='credits-note'>余额达到或低于保底、余额未知、明细不完整或超过 {Math.round(policy.balanceMaxAgeSeconds / 60)} 分钟未刷新时，暂停该账号的新转发。并发请求与查询间隔仍可能使余额低于保底值；福利领取不受影响。</p>
-      <label>WorkBuddy 全局选号 <select value={policy.selection} disabled={busy} onChange={event => setPolicy({ ...policy, selection: event.target.value as WorkBuddyPolicy['selection'] })}>
-        <option value='priority'>原账号优先级（默认）</option><option value='expiry'>临期积分优先</option><option value='cost'>同模型实扣成本优先</option>
-      </select></label>
-      <p className='credits-note'>选号设置影响所有 WorkBuddy 账号；仅在同地区可用账号内排序。积分包或成本样本不足时沿用账号优先级。</p>
-      <p className='credits-note'>最近实扣积分：{amountText(policy.cost?.lastCredits, '未上报')} · 样本 {policy.cost?.samples ?? 0} · {dateText(policy.cost?.lastAt)}</p>
-      {!!policy.cost?.models.length && <ul className='credits-issues'>{policy.cost.models.map(model => <li key={model.model}>{model.model} · 每千 token {amountText(model.creditsPer1kTokens, '未上报')} 积分 · {model.samples} 个样本</li>)}</ul>}
+      <p className='credits-note'>积分保底请在账号设置的「限制器」中配置余额规则；账号选路统一遵循全局选路策略。</p>
       <Button type='submit' variant='outline' disabled={busy}>{busy ? '保存中…' : '保存设置'}</Button>
     </form>}
   </details>

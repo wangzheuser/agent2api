@@ -45,8 +45,6 @@ use crate::server::core::usage_records::{default_low_balance_mode, DEFAULT_LOW_B
 use crate::server::db::Db;
 use crate::server::logging;
 
-/// Cline 免费池的 provider id（与 `usage_records::CLINE_FREE_PROVIDER` 同源推导）。
-const CLINE_FREE_PROVIDER: &str = kind_id(ProviderKind::ClineFree);
 /// CodeArts 的 provider id：它家的缺省限制按 Token（见 [`default_rules`]）。
 const CODEARTS_PROVIDER: &str = kind_id(ProviderKind::CodeArts);
 
@@ -105,8 +103,10 @@ pub enum LimiterAction {
 pub struct LimiterRule {
     pub kind: LimiterKind,
     pub action: LimiterAction,
-    /// 阈值：余额 = 余额数字下限；Token = 窗口内消耗上限。恒 > 0。
+    /// 阈值：余额 = 余额数字下限；Token = 窗口内消耗上限。
     pub threshold: f64,
+    /// 余额包含等于阈值的情况（积分保底）；缺省 false 保持旧规则的严格小于。
+    pub inclusive: bool,
     /// 重置周期（秒）；仅「固定周期」的 Token 规则有效。
     pub period: i64,
     /// 重置方式；余额规则恒 Fixed（跟随余额读数，无窗口概念）。
@@ -140,7 +140,15 @@ impl LimiterRule {
         if self.kind == LimiterKind::Token && self.reset == LimiterReset::Fixed {
             object["period"] = Value::from(self.period);
         }
+        if self.inclusive {
+            object["inclusive"] = Value::Bool(true);
+        }
         object
+    }
+
+    fn balance_hit(&self, remaining: f64) -> bool {
+        remaining.is_finite()
+            && (remaining < self.threshold || (self.inclusive && remaining == self.threshold))
     }
 }
 
@@ -170,7 +178,15 @@ fn parse_rules(value: Option<&Value>) -> Option<Vec<LimiterRule>> {
                     _ => LimiterReset::Fixed,
                 };
                 let threshold = fields.get("threshold").and_then(Value::as_f64)?;
-                if !threshold.is_finite() || threshold <= 0.0 {
+                let inclusive = match fields.get("inclusive") {
+                    None => false,
+                    Some(Value::Bool(value)) => *value,
+                    _ => return None,
+                };
+                if !threshold.is_finite() || threshold < 0.0
+                    || (threshold == 0.0 && !(kind == LimiterKind::Balance && inclusive))
+                    || (inclusive && kind != LimiterKind::Balance)
+                {
                     return None;
                 }
                 // period 只对「固定周期」的 Token 规则要求；越界（手改脏值）整条
@@ -186,7 +202,7 @@ fn parse_rules(value: Option<&Value>) -> Option<Vec<LimiterRule>> {
                     0
                 };
                 let enabled = fields.get("enabled").map(js_truthy).unwrap_or(true);
-                Some(LimiterRule { kind, action, threshold, period, reset, enabled })
+                Some(LimiterRule { kind, action, threshold, inclusive, period, reset, enabled })
             })
             .collect(),
     )
@@ -202,31 +218,20 @@ fn parse_rules(value: Option<&Value>) -> Option<Vec<LimiterRule>> {
 ///   （免费版账号的统计里没有积分类计量表、`available` 为 null，额度全在福利
 ///   token 池），缺省的余额规则形同虚设；按自然日 Token 消耗判定才兜得住
 ///   「别把一个账号打爆」，而「过了 0 点额度就回来」正是它的额度形态。
-/// - **Cline 免费池 → 无规则**：免费池余额贴 0 / 欠费是常态，原「不处理」
-///   缺省的理由不变。
-/// - **其余 provider → 余额 < 1 跳过**（历史缺省不变）。
+/// - **其余 provider → 无规则**：保留本地缺省关闭的约定，仅显式配置才限制余额。
 pub fn default_rules(provider: &str) -> Vec<LimiterRule> {
     if provider == CODEARTS_PROVIDER {
         return vec![LimiterRule {
             kind: LimiterKind::Token,
             action: LimiterAction::Skip,
             threshold: DEFAULT_DAILY_TOKEN_LIMIT,
+            inclusive: false,
             period: 0,
             reset: LimiterReset::Daily,
             enabled: true,
         }];
     }
-    if provider == CLINE_FREE_PROVIDER {
-        return Vec::new();
-    }
-    vec![LimiterRule {
-        kind: LimiterKind::Balance,
-        action: LimiterAction::Skip,
-        threshold: DEFAULT_LOW_BALANCE_THRESHOLD,
-        period: 0,
-        reset: LimiterReset::Fixed,
-        enabled: true,
-    }]
+    Vec::new()
 }
 
 /// 记录字段上**没有** `limiters` 键时的推导：有显式 `lowBalance`（用户 / 旧版
@@ -254,7 +259,7 @@ fn derive_from_legacy(fields: &serde_json::Map<String, Value>) -> Vec<LimiterRul
         "disable" => (LimiterKind::Balance, LimiterAction::Disable),
         _ => return Vec::new(),
     };
-    vec![LimiterRule { kind, action, threshold, period: 0, reset: LimiterReset::Fixed, enabled: true }]
+    vec![LimiterRule { kind, action, threshold, inclusive: false, period: 0, reset: LimiterReset::Fixed, enabled: true }]
 }
 
 /// 这条账号的**有效限制规则**：显式 `limiters` 优先，缺失时按旧配置推导。
@@ -317,8 +322,18 @@ pub fn normalize_rules(
             .get("threshold")
             .and_then(Value::as_f64)
             .ok_or_else(|| "限制阈值必须是大于 0 的数字".to_string())?;
-        if !threshold.is_finite() || threshold <= 0.0 {
-            return Err("限制阈值必须是大于 0 的数字".to_string());
+        let inclusive = match fields.get("inclusive") {
+            None => false,
+            Some(Value::Bool(value)) => *value,
+            _ => return Err("包含等于阈值必须是布尔值".to_string()),
+        };
+        if inclusive && kind != LimiterKind::Balance {
+            return Err("仅余额规则支持包含等于阈值".to_string());
+        }
+        if !threshold.is_finite() || threshold < 0.0
+            || (threshold == 0.0 && !(kind == LimiterKind::Balance && inclusive))
+        {
+            return Err("限制阈值必须大于 0；余额包含等于时允许为 0".to_string());
         }
         // reset 缺省 = fixed（前端旧草稿不带这个键也能存）；只认两值，不猜
         let reset = match fields.get("reset").and_then(Value::as_str) {
@@ -341,43 +356,31 @@ pub fn normalize_rules(
             0
         };
         let enabled = fields.get("enabled").map(js_truthy).unwrap_or(true);
-        rules.push(LimiterRule { kind, action, threshold, period, reset, enabled });
+        rules.push(LimiterRule { kind, action, threshold, inclusive, period, reset, enabled });
     }
     Ok(rules)
 }
 
 // ─── 判定（选路 / 自动禁用共用的口径）───────────────────────
 
-/// 余额跳过判定：任一启用的余额 skip 规则满足「读数严格小于阈值」即拦。
-/// `facts` 是 `usage_records::balance_facts()` 的内存读数（判不出 = 放行，
-/// 那条口径不变）。取代旧版按 `lowBalance.mode` 单配置的读法 —— 推导规则
-/// 让旧记录拿到同一个结论。
-pub fn balance_skip_blocked(account: &Value, facts: &HashMap<String, crate::server::core::usage_records::BalanceFact>) -> bool {
-    let Some(id) = account.get("id").and_then(Value::as_str) else { return false };
-    let fact = facts.get(id);
+/// 余额跳过判定：任一启用的余额 skip 规则命中即拦。
+/// 身份匹配和「无事实放行」由 `usage_records` 在传入读数前处理。
+pub fn balance_skip_blocked(account: &Value, remaining: Option<f64>) -> bool {
     effective_rules(account).iter().any(|rule| {
         rule.kind == LimiterKind::Balance
             && rule.action == LimiterAction::Skip
             && rule.enabled
-            && fact.is_some_and(|fact| matches!(fact.remaining, Some(remaining) if remaining < rule.threshold))
+            && remaining.is_some_and(|remaining| rule.balance_hit(remaining))
     })
 }
 
-/// 余额自动禁用的阈值：任一启用的余额 disable 规则满足「读数 < 阈值」就该禁，
-/// 等价于取其中**最大**的阈值（`remaining < max` ⇔ 至少一条命中）。
-/// `None` = 没有这条规则（缺省不启用禁用的口径不变）。
-pub fn balance_disable_threshold(account: &Value) -> Option<f64> {
+/// 自动禁用与跳过使用相同的余额边界，禁用后仍需用户手动启用。
+pub fn balance_disable_hit(account: &Value, remaining: f64) -> bool {
     effective_rules(account)
         .iter()
-        .filter(|rule| {
+        .any(|rule| {
             rule.kind == LimiterKind::Balance && rule.action == LimiterAction::Disable && rule.enabled
-        })
-        .map(|rule| rule.threshold)
-        .fold(None, |max: Option<f64>, threshold| {
-            Some(match max {
-                Some(current) if current >= threshold => current,
-                _ => threshold,
-            })
+                && rule.balance_hit(remaining)
         })
 }
 
@@ -497,7 +500,7 @@ pub fn describe_rule(rule: &LimiterRule) -> String {
         LimiterAction::Disable => "禁用",
     };
     match rule.kind {
-        LimiterKind::Balance => format!("余额 < {} 时{action}", rule.threshold),
+        LimiterKind::Balance => format!("余额 {} {} 时{action}", if rule.inclusive { "≤" } else { "<" }, rule.threshold),
         // 自然日不带周期：「每日」本身就是窗口说明
         LimiterKind::Token if rule.reset == LimiterReset::Daily => {
             format!("每日消耗 ≥ {} Token 时{action}", rule.threshold)
@@ -657,4 +660,78 @@ pub fn token_usage_rows(account: &Value, facts: &HashMap<(String, i64), TokenFac
             json!({ "kind": kind, "windowStart": start, "used": used })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::core::usage_records::{self, BalanceFact};
+
+    #[test]
+    fn generic_floor_preserves_boundaries_identity_and_rule_precedence() {
+        for provider in ["workbuddy", "workbuddy-intl", "qoder", "custom-fixture", "cline-free"] {
+            let mut account = json!({"id":"a","provider":provider,"uid":"one","limiters":[
+                {"type":"balance","action":"skip","threshold":0.012345,"inclusive":true,"enabled":true}
+            ],"lowBalance":{"mode":"off","threshold":0}});
+            let mut facts = HashMap::from([("a".into(), BalanceFact {
+                identity: usage_records::identity(&account), remaining: Some(0.012345),
+            })]);
+            assert!(usage_records::balance_blocked(&account, &facts), "{provider}");
+            facts.get_mut("a").unwrap().remaining = Some(0.012346);
+            assert!(!usage_records::balance_blocked(&account, &facts));
+            facts.get_mut("a").unwrap().remaining = Some(0.012344);
+            assert!(usage_records::balance_blocked(&account, &facts));
+            facts.get_mut("a").unwrap().remaining = None;
+            assert!(!usage_records::balance_blocked(&account, &facts));
+            account["limiters"][0]["threshold"] = json!(0);
+            facts.get_mut("a").unwrap().remaining = Some(0.0);
+            assert!(usage_records::balance_blocked(&account, &facts));
+            facts.get_mut("a").unwrap().remaining = Some(0.000001);
+            assert!(!usage_records::balance_blocked(&account, &facts));
+            facts.get_mut("a").unwrap().remaining = Some(0.0);
+            account["uid"] = json!("replaced");
+            assert!(!usage_records::balance_blocked(&account, &facts));
+            account["uid"] = json!("one");
+            account["limiters"][0]["enabled"] = json!(false);
+            account["lowBalance"] = json!({"mode":"skip","threshold":100});
+            assert!(!usage_records::balance_blocked(&account, &facts));
+            account["limiters"] = json!([]);
+            assert!(!usage_records::balance_blocked(&account, &facts));
+            account["limiters"] = json!([
+                {"type":"balance","action":"disable","threshold":1},
+                {"type":"balance","action":"skip","threshold":10},
+            ]);
+            facts.get_mut("a").unwrap().remaining = Some(5.0);
+            assert!(usage_records::balance_blocked(&account, &facts), "second rule participates");
+            facts.get_mut("a").unwrap().remaining = Some(10.0);
+            assert!(!usage_records::balance_blocked(&account, &facts), "legacy equality still passes");
+            account["limiters"][0]["inclusive"] = json!(true);
+            assert!(balance_disable_hit(&account, 1.0));
+            assert!(!balance_disable_hit(&account, 1.000001));
+        }
+        for provider in ["workbuddy", "qoder", "custom-fixture"] {
+            assert!(default_rules(provider).is_empty(), "unconfigured accounts stay unrestricted");
+        }
+        assert_eq!(default_rules("codearts")[0].kind, LimiterKind::Token);
+    }
+
+    #[test]
+    fn inclusive_balance_rules_validate_and_roundtrip_without_changing_legacy_rules() {
+        let fields = serde_json::Map::new();
+        let value = json!([{"type":"balance","action":"skip","threshold":0,"inclusive":true}]);
+        let rules = normalize_rules(&value, &fields).unwrap();
+        assert_eq!(effective_rules(&json!({"limiters":rules_to_json(&rules)})), rules);
+        assert_eq!(describe_rule(&rules[0]), "余额 ≤ 0 时跳过");
+        for invalid in [
+            json!([{"type":"balance","action":"skip","threshold":0}]),
+            json!([{"type":"balance","action":"skip","threshold":-1,"inclusive":true}]),
+            json!([{"type":"balance","action":"skip","threshold":1,"inclusive":"true"}]),
+            json!([{"type":"token","action":"skip","threshold":1,"inclusive":true,"reset":"daily"}]),
+        ] {
+            assert!(normalize_rules(&invalid, &fields).is_err());
+        }
+        let legacy = normalize_rules(&json!([{"type":"balance","action":"skip","threshold":1}]), &fields).unwrap();
+        assert!(legacy[0].to_json().get("inclusive").is_none());
+        assert_eq!(describe_rule(&legacy[0]), "余额 < 1 时跳过");
+    }
 }

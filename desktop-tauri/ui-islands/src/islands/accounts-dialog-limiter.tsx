@@ -44,7 +44,7 @@ type RuleState = {
 
 /** 规则的**触发条件**一句话（列表与编辑器共用；Token 阈值带「万」的紧凑读法） */
 export function describeRuleCondition(rule: LimiterRule): string {
-  if (rule.type === 'balance') return t('余额 < {threshold}', { threshold: rule.threshold })
+  if (rule.type === 'balance') return t(rule.inclusive ? '余额 ≤ {threshold}' : '余额 < {threshold}', { threshold: rule.threshold })
   if (rule.reset === 'daily') return t('每日消耗 ≥ {count} Token（每天 0 点重置）', { count: formatTokenCount(rule.threshold) })
   return t('每 {period}消耗 ≥ {count} Token', { period: formatIntervalSeconds(rule.period ?? 0), count: formatTokenCount(rule.threshold) })
 }
@@ -70,14 +70,19 @@ function ruleStateOf(account: AccountRecord, rule: LimiterRule): RuleState {
   }
   if (rule.type === 'balance') {
     const entry = usageEntryOf(account)
-    const blocked = balanceBlockedOf(account, entry)
+    const blocked = balanceBlockedOf({ ...account, limiters: [{ ...rule, action: 'skip' }] }, entry)
     const data = (entry && typeof entry === 'object' ? entry : null) as Record<string, unknown> | null
     const raw = data ? data.totalLeft ?? data.available : undefined
     const current = raw === null || raw === undefined || raw === '' || data?.unlimited
       ? ''
       : t(' · 当前 {n}', { n: Number(raw) })
+    if (blocked && rule.action === 'disable') {
+      return account.enabled === false
+        ? { text: t('已触发 · 账号已禁用'), kind: 'danger', title: t('需手动重新启用') }
+        : { text: t('已触发{current}', { current }), kind: 'warn', title: t('下次余额查询后判定自动禁用') }
+    }
     return blocked
-      ? { text: t('已跳过{current}', { current }), kind: 'warn', title: t('余额低于阈值，转发时会跳过该账号（余额回升自动恢复）') }
+      ? { text: t('已跳过{current}', { current }), kind: 'warn', title: t('余额命中限制规则，转发时跳过该账号（余额回升自动恢复）') }
       : { text: t('未触发{current}', { current }), kind: 'ok' }
   }
   const readings = tokenUsageOf(account)
@@ -114,6 +119,7 @@ type LimiterEditorDraft = {
   type: 'balance' | 'token'
   action: 'skip' | 'disable'
   thresholdInput: string
+  inclusive: boolean
   /** Token 阈值的输入单位（万 / 个）：界面辅助，落库统一换算成原始个数 */
   tokenUnit: 'wan' | 'unit'
   /** 重置方式：固定周期（周期输入）/ 自然日（每天 0 点重置，无周期输入） */
@@ -132,12 +138,12 @@ function splitPeriod(seconds: number): { value: string; unit: 'minutes' | 'hours
 /** 规则 → 编辑器草稿（Token 阈值按当前单位换算成输入框里的数） */
 function editorDraftOf(rule: LimiterRule | null): LimiterEditorDraft {
   const blank: LimiterEditorDraft = {
-    type: 'balance', action: 'skip', thresholdInput: '', tokenUnit: 'wan',
+    type: 'balance', action: 'skip', thresholdInput: '', inclusive: true, tokenUnit: 'wan',
     reset: 'fixed', periodInput: '1', periodUnit: 'hours',
   }
   if (!rule) return blank
   if (rule.type === 'balance') {
-    return { ...blank, type: 'balance', action: rule.action, thresholdInput: String(rule.threshold) }
+    return { ...blank, type: 'balance', action: rule.action, thresholdInput: String(rule.threshold), inclusive: rule.inclusive === true }
   }
   if (rule.reset === 'daily') {
     return { ...blank, type: 'token', action: rule.action, reset: 'daily', thresholdInput: String(rule.threshold % 10_000 === 0 ? rule.threshold / 10_000 : rule.threshold), tokenUnit: rule.threshold % 10_000 === 0 ? 'wan' : 'unit' }
@@ -158,11 +164,12 @@ function editorDraftOf(rule: LimiterRule | null): LimiterEditorDraft {
 /** 编辑器草稿 → 规则（校验不过返回错误文案；与后端 `apply_patch` 同一套规则） */
 function ruleOfDraft(draft: LimiterEditorDraft): { error: string } | { rule: LimiterRule } {
   const thresholdRaw = Number(draft.thresholdInput)
-  if (!Number.isFinite(thresholdRaw) || thresholdRaw <= 0) {
-    return { error: t('限制阈值必须是大于 0 的数字') }
+  if (!draft.thresholdInput.trim() || !Number.isFinite(thresholdRaw) || thresholdRaw < 0 ||
+    (thresholdRaw === 0 && !(draft.type === 'balance' && draft.inclusive))) {
+    return { error: t('限制阈值必须大于 0；余额包含等于时允许为 0') }
   }
   if (draft.type === 'balance') {
-    return { rule: { type: 'balance', action: draft.action, threshold: thresholdRaw, enabled: true } }
+    return { rule: { type: 'balance', action: draft.action, threshold: thresholdRaw, ...(draft.inclusive ? { inclusive: true } : {}), enabled: true } }
   }
   const threshold = Math.round(draft.tokenUnit === 'wan' ? thresholdRaw * 10_000 : thresholdRaw)
   if (draft.reset === 'daily') {
@@ -268,11 +275,16 @@ function LimiterEditorDialog({
             <>
               <div className='field-row'>
                 <label>{t('触发条件')}</label>
-                <span className='detail' style={{ fontSize: 13 }}>{t('余额低于')}</span>
-                <Input type='number' min={0} step={1} className='max-w-[120px]' placeholder={t('阈值')}
+                <span className='detail' style={{ fontSize: 13 }}>{t(draftLocal.inclusive ? '余额低于或等于' : '余额低于')}</span>
+                <Input type='number' min={0} step='any' className='max-w-[120px]' placeholder={t('阈值')} aria-label={t('余额阈值')}
                   value={draftLocal.thresholdInput}
                   onChange={event => update({ thresholdInput: event.currentTarget.value })} />
                 <span className='detail' style={{ fontSize: 13 }}>{t('时')}</span>
+              </div>
+              <div className='field-row'>
+                <label htmlFor='limiter-inclusive'>{t('包含等于阈值（积分保底）')}</label>
+                <Switch id='limiter-inclusive' checked={draftLocal.inclusive}
+                  onCheckedChange={value => update({ inclusive: value === true })} />
               </div>
               <div className='field-row'>
                 <label>{t('触发后')}</label>
@@ -403,7 +415,7 @@ export function LimiterSection({
 
   const saveEditor = (rule: LimiterRule, index: number): void => {
     const next = [...draft]
-    if (index >= 0) next[index] = rule
+    if (index >= 0) next[index] = { ...rule, enabled: next[index].enabled }
     else next.push(rule)
     onChange(next)
     setEditor(null)
@@ -456,6 +468,8 @@ export function LimiterSection({
         <Button variant='outline' onClick={openAdd}>{t('＋ 添加限制')}</Button>
         <span className='detail'>{t('可添加多条；同类规则也允许并存（例如一条按余额、两条不同重置方式的 Token）')}</span>
       </div>
+      <p className='detail'>{t('积分保底：添加余额规则并选择跳过，适用于返回余额的提供商，单位沿用该账号余额。仅过滤候选，不改变账号选路和模型路由策略；指定账号测试会绕过跳过规则。')}</p>
+      <p className='detail'>{t('按最近成功读数判定，查询失败保留上次读数；尚无读数或不限量时不拦截。并发和查询间隔可能使实际余额低于保底。')}</p>
       <LimiterEditorDialog account={account} target={editor} onClose={() => setEditor(null)} onSave={saveEditor} />
     </>
   )

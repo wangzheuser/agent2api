@@ -151,23 +151,24 @@ pub async fn run_upgrade(State(state): State<ServerState>) -> Response {
             // 顺序：必须排在 `config::reload()` **之后** —— 其中的
             // `migrate_cline_split` 读 `modelRules`，而那个配置项正是这次迁移
             // 刚从旧 `config.json` 搬进来的，快照没重装就读不到它。
-            crate::server::account_bootstrap::run(&store);
+            crate::server::account_bootstrap::run(&store)?;
             // 统计侧的口径订正同理补调（启动时被 upgrade_pending 跳过，
             // 见 `RequestStats::remap_model_dimension_once` 的调用时机说明）：
             // 旧聚合行刚导进来，模型维度还按请求名累计，不重算的话本次运行
             // 的报表会一直把映射别名当成独立模型。
             request_stats.remap_model_dimension_once();
         }
-        outcomes
+        Ok::<_, String>(outcomes)
     })
     .await;
     end_run();
 
     let outcomes = match result {
-        Ok(Some(outcomes)) => outcomes,
+        Ok(Ok(Some(outcomes))) => outcomes,
         // `Db::with` 返回 None = 连接锁中毒（某次持锁 panic 打断了未提交的事务）。
         // 接管连接去读可能读到半截数据，所以它保守回落 —— 这里如实报错。
-        Ok(None) => return errors::management_error(500, "数据库连接不可用，迁移未执行"),
+        Ok(Ok(None)) => return errors::management_error(500, "数据库连接不可用，迁移未执行"),
+        Ok(Err(error)) => return errors::management_error(500, error),
         Err(error) => return errors::management_error(500, format!("迁移任务执行失败: {error}")),
     };
 

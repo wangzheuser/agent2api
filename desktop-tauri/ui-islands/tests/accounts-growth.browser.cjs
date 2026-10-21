@@ -19,7 +19,7 @@ const state = {
   streak: { days: 7, makeupCards: 1, missedDates: ['2026-10-01'], timezone: 'Asia/Shanghai', tiers: [{ id: '7d', requiredDays: 7, claimable: true, claimed: false, rewards: { ...rewards, energy: 2 } }] },
   lottery: { chances: 1, canDraw: true }, activities: [{ code: 'gift', title: '新手礼包', state: 'unknown', canClaim: false, canAttempt: true, reason: '资格由上游确认，仅手动尝试' }], errors: [], running: false, lastRun: null,
 }
-const policy = { schemaVersion: 1, id: 'A0', identity: 'identity-A0', autoGrowth: false, autoTravel: false, creditFloor: null, selection: 'priority', selectionScope: 'provider', balanceMaxAgeSeconds: 900, cost: { lastCredits: 0, lastAt: Date.now(), samples: 1, models: [] } }
+const policy = { schemaVersion: 1, id: 'A0', identity: 'identity-A0', autoGrowth: false, autoTravel: false }
 const styles = ['css/tokens.css', 'css/layout.css', 'css/components.css', 'css/page-accounts.css', 'css/page-accounts-providers.css', 'css/page-accounts-table.css', 'islands/ui.css']
 const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">${styles.map(file => `<link rel="stylesheet" href="${href(file)}">`).join('')}<style>body{padding:20px}.page{display:block!important}</style></head><body><section class="page active" data-page="accounts"></section><script>
 window.fixture={accounts:${JSON.stringify(accounts)},base:${JSON.stringify(state)},policy:${JSON.stringify(policy)},growthCalls:[],actions:[],pending:[],defer:false,active:0,maximum:0,policyWrites:[]};
@@ -94,15 +94,16 @@ async function run() {
     assert.equal(await dialog.getByRole('button', { name: '消耗 1 次机会抽奖', exact: true }).isEnabled(), true)
     assert.equal(await dialog.getByRole('button', { name: '检查并尝试领取', exact: true }).isEnabled(), true)
     assert.equal(await dialog.getByRole('button', { name: '消耗 1 张卡补签', exact: true }).isDisabled(), true)
-    await dialog.locator('summary', { hasText: '积分保底、自动福利与选号策略' }).click()
+    await dialog.locator('summary', { hasText: '自动福利设置' }).click()
     await dialog.getByRole('button', { name: '保存设置', exact: true }).waitFor()
     assert.equal(await dialog.getByRole('checkbox', { name: '自动领取已完成奖励', exact: true }).isChecked(), false)
-    await dialog.getByRole('spinbutton', { name: '账号保底积分' }).fill('0')
+    await dialog.getByRole('checkbox', { name: '自动领取已完成奖励', exact: true }).check()
     await dialog.getByRole('button', { name: '保存设置', exact: true }).click()
     await page.waitForFunction(() => fixture.policyWrites.length === 1)
-    assert.equal(await page.evaluate(() => fixture.policyWrites[0].creditFloor), 0)
+    assert.equal(await page.evaluate(() => fixture.policyWrites[0].autoGrowth), true)
+    assert.equal(await page.evaluate(() => fixture.policyWrites[0].autoTravel), false)
     assert.equal(await page.evaluate(() => fixture.policyWrites[0].expectedIdentity), 'identity-A0')
-    checks.push('resource-consuming actions use separate buttons and policy preserves disabled defaults and explicit zero floor')
+    checks.push('resource-consuming actions use separate buttons and growth automation saves independently from routing limits')
     await dialog.screenshot({ path: path.join(evidence, 'growth-ui-settings.png') })
     await page.setViewportSize({ width: 320, height: 800 })
     const dimensions = await dialog.evaluate(el => ({ width: el.clientWidth, scroll: el.scrollWidth, body: el.querySelector('.credits-body').clientWidth, bodyScroll: el.querySelector('.credits-body').scrollWidth }))

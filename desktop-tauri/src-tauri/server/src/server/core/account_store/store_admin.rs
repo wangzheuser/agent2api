@@ -513,6 +513,52 @@ impl AccountStore {
         }
     }
 
+    /// 把旧 WorkBuddy `creditFloor` 一次性迁移到通用余额限制器。
+    ///
+    /// 只迁移没有显式限制配置的国内 / 国际 WorkBuddy 账号；旧策略 KV
+    /// 保留，重复启动时因为已写入 `limiters` 自动幂等。
+    pub(crate) fn migrate_workbuddy_credit_floors(&self) -> Result<Vec<String>, AccountStoreError> {
+        let guard = self.guard();
+        let changed = self.with_conn_mut(&guard, |conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let states = crate::server::core::task_state::read_states(&tx)
+                .map_err(|error| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, error.into()))?;
+            let mut changed = Vec::new();
+            for mut record in sql::load_all(&tx)? {
+                if !matches!(record.provider().as_str(), "workbuddy" | "workbuddy-intl")
+                    || record.get("limiters").is_some()
+                    || record.get("lowBalance").is_some_and(|value| value != &json!({"mode":"skip","threshold":1}))
+                {
+                    continue;
+                }
+                let Some(floor) = crate::server::core::workbuddy_policy::legacy_credit_floor(&record.to_value(), &states) else {
+                    continue;
+                };
+                record.set(
+                    "limiters",
+                    json!([{
+                        "type": "balance",
+                        "action": "skip",
+                        "threshold": floor,
+                        "inclusive": true,
+                        "enabled": true
+                    }]),
+                );
+                record.set(
+                    "lowBalance",
+                    json!({"mode": "skip", "threshold": floor}),
+                );
+                record.set_updated_at(crate::server::logging::now_ms());
+                sql::update_in_place(&tx, &record)?;
+                changed.push(record.id().to_string());
+            }
+            tx.commit()?;
+            Ok(changed)
+        })?;
+        drop(guard);
+        Ok(changed)
+    }
+
 
     pub fn migrate_startup(&self) -> Value {
         let _guard = self.guard();
@@ -914,5 +960,69 @@ impl AccountStore {
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod credit_floor_tests {
+    use super::*;
+
+    #[test]
+    fn migration_preserves_fraction_zero_custom_rules_and_rolls_back_atomically() {
+        let (db, _temp) = crate::server::db::test_temp::TempDb::open("credit-floor-migration");
+        let store = AccountStore::with_db(Some(db.clone()));
+        let fixtures = [
+            ("cn", "workbuddy", json!(0.012345), json!({})),
+            ("zero", "workbuddy-intl", json!(0), json!({})),
+            ("default", "workbuddy", json!(10.5), json!({"lowBalance":{"mode":"skip","threshold":1}})),
+            ("custom", "workbuddy", json!(20), json!({"limiters":[{"type":"token","action":"skip","threshold":100,"reset":"daily"}]})),
+            ("empty", "workbuddy", json!(20), json!({"limiters":[]})),
+            ("disabled", "workbuddy", json!(20), json!({"limiters":[{"type":"balance","action":"skip","threshold":2,"enabled":false}]})),
+            ("legacy-custom", "workbuddy", json!(20), json!({"lowBalance":{"mode":"disable","threshold":5}})),
+            ("other", "qoder", json!(20), json!({})),
+            ("unset", "workbuddy", Value::Null, json!({})),
+        ];
+        let mut states = serde_json::Map::new();
+        db.with(|conn| {
+            for (id, provider, floor, extra) in &fixtures {
+                let mut record = json!({"id":id,"provider":provider,"uid":id,"enabled":true,"priority":1,"addedAt":1,"note":"keep"});
+                record.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+                // 历史明文与正常写入的密文都需能迁移；投影列按记录保留。
+                conn.execute("INSERT INTO accounts(id,provider,priority,enabled,added_at,data) VALUES (?1,?2,1,1,1,?3)",
+                    rusqlite::params![id, provider, record.to_string()]).unwrap();
+                if let Some(identity) = crate::server::core::workbuddy_policy::identity(&record) {
+                    states.insert(format!("workbuddy:policy:{identity}"), json!({"value":{"creditFloor":floor,"autoGrowth":true,"autoTravel":false}}));
+                }
+            }
+            states.insert("workbuddySelection".into(), json!({"value":"expiry"}));
+            conn.execute("INSERT INTO kv(key,value) VALUES ('backgroundTaskState',?1)", [Value::Object(states.clone()).to_string()]).unwrap();
+            conn.execute_batch("CREATE TRIGGER fail_floor BEFORE UPDATE ON accounts WHEN OLD.id='zero' BEGIN SELECT RAISE(ABORT,'fixture migration failure'); END;").unwrap();
+        }).unwrap();
+        assert!(store.migrate_workbuddy_credit_floors().is_err());
+        db.with(|conn| {
+            assert!(sql::load_by_id(conn, "cn").unwrap().unwrap().get("limiters").is_none(), "earlier row rolled back");
+            conn.execute_batch("DROP TRIGGER fail_floor").unwrap();
+        }).unwrap();
+        assert_eq!(store.migrate_workbuddy_credit_floors().unwrap(), vec!["cn", "zero", "default"]);
+        assert!(store.migrate_workbuddy_credit_floors().unwrap().is_empty());
+        db.with(|conn| {
+            for (id, _, floor, extra) in &fixtures {
+                let record = sql::load_by_id(conn, id).unwrap().unwrap();
+                assert_eq!(record.get("note"), Some(&json!("keep")));
+                if matches!(*id, "cn" | "zero" | "default") {
+                    let rule = &record.get("limiters").unwrap()[0];
+                    assert_eq!(rule["threshold"].as_f64(), floor.as_f64());
+                    assert_eq!(rule["inclusive"], true);
+                    assert_eq!(rule["action"], "skip");
+                } else {
+                    assert_eq!(record.get("limiters"), extra.get("limiters"));
+                    assert_eq!(record.get("lowBalance"), extra.get("lowBalance"));
+                }
+            }
+            let stored: String = conn.query_row("SELECT value FROM kv WHERE key='backgroundTaskState'", [], |row| row.get(0)).unwrap();
+            assert_eq!(serde_json::from_str::<Value>(&stored).unwrap(), Value::Object(states));
+        }).unwrap();
+        store.update_account("cn", &json!({"limiters":[]})).unwrap();
+        assert!(store.migrate_workbuddy_credit_floors().unwrap().is_empty(), "deleting a migrated rule does not resurrect it");
     }
 }

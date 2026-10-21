@@ -30,11 +30,9 @@ export function growthClientToken(): string {
   return Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('')
 }
 export type WorkBuddyPolicy = {
-  schemaVersion: number; id: string; identity: string; autoGrowth: boolean; autoTravel: boolean; creditFloor: number | null
-  selection: 'priority' | 'expiry' | 'cost'; selectionScope: 'provider'; balanceMaxAgeSeconds: number
-  cost: { lastCredits: number | null; lastAt: number | null; samples: number; models: { model: string; creditsPer1kTokens: number | null; samples: number; lastAt: number | null }[] }
+  schemaVersion: number; id: string; identity: string; autoGrowth: boolean; autoTravel: boolean
 }
-export type PolicyPatch = Pick<WorkBuddyPolicy, 'autoGrowth' | 'autoTravel' | 'creditFloor' | 'selection'> & { expectedIdentity: string }
+export type PolicyPatch = Pick<WorkBuddyPolicy, 'autoGrowth' | 'autoTravel'> & { expectedIdentity: string }
 type GrowthBridge = {
   getWorkBuddyGrowth(id: string): Promise<GrowthState>
   workBuddyGrowthAction(action: GrowthAction): Promise<GrowthResult>

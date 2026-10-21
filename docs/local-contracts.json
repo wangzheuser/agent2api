@@ -848,32 +848,38 @@
       "id": "workbuddy-credit-policy",
       "level": "P0",
       "status": "必须保留",
-      "behavior": "积分底线要求新鲜完整身份，未知不当作零；到期与成本策略只使用可信额度与真实模型样本。",
+      "behavior": "积分保底作为通用余额限制器：只使用当前账号身份的最近成功读数，未知不当作零；账号选路继续由全局账号选路策略决定，不叠加 WorkBuddy 专属到期或成本重排。",
       "source_commits": [
         "91c0b81",
         "ebe1914",
         "a02f714"
       ],
       "implementation": [
-        "desktop-tauri/src-tauri/server/src/server/core/workbuddy_policy.rs"
+        "desktop-tauri/src-tauri/server/src/server/core/workbuddy_policy.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/limiter.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/usage_records.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/upstream/rotate.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/routing.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/account_store/store_admin.rs",
+        "desktop-tauri/ui-islands/src/islands/accounts-dialog-limiter.tsx"
       ],
       "tests": [
         {
           "kind": "rust",
-          "path": "desktop-tauri/src-tauri/server/src/server/core/workbuddy_policy.rs",
-          "name": "server::core::workbuddy_policy::tests::floor_uses_fresh_complete_identity_and_preserves_zero",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/limiter.rs",
+          "name": "server::core::limiter::tests::generic_floor_preserves_boundaries_identity_and_rule_precedence",
           "id": "case-4fac1c0d224b"
         },
         {
           "kind": "rust",
-          "path": "desktop-tauri/src-tauri/server/src/server/core/workbuddy_policy.rs",
-          "name": "server::core::workbuddy_policy::tests::expiry_reorders_only_known_same_region_slots",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/rotate.rs",
+          "name": "server::core::upstream::rotate::policy_tests::credit_floor_blocks_normal_cooldown_squeeze_and_default_session_routes",
           "id": "case-626ccbe8b54d"
         },
         {
           "kind": "rust",
-          "path": "desktop-tauri/src-tauri/server/src/server/core/workbuddy_policy.rs",
-          "name": "server::core::workbuddy_policy::tests::cost_requires_real_model_samples_and_respects_missing",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/account_store/store_admin.rs",
+          "name": "server::core::account_store::store_admin::credit_floor_tests::migration_preserves_fraction_zero_custom_rules_and_rolls_back_atomically",
           "id": "case-137c9f9bcca2"
         },
         {
@@ -882,7 +888,51 @@
           "name": "server::core::workbuddy_policy::region_restore_tests::migrated_international_identity_retains_policy_and_does_not_collide_with_cn",
           "id": "case-668453898c2f"
         }
-      ]
+      ],
+      "evolution": {
+        "baseline_sha256": "a418f1f0f8fe0fab58d7c9cafb4f9dd2d14af2d35c5c7330de0a90e6de8c2dfe",
+        "reason": "按用户授权保留积分保底并将其收敛到通用余额限制器；删除 WorkBuddy 专属到期/成本选路，避免与全局账号选路和路由策略叠加。",
+        "review": "本轮已审查 limiter、usage_records、rotate、routing、store_admin 与限制器界面，并以 cargo test -p agent2api-server --locked、UI typecheck、UI build 和 accounts-growth 浏览器用例验证候选实现。",
+        "business_change": {
+          "authorization": "用户于 2026-10-21 明确要求保留积分保底、使其通用，并授权允许做减法后按方案实施。",
+          "reason": "WorkBuddy 专属到期优先和成本优先会与全局账号选路及路由策略形成第二套排序语义；移除专属重排，保留可复用的积分保底约束。",
+          "previous_behavior": "积分底线要求新鲜完整身份，未知不当作零；到期与成本策略只使用可信额度与真实模型样本。"
+        },
+        "implementation_moves": [
+          {
+            "from": "desktop-tauri/src-tauri/server/src/server/core/workbuddy_policy.rs",
+            "to": [
+              "desktop-tauri/src-tauri/server/src/server/core/workbuddy_policy.rs",
+              "desktop-tauri/src-tauri/server/src/server/core/limiter.rs",
+              "desktop-tauri/src-tauri/server/src/server/core/usage_records.rs",
+              "desktop-tauri/src-tauri/server/src/server/core/upstream/rotate.rs",
+              "desktop-tauri/src-tauri/server/src/server/core/routing.rs",
+              "desktop-tauri/src-tauri/server/src/server/core/account_store/store_admin.rs",
+              "desktop-tauri/ui-islands/src/islands/accounts-dialog-limiter.tsx"
+            ]
+          }
+        ],
+        "test_moves": [
+          {
+            "from": "case-4fac1c0d224b",
+            "to": ["case-4fac1c0d224b"],
+            "mode": "adapted",
+            "reason": "积分保底从 WorkBuddy 专属策略迁移为通用余额规则，保留边界、身份和未知读数断言。"
+          },
+          {
+            "from": "case-626ccbe8b54d",
+            "to": ["case-626ccbe8b54d"],
+            "mode": "replacement",
+            "reason": "旧到期重排用例由通用限制器选路、冷却、并发和指定账号测试用例替代；专属排序行为按授权移除。"
+          },
+          {
+            "from": "case-137c9f9bcca2",
+            "to": ["case-137c9f9bcca2"],
+            "mode": "replacement",
+            "reason": "旧成本样本排序用例由积分保底迁移的精度、零值、自定义规则保留及事务回滚用例替代；专属成本排序按授权移除。"
+          }
+        ]
+      }
     },
     {
       "id": "upstream-credit-telemetry",

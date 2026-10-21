@@ -14,7 +14,7 @@ import {
   type GenericBalanceDetails, type WorkBuddyCreditSegment,
 } from './accounts-credit-details'
 import { growthAccountKey, supportsGrowth } from './accounts-growth-data'
-import { AccountsGrowthPanel, WorkBuddyPolicyPanel } from './accounts-growth-panel'
+import { AccountsGrowthPanel } from './accounts-growth-panel'
 
 const HOUR = 3600000
 const issueLabels: Record<string, string> = {
@@ -280,7 +280,6 @@ export function AccountsCreditDialog({ id, onClose, returnFocus, initialTab = 'c
             {legacy && <p>原余额摘要：{legacy.unlimited ? '不限量' : typeof legacy.totalLeft === 'number' ? formatCreditAmount(legacy.totalLeft) : '未知'}{failure ? '（上次成功查询）' : ''}</p>}
             <p>{failure ? '请重试当前账号。' : '当前服务器或缓存未返回新版积分明细，可刷新当前账号后重试。'}</p>
           </div>}
-          {!enterprise && !account.enterpriseId && account.type !== 'enterprise' && !growthEnabled && <WorkBuddyPolicyPanel key={growthAccountKey(account)} account={account} />}
         </>}
       </DialogBody>
       <DialogFooter className='credits-footer'>

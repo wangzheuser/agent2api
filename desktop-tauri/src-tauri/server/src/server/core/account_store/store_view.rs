@@ -579,9 +579,8 @@ fn usage_query_public(value: Option<&Value>) -> Value {
 
 /// 记录上的 `lowBalance` → 公开形态的规范化形状。
 ///
-/// 缺省（无配置）按 provider 区分（与 `usage_records::balance_blocked` 同一口径，
-/// 见 `default_low_balance_mode`）：Cline 免费池 = `off`（不处理），其余 = `skip`、
-/// 阈值 1；显式配置一律原样尊重 —— 那是用户选过的，缺省不能覆盖它。skip / disable
+/// 缺省（无配置）按 `usage_records::default_low_balance` 归一为 `off`；
+/// 显式配置一律原样尊重 —— 那是用户选过的，缺省不能覆盖它。skip / disable
 /// 档下阈值缺失或非法时回落缺省 1。
 fn low_balance_public(provider: &str, value: Option<&Value>) -> Value {
     use crate::server::core::usage_records::{default_low_balance, default_low_balance_mode, DEFAULT_LOW_BALANCE_THRESHOLD};

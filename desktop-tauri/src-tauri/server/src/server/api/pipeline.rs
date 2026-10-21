@@ -577,7 +577,6 @@ pub fn record_entry(context: &RecordContext, fallback_error: Option<String>) {
         .or(fallback_error)
         .map(|text| truncate_chars(&text, ERROR_SUMMARY_CHARS));
     context.telemetry.settle_affinity((200..300).contains(&context.status) && error.is_none());
-    crate::server::core::workbuddy_policy::observe_cost(&snapshot, (200..300).contains(&context.status) && error.is_none());
     let attempts = snapshot.attempts.max(1);
     let mut entry = NewRequestEntry::new(context.model.clone(), context.status);
     entry.ts = Some(context.started_at);

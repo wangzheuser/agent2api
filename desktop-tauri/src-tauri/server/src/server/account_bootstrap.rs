@@ -62,7 +62,7 @@ use crate::server::core::model_rules;
 use crate::server::logging;
 
 /// 账号侧的启动期一次性迁移（幂等，可重复调用）。
-pub(crate) fn run(store: &AccountStore) {
+pub(crate) fn run(store: &AccountStore) -> Result<(), String> {
     import_legacy_auth_json(store);
     // 启动期数据迁移（一次读、一次写，见 store_admin::migrate_startup）：
     //   ① 历史账号补 `provider: "workbuddy"`（Agent2API 惰性迁移，§3.2）
@@ -164,6 +164,20 @@ pub(crate) fn run(store: &AccountStore) {
     // 三条导入**追加式共存**：各看自己那一家的账号列表与自己那个标记键，
     // 互不影响，先后顺序不改变任何结果（后一条只增不改前面的账号）。
     store.import_legacy_autoclaw_data();
+    // 账号导入、地区拆分后迁移；失败时不启动缺少保底保护的网关。
+    match store.migrate_workbuddy_credit_floors() {
+        Ok(ids) if !ids.is_empty() => logging::log(
+            "[Accounts]",
+            &format!(
+                "🔁 已将 {} 个 WorkBuddy 账号的旧积分保底迁移到通用限制器：{}",
+                ids.len(),
+                ids.join("、")
+            ),
+        ),
+        Ok(_) => {}
+        Err(error) => return Err(format!("积分保底迁移失败，已中止启动：{error}")),
+    }
+    Ok(())
 }
 
 /// 旧版单账号 `auth.json` → 一个 workbuddy 账号（仅当账号列表为空时导入一次）。
