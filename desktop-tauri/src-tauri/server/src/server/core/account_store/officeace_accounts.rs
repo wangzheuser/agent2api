@@ -236,6 +236,8 @@ impl AccountStore {
                 Value::String(refresh_token.to_string()),
             );
         }
+        fields.remove("refreshState");
+        fields.remove("refreshError");
         record.set_updated_at(logging::now_ms());
         self.with_conn(&guard, |conn| sql::update_in_place(conn, &record))?;
         Ok(())
@@ -497,6 +499,8 @@ impl AccountStore {
                 merged.entry(key.clone()).or_insert_with(|| value.clone());
             }
         }
+        merged.remove("refreshState");
+        merged.remove("refreshError");
         let saved = StoredAccount::from_map(merged);
         self.with_conn(&guard, |conn| sql::put(conn, &saved))?;
         logging::log(
@@ -548,6 +552,7 @@ impl AccountStore {
                     .is_some_and(|value| !value.trim().is_empty()),
             ),
         );
+        public.insert("available".to_string(), Value::Bool(record.has_credentials()));
         Value::Object(public)
     }
 }

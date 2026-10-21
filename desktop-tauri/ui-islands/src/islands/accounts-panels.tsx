@@ -51,7 +51,7 @@ import { formatTime, poolItemLabel, POOL_VALUE_PREFIX, shared, type AccountRecor
 import {
   accountTags, activeLimits, checkedInToday, checkinDoneTitle, claimDoneTitle, claimedToday,
   isWorkBuddyInternational, supportsCheckin, balanceBlockedOf,
-  displayNameOf, editionSuffix, expiryMillis, formatIntervalSeconds, formatResetText,
+  displayNameOf, editionSuffix, expiryMillis, expiryScopeOf, formatIntervalSeconds, formatResetText,
   formatTokenCount, identifierOf, isDesktopAccount, isEnabled, lowBalanceBlockedOf, lowBalanceOf,
   planBadgeLabel, providerFeatures, providerOf, RESET_UNKNOWN, supportsClaim, supportsUsage,
   supportsUsageDetail, tokenBlockedOf, tokenCountdownText, tokenDisableTriggeredOf,
@@ -361,9 +361,9 @@ export function LimitsCell({ account, open }: { account: AccountRecord; open: bo
 /* ─── 有效期 / 连接数 / 余额列 ──────────────── */
 
 /**
- * 有效期：按「这家有没有版本概念」选字段（workbuddy 是 expiresAt，其余是
- * tokenExpiresAt），与域层的 tokenExpiryOf 同口径。文案收短成「30 天后」，
- * 完整句留在 title —— 列宽有限。
+ * 有效期：按 provider 的字段与业务作用域显示。OfficeAce 的 expiresAt 只属于
+ * 控制面，Loomy 的 expiresAt 是本地估算 session 期限，不能与模型转发凭证混为一谈。
+ * 文案收短成「30 天后」，完整句留在 title —— 列宽有限。
  *
  * 读数经域层 `expiryMillis` **先归一到毫秒**再判：落盘的到期值在秒与毫秒之间漂过
  * （Trae 的凭据是从 CPA 的 auth 文件与手工粘贴进来的，那里是 10 位秒；别家与上游
@@ -373,17 +373,39 @@ export function LimitsCell({ account, open }: { account: AccountRecord; open: bo
  */
 export function ExpiryCell({ account }: { account: AccountRecord }) {
   const features = providerFeatures(providerOf(account))
+  const scope = expiryScopeOf(account)
   const expiresAt = expiryMillis(features.edition ? account.expiresAt : account[features.expiry])
+  if (account.refreshState === 'reauth_required') {
+    const scopeText = scope === 'control-plane' ? '控制面凭证' : '模型凭证'
+    return (
+      <Badge
+        variant='destructive'
+        shape='tag'
+        title={account.refreshError || `${scopeText}自动刷新失败，请重新登录或重新导入`}
+      >
+        {scope === 'control-plane' ? '控制面需重登' : '需重新登录'}
+      </Badge>
+    )
+  }
   if (!expiresAt) return <span className='muted' title='记录里没有过期时间'>—</span>
   const left = expiresAt - Date.now()
-  if (left <= 0) return <Badge variant='destructive' shape='tag' title='凭证已过期，转发时会先刷新'>已过期</Badge>
+  if (left <= 0) {
+    if (scope === 'control-plane') {
+      return <Badge variant='warning' shape='tag' title='仅影响余额、签到和控制面续期，不影响模型转发'>控制面已过期</Badge>
+    }
+    if (scope === 'estimated-session') {
+      return <Badge variant='warning' shape='tag' title='这是本地按登录时间估算的 session 期限；实际失效以模型网关返回为准'>预计需重登</Badge>
+    }
+    return <Badge variant='destructive' shape='tag' title='模型凭证已过期，转发前会尝试刷新'>已过期</Badge>
+  }
   const text = left < 3600e3 ? `${Math.max(1, Math.round(left / 60e3))} 分钟后`
     : left < 48 * 3600e3 ? `${(left / 3600e3).toFixed(1)} 小时后`
       : `${Math.floor(left / 24 / 3600e3)} 天后`
   // 完整时间点只在解析得出时补进 title：formatTime 对非法时间戳返回空串，
   // 直接拼会留下一个空的「（）」
   const full = formatTime(expiresAt)
-  return <span title={full ? `${text}过期（${full}）` : `${text}过期`}>{text}</span>
+  const suffix = scope === 'control-plane' ? '控制面到期' : scope === 'estimated-session' ? '预计需重登' : '过期'
+  return <span title={full ? `${text}${suffix}（${full}）` : `${text}${suffix}`}>{text}</span>
 }
 
 /**

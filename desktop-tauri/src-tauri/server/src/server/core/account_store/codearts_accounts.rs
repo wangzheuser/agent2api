@@ -121,6 +121,8 @@ impl AccountStore {
         fields.insert("addedAt".to_string(), Value::from(existing.as_ref().map(StoredAccount::added_at).unwrap_or_else(logging::now_ms)));
         fields.insert("updatedAt".to_string(), Value::from(logging::now_ms()));
         fields.insert("rateLimits".to_string(), json!({}));
+        fields.remove("refreshState");
+        fields.remove("refreshError");
         let record = StoredAccount::from_map(fields);
         self.with_conn(&guard, |conn| sql::put(conn, &record))?;
         logging::log("[Accounts]", &format!("✅ CodeArts 账号已保存（优先级 {priority}）"));
@@ -161,6 +163,8 @@ impl AccountStore {
             }
         }
         record.set("tokenTail", Value::String(token_tail_of(&credential.access_key_id)));
+        record.remove("refreshState");
+        record.remove("refreshError");
         record.set_updated_at(logging::now_ms());
         self.with_conn(&guard, |conn| sql::update_in_place(conn, &record))?;
         Ok(CredentialWrite::Written)

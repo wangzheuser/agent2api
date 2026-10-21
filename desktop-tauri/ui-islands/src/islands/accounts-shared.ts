@@ -129,6 +129,10 @@ export type AccountRecord = {
   /** ZCode：这一行当前走哪条上游通道（`coding-plan` / `start-plan`，见 accounts-domain 的 ZCODE_PLAN_*） */
   zcodePlan?: string
   hasRefreshToken?: boolean
+  /** 凭证维护的终态：需要重新登录/重新导入，不能继续自动重试 */
+  refreshState?: 'reauth_required' | string
+  /** 最近一次终态刷新失败的脱敏原因 */
+  refreshError?: string
   hasBalanceToken?: boolean
   /**
    * 自定义账号：记录里有没有非空 `apiKey`（设置弹窗据此决定输入框的提示文案与

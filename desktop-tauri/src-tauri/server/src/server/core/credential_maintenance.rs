@@ -51,6 +51,7 @@ pub const STATUS_REFRESHED: &str = "refreshed";
 pub const STATUS_SKIPPED: &str = "skipped";
 /// 尝试刷新但失败（结果里带可读的 `message`）
 pub const STATUS_FAILED: &str = "failed";
+pub const REFRESH_STATE_REAUTH_REQUIRED: &str = "reauth_required";
 
 /// 周期维护的**默认**间隔说明：10 分钟。
 ///
@@ -115,6 +116,18 @@ pub async fn refresh_expiring_accounts(store: &AccountStore) -> Vec<Value> {
             .get("provider")
             .and_then(Value::as_str)
             .unwrap_or("");
+        if account
+            .get("refreshState")
+            .and_then(Value::as_str)
+            == Some(REFRESH_STATE_REAUTH_REQUIRED)
+        {
+            slots[index] = Some(skipped(
+                &id,
+                provider,
+                "自动刷新已停止，请重新登录或重新导入凭证",
+            ));
+            continue;
+        }
         // 判据只有两条：该家支持刷新 + 这个账号的凭证确实临期。
         // **不按 enabled 过滤**：禁用是「转发别用它」，不是「别维护它」——
         // 账号页对禁用账号同样显示有效期，漏刷会让它一直挂着「已过期」，
@@ -178,6 +191,14 @@ pub async fn refresh_expiring_accounts(store: &AccountStore) -> Vec<Value> {
                 })
             }
             Err(error) => {
+                if is_terminal_refresh_failure(provider, &error.message) {
+                    if !store.set_refresh_reauth_required(&id, &error.message) {
+                        logging::verbose(
+                            "[Accounts]",
+                            &format!("账号 {id} 的刷新终态未能落盘"),
+                        );
+                    }
+                }
                 logging::log(
                     "[Accounts]",
                     &format!("❌ 账号 {id} 凭证自动刷新失败: {}", error.message),
@@ -201,6 +222,16 @@ pub async fn refresh_expiring_accounts(store: &AccountStore) -> Vec<Value> {
         if failed > 0 { "error" } else { "info" },
     );
     results
+}
+
+fn is_terminal_refresh_failure(provider: &str, message: &str) -> bool {
+    if provider != "codearts" && provider != "officeace" {
+        return false;
+    }
+    let lower = message.to_ascii_lowercase();
+    lower.contains("invalid refresh token")
+        || lower.contains("refresh token has been used")
+        || lower.contains("sts5.1806")
 }
 
 /// 维护任务的**响应体**：`{ results, refreshed, skipped, failed }`。
@@ -235,6 +266,25 @@ pub fn summarize(results: &[Value]) -> (usize, usize, usize) {
         count(STATUS_SKIPPED),
         count(STATUS_FAILED),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_terminal_refresh_failure;
+
+    #[test]
+    fn only_known_one_time_refresh_failures_require_reauth() {
+        assert!(is_terminal_refresh_failure(
+            "codearts",
+            "HTTP 400 invalid refresh token: the refresh token has been used"
+        ));
+        assert!(is_terminal_refresh_failure(
+            "officeace",
+            "STS5.1806 invalid refresh token"
+        ));
+        assert!(!is_terminal_refresh_failure("codearts", "HTTP 503 upstream timeout"));
+        assert!(!is_terminal_refresh_failure("loomy", "invalid refresh token"));
+    }
 }
 
 /// 一条 `skipped` 结果（`reason` 给用户看，说明为什么没刷）

@@ -46,6 +46,8 @@ type ProviderFeatures = {
   identifier: string
   /** 有效期落在记录里的哪个键（expiresAt / tokenExpiresAt） */
   expiry: string
+  /** 有效期对应的业务对象，而不是一概视为模型转发凭证 */
+  expiryScope?: 'routing' | 'control-plane' | 'estimated-session'
   /** 「这家的账号以邮箱报名字」（Qoder / AutoClaw 国际版 / Accio）。两处消费：
    *  displayNameOf（**未设备注**账号的主名口径，设过备注的以备注名为主）与
    *  models-fetch-modal 的 accountLabel（拉取模型的账号下拉） */
@@ -189,7 +191,10 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   // `edition: false` —— 单一入口（手机验证码登录），没有国际版/地区概念。
   // `expiry: 'expiresAt'` —— 落账号时按登录时刻 + 14 天估算（上游没有续期接口，
   //   过期只能重新登录；这一列对它是「什么时候该重登」的提示）。
-  loomy: { usage: true, edition: false, identifier: 'userId', expiry: 'expiresAt' },
+  loomy: {
+    usage: true, edition: false, identifier: 'userId', expiry: 'expiresAt',
+    expiryScope: 'estimated-session',
+  },
   // KukuAI（百度文库库库 AI）。各位各有出处：
   // `usage: true` —— 余额/积分查询（GET /bizapi/gfpro/getgfvipremain 的
   //   totalPoint，见后端 providers::kuku::balance）。
@@ -211,7 +216,10 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   // `identifier: 'id'` —— 账号标识渲染的是**账号 id**（`officeace-<hash>`，
   //   由网关基址 + app key 派生），不是任何凭据本身：面板上显示 `modelAppKey`
   //   会把网关 key 露在界面上（`identifierOf` 读的是字段**值**，不只是标签）。
-  officeace: { usage: true, edition: false, identifier: 'id', expiry: 'expiresAt' },
+  officeace: {
+    usage: true, edition: false, identifier: 'id', expiry: 'expiresAt',
+    expiryScope: 'control-plane',
+  },
 }
 
 /**
@@ -232,6 +240,10 @@ export function providerOf(account: AccountRecord | null | undefined): string {
 /** provider id → 能力表（未登记的家走 GENERIC_FEATURES） */
 export function providerFeatures(providerId: string | undefined): ProviderFeatures {
   return (providerId && PROVIDER_FEATURES[providerId]) || GENERIC_FEATURES
+}
+
+export function expiryScopeOf(account: AccountRecord | null | undefined): NonNullable<ProviderFeatures['expiryScope']> {
+  return providerFeatures(providerOf(account)).expiryScope || 'routing'
 }
 
 /** CodeArts 福利入口的能力判断，保留给签到中心和旧账号页共用。 */

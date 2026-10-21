@@ -56,6 +56,23 @@ use super::{AccountStoreError, CredentialWrite};
 impl AccountStore {
     // ─── 凭证回写与限额标记 ──────────────────────────────────
 
+    /// refresh token 已被上游作废时的持久状态。该状态只阻止重复自动重试，
+    /// 不改变账号启用开关或其它转发凭证。
+    pub fn set_refresh_reauth_required(&self, id: &str, message: &str) -> bool {
+        let _guard = self.guard();
+        let Some(mut record) = self.record_by_id(&_guard, id) else {
+            return false;
+        };
+        record.set("refreshState", Value::String("reauth_required".to_string()));
+        record.set(
+            "refreshError",
+            Value::String(truncate_chars(message, 300)),
+        );
+        record.set_updated_at(logging::now_ms());
+        self.with_conn(&_guard, |conn| sql::update_in_place(conn, &record))
+            .is_ok()
+    }
+
     /// 账号刷新成功后回写新 token（账号不存在返回 false）
     pub fn update_account_tokens(
         &self,

@@ -373,6 +373,12 @@ pub fn referenced_pool_ids(&self) -> std::collections::HashSet<String> {
                     "chatSupported".to_string(),
                     Value::Bool(forwards_requests(record)),
                 );
+                if let Some(value) = record.get("refreshState") {
+                    fields.insert("refreshState".to_string(), value.clone());
+                }
+                if let Some(value) = record.get("refreshError") {
+                    fields.insert("refreshError".to_string(), value.clone());
+                }
                 // 最近一次签到成功的时刻（0 = 从未签过）。跨家统一注入的理由与上面
                 // 两条相同：它是「这条账号的签到状态」这一个事实，各家的存放位置
                 // 一致（`checkinAt`），界面不必按 provider 查表。
