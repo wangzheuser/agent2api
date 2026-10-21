@@ -114,6 +114,29 @@ pub struct ConnectionGuard {
 }
 
 impl ConnectionGuard {
+    pub(super) fn try_rebind(&mut self, account_id: Option<String>, limit: u64) -> bool {
+        let next = account_id.filter(|id| !id.is_empty());
+        if self.account_id == next { return true; }
+        let mut counts = lock_counts(&self.connections.inner);
+        if let Some(id) = next.as_deref() {
+            if limit > 0 && counts.get(id).copied().unwrap_or(0) as u64 >= limit {
+                return false;
+            }
+        }
+        if let Some(previous) = self.account_id.as_deref() {
+            match counts.get_mut(previous) {
+                Some(count) if *count > 1 => *count -= 1,
+                Some(_) => { counts.remove(previous); }
+                None => {}
+            }
+        }
+        if let Some(id) = next.as_deref() {
+            *counts.entry(id.to_string()).or_insert(0) += 1;
+        }
+        self.account_id = next;
+        true
+    }
+
     pub(super) fn new(connections: Connections) -> Self {
         Self { connections, account_id: None }
     }
@@ -160,5 +183,56 @@ impl Drop for ConnectionGuard {
         if let Some(account_id) = self.account_id.as_deref() {
             self.connections.sub(account_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hard_cap_is_atomic_and_handoff_releases_once() {
+        let connections = Connections::new();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let connections = connections.clone();
+            let barrier = barrier.clone();
+            threads.push(std::thread::spawn(move || {
+                let mut guard = ConnectionGuard::new(connections);
+                barrier.wait();
+                let reserved = guard.try_rebind(Some("fixture".into()), 1);
+                barrier.wait();
+                (reserved, guard)
+            }));
+        }
+        barrier.wait();
+        barrier.wait();
+        let results: Vec<_> = threads.into_iter().map(|thread| thread.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|(reserved, _)| *reserved).count(), 1);
+        assert_eq!(connections.snapshot(), vec![("fixture".into(), 1)]);
+        drop(results);
+        let mut guard = ConnectionGuard::new(connections.clone());
+        assert!(guard.try_rebind(Some("fixture".into()), 1));
+        let stream_guard = guard.handoff();
+        drop(guard);
+        assert_eq!(connections.snapshot(), vec![("fixture".into(), 1)]);
+        drop(stream_guard);
+        assert!(connections.snapshot().is_empty());
+    }
+
+    #[test]
+    fn zero_cap_stays_unlimited_and_failed_rebind_keeps_previous_slot() {
+        let connections = Connections::new();
+        let mut first = ConnectionGuard::new(connections.clone());
+        let mut second = ConnectionGuard::new(connections.clone());
+        assert!(first.try_rebind(Some("unlimited".into()), 0));
+        assert!(second.try_rebind(Some("unlimited".into()), 0));
+        assert_eq!(connections.snapshot(), vec![("unlimited".into(), 2)]);
+        assert!(first.try_rebind(Some("limited".into()), 1));
+        assert!(!second.try_rebind(Some("limited".into()), 1));
+        assert_eq!(connections.snapshot(), vec![("limited".into(), 1), ("unlimited".into(), 1)]);
+        drop(first); drop(second);
+        assert!(connections.snapshot().is_empty());
     }
 }

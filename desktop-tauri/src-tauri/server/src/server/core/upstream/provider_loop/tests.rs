@@ -21,6 +21,7 @@ async fn native_reward_providers_http_200_errors_reach_the_rotation_classifier()
             false,
             false,
             false,
+        None,
     )
         .await
         {
@@ -77,7 +78,7 @@ async fn success_head_wait_is_cancelled_without_waiting_for_another_chunk() {
                 &telemetry,
                 false,
                 false
-            , false),
+            , false, None),
             cancel
         );
         let failure = match result {
@@ -155,6 +156,7 @@ async fn zcode_http_200_quota_json_is_classified_before_streaming_without_resend
             false,
             false,
             false,
+        None,
     )
         .await;
         task.abort();
@@ -213,6 +215,7 @@ async fn zcode_http_auth_and_quota_errors_keep_their_status() {
             false,
             false,
             false,
+        None,
     )
         .await;
         task.abort();
@@ -248,6 +251,7 @@ async fn zcode_unknown_or_malformed_success_json_returns_an_error() {
             false,
             false,
             false,
+        None,
     )
         .await;
         task.abort();
@@ -286,6 +290,7 @@ async fn zcode_success_sse_and_other_providers_json_remain_unconsumed() {
             false,
             false,
             false,
+        None,
     )
         .await;
         task.abort();
@@ -358,6 +363,7 @@ async fn one_time_proof_retries_return_for_rebuild_while_normal_requests_reuse_t
             false,
             single_use,
             false,
+        None,
     )
         .await;
         assert_eq!(budget.remaining, 0);
@@ -373,7 +379,7 @@ async fn one_time_proof_retries_return_for_rebuild_while_normal_requests_reuse_t
                 &telemetry,
                 false,
                 true
-            , false)
+            , false, None)
             .await
             .is_ok());
             assert_eq!(*seen.lock().unwrap(), vec!["first", "second"]);
@@ -451,6 +457,7 @@ async fn cache_creation_raw_capture_is_exact_for_prefetched_and_translated_strea
                 false,
                 false,
                 false,
+        None,
     )
             .await
             .ok()
@@ -537,6 +544,7 @@ async fn http_405_switches_accounts_without_same_account_retry() {
         false,
         false,
         false,
+        None,
     )
     .await
     {
@@ -594,6 +602,7 @@ async fn zcode_http_200_quota_envelope_returns_a_rotatable_failure() {
         false,
         false,
         false,
+        None,
     )
     .await;
     let failure = match result {

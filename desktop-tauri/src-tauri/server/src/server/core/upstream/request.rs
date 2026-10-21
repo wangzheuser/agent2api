@@ -83,6 +83,7 @@ pub struct TransportRequest {
 /// 前者是本文件（协议层），后者是适配器（provider 层）。
 pub struct UpstreamErrorDetail {
     pub code: Option<i64>,
+    pub raw_code: Value,
     pub message: String,
     /// Provider 需要的少量结构化恢复字段。只保留白名单，避免把上游错误体的
     /// 凭据/调试字段继续向适配器传播。
@@ -95,6 +96,7 @@ impl UpstreamErrorDetail {
     pub fn to_value(&self) -> Value {
         let mut value = json!({
             "code": self.code.map(Value::from).unwrap_or(Value::Null),
+            "raw_code": self.raw_code,
             "message": self.message,
         });
         if let Some(object) = value.as_object_mut() {
@@ -121,10 +123,18 @@ pub async fn read_upstream_error(
         capture.push(text.as_bytes());
     }
     let mut code = None;
+    let mut raw_code = Value::Null;
     let mut fields = Map::new();
     let mut message: String = text.chars().take(500).collect();
     if let Ok(payload) = serde_json::from_str::<Value>(&text) {
-        code = payload.get("code").and_then(Value::as_i64);
+        raw_code = payload.get("code").or_else(|| payload.get("error").and_then(|error| error.get("code")))
+            .cloned().unwrap_or(Value::Null);
+        code = raw_code.as_i64();
+        for key in ["msg", "displayMsg"] {
+            if let Some(value) = payload.get(key).or_else(|| payload.get("error").and_then(|error| error.get(key))) {
+                fields.insert(key.to_string(), value.clone());
+            }
+        }
         copy_reset_fields(&payload, &mut fields);
         if let Some(error) = payload.get("error") {
             copy_reset_fields(error, &mut fields);
@@ -151,7 +161,7 @@ pub async fn read_upstream_error(
             message = candidate.to_string();
         }
     }
-    UpstreamErrorDetail { code, message, fields }
+    UpstreamErrorDetail { code, raw_code, message, fields }
 }
 
 const RESET_FIELDS: [&str; 4] = ["resets_at", "reset_at", "resetAt", "retry_after"];

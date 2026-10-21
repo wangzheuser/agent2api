@@ -75,6 +75,27 @@ fn inflight_table() -> &'static Mutex<HashMap<String, ()>> {
     TABLE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+struct RefreshReservation(String);
+
+impl RefreshReservation {
+    fn acquire(id: &str) -> Result<Self, WorkBuddyAuthError> {
+        let mut table = inflight_table().lock().unwrap_or_else(|error| error.into_inner());
+        if table.contains_key(id) {
+            return Err(WorkBuddyAuthError::with_status(
+                409, format!("账号 {id} 的 token 正在刷新中，请稍后重试"),
+            ));
+        }
+        table.insert(id.to_string(), ());
+        Ok(Self(id.to_string()))
+    }
+}
+
+impl Drop for RefreshReservation {
+    fn drop(&mut self) {
+        inflight_table().lock().unwrap_or_else(|error| error.into_inner()).remove(&self.0);
+    }
+}
+
 /// 刷新结果（供路由层与登录流程共用）
 #[derive(Clone, Debug)]
 pub struct RefreshedAuth {
@@ -87,6 +108,10 @@ pub struct RefreshedAuth {
 impl AuthService {
     pub fn new(store: AccountStore, context: Context) -> Self {
         Self { store, context }
+    }
+
+    pub(crate) fn store(&self) -> &AccountStore {
+        &self.store
     }
 
     /// 用「与默认上下文同源」的上下文构造（Agent2API W2b-T3）。
@@ -128,16 +153,27 @@ impl AuthService {
     // Node 版：`WORKBUDDY_TOKEN` 存在时直接用它组会话，完全不看账号库。
     // 这是给脚本/CI 用的旁路入口，保持一致。
 
-    fn env_session() -> Option<Value> {
-        let token = std::env::var("WORKBUDDY_TOKEN").ok()?.trim().to_string();
-        if token.is_empty() {
-            return None;
-        }
-        let refresh = std::env::var("WORKBUDDY_REFRESH_TOKEN")
-            .ok()
-            .unwrap_or_default();
-        let uid = std::env::var("WORKBUDDY_USER_ID").ok().unwrap_or_default();
+    fn env_session_for(provider: &str) -> Option<Value> {
+        use crate::server::core::providers::workbuddy::Region;
+        let region = Region::from_provider_id(provider)?;
+        let token = region.env_token()?;
+        let legacy_intl = region == Region::Intl
+            && Region::from_edition_id(std::env::var("WORKBUDDY_EDITION").ok().as_deref())
+                == Region::Intl
+            && std::env::var("WORKBUDDY_INTL_TOKEN")
+                .ok().is_none_or(|value| value.trim().is_empty());
+        let prefix = if region == Region::Intl && !legacy_intl {
+            "WORKBUDDY_INTL"
+        } else {
+            "WORKBUDDY"
+        };
+        let refresh = std::env::var(format!("{prefix}_REFRESH_TOKEN")).unwrap_or_default();
+        let uid = std::env::var(format!("{prefix}_USER_ID")).unwrap_or_default();
         Some(json!({
+            "provider": region.provider_id(),
+            "edition": region.id(),
+            "endpoint": region.env_endpoint_override()
+                .unwrap_or_else(|| region.default_endpoint().to_string()),
             "auth": with_expires_at(json!({
                 "accessToken": token,
                 "refreshToken": refresh,
@@ -145,6 +181,13 @@ impl AuthService {
             })),
             "account": { "uid": uid },
         }))
+    }
+
+    /// 与默认转发共享身份的只读快照；管理查询和目录刷新不能隐式续期。
+    pub fn default_session_snapshot_for(&self, provider: &str) -> Option<Value> {
+        Self::env_session_for(provider).or_else(|| {
+            self.store.current_entry_for_provider(provider).map(|entry| entry.session)
+        })
     }
 
     /// 当前可用凭证；临期自动刷新并回写。
@@ -166,8 +209,7 @@ impl AuthService {
     /// 而不是全局队首 —— 否则「只有 raccoon 账号」的机器上，
     /// workbuddy 的默认登录态会借到 raccoon 账号的凭证（发出去必然 401）。
     ///
-    /// 环境变量旁路（`WORKBUDDY_TOKEN`）是 **workbuddy 专属**：只有 scope 是
-    /// workbuddy 时才认它（see `env_session`）。
+    /// 环境变量旁路按 WorkBuddy 地区隔离，其他 provider 不借用凭证。
     pub async fn get_current_session_for(
         &self,
         provider: &str,
@@ -180,14 +222,9 @@ impl AuthService {
         &self,
         scope: Option<&str>,
     ) -> Result<Option<Value>, WorkBuddyAuthError> {
-        // 环境变量凭证只属于 workbuddy（WORKBUDDY_TOKEN）
-        let env_applies = scope
-            .map(|provider| provider == crate::server::core::providers::DEFAULT_PROVIDER_ID)
-            .unwrap_or(true);
-        if env_applies {
-            if let Some(session) = Self::env_session() {
-                return Ok(Some(session));
-            }
+        let provider = scope.unwrap_or(crate::server::core::providers::DEFAULT_PROVIDER_ID);
+        if let Some(session) = Self::env_session_for(provider) {
+            return Ok(Some(session));
         }
         let entry = match scope {
             Some(provider) => self.store.current_entry_for_provider(provider),
@@ -241,7 +278,7 @@ impl AuthService {
 
     /// 会话状态只读本地凭证；续期由维护任务和实际转发按需触发。
     pub fn get_status(&self) -> Value {
-        let session = Self::env_session()
+        let session = Self::env_session_for(crate::server::core::providers::DEFAULT_PROVIDER_ID)
             .or_else(|| self.store.get_current_entry().map(|entry| entry.session));
         let Some(session) = session else {
             return self.unconfigured_status();
@@ -445,6 +482,16 @@ impl AuthService {
         context: &Context,
         proxy: Option<&ResolvedProxy>,
     ) -> Result<RefreshedAuth, WorkBuddyAuthError> {
+        self.refresh_session_checked(auth, context, proxy, None).await
+    }
+
+    async fn refresh_session_checked(
+        &self,
+        auth: &Value,
+        context: &Context,
+        proxy: Option<&ResolvedProxy>,
+        session: Option<&Value>,
+    ) -> Result<RefreshedAuth, WorkBuddyAuthError> {
         let refresh_token = auth
             .get("refreshToken")
             .and_then(Value::as_str)
@@ -460,6 +507,30 @@ impl AuthService {
         let url = context.auth_url("/auth/token/refresh");
         let response =
             send_request_via("POST", &url, Some(&json!({})), &headers, proxy, None).await?;
+        if let Some(session) = session {
+            use super::providers::adapter::{adapter_for, UpstreamErrorClass, UpstreamStopReason};
+            use super::providers::workbuddy::Region;
+            let provider = session["provider"].as_str().unwrap_or("workbuddy");
+            if let Some(region) = Region::from_provider_id(provider) {
+                let kind = if region == Region::Intl {
+                    super::providers::ProviderKind::WorkBuddyIntl
+                } else { super::providers::ProviderKind::WorkBuddy };
+                if let UpstreamErrorClass::Terminal { kind: reason, status, message, upstream_code } =
+                    adapter_for(kind).classify_error(response.status, response.payload.as_ref().unwrap_or(&Value::Null))
+                {
+                    if reason == UpstreamStopReason::AccountRestricted {
+                        super::workbuddy_safety::pause(&self.store, session).map_err(|error| {
+                            let mut failure = WorkBuddyAuthError::with_status(error.status_code, error.message);
+                            failure.terminal = true;
+                            failure
+                        })?;
+                    }
+                    let mut error = WorkBuddyAuthError::with_code(message, Some(i32::from(status)), upstream_code);
+                    error.terminal = true;
+                    return Err(error);
+                }
+            }
+        }
         let data = unwrap_response(&response, "auth/token/refresh")?;
         let access_token = data
             .get("accessToken")
@@ -477,30 +548,20 @@ impl AuthService {
     /// 并发防重：同一账号同时只允许一次真实刷新，后到者直接返回先到者的结果
     /// —— 与 Node 版「单线程 + 无并发刷新」的实际效果一致，但显式化了。
     pub async fn refresh_account(&self, id: &str) -> Result<RefreshedAuth, WorkBuddyAuthError> {
+        if let Some(entry) = self.store.get_session_by_id(id) {
+            super::workbuddy_safety::check(&self.store, &entry.session).map_err(|error| {
+                let mut failure = WorkBuddyAuthError::with_code(error.message, Some(error.status_code), error.upstream_code);
+                failure.terminal = true;
+                failure
+            })?;
+        }
         // 不做「等前一个完成再复用结果」的复杂等待：这里用占位表把重复请求
         // 快速拒掉（返回明确错误），因为刷新本身很快，重复触发通常来自
         // 用户连点或启动维护，报错比静默复用更利于定位问题。
         // 表是**进程级**的（见 `AuthService` 的说明）：本实例、适配器构造的
         // 实例、`/api/accounts/refresh` 共用同一份占位状态。
-        {
-            let table = inflight_table();
-            let mut guard = match table.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            if guard.contains_key(id) {
-                return Err(WorkBuddyAuthError::with_status(
-                    409,
-                    format!("账号 {id} 的 token 正在刷新中，请稍后重试"),
-                ));
-            }
-            guard.insert(id.to_string(), ());
-        }
-        let result = self.refresh_account_inner(id).await;
-        if let Ok(mut guard) = inflight_table().lock() {
-            guard.remove(id);
-        }
-        result
+        let _reservation = RefreshReservation::acquire(id)?;
+        self.refresh_account_inner(id).await
     }
 
     async fn refresh_account_inner(&self, id: &str) -> Result<RefreshedAuth, WorkBuddyAuthError> {
@@ -531,7 +592,7 @@ impl AuthService {
         let auth = session.get("auth").cloned().unwrap_or(Value::Null);
         // 续期也走该账号自己的出口（账号没配代理 → 直连）
         let proxy = session_proxy(&session);
-        let next = self.refresh_session(&auth, &context, proxy.as_ref()).await?;
+        let next = self.refresh_session_checked(&auth, &context, proxy.as_ref(), Some(&session)).await?;
         if next.access_token.is_empty() {
             return Err(WorkBuddyAuthError::new("token 刷新响应缺少 accessToken"));
         }
@@ -790,4 +851,24 @@ pub fn context_for_edition(edition: Option<&str>, endpoint: Option<&str>) -> Con
         Some(info.platform),
         Some(info.id),
     )
+}
+
+#[cfg(test)]
+mod refresh_reservation_tests {
+    use super::RefreshReservation;
+
+    #[tokio::test]
+    async fn cancelled_refresh_releases_its_reservation() {
+        let (ready, waiting) = tokio::sync::oneshot::channel();
+        let job = tokio::spawn(async move {
+            let _guard = RefreshReservation::acquire("cancelled-refresh-fixture").unwrap();
+            ready.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        waiting.await.unwrap();
+        assert!(RefreshReservation::acquire("cancelled-refresh-fixture").is_err());
+        job.abort();
+        assert!(job.await.unwrap_err().is_cancelled());
+        assert!(RefreshReservation::acquire("cancelled-refresh-fixture").is_ok());
+    }
 }

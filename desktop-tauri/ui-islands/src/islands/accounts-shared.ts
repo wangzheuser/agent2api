@@ -164,6 +164,7 @@ export type AccountRecord = {
   source?: string
   proxy?: ProxyConfig | null
   rateLimits?: Record<string, RateLimitInfo>
+  workbuddySafety?: { paused: boolean; identity?: string; revision?: number; reason?: string; observedAt?: number }
   [key: string]: unknown
 }
 
@@ -236,6 +237,7 @@ export type AccountsBridge = {
   reorderAccounts(queue: string[]): Promise<unknown>
   moveAccount(id: string, direction: 'up' | 'down'): Promise<unknown>
   clearRateLimits(id: string, model?: string | null): Promise<unknown>
+  resumeWorkbuddySafety(id: string, payload: { confirmed: boolean; identity: string; revision: number }): Promise<unknown>
   /**
    * 账号路由（策略 / 粘性 / 退避 / 垫底 / 熔断）与候选队列可见化。
    * `setRoutingConfig` 收**部分**补丁、返回生效后的全量值（与 /api/timeouts

@@ -12,7 +12,7 @@
 //! chat 域  https://copilot.tencent.com   growth 任务列表 / accept / claim / 领养
 //!           /activity/growth/tasks、/activity/growth/buddy/*、/v2/activity/growth/energy
 //! billing 域 https://www.codebuddy.cn   常规上报（POST /v2/report）
-//! web 域    https://www.workbuddy.cn    网页成长中心（Library_read 上报 + claim 降级）
+//! web 域    https://www.workbuddy.cn    网页成长中心（Library_read 上报）
 //! ```
 //! 小程序域（school 开学季）与猫猫旅行分别在同目录的 `school.rs` / `travel.rs`。
 //!
@@ -45,6 +45,7 @@ pub mod spec;
 pub mod travel;
 
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::server::core::account_store::AccountStore;
 use crate::server::core::auth_http::send_raw;
@@ -57,7 +58,7 @@ use spec::{ids_for, spec_of, ObjectId};
 pub const CHAT_BASE: &str = "https://copilot.tencent.com";
 /// billing 域基址（常规 `/v2/report` 上报）。
 pub const BILL_BASE: &str = "https://www.codebuddy.cn";
-/// web 域基址（网页成长中心：web 事件上报 + claim 降级）。
+/// web 域基址（网页成长中心：web 事件上报）。
 pub const WEB_BASE: &str = "https://www.workbuddy.cn";
 
 /// 写动作之间的默认间隔（毫秒）。参考项目所有写动作硬性 ≥1s ——
@@ -87,6 +88,12 @@ pub struct GrowthAccount {
     /// 的 `X-Domain` 头就来自它（请求形态是实测沉淀的一部分）。
     pub domain: String,
     pub proxy: Option<ResolvedProxy>,
+    store: AccountStore,
+    session: Value,
+    stopped: AtomicBool,
+    request_gate: tokio::sync::Mutex<()>,
+    #[cfg(test)]
+    test_origin: Option<String>,
 }
 
 impl GrowthAccount {
@@ -125,8 +132,14 @@ impl GrowthAccount {
         let proxy = ResolvedProxy::from_json(session.get("proxy").unwrap_or(&Value::Null))
             .ok()
             .flatten();
-        Some(Self { uid, nick, token, domain, proxy })
+        if crate::server::core::workbuddy_safety::check(store, session).is_err() { return None; }
+        Some(Self { uid, nick, token, domain, proxy, store: store.clone(), session: session.clone(),
+            stopped: AtomicBool::new(false), request_gate: tokio::sync::Mutex::new(()),
+            #[cfg(test)] test_origin: None,
+        })
     }
+
+    pub fn is_stopped(&self) -> bool { self.stopped.load(Ordering::Acquire) }
 
     /// 稳定派生一个 36 位 hex 设备标识（machineId / sessionId 用，幂等）。
     ///
@@ -170,9 +183,11 @@ impl GrowthCall {
             .to_string()
     }
 
-    /// 业务成功：HTTP 2xx 且 code 为 0 或缺省。
+    /// 业务成功：HTTP 2xx、有效 JSON 对象且 code 为 0 或缺省。
     pub fn ok(&self) -> bool {
-        (200..300).contains(&self.status) && matches!(self.code(), Some(0) | None)
+        (200..300).contains(&self.status) && self.payload.as_ref().filter(|value| value.is_object())
+            .is_some_and(|value| value.get("code").map_or(true,
+                |code| code.is_null() || code.as_i64() == Some(0) || code.as_str() == Some("0")))
     }
 
     /// 信封的 data 段。
@@ -200,6 +215,17 @@ pub async fn growth_request(
     body: Option<&Value>,
     headers: &[(String, String)],
 ) -> Result<GrowthCall, String> {
+    let _gate = account.request_gate.lock().await;
+    if account.is_stopped() { return Err("本轮成长任务已停止，不再发送后续请求".into()); }
+    crate::server::core::workbuddy_safety::check(&account.store, &account.session).map_err(|error| {
+        account.stopped.store(true, Ordering::Release);
+        error.message
+    })?;
+    #[cfg(test)]
+    let redirected = account.test_origin.as_ref().map(|origin| url::Url::parse(url)
+        .map(|url| format!("{origin}{}", url.path()))).transpose().map_err(|_| "测试请求地址无效")?;
+    #[cfg(test)]
+    let url = redirected.as_deref().unwrap_or(url);
     let mut final_headers: Vec<(String, String)> = vec![
         ("Authorization".to_string(), format!("Bearer {}", account.token)),
         ("Accept".to_string(), "application/json".to_string()),
@@ -232,13 +258,20 @@ pub async fn growth_request(
     )
     .await
     .map_err(|error| {
+        account.stopped.store(true, Ordering::Release);
         if error.is_timeout() {
             "成长任务接口请求超时".to_string()
         } else {
             format!("成长任务接口请求失败: {error}")
         }
     })?;
-    Ok(GrowthCall { status: response.status, payload: response.payload })
+    if let Some(error) = crate::server::core::billing::workbuddy_stop_error(&account.store, &account.session, response.status, response.payload.as_ref().unwrap_or(&Value::Null)) {
+        account.stopped.store(true, Ordering::Release);
+        return Err(error.message);
+    }
+    let call = GrowthCall { status: response.status, payload: response.payload };
+    if !call.ok() { account.stopped.store(true, Ordering::Release); }
+    Ok(call)
 }
 
 /// 便捷封装：chat 域（copilot.tencent.com）请求。
@@ -342,10 +375,9 @@ pub async fn accept_task(
 
 /// 领奖（POST {chat}/activity/growth/tasks/{code}/claim，无 body）。
 ///
-/// ── 幂等与降级（M15 实测口径，逐条对齐参考项目）──────────────
+/// ── 幂等与拒绝边界 ────────────────────────────────────
 /// · 已领任务返回 `already_claimed` + credit/energy 读数 —— 不算失败；
-/// · chat 域 400 时降级 web 域（`{web}/activity/growth/tasks/{code}/claim`，
-///   带 Origin/Referer/x-client-platform: web 头）—— 部分任务 chat 域 400；
+/// · 未有明确兼容错误信号时，chat 域拒绝直接停止，不跨域重复领奖；
 /// · `mp=true` 时 chat 域先带 `X-Client-Platform: miniprogram`（小程序任务
 ///   领奖必需）。
 ///
@@ -363,19 +395,6 @@ pub async fn claim_task(
         Ok(call) => call,
         Err(error) => return (0, 0, 0, error),
     };
-    if call.status == 400 {
-        // chat 域 400 → 降级 web 域（fork ClaimReward 同款头）
-        logging::verbose(
-            "[Growth]",
-            &format!("claim {code} chat 域 400（{}），降级 web 域", call.msg()),
-        );
-        let web_headers = events::web_claim_headers(account);
-        let web = web_call(account, "POST", &path, None, &web_headers).await;
-        return match web {
-            Ok(web) => parse_claim(account, code, &web),
-            Err(error) => (0, 0, 0, error),
-        };
-    }
     parse_claim(account, code, &call)
 }
 
@@ -440,10 +459,10 @@ pub async fn growth_streak(account: &GrowthAccount) -> Option<i64> {
 pub async fn adopt_buddy(account: &GrowthAccount) -> (bool, String) {
     // 1) 前置解锁：一次 chat_request_send 上报
     let report = events::report_chat_send(account, false).await;
-    let _ = report;
+    if let Err(error) = report { return (false, error); }
     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
     // 2) 同意协议（幂等）
-    let _ = chat_call(
+    let agreement = chat_call(
         account,
         "POST",
         "/activity/growth/buddy/agreement",
@@ -451,6 +470,8 @@ pub async fn adopt_buddy(account: &GrowthAccount) -> (bool, String) {
         &[],
     )
     .await;
+    if let Err(error) = agreement { return (false, error); }
+    if account.is_stopped() { return (false, "同意协议请求被拒绝，本轮停止".into()); }
     tokio::time::sleep(std::time::Duration::from_millis(600)).await;
     // 3) 领养
     let call = chat_call(account, "POST", "/activity/growth/buddy/first", Some(&json!({})), &[]).await;
@@ -780,6 +801,7 @@ async fn accept_with_verify(account: &GrowthAccount, code: &str, mp: bool) -> bo
                 (false, error)
             }
         };
+        if account.is_stopped() { return false; }
         // 回读确认（响应可能说 accepted 但服务端未落账）
         let after = list_tasks(account, mp)
             .await
@@ -812,4 +834,104 @@ pub fn supports_growth(account: &Value) -> bool {
         .and_then(Value::as_str)
         .unwrap_or(crate::server::core::providers::DEFAULT_PROVIDER_ID);
     provider == crate::server::core::providers::workbuddy::Region::Cn.provider_id()
+}
+
+#[cfg(test)]
+mod safety_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    fn account(store: &AccountStore, uid: &str, origin: &str) -> GrowthAccount {
+        GrowthAccount {
+            uid: uid.into(), nick: "fixture".into(), token: "fixture".into(),
+            domain: "copilot.tencent.com".into(), proxy: None, store: store.clone(),
+            session: json!({"provider":"workbuddy","account":{"uid":uid},"auth":{"accessToken":"fixture"}}),
+            stopped: AtomicBool::new(false), request_gate: tokio::sync::Mutex::new(()),
+            test_origin: Some(origin.into()),
+        }
+    }
+
+    #[test]
+    fn growth_success_requires_zero_or_absent_business_code() {
+        for code in [json!("11140"), json!("11-128"), json!("unknown"), json!(11140)] {
+            assert!(!GrowthCall { status: 200, payload: Some(json!({"code":code})) }.ok());
+        }
+        for code in [json!(0), json!("0"), Value::Null] {
+            assert!(GrowthCall { status: 200, payload: Some(json!({"code":code})) }.ok());
+        }
+        for payload in [None, Some(Value::Null), Some(json!("not a response envelope"))] {
+            assert!(!GrowthCall { status: 200, payload }.ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_growth_rejection_stops_tasks_fallback_and_lottery_without_false_pause() {
+        use axum::{http::{StatusCode, Uri}, Router};
+        let (db, _file) = crate::server::db::test_temp::TempDb::open("legacy-growth-stop");
+        let store = AccountStore::with_db(Some(db));
+        for (index, (status, payload, paused)) in [
+            (429, json!({"msg":"rate limited"}), false),
+            (405, json!({"msg":"channel refused"}), false),
+            (400, json!({"msg":"rejected"}), false),
+            (200, json!({"code":"11140","msg":"account has been restricted"}), true),
+            (200, json!({"code":"business_rejected","msg":"rejected"}), false),
+            (200, Value::Null, false),
+        ].into_iter().enumerate() {
+            let hits = Arc::new(Mutex::new(Vec::new()));
+            let seen = hits.clone();
+            let app = Router::new().fallback(move |uri: Uri| {
+                let seen = seen.clone();
+                let payload = payload.clone();
+                async move {
+                    seen.lock().unwrap().push(uri.path().to_string());
+                    if uri.path() == "/portal/activity/school/tasks" {
+                        (StatusCode::OK, json!({"code":0,"data":{"in_period":true,"tasks":[
+                            {"task_code":"share_invite","status":"pending"},
+                            {"task_code":"chat_3_times","status":"pending"}
+                        ]}}).to_string())
+                    } else {
+                        (StatusCode::from_u16(status).unwrap(), payload.to_string())
+                    }
+                }
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let uid = format!("school-{index}");
+            let school_account = account(&store, &uid, &origin);
+            let (reports, lottery) = school::run_all(&school_account, &[], true).await;
+            assert_eq!(reports.len(), 1);
+            assert_eq!(reports[0].outcome, "failed");
+            assert!(lottery.is_none());
+            assert!(school_account.is_stopped());
+            assert_eq!(hits.lock().unwrap().as_slice(), [
+                "/portal/activity/school/tasks", "/portal/activity/school/tasks/share_invite/viewed"
+            ]);
+            assert_eq!(crate::server::core::workbuddy_safety::status(&store, &school_account.session).unwrap()["paused"], paused);
+            assert_eq!(claim_task(&school_account, "fixture", false).await.0, 0);
+            assert_eq!(hits.lock().unwrap().len(), 2);
+            let next_run = account(&store, &uid, &origin);
+            let _ = chat_call(&next_run, "POST", "/new-run", None, &[]).await;
+            assert_eq!(hits.lock().unwrap().len(), if paused { 2 } else { 3 });
+
+            hits.lock().unwrap().clear();
+            let buddy = account(&store, &format!("buddy-{index}"), &origin);
+            assert!(events::light_up(&buddy, "fixture", "buddy5", &[], 2).await.is_some());
+            assert_eq!(hits.lock().unwrap().len(), 1);
+
+            hits.lock().unwrap().clear();
+            let claim = account(&store, &format!("claim-{index}"), &origin);
+            assert_eq!(claim_task(&claim, "fixture", false).await.0, 0);
+            assert_eq!(hits.lock().unwrap().len(), 1);
+
+            hits.lock().unwrap().clear();
+            let concurrent = account(&store, &format!("concurrent-{index}"), &origin);
+            let _ = tokio::join!(
+                chat_call(&concurrent, "POST", "/first", None, &[]),
+                chat_call(&concurrent, "POST", "/second", None, &[])
+            );
+            assert_eq!(hits.lock().unwrap().len(), 1);
+            server.abort();
+        }
+    }
 }

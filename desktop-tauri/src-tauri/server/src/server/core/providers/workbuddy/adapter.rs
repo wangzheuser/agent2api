@@ -9,7 +9,7 @@
 //!   - 头集合与 URL        ← `upstream::request::{chat_headers, chat_completions_url}`
 //!   - system 注入         ← `upstream::request::ensure_leading_system_message`
 //!   - 429 / 6004 判定     ← `upstream::request::is_quota_limit_error` + `errors::parse_quota_reset_at`
-//!   - 11-128 退避建议      ← 本文件 `RATE_LIMIT_CODE`（次数 / 间隔走全局重试设置）
+//!   - 账号限制 / 渠道拒绝 / 队列繁忙：停止本次请求，不重放、不换号
 //!   - token 临期刷新      ← `auth::{get_current_session, is_token_expiring, refresh_account}`
 //!   - 模型清单            ← `core::models::global_catalog(region)`
 //!
@@ -55,27 +55,13 @@ use crate::server::errors::GatewayError;
 
 use super::super::adapter::{
     ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, ReasoningField, ReasoningPatch,
-    RetryAdvice, UpstreamErrorClass,
+    SuccessHead, UpstreamErrorClass, UpstreamStopReason,
 };
 use super::super::content_block;
 use super::super::ProviderKind;
 use super::region::Region;
 use super::normalize;
 
-/// 上游错误码 11-128（历史文案：Illegal API invocation from an unapproved channel）。
-///
-/// 实测语义：多为提示词命中上游敏感词审核而被拦截（并非单纯的频率风控）。
-/// 常量名沿用 Node 版的历史命名，不要据此理解成「频率限制」。
-/// 拦截会持续一小段时间，期间客户端失败自动重试会形成重试风暴并给拦截续期，
-/// 因此命中 11-128 时值得退避重试 —— 次数与间隔统一走设置页的「请求重试」
-/// （历史硬编码是 10 秒 / 25 秒各一次；间隔设得过短会拉长拦截窗口，建议 ≥10 秒）。
-///
-/// ── 为什么是字符串 ─────────────────────────────────────────
-/// 上游 body 里的 code 是**字符串** `"11-128"`（`11-128` 不是合法的 JSON
-/// 数字，也无法用 i64 表达）。历史实现写成 `const RATE_LIMIT_CODE: i64 =
-/// 11-128`，那是 `11 减 128 = -117` 的算术陷阱 —— 判定恒假，11-128 的
-/// 指引 / 退避路径从未生效。改为按字符串精确匹配（`as_i64` 对它取不到值，
-/// `as_str` 才是正解）。
 const RATE_LIMIT_CODE: &str = "11-128";
 
 /// 上游要求首条消息必须是 system prompt，否则返回 400
@@ -93,9 +79,6 @@ pub(crate) const DAILY_ACTIVITY_FREE_MODELS: &[&str] =
 /// msg 形如 `您的使用量已超出频率限制，将在 2026-09-11 19:43:46 UTC+8 重置…`
 /// —— 恢复时间只在文本里，由 `errors::parse_quota_reset_at` 解析。
 const QUOTA_LIMIT_CODE: i64 = 6004;
-
-/// 11-128 透传给客户端时追加的敏感词指引（避免被误当成普通频率限制）
-const WAF_HINT: &str = "；提示词可能命中上游敏感词，请检查提示词";
 
 /// WorkBuddy 适配器（无状态单例，见 `adapter::adapter_for`）。
 ///
@@ -268,71 +251,111 @@ impl ProviderAdapter for WorkBuddyAdapter {
         }
     }
 
-    /// 上游错误分类（照抄改造前 `upstream` 的判定与文案）：
-    ///   - 401 → TokenExpired（刷新后同账号重试一次）
-    ///   - 429 或 code 6004 → QuotaLimited（冷却 + 换账号）
-    ///   - 内容策略拦截（11-128 或审核文案）→ ContentBlocked（**不罚账号**：换中性提示词后
-    ///     同账号重试一次 + 触发降级，见 `core::degrade`）
-    ///   - 其余 → Fatal（原样透传）
-    ///
-    /// 文案逐字对齐改造前 `rotate::request_with_waf_retry` 的那三行
-    /// `format!("上游返回 {status}: {message}{hint}")`。
     fn classify_error(&self, status: u16, error_body: &Value) -> UpstreamErrorClass {
-        let code = error_body.get("code").and_then(Value::as_i64);
-        // 11-128 上游以字符串下发（见 `RATE_LIMIT_CODE` 的说明），数字解析取不到它
-        let code_str = error_body.get("code").and_then(Value::as_str);
-        let raw = error_body
-            .get("message")
-            .and_then(Value::as_str)
+        if error_body.get("code").is_none() && error_body.get("raw_code").is_none() {
+            if let Some(error) = error_body.get("error").filter(|error| error.is_object()) {
+                return self.classify_error(status, error);
+            }
+        }
+        let raw_code = error_body.get("raw_code").filter(|v| !v.is_null())
+            .or_else(|| error_body.get("code"));
+        let code = raw_code.and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()));
+        let code_str = raw_code.and_then(Value::as_str);
+        let raw = error_body.get("message").and_then(Value::as_str)
             .filter(|text| !text.is_empty())
+            .or_else(|| error_body.get("msg").and_then(Value::as_str))
             .unwrap_or("上游错误");
+        let display = error_body.get("displayMsg");
+        let details = format!("{} {} {}", raw,
+            display.and_then(Value::as_str).unwrap_or(""),
+            display.map(Value::to_string).unwrap_or_default()).to_lowercase();
+        let restricted = details.contains("account has been restricted")
+            || details.contains("account is restricted")
+            || details.contains("account suspended")
+            || details.contains("账号已被限制") || details.contains("账号被封")
+            || details.contains("账户已被限制") || details.contains("账号封禁");
+        let rate_limited = details.contains("rate limit") || details.contains("rate-limit")
+            || details.contains("rate_limit")
+            || details.contains("频率限制") || details.contains("请求频繁");
+        let channel_refused = code_str == Some(RATE_LIMIT_CODE) || code == Some(11128)
+            || details.contains("unapproved channel") || details.contains("illegal api invocation");
+        let terminal = if channel_refused {
+            Some((UpstreamStopReason::ChannelRefused, 403,
+                "WorkBuddy 拒绝当前接入渠道，已停止本次请求；请使用官方客户端核实，未自动改写提示词或换号。"))
+        } else if !rate_limited && (restricted || (code == Some(11140) && details.contains("request illegal"))) {
+            Some((UpstreamStopReason::AccountRestricted, 403,
+                "WorkBuddy 账号受到安全限制，已暂停该账号的请求；请在官方客户端核实并手动恢复。"))
+        } else if status == 403 && !rate_limited && details.contains("request illegal") {
+            Some((UpstreamStopReason::ChannelRefused, 403,
+                "WorkBuddy 拒绝本次请求，已停止重试；上游未明确限制账号，未持久暂停。"))
+        } else if code != Some(QUOTA_LIMIT_CODE) && (status == 429 || code == Some(6021))
+            && (code == Some(6021) || details.contains("queue.full") || details.contains("queue full")) {
+            Some((UpstreamStopReason::UpstreamBusy, 503,
+                "WorkBuddy 上游队列繁忙，请稍后重试；未标记账号限额或切换账号。"))
+        } else { None };
+        if let Some((kind, status, message)) = terminal {
+            return UpstreamErrorClass::Terminal { kind, status, message: message.into(), upstream_code: code };
+        }
         if status == 401 {
-            return UpstreamErrorClass::TokenExpired {
-                message: format!("上游返回 {status}: {raw}"),
-            };
+            return UpstreamErrorClass::TokenExpired { message: format!("上游返回 {status}: {raw}") };
         }
         if status == 429 || code == Some(QUOTA_LIMIT_CODE) {
-            // 恢复时间只在上游文案里：解析失败给 None，由冷却标记落 10 分钟兜底
             let reset_at = crate::server::errors::parse_quota_reset_at(raw);
             return UpstreamErrorClass::QuotaLimited {
                 reset_at: if reset_at > 0 { Some(reset_at) } else { None },
-                message: format!("上游返回 {status}: {raw}"),
-                upstream_code: code,
-                status,
+                message: format!("上游返回 {status}: {raw}"), upstream_code: code,
+                status: if status < 400 { 429 } else { status },
             };
         }
-        // 11-128 透传时追加敏感词指引（改造前在 rotate::request_with_waf_retry 里）
-        let is_waf_code = code_str == Some(RATE_LIMIT_CODE);
-        let hint = if is_waf_code { WAF_HINT } else { "" };
-        let message = format!("上游返回 {status}: {raw}{hint}");
-        // 内容策略拦截（11-128 及其历史文案）：**不罚账号**，交给编排层降级到
-        // 中性提示词后同账号重试一次（见 `core::degrade`）。判据取并集 ——
-        // 业务码兜住「上游改了文案」、共用文案规则兜住「上游改了码」，两条
-        // 指向的是同一件事（论证见 `providers::content_block` 模块头）。
-        //
-        // 提示文案分两种：11-128 用它自己那句既有措辞（`WAF_HINT`，改造前
-        // 就在 —— 既有用户的错误文案逐字不变是本项目的约定，不并进共用提示）；
-        // 只按文案命中的那一支才补共用提示（两条提示说的是同一件事，
-        // 叠在一起只是噪音）。
-        if is_waf_code {
-            return UpstreamErrorClass::ContentBlocked {
-                status,
-                message,
-                upstream_code: code,
-            };
-        }
+        let status = if status < 400 { 502 } else { status };
+        let message = format!("上游返回 {status}: {raw}");
         if content_block::matched(status, error_body) {
             return UpstreamErrorClass::ContentBlocked {
-                status,
-                message: format!("{message}{}", content_block::CONTENT_BLOCK_HINT),
-                upstream_code: code,
+                status, message: format!("{message}{}", content_block::CONTENT_BLOCK_HINT), upstream_code: code,
             };
         }
-        UpstreamErrorClass::Fatal {
-            status,
-            message,
-            upstream_code: code,
+        UpstreamErrorClass::Fatal { status, message, upstream_code: code }
+    }
+
+    fn inspect_success_head(&self, head: &[u8]) -> SuccessHead {
+        if head.is_empty() { return SuccessHead::Pending; }
+        let text = String::from_utf8_lossy(head);
+        let trimmed = text.trim_start();
+        if trimmed.starts_with('{') {
+            return match serde_json::from_str::<Value>(trimmed) {
+                Ok(payload) => {
+                    let class = self.classify_error(200, &payload);
+                    if !matches!(class, UpstreamErrorClass::Fatal { .. }) {
+                        SuccessHead::Failure(class)
+                    } else { SuccessHead::Ready }
+                }
+                Err(error) if error.is_eof() && head.len() < 65536 => SuccessHead::Pending,
+                Err(_) => SuccessHead::Ready,
+            };
         }
+        // 角色/用量初始化不是正文；同一个 chunk 内也必须继续看后面的业务错误。
+        let mut ready = false;
+        for line in text.split_inclusive('\n') {
+            if !line.ends_with('\n') { break; }
+            let Some(data) = line.trim().strip_prefix("data:") else { continue; };
+            if data.trim() == "[DONE]" { ready = true; continue; }
+            let Ok(payload) = serde_json::from_str::<Value>(data.trim()) else { continue; };
+            let class = self.classify_error(200, &payload);
+            if !matches!(class, UpstreamErrorClass::Fatal { .. }) {
+                return SuccessHead::Failure(class);
+            }
+            let choice = &payload["choices"][0];
+            let delta = &choice["delta"];
+            let has_text = ["content", "reasoning_content", "reasoning"]
+                .iter().any(|key| delta[*key].as_str().is_some_and(|value| !value.is_empty()));
+            let has_tool = delta["tool_calls"].as_array().is_some_and(|calls| !calls.is_empty())
+                || delta.get("function_call").is_some_and(|value| !value.is_null());
+            let finished = choice["finish_reason"].as_str().is_some_and(|reason| !reason.is_empty());
+            // 未识别的业务信封保留原来的透传，不能吞掉其他协议的错误正文。
+            ready |= has_text || has_tool || finished
+                || payload.get("code").is_some() || payload.get("error").is_some();
+        }
+        if ready || head.len() >= 65536 { SuccessHead::Ready } else { SuccessHead::Pending }
     }
 
     /// 取 access token（含临期主动刷新并回写 store）。
@@ -375,9 +398,7 @@ impl ProviderAdapter for WorkBuddyAdapter {
                     &format!("token 临期，自动刷新（账号 {account_id}）…"),
                 );
                 let auth = AuthService::for_store(store.clone());
-                let refreshed = auth.refresh_account(account_id).await.map_err(|error| {
-                    GatewayError::with_status(error.http_status(), error.message)
-                })?;
+                let refreshed = auth.refresh_account(account_id).await.map_err(|error| error.to_gateway_error())?;
                 return Ok(refreshed.access_token);
             }
             let token = entry
@@ -447,10 +468,7 @@ impl ProviderAdapter for WorkBuddyAdapter {
                             )
                         })
                 }
-                Err(error) => Err(GatewayError::with_status(
-                    error.http_status(),
-                    error.message,
-                )),
+                Err(error) => Err(error.to_gateway_error()),
             }
         })
     }
@@ -502,41 +520,6 @@ impl ProviderAdapter for WorkBuddyAdapter {
     /// workbuddy 有远程目录（`GET /v3/config` 的 `data.models`），支持刷新模型清单。
     fn supports_model_refresh(&self) -> bool {
         true
-    }
-
-    /// 11-128 退避建议（改造前 `rotate::request_with_waf_retry` 的判定；
-    /// 次数与间隔改由设置页的「请求重试」统一提供）。
-    ///
-    /// **循环**留在编排层（架构文档 §4.3「11-128 退避逻辑保持在转发层」），
-    /// 这里只回答「这个错误要不要退避、退多久、为什么」——
-    /// 「哪个码是敏感词拦截」是 workbuddy 的知识，不该漏进 `upstream/`。
-    ///
-    /// `budget` 是编排层按「这一轮是不是已经换过家」算出的预算
-    /// （见 `ProviderAdapter::retry_advice` 的说明）—— 本函数只比 `attempt`
-    /// 与它，不去读全局设置里的哪一档。
-    ///
-    /// 返回的 `reason` 不含「第 n/N 次」：那是编排层才知道的读数
-    /// （见 `RetryAdvice` 的说明）。
-    fn retry_advice(
-        &self,
-        error_body: &Value,
-        attempt: usize,
-        budget: usize,
-    ) -> Option<RetryAdvice> {
-        // 11-128 以字符串下发（见 `RATE_LIMIT_CODE` 的说明），数字解析取不到它
-        let code_str = error_body.get("code").and_then(Value::as_str);
-        if code_str != Some(RATE_LIMIT_CODE) {
-            return None;
-        }
-        if attempt >= budget {
-            return None;
-        }
-        let retry = crate::server::config::retry_settings();
-        Some(RetryAdvice {
-            delay_ms: retry.delay_ms(),
-            reason: "上游敏感词拦截（11-128），请检查提示词中的敏感词（可在设置页「通用 → 指纹脱敏」开关）"
-                .to_string(),
-        })
     }
 
     /// workbuddy 有环境变量凭证旁路（国内版 `WORKBUDDY_TOKEN`、

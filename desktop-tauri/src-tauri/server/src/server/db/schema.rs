@@ -180,7 +180,8 @@ pub const RESERVED_KV_KEYS: &[&str] = &[
 /// 做成函数而不是让调用方自己 `.contains()`：将来若固定键改成带前缀的命名，
 /// 改一处即可（与 `db::migrate` 各迁移项包一层 `sql::has_key` 同一手法）。
 pub fn is_reserved(key: &str) -> bool {
-    RESERVED_KV_KEYS.contains(&key)
+    // 账号安全暂停独立于配置；配置保存不能覆盖或清除人工恢复状态。
+    RESERVED_KV_KEYS.contains(&key) || key.starts_with("workbuddySafety:")
 }
 
 /// 当前 schema 版本。加表 / 加列时 +1，并在 [`apply_version`] 里补一个分支。

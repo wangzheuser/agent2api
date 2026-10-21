@@ -1,5 +1,5 @@
 import * as React from 'react'
-import { Button } from '@ui'
+import { Button, Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@ui'
 import { findAccount, refreshCreditDetails } from './accounts-data'
 import type { AccountRecord } from './accounts-shared'
 import {
@@ -81,6 +81,7 @@ export function AccountsGrowthPanel({ account, namesHidden = false }: { account:
   const [location, setLocation] = React.useState('')
   const [makeupDate, setMakeupDate] = React.useState('')
   const [agreement, setAgreement] = React.useState(false)
+  const [confirmLegacy, setConfirmLegacy] = React.useState(false)
   const lock = React.useRef(false)
   const mounted = React.useRef(true)
   const actionRequest = React.useRef<{ key: string; token: string; task?: GrowthTask } | null>(null)
@@ -103,6 +104,7 @@ export function AccountsGrowthPanel({ account, namesHidden = false }: { account:
   }
   async function act(action: string, options: Omit<GrowthAction, 'id' | 'action'> = {}) {
     if (lock.current || !state || uncertain) return
+    if (state.legacyPending) { setError('旧入口操作结果待核实，请先确认原操作结果。'); return }
     const identity = state.identity
     const request = { ...options, id: account.id, action, expectedIdentity: identity }
     const requestKey = growthActionKey(request)
@@ -124,7 +126,7 @@ export function AccountsGrowthPanel({ account, namesHidden = false }: { account:
       if (current()) { setError(namesHidden ? '操作结果待核实，请先刷新状态。' : `操作结果待核实：${errorText(error)}。请先刷新状态后再操作。`); setUncertain(true) }
     } finally { lock.current = false; if (current()) setBusy(false) }
   }
-  const disabled = busy || uncertain || !!state?.running || !!state?.pending
+  const disabled = busy || uncertain || !!state?.running || !!state?.pending || !!state?.legacyPending
   const travel = state?.travel
   const selectedLocation = travel?.locations.find(item => item.id === location && item.enabled)
   return <div className='growth-panel' aria-busy={busy}>
@@ -140,6 +142,29 @@ export function AccountsGrowthPanel({ account, namesHidden = false }: { account:
       {state.pending && <div className='credits-alert'>此前操作结果待核实，新动作暂缓。
         {state.pending.request.id === account.id ? <Button variant='outline' disabled={busy || uncertain || state.running} onClick={() => void act(state.pending!.request.action, state.pending!.request)}>继续核实上次操作</Button> : <span>请回到发起操作的账号核实。</span>}
       </div>}
+      {state.legacyPending && <div className='credits-alert'>旧入口操作结果待核实，已阻止重复发送。
+        <Button variant='outline' disabled={busy || state.running} onClick={() => setConfirmLegacy(true)}>核对旧操作结果</Button>
+      </div>}
+      <Dialog open={confirmLegacy} onOpenChange={next => { if (!busy) setConfirmLegacy(next) }}>
+        <DialogContent>
+          <DialogHeader><DialogTitle>确认已核对旧成长操作</DialogTitle></DialogHeader>
+          <DialogBody>请先在官方客户端核对任务、旅行或抽奖结果。确认只清除本地待核实标记，不重发操作，也不表示奖励已经到账。</DialogBody>
+          <DialogFooter>
+            <Button variant='outline' disabled={busy} onClick={() => setConfirmLegacy(false)}>取消</Button>
+            <Button disabled={busy || !state.legacyPending} onClick={async () => {
+              if (!state.legacyPending || lock.current) return
+              lock.current = true; setBusy(true)
+              try {
+                await growthApi().resolveLegacyGrowth(account.id, {
+                  confirmed: true, expectedIdentity: state.identity, clientToken: state.legacyPending.clientToken,
+                })
+                if (current()) { setConfirmLegacy(false); setState(null); setUncertain(true); setError('已确认原操作结果，请刷新福利状态后继续。') }
+              } catch (error) { if (current()) setError(errorText(error)) }
+              finally { lock.current = false; if (current()) setBusy(false) }
+            }}>已核对，解除待核实</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       {!state.supported && <p className='credits-alert'>{state.reason || '当前账号不适用国内成长福利。'}</p>}
       {!!state.errors.length && <div className='credits-alert' role='status'>部分状态查询失败：{state.errors.map(item => namesHidden ? item.section : `${item.section}：${item.message}`).join('；')}</div>}
       {state.supported && <>

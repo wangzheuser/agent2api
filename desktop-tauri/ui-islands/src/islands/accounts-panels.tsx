@@ -24,6 +24,12 @@ import {
   BadgeDot,
   Button,
   Checkbox,
+  Dialog,
+  DialogBody,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
   Popover,
   PopoverContent,
   PopoverTrigger,
@@ -59,7 +65,7 @@ import {
   commitPriority, connectionsOf, maskName, moveAccount, openCreditsDialog, openSettingsDialog, poolError,
   openBatchDialog, openZcodePlans, proxyPoolSnapshot, queryUsageOnce, runCheckin, setAccountEnabled,
   setGroupEnabled, setPanelOpen, startCodeArtsWelfare, toggleGroupCollapsed, tokenUsageOf,
-  toggleNamesHidden, usageEntryOf, usageFailureOf,
+  toggleNamesHidden, usageEntryOf, usageFailureOf, resumeWorkbuddySafety,
 } from './accounts-data'
 import type { AccountGroup } from './accounts-domain'
 import { PROVIDER_ICONS } from './add-provider-pick'
@@ -245,6 +251,8 @@ export function PriorityStepper({ account, seat }: {
  * 轨道位置与滑块表达，再补一枚「启用」是同一格里的第二次说明。
  */
 export function StatusCell({ account }: { account: AccountRecord }) {
+  const [confirmResume, setConfirmResume] = React.useState(false)
+  const [resuming, setResuming] = React.useState(false)
   const enabled = isEnabled(account)
   const tags = accountTags(account)
   // Token 限额的禁用档命中且账号已被禁用：补一枚红色徽章回答「为什么是禁的」
@@ -271,6 +279,29 @@ export function StatusCell({ account }: { account: AccountRecord }) {
           ))}
         </div>
       ) : null}
+      {account.workbuddySafety?.paused && account.workbuddySafety.identity ? (
+        <Button variant='outline' size='sm' onClick={() => setConfirmResume(true)}>解除安全暂停</Button>
+      ) : null}
+      <Dialog open={confirmResume} onOpenChange={next => { if (!resuming) setConfirmResume(next) }}>
+        <DialogContent>
+          <DialogHeader><DialogTitle>确认恢复 WorkBuddy 请求</DialogTitle></DialogHeader>
+          <DialogBody>
+            <p>请先通过官方客户端确认该账号的限制已解除。恢复后转发与后台任务可能再次请求上游。</p>
+            <p>这只解除本地安全暂停，不表示上游已解封，也不会清除普通限额。</p>
+          </DialogBody>
+          <DialogFooter>
+            <Button variant='outline' disabled={resuming} onClick={() => setConfirmResume(false)}>取消</Button>
+            <Button disabled={resuming} onClick={async () => {
+              setResuming(true)
+              try {
+                if (await resumeWorkbuddySafety(account)) setConfirmResume(false)
+              } finally {
+                setResuming(false)
+              }
+            }}>{resuming ? '恢复中…' : '已确认，恢复请求'}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </>
   )
 }

@@ -349,6 +349,8 @@ const BRIDGE_JS: &str = r#"
     clearRateLimits: (id, model) =>
       call('POST', '/api/accounts/' + encodeURIComponent(id) + '/rate-limits/clear',
         model ? { model } : {}),
+    resumeWorkbuddySafety: (id, payload) =>
+      call('POST', '/api/accounts/' + encodeURIComponent(id) + '/workbuddy-safety/resume', payload),
     // ── 账号路由（策略 / 粘性 / 退避 / 垫底 / 熔断 + 队列可见化）──
     getRoutingConfig: () => call('GET', '/api/routing'),
     setRoutingConfig: patch => call('PUT', '/api/routing', patch || {}),
@@ -469,6 +471,8 @@ const BRIDGE_JS: &str = r#"
     getAutoClawTasks: id => call('GET', '/api/accounts/autoclaw/tasks?id=' + encodeURIComponent(String(id || ''))),
     getWorkBuddyGrowth: id => call('GET', '/api/accounts/workbuddy/growth?id=' + encodeURIComponent(id)),
     workBuddyGrowthAction: input => call('POST', '/api/accounts/workbuddy/growth/action', input),
+    resolveLegacyGrowth: (id, payload) =>
+      call('POST', '/api/accounts/' + encodeURIComponent(id) + '/growth/legacy/resolve', payload),
     getWorkBuddyPolicy: id => call('GET', '/api/accounts/workbuddy/policy?id=' + encodeURIComponent(id)),
     updateWorkBuddyPolicy: (id, patch) => call('PATCH', '/api/accounts/workbuddy/policy?id=' + encodeURIComponent(id), patch),
     // 逐账号活跃连接数 `{counts: {id: n}}`（只含非零项，缺失即 0）。

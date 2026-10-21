@@ -79,6 +79,31 @@ pub struct BillingError {
     pub upstream_code: Option<i64>,
 }
 
+pub(crate) fn workbuddy_stop_error(
+    store: &crate::server::core::account_store::AccountStore,
+    session: &Value,
+    status: u16,
+    body: &Value,
+) -> Option<BillingError> {
+    use crate::server::core::providers::adapter::{ProviderAdapter, UpstreamErrorClass, UpstreamStopReason};
+    use crate::server::core::providers::workbuddy::{Region, WorkBuddyAdapter};
+    match WorkBuddyAdapter::new(Region::Cn).classify_error(status, body) {
+        UpstreamErrorClass::Terminal { kind, status, message, upstream_code } => {
+            if kind == UpstreamStopReason::AccountRestricted {
+                if let Err(error) = crate::server::core::workbuddy_safety::pause(store, session) {
+                    return Some(BillingError::new(error.message, 503));
+                }
+            }
+            Some(BillingError::with_code(message, status as i32, upstream_code))
+        }
+        UpstreamErrorClass::TokenExpired { message } => Some(BillingError::new(message, 401)),
+        UpstreamErrorClass::QuotaLimited { message, status, upstream_code, .. } => {
+            Some(BillingError::with_code(message, status as i32, upstream_code))
+        }
+        _ => None,
+    }
+}
+
 impl BillingError {
     pub fn new(message: impl Into<String>, status_code: i32) -> Self {
         Self {
@@ -222,6 +247,8 @@ impl BillingService {
             Some(session) => session.clone(),
             None => self.require_session().await?,
         };
+        crate::server::core::workbuddy_safety::check(self.auth.store(), &session)
+            .map_err(|error| BillingError::new(error.message.clone(), error.status_code))?;
         // 账户级端点：国内版/国际版账号各走自己的站点。
         // 会话缺 endpoint 时回落到 auth 的默认 baseUrl（Node 的
         // `normalizeEndpoint(activeSession.endpoint || baseUrl)`）
@@ -290,6 +317,9 @@ impl BillingService {
         })?;
 
         let payload = response.payload;
+        if let Some(error) = workbuddy_stop_error(self.auth.store(), &session, response.status, payload.as_ref().unwrap_or(&Value::Null)) {
+            return Err(error);
+        }
         let code = payload
             .as_ref()
             .and_then(|value| value.get("code"))

@@ -24,7 +24,47 @@ use super::request::{
     BILLING_ACTIVITY_CHECKIN_STATUS, BILLING_DAILY_CHECKIN, js_truthy,
 };
 use super::{assert_checkin_supported, normalize_activity_status, normalize_daily_claim, BillingError, BillingService};
-use super::activity_response::consume_activity_response;
+use super::activity_response::validate_activity_sse;
+
+pub(super) async fn consume_workbuddy_activity_response(
+    store: &crate::server::core::account_store::AccountStore,
+    session: &Value,
+    mut response: reqwest::Response,
+) -> Result<bool, BillingError> {
+    let status = response.status().as_u16();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| BillingError::new("活跃响应中断", 502))? {
+        if bytes.len() + chunk.len() > (1 << 20) {
+            return Err(BillingError::new("活跃响应超过大小限制", 502));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let payloads = if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+        vec![value]
+    } else {
+        text.lines().filter_map(|line| line.strip_prefix("data:")).filter_map(|data| serde_json::from_str::<Value>(data.trim()).ok()).collect()
+    };
+    for value in &payloads {
+        for payload in [value, &value["data"], &value["error"]] {
+            if payload.is_null() { continue; }
+            if let Some(error) = super::workbuddy_stop_error(store, session, status, payload) {
+                return Err(error);
+            }
+            let code = payload["code"].as_str().unwrap_or("");
+            let message = payload["msg"].as_str().or_else(|| payload["message"].as_str()).unwrap_or("").to_lowercase();
+            if matches!(status, 400 | 404) && (code == "model_not_found" || code == "unsupported_model"
+                || message.contains("model") && (message.contains("not found") || message.contains("not supported") || message.contains("unsupported"))) {
+                return Ok(false);
+            }
+        }
+    }
+    if !(200..300).contains(&status) {
+        return Err(BillingError::new(format!("活跃请求被拒绝 HTTP {status}"), status as i32));
+    }
+    validate_activity_sse(&bytes).map_err(|error| BillingError::new(error, 502))?;
+    Ok(true)
+}
 
 /// 国际版每日活跃任务的**执行粒度**（对应签到中心的三颗手动按钮；
 /// 定时与批量签到恒走 [`WorkbuddyActivity::Full`]，粒度细分只是手动入口的事）。
@@ -247,9 +287,13 @@ impl BillingService {
         // 链路，并把探测/领取/保活结果一起返回，避免重复打上游。
         if super::is_international(&active) {
             let activity = self.workbuddy_daily_activity(&active, WorkbuddyActivity::Full).await;
-            let usage = match self.query_credits_summary(Some(&active), locale).await {
-                Ok(value) => value,
-                Err(error) => json!({ "error": error.message }),
+            let usage = if activity.pointer("/activity/stopped") == Some(&Value::Bool(true)) {
+                json!({"status":"not_queried","error":"活跃任务已停止，未继续查询最新积分"})
+            } else {
+                match self.query_credits_summary(Some(&active), locale).await {
+                    Ok(value) => value,
+                    Err(error) => json!({ "error": error.message }),
+                }
             };
             return Ok(json!({
                 "checkinStatus": activity.get("status").cloned().unwrap_or(Value::Null),
@@ -305,10 +349,39 @@ impl BillingService {
     ///   * 领取只在「活动开放且今日未领」时打：`todayCheckedIn` 直接给
     ///     `alreadyCompleted`（上游幂等，但少一发是一发），活动没开就不打领取。
     ///
-    /// 保活的模型链来自 `keepalive::models()`（签到中心可自定义，空回落缺省链），
-    /// 逐个尝试、第一个成功的收口（见 `poke_daily_activity`）。
+    /// 模型链只在模型明确不支持时继续；授权、容量及业务拒绝立即结束本轮。
     pub async fn workbuddy_daily_activity(&self, session: &Value, mode: WorkbuddyActivity) -> Value {
-        let balance_before = self.log_workbuddy_activity_balance(session, "前").await;
+        let mut completed_claim = Value::Null;
+        let result = async {
+            crate::server::core::workbuddy_safety::check(self.auth.store(), session)
+                .map_err(|error| BillingError::new(error.message.clone(), error.status_code))?;
+            let identity = crate::server::core::workbuddy_policy::identity(session)
+                .ok_or_else(|| BillingError::new("账号身份缺失", 400))?;
+            let lease = match crate::server::core::task_state::claim(
+                &format!("workbuddy-daily-activity:{identity}"), 0, true,
+                crate::server::core::task_state::ManualBackoff::Respect, 1000,
+            ).map_err(|error| BillingError::new(error, 503))? {
+                crate::server::core::task_state::Claim::Acquired(lease) => lease,
+                crate::server::core::task_state::Claim::Deferred(_) => return Err(BillingError::new("活跃任务正在执行或冷却中", 409)),
+            };
+            let result = self.run_workbuddy_daily_activity(session, mode, &mut completed_claim).await;
+            lease.finish(result.is_ok(), if result.is_ok() { "活跃任务完成" } else { "活跃任务停止" }.into(), None, 0, 0)
+                .map_err(|error| BillingError::new(error, 503))?;
+            result
+        }.await;
+        match result {
+            Ok(value) => value,
+            Err(error) => json!({"status":null,
+                "claim":if completed_claim.is_null() { json!({"success":false,"code":error.upstream_code,"msg":error.message}) } else { completed_claim },
+                "activity":{"mode":mode.as_str(),"stopped":true,"pokeSucceeded":null,"error":error.message,"rewardStatus":"unverified"}}),
+        }
+    }
+
+    async fn run_workbuddy_daily_activity(&self, session: &Value, mode: WorkbuddyActivity, completed_claim: &mut Value) -> Result<Value, BillingError> {
+        let cached_web = if mode != WorkbuddyActivity::Claim {
+            super::web_activity::cached(session).map_err(|error| BillingError::new(error, 409))?
+        } else { None };
+        let balance_before = self.log_workbuddy_activity_balance(session, "前").await?;
 
         let (status_available, active, today_checked_in, status_value) = if mode == WorkbuddyActivity::Keepalive {
             (false, false, false, Value::Null)
@@ -346,6 +419,7 @@ impl BillingService {
                             result.code.unwrap_or(-1)
                         ),
                     );
+                    return Err(BillingError::with_code("签到活动状态未确认，停止后续请求；可在确认账号正常后单独执行保活", 502, result.code));
                 }
                 (
                     status_available,
@@ -359,18 +433,7 @@ impl BillingService {
                     "[Checkin]",
                     &format!("WorkBuddy 国际版活跃探测失败: {}", error.message),
                 );
-                (
-                    false,
-                    false,
-                    false,
-                    json!({
-                        "active": false,
-                        "todayCheckedIn": false,
-                        "statusAvailable": false,
-                        "code": -1,
-                        "msg": error.message,
-                    }),
-                )
+                return Err(error);
             }
         }
         };
@@ -405,28 +468,43 @@ impl BillingService {
                         "[Checkin]",
                         &format!("WorkBuddy 国际版活跃奖励领取失败: {}", error.message),
                     );
-                    json!({ "success": false, "code": -1, "msg": error.message })
+                    return Err(error);
                 }
             }
         } else {
             json!({ "success": false, "code": 0, "msg": "活动未开启" })
         };
+        *completed_claim = claim.clone();
+        if active && !today_checked_in && claim["success"] != true && claim["alreadyCompleted"] != true {
+            return Err(BillingError::with_code(
+                claim["msg"].as_str().unwrap_or("活跃奖励领取失败，停止后续请求"),
+                502,
+                claim["code"].as_i64(),
+            ));
+        }
 
         let (api_poke_succeeded, poke_model, web) = if mode != WorkbuddyActivity::Claim {
-            let (api, model) = self.poke_daily_activity(session).await;
+            if let Some(web) = cached_web {
+                (None, None, Some(web))
+            } else {
+            let (api, model) = self.poke_daily_activity(session).await?;
             let models = super::keepalive::models();
-            let web = super::web_activity::run(session, model.as_deref().unwrap_or(&models[0])).await;
+            let web = super::web_activity::run(self.auth.store(), session, model.as_deref().unwrap_or(&models[0])).await;
             logging::log("[Checkin]", &format!(
                 "WorkBuddy 国际版网页保活（status={}，outputChunks={}，success={}，error={}）",
                 web.status, web.output_chunks, web.success, web.error.as_deref().unwrap_or("none"),
             ));
+            if !web.success {
+                return Err(BillingError::new(web.error.unwrap_or_else(|| "网页保活未完成".into()), 502));
+            }
             (Some(api), model, Some(web))
+            }
         } else {
             (None, None, None)
         };
-        let report = if mode != WorkbuddyActivity::Claim { self.report_chat_activity(session).await } else { Value::Null };
+        let report = if mode != WorkbuddyActivity::Claim && api_poke_succeeded.is_some() { self.report_chat_activity(session).await? } else { Value::Null };
         let poke_succeeded = web.as_ref().map(|result| result.success);
-        let balance_after = self.log_workbuddy_activity_balance(session, "执行后").await;
+        let balance_after = self.log_workbuddy_activity_balance(session, "执行后").await?;
         let balance_delta = balance_before
             .as_ref()
             .zip(balance_after.as_ref())
@@ -457,7 +535,7 @@ impl BillingService {
             ),
         );
 
-        json!({
+        Ok(json!({
             "status": status_value,
             "claim": claim,
             "activity": {
@@ -475,13 +553,13 @@ impl BillingService {
                 "balanceDelta": balance_delta,
                 "rewardStatus": "unverified",
             },
-        })
+        }))
     }
 
     /// 记录活跃保活前后的积分快照，便于核对活动奖励是否入账。
     ///
-    /// 余额查询是旁路诊断动作：失败只记录日志，不改变活跃任务的结果。
-    async fn report_chat_activity(&self, session: &Value) -> Value {
+    /// 前后快照失败会结束本轮，不在上游拒绝后继续发送活跃请求。
+    async fn report_chat_activity(&self, session: &Value) -> Result<Value, BillingError> {
         let uid = session
             .get("account")
             .and_then(|account| account.get("uid"))
@@ -489,11 +567,11 @@ impl BillingService {
             .unwrap_or("")
             .to_string();
         if uid.is_empty() {
-            return json!({
+            return Ok(json!({
                 "succeeded": false,
                 "streakDays": Value::Null,
                 "msg": "会话缺少账号 uid，无法上报活跃",
-            });
+            }));
         }
         let conversation_id = format!("agent2api-{}", new_request_id());
         let now = logging::now_ms();
@@ -554,7 +632,7 @@ impl BillingService {
                     "[Checkin]",
                     &format!("WorkBuddy 国际版活跃上报失败: {}", error.message),
                 );
-                false
+                return Err(error.clone());
             }
         };
         // 回读连登天数（只读 oracle）：上报 200 ≠ 计分，闭环验证用。
@@ -566,7 +644,7 @@ impl BillingService {
                         "[Checkin]",
                         &format!("WorkBuddy 国际版连登回读失败（上报本身已成功）: {}", error.message),
                     );
-                    None
+                    return Err(error);
                 }
             }
         } else {
@@ -575,7 +653,7 @@ impl BillingService {
         let streak_text = streak_days
             .map(|days| format!("，连登 {days} 天"))
             .unwrap_or_default();
-        json!({
+        Ok(json!({
             "succeeded": succeeded,
             "streakDays": streak_days.map(Value::from).unwrap_or(Value::Null),
             "msg": if succeeded {
@@ -583,7 +661,7 @@ impl BillingService {
             } else {
                 "活跃上报失败".to_string()
             },
-        })
+        }))
     }
 
     async fn read_growth_streak(&self, session: &Value) -> Result<i64, BillingError> {
@@ -605,7 +683,7 @@ impl BillingService {
             .unwrap_or(0))
     }
 
-    async fn log_workbuddy_activity_balance(&self, session: &Value, phase: &str) -> Option<Value> {
+    async fn log_workbuddy_activity_balance(&self, session: &Value, phase: &str) -> Result<Option<Value>, BillingError> {
         let account = session
             .get("account")
             .and_then(Value::as_object);
@@ -632,7 +710,7 @@ impl BillingService {
                         summary.get("bonusLeft").unwrap_or(&Value::Null),
                     ),
                 );
-                Some(summary)
+                Ok(Some(summary))
             }
             Err(error) => {
                 logging::log(
@@ -642,21 +720,23 @@ impl BillingService {
                         error.message
                     ),
                 );
-                None
+                Err(error)
             }
         }
     }
 
-    async fn poke_daily_activity(&self, session: &Value) -> (bool, Option<String>) {
+    async fn poke_daily_activity(&self, session: &Value) -> Result<(bool, Option<String>), BillingError> {
         const TIMEOUT_MS: u64 = 20_000;
         for model in super::keepalive::models() {
+            crate::server::core::workbuddy_safety::check(self.auth.store(), session)
+                .map_err(|error| BillingError::new(error.message.clone(), error.status_code))?;
             let plan = match crate::server::core::providers::workbuddy::build_daily_activity_request(
                 session, &model,
             ) {
                 Ok(plan) => plan,
                 Err(error) => {
                     logging::verbose("[Checkin]", &error);
-                    continue;
+                    return Err(BillingError::new(error, 400));
                 }
             };
             let response = match tokio::time::timeout(
@@ -674,29 +754,23 @@ impl BillingService {
                             error.message
                         ),
                     );
-                    continue;
+                    return Err(BillingError::new(error.message, 502));
                 }
                 Err(_) => {
                     logging::verbose(
                         "[Checkin]",
                         &format!("WorkBuddy 国际版活跃模型 {model} 请求超时"),
                     );
-                    continue;
+                    return Err(BillingError::new("活跃模型请求超时，停止后续请求", 504));
                 }
             };
             let status = response.status();
-            if !status.is_success() {
-                logging::verbose("[Checkin]", &format!(
-                    "WorkBuddy 国际版活跃模型 {model} 返回 HTTP {}", status.as_u16()
-                ));
-                continue;
-            }
             let body_result = tokio::time::timeout(
                 std::time::Duration::from_millis(TIMEOUT_MS),
-                consume_activity_response(response, 1 << 20),
+                consume_workbuddy_activity_response(self.auth.store(), session, response),
             )
             .await
-            .unwrap_or(Err("响应流读取超时"));
+            .unwrap_or_else(|_| Err(BillingError::new("响应流读取超时", 504)));
             if let Err(reason) = body_result {
                 logging::verbose(
                     "[Checkin]",
@@ -705,15 +779,16 @@ impl BillingService {
                         status.as_u16()
                     ),
                 );
-                continue;
+                return Err(reason);
             }
+            if matches!(body_result, Ok(false)) { continue; }
             logging::verbose(
                 "[Checkin]",
                 &format!("WorkBuddy 国际版活跃保活有效对话完成（model={model}，日活奖励尚未确认）"),
             );
-            return (true, Some(model));
+            return Ok((true, Some(model)));
         }
-        (false, None)
+        Err(BillingError::new("全部保活模型不可用，停止后续请求", 503))
     }
 
 }

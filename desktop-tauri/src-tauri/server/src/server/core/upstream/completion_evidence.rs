@@ -60,8 +60,38 @@ pub fn observe_stream(
         .boxed()
 }
 
+/// 沿用逐帧解析器识别正文之后的风控错误，不等待整轮响应。
+pub fn observe_workbuddy_stream(
+    stream: BoxStream<'static, Result<Bytes, std::io::Error>>,
+    store: crate::server::core::account_store::AccountStore,
+    session: Value,
+    telemetry: Arc<RequestTelemetry>,
+) -> BoxStream<'static, Result<Bytes, std::io::Error>> {
+    let mut observer = Observer::new(EvidenceProtocol::WorkBuddy);
+    observer.safety = Some((store, session));
+    stream.map(move |item| {
+        match &item {
+            Ok(bytes) => observer.push(bytes),
+            Err(_) => observer.failed = true,
+        }
+        if telemetry.observes_affinity() {
+            telemetry.note_completion_evidence(
+                observer.terminal(), observer.payload,
+                observer.terminal() && observer.input_usage && observer.output_usage,
+                observer.failed,
+            );
+        }
+        match &observer.terminal_error {
+            Some(message) => Err(std::io::Error::other(message.clone())),
+            None => item,
+        }
+    }).boxed()
+}
+
 struct Observer {
     protocol: EvidenceProtocol,
+    safety: Option<(crate::server::core::account_store::AccountStore, Value)>,
+    terminal_error: Option<String>,
     line: Vec<u8>,
     data: String,
     event_type: String,
@@ -91,6 +121,8 @@ impl Observer {
     fn new(protocol: EvidenceProtocol) -> Self {
         Self {
             protocol,
+            safety: None,
+            terminal_error: None,
             line: Vec::new(),
             data: String::new(),
             event_type: String::new(),
@@ -220,6 +252,22 @@ impl Observer {
         };
         if !event.is_object() {
             return;
+        }
+        if self.terminal_error.is_none() {
+            if let Some((store, session)) = &self.safety {
+                use crate::server::core::providers::{adapter::{adapter_for, UpstreamErrorClass, UpstreamStopReason}, ProviderKind};
+                let provider = if session["provider"] == "workbuddy-intl" {
+                    ProviderKind::WorkBuddyIntl
+                } else { ProviderKind::WorkBuddy };
+                if let UpstreamErrorClass::Terminal { kind, message, .. } = adapter_for(provider).classify_error(200, &event) {
+                    self.failed = true;
+                    self.terminal_error = Some(if kind == UpstreamStopReason::AccountRestricted {
+                        crate::server::core::workbuddy_safety::pause(store, session)
+                            .err().map(|error| error.message).unwrap_or(message)
+                    } else { message });
+                    return;
+                }
+            }
         }
         if event.get("error").is_some_and(|value| !value.is_null()) {
             self.failed = true;

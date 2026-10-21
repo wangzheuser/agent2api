@@ -76,7 +76,8 @@ async fn pagination_preserves_session_filters_precision_and_auth_error_channel()
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let billing = service();
+    let (db, _file) = crate::server::db::test_temp::TempDb::open("billing-usage-safety");
+    let billing = BillingService::new(AuthService::for_store(AccountStore::with_db(Some(db))));
     for (uid, count, pages) in [
         ("0", 0, 1),
         ("100", 100, 2),

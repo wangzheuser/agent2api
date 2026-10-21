@@ -19,7 +19,7 @@ pub(super) async fn consume_activity_response(
     validate_activity_sse(&body)
 }
 
-fn validate_activity_sse(body: &[u8]) -> Result<(), &'static str> {
+pub(super) fn validate_activity_sse(body: &[u8]) -> Result<(), &'static str> {
     let text = std::str::from_utf8(body).map_err(|_| "响应不是有效 UTF-8")?;
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
     let mut answered = false;

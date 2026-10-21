@@ -747,6 +747,9 @@ pub fn shim_js() -> &'static str {
       return call('POST', '/api/accounts/' + encodeURIComponent(id) + '/rate-limits/clear',
         model ? { model: model } : {});
     },
+    resumeWorkbuddySafety: function (id, payload) {
+      return call('POST', '/api/accounts/' + encodeURIComponent(id) + '/workbuddy-safety/resume', payload);
+    },
     batchAccounts: function (payload) {
       payload = payload || {};
       var body = {
@@ -818,6 +821,9 @@ pub fn shim_js() -> &'static str {
     },
     getWorkBuddyGrowth: function (id) { return call('GET', '/api/accounts/workbuddy/growth?id=' + encodeURIComponent(id)); },
     workBuddyGrowthAction: function (input) { return call('POST', '/api/accounts/workbuddy/growth/action', input); },
+    resolveLegacyGrowth: function (id, payload) {
+      return call('POST', '/api/accounts/' + encodeURIComponent(id) + '/growth/legacy/resolve', payload);
+    },
     getWorkBuddyPolicy: function (id) { return call('GET', '/api/accounts/workbuddy/policy?id=' + encodeURIComponent(id)); },
     updateWorkBuddyPolicy: function (id, patch) { return call('PATCH', '/api/accounts/workbuddy/policy?id=' + encodeURIComponent(id), patch); },
     getAccountConnections: function () { return call('GET', '/api/accounts/connections'); },

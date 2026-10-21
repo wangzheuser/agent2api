@@ -22,13 +22,8 @@
 //!      原样重试一次（只一次：再失败按普通失败处理，不会空转）；
 //!   3. `Fatal` → 原样透传给客户端。
 //!
-//! 分类由适配器给出，本模块只按这三档行动 —— 于是「11128 要退避、6004 是限额」
-//! 这类 provider 知识全在适配器里，本文件对「上游是哪一家」一无所知。
-//!
-//! ── 退避重试（11128）为什么留在这里 ─────────────────────────
-//! 架构文档 §4.3 明确要求「11128 退避逻辑保持在转发层」：**循环**在这里
-//! （打日志、睡、再发），而「哪个码要退避、退多久、文案怎么写」由适配器的
-//! `retry_advice` 给出。这样既能满足契约，又不会让具体错误码漏进本文件。
+//! `Terminal` 优先终止，不进入换号、降级或退避；其它分类沿用原有动作。
+//! 适配器判定业务错误，编排层管理重试预算和生命周期。
 //!
 //! ── 有状态 provider 的分流（W5-T-d4，架构文档 §4.2.1）─────────
 //! 有状态 provider（CatPaw）**只替换「一次发送」，不替换账号循环**：选路、
@@ -81,7 +76,7 @@ use crate::server::config;
 use crate::server::core::custom_providers;
 use crate::server::core::protocol::strip_internal_fields;
 use crate::server::core::providers::adapter::{
-    adapter_for, ProviderAdapter, RetryAdvice, SuccessHead, UpstreamErrorClass,
+    adapter_for, ProviderAdapter, RetryAdvice, SuccessHead, UpstreamErrorClass, UpstreamStopReason,
 };
 use crate::server::core::providers::custom::forward as custom_forward;
 use crate::server::core::providers::readiness;
@@ -336,7 +331,8 @@ fn fallback_retry_advice(
         return None;
     }
     match class {
-        UpstreamErrorClass::QuotaLimited { .. }
+        UpstreamErrorClass::Terminal { .. }
+        | UpstreamErrorClass::QuotaLimited { .. }
         | UpstreamErrorClass::TokenExpired { .. }
         | UpstreamErrorClass::ContentBlocked { .. } => None,
         UpstreamErrorClass::Fatal { .. } => Some(RetryAdvice {
@@ -582,7 +578,15 @@ async fn attempt_queue(
         // 连接计数改绑到这一轮选中的账号：失败重试换账号时计数跟着走，
         // 于是「一个请求任意时刻只占一个账号」这条口径不需要每个分支各维护一次
         // （429 降级、401 刷新后换号、会话式失败顺延三条路径都经过这里）。
-        connections.rebind(target.account_id.clone());
+        if rotate::is_workbuddy(&target.provider) {
+            let limit = target.account.as_ref().map(crate::server::core::routing::max_concurrent_of).unwrap_or(0);
+            if !connections.try_rebind(target.account_id.clone(), limit) {
+                if let Some(id) = target.account_id.as_ref() { tried_ids.push(id.clone()); }
+                continue;
+            }
+        } else {
+            connections.rebind(target.account_id.clone());
+        }
         // ── 自定义提供商的分流（第二阶段；与下面的 is_stateful 同形状）──
         // 位置在 `kind_from_id` 之前：custom id **不进** `ProviderKind`
         // （「不认识就是不认识」的全仓口径，见 `custom_providers` 的模块头），
@@ -805,7 +809,8 @@ async fn attempt_queue(
                 // 适配器给出的 token 单独构成一个最小会话（只有 Authorization
                 // 需要它），不覆盖 workbuddy 那条已经能拿到完整会话的路径 ——
                 // 所以既有行为逐字不变。
-                if target.account_id.is_none() && adapter.allows_anonymous_default_session() {
+                if target.account_id.is_none() && adapter.allows_anonymous_default_session()
+                    && !rotate::is_workbuddy(provider_id) {
                     match adapter.ensure_access_token(&service.store, "").await {
                         Ok(token) if !token.is_empty() => json!({
                             "auth": {
@@ -841,6 +846,7 @@ async fn attempt_queue(
                         session = fresh;
                     }
                 }
+                Err(error) if error.code.as_deref() == Some("workbuddy_terminal") => return Err(error),
                 Err(error) => logging::verbose(
                     "[Upstream]",
                     &format!(
@@ -1068,6 +1074,7 @@ async fn attempt_queue(
                 degraded,
                 adapter.request_is_single_use(&session),
                 ctx.route_session.is_some(),
+                rotate::is_workbuddy(provider_id).then_some((service, &session, target.account_id.as_deref(), wire_model.as_str())),
             )
             .await
             {
@@ -1097,6 +1104,13 @@ async fn attempt_queue(
                             Some(cancellation::MANUAL_TERMINATED),
                         );
                         return Err(cancellation::cancelled_error());
+                    }
+                    if let UpstreamErrorClass::Terminal { kind, .. } = &failure.class {
+                        ctx.telemetry.finish_last_attempt(Some(i64::from(failure.error.status_code)), Some(&failure.error.message));
+                        if *kind == UpstreamStopReason::AccountRestricted {
+                            crate::server::core::workbuddy_safety::pause(&service.store, &session)?;
+                        }
+                        return Err(failure.error);
                     }
                     // ── 指定错误码直接换号 ──────────────────────────────
                     // 用户点名的状态码（默认 402）不做「同一账号再看一眼」：
@@ -1188,11 +1202,14 @@ async fn attempt_queue(
                                 "token 被上游拒绝（401），尝试刷新后重试一次（账号 {account_id}）"
                             ),
                         );
-                        if adapter
-                            .refresh_access_token(&service.store, &account_id)
-                            .await
-                            .is_ok()
-                        {
+                        let refresh_result = adapter.refresh_access_token(&service.store, &account_id).await;
+                        if let Err(error) = &refresh_result {
+                            if error.code.as_deref() == Some("workbuddy_terminal") {
+                                ctx.telemetry.finish_last_attempt(Some(i64::from(error.status_code)), Some(&error.message));
+                                return Err(error.clone());
+                            }
+                        }
+                        if refresh_result.is_ok() {
                             // 刷新已回写 store：重取会话（内含新 accessToken）再发一次
                             if let Ok(fresh) = rotate::session_for(
                                 service,
@@ -1421,7 +1438,11 @@ async fn attempt_queue(
         // 翻译在**两处出口之前**做，于是流式与非流式共用同一条下行语义：
         // reasoning 合并、usage 提取、model 回写、取消处理全都不需要第二套。
         let mut response = response;
-        if ctx.telemetry.observes_affinity() {
+        if rotate::is_workbuddy(provider_id) {
+            response.stream = super::completion_evidence::observe_workbuddy_stream(
+                response.stream, service.store.clone(), session.clone(), ctx.telemetry.clone(),
+            );
+        } else if ctx.telemetry.observes_affinity() {
             response.stream = super::completion_evidence::observe_stream(
                 response.stream, ctx.telemetry.clone(), response_protocol,
             );
@@ -2106,7 +2127,8 @@ async fn sleep_or_cancel(
 
 fn gateway_error_from_class(class: &UpstreamErrorClass) -> GatewayError {
     match class {
-        UpstreamErrorClass::QuotaLimited { status, message, upstream_code, .. }
+        UpstreamErrorClass::Terminal { status, message, upstream_code, .. }
+        | UpstreamErrorClass::QuotaLimited { status, message, upstream_code, .. }
         | UpstreamErrorClass::ContentBlocked { status, message, upstream_code }
         | UpstreamErrorClass::Fatal { status, message, upstream_code } => {
             GatewayError::with_status(*status as i32, message.clone())
@@ -2228,8 +2250,25 @@ async fn send_with_retry(
     degraded: bool,
     single_use: bool,
     refresh_route_ids: bool,
+    safety: Option<(&UpstreamService, &Value, Option<&str>, &str)>,
 ) -> Result<PreparedResponse, OutboundFailure> {
     loop {
+        if let Some((service, session, account_id, model)) = safety {
+            if let Err(error) = crate::server::core::workbuddy_safety::check(&service.store, session) {
+                let class = UpstreamErrorClass::Terminal {
+                    kind: UpstreamStopReason::ChannelRefused, status: error.status_code as u16,
+                    message: error.message.clone(), upstream_code: None,
+                };
+                return Err(OutboundFailure { class, error, rebuild: false });
+            }
+            if account_id.is_some_and(|id| rotate::account_limit_reset_at(service, id, model) > logging::now_ms()) {
+                let class = UpstreamErrorClass::Terminal {
+                    kind: UpstreamStopReason::UpstreamBusy, status: 503,
+                    message: "WorkBuddy 账号对该模型仍在冷却期，已停止请求".into(), upstream_code: None,
+                };
+                return Err(OutboundFailure { error: gateway_error_from_class(&class), class, rebuild: false });
+            }
+        }
         // 手动终止：发送前先看令牌（退避睡眠 / 上一轮失败之后回到这里）。
         // 出口是 `cancelled_failure`，但调用方（attempt_queue）在分类动作之前
         // 会再查一次令牌并直接返回 —— 这个 class 只是让本函数的返回形状成立。
@@ -2321,6 +2360,7 @@ async fn send_with_retry(
                 Ok(detail) => detail,
                 Err(_elapsed) => super::request::UpstreamErrorDetail {
                     code: None,
+                    raw_code: Value::Null,
                     message: format!("非流式响应超时({}秒)", budget.as_secs()),
                     fields: serde_json::Map::new(),
                 },
@@ -2328,6 +2368,10 @@ async fn send_with_retry(
         };
         let body = detail.to_value();
         let class = adapter.classify_error(status, &body);
+        if matches!(class, UpstreamErrorClass::Terminal { .. }) {
+            let error = gateway_error_from_class(&class);
+            return Err(OutboundFailure { class, error, rebuild: false });
+        }
         // 退避重试：provider 专属判定优先，没声明时对瞬时状态码统一兜底
         //
         // ── 内容拦截为什么在 `!degraded` 时跳过这一整层 ──────────────
@@ -2377,7 +2421,8 @@ async fn send_with_retry(
         }
         // 文案由适配器给出（含 provider 提示），编排层原样组装成网关错误
         let error = match &class {
-            UpstreamErrorClass::QuotaLimited { status, message, upstream_code, .. } => {
+            UpstreamErrorClass::Terminal { status, message, upstream_code, .. }
+            | UpstreamErrorClass::QuotaLimited { status, message, upstream_code, .. } => {
                 GatewayError::with_status(*status as i32, message.clone())
                     .with_optional_code(*upstream_code)
             }

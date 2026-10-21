@@ -3,6 +3,107 @@ use axum::{
     body::Body, http::StatusCode, response::Response as HttpResponse, routing::get, Router,
 };
 use tokio::sync::mpsc;
+use std::sync::{Arc, Mutex};
+
+#[test]
+fn web_activity_daily_success_and_uncertainty_survive_date_rollover() {
+    let completed = json!({"day":"2026-10-21","phase":"success","outcome":{
+        "success":true,"conversationId":"fixture","status":"completed","outputChunks":1,
+        "turnCompleted":true,"elapsedMs":5,"error":null
+    }});
+    let restored: Value = serde_json::from_str(&completed.to_string()).unwrap();
+    assert!(saved_outcome(Some(&restored), "2026-10-21").unwrap().unwrap().success);
+    assert!(saved_outcome(Some(&restored), "2026-10-22").unwrap().is_none());
+    assert!(saved_outcome(Some(&restored), "2026-10-20").is_err());
+    for phase in ["pending_create", "conversation_created", "uncertain"] {
+        let state = json!({"day":"2026-10-21","phase":phase,"conversationId":"fixture"});
+        for day in ["2026-10-21", "2026-10-22"] {
+            assert!(saved_outcome(Some(&state), day).is_err());
+        }
+    }
+    let mut invalid = completed.clone();
+    invalid["outcome"]["outputChunks"] = json!(0);
+    assert!(saved_outcome(Some(&invalid), "2026-10-21").is_err());
+    let mut invalid = completed;
+    invalid["outcome"].as_object_mut().unwrap().remove("turnCompleted");
+    assert!(saved_outcome(Some(&invalid), "2026-10-21").is_err());
+    let rejected = json!({"phase":"rejected","outcome":{"status":"CREATE_REJECTED","conversationId":null}});
+    assert!(saved_outcome(Some(&rejected), "2026-10-21").unwrap().is_none());
+}
+
+#[test]
+fn web_activity_identity_separates_regions_and_enterprises_not_credentials() {
+    let original = json!({"provider":"workbuddy","account":{"uid":"same","enterpriseId":"a"},"auth":{"accessToken":"old"}});
+    let key = state_key(&original).unwrap();
+    let mut other = original.clone();
+    other["auth"]["accessToken"] = json!("new");
+    assert_eq!(state_key(&other).unwrap(), key);
+    other["provider"] = json!("workbuddy-intl");
+    assert_ne!(state_key(&other).unwrap(), key);
+    other = original;
+    other["account"]["enterpriseId"] = json!("b");
+    assert_ne!(state_key(&other).unwrap(), key);
+}
+
+#[tokio::test]
+async fn web_activity_persists_before_create_and_never_recreates_unknown_result() {
+    static DATABASE: std::sync::OnceLock<(crate::server::db::Db, crate::server::db::test_temp::TempDb)> = std::sync::OnceLock::new();
+    let (db, _) = DATABASE.get_or_init(|| crate::server::db::test_temp::TempDb::open("web-activity-state"));
+    task_state::install(Some(db.clone()));
+    let store = AccountStore::with_db(Some(db.clone()));
+    for (name, status, payload, phase, first_hits, paused) in [
+        ("unknown-502", 502, json!({"msg":"unknown"}), "uncertain", 1, false),
+        ("missing-id", 200, json!({"code":0,"data":{}}), "uncertain", 1, false),
+        ("created-id", 200, json!({"code":0,"data":{"id":"fixture-created-id"}}), "uncertain", 2, false),
+        ("error-with-id", 429, json!({"code":6021,"data":{"id":"fixture-created-id"}}), "uncertain", 1, false),
+        ("reject-429", 429, json!({"msg":"rate limited"}), "rejected", 1, false),
+        ("reject-403", 403, json!({"msg":"denied"}), "rejected", 1, false),
+        ("reject-405", 405, json!({"msg":"method rejected"}), "rejected", 1, false),
+        ("restricted", 200, json!({"code":"11140","msg":"account has been restricted"}), "rejected", 1, true),
+    ] {
+        let session = json!({"provider":"workbuddy-intl","account":{"uid":name},"auth":{"accessToken":"fixture"}});
+        let key = state_key(&session).unwrap();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = hits.clone();
+        let persisted_key = key.clone();
+        let app = Router::new().fallback(move |method: axum::http::Method| {
+            let seen = seen.clone();
+            let key = persisted_key.clone();
+            let payload = payload.clone();
+            async move {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let state = task_state::read(&key).unwrap().value.unwrap();
+                if method == axum::http::Method::GET {
+                    assert_eq!(state["phase"], "conversation_created");
+                    assert_eq!(state["conversationId"], "fixture-created-id");
+                    (StatusCode::BAD_GATEWAY, json!({"msg":"session unavailable"}).to_string())
+                } else {
+                    assert_eq!(state["phase"], "pending_create");
+                    (StatusCode::from_u16(status).unwrap(), payload.to_string())
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        assert!(!run_with_origin(&store, &session, "fixture", &origin).await.success, "{name}");
+        let value = task_state::read(&key).unwrap().value.unwrap();
+        assert_eq!(value["phase"], phase, "{name}");
+        if name.contains("with-id") || name == "created-id" {
+            assert_eq!(value["outcome"]["conversationId"], "fixture-created-id");
+        }
+        assert_eq!(crate::server::core::workbuddy_safety::status(&store, &session).unwrap()["paused"], paused);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), first_hits, "{name}");
+        task_state::clear_cooldown(&key).unwrap();
+        assert!(!run_with_origin(&store, &session, "fixture", &origin).await.success);
+        task_state::clear_cooldown(&key).unwrap();
+        let restored_store = AccountStore::with_db(Some(db.clone()));
+        assert!(!run_with_origin(&restored_store, &session, "fixture", &origin).await.success);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst),
+            if phase == "rejected" && !paused { 3 } else { first_hits }, "{name}");
+        server.abort();
+    }
+}
 
 #[test]
 fn acp_only_counts_real_answer_and_matching_result() {
@@ -167,6 +268,7 @@ async fn acp_waits_for_rpc_ack_and_consumes_fragmented_sse() {
         connection: "test-connection".into(),
         events: Events::new(response),
         output_chunks: 0,
+        safety: None,
     };
     tokio::time::timeout(Duration::from_secs(5), async {
         channel.rpc(1, "initialize", json!({})).await.unwrap();
@@ -216,8 +318,9 @@ async fn broken_sse_and_redirects_fail_closed() {
 #[tokio::test]
 async fn missing_login_fails_without_network_and_releases_reservation() {
     let session = json!({"account":{"uid":"fixture"}});
-    let first = run(&session, "fixture-model").await;
+    let store = AccountStore::with_db(None);
+    let first = run(&store, &session, "fixture-model").await;
     assert!(!first.success);
     assert_eq!(first.error.as_deref(), Some("账号未登录"));
-    assert_eq!(run(&session, "fixture-model").await.error, first.error);
+    assert_eq!(run(&store, &session, "fixture-model").await.error, first.error);
 }

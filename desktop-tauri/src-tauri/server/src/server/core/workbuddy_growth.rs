@@ -41,6 +41,8 @@ pub fn target(store: &AccountStore, id: &str) -> Result<GrowthTarget, GrowthErro
     let mut session = entry.session;
     session["proxy"] = entry.proxy;
     session["proxyError"] = json!(entry.proxy_error);
+    super::workbuddy_safety::check(store, &session)
+        .map_err(|error| GrowthError::new(error.status_code, error.message))?;
     if workbuddy_policy::identity(&session).as_deref() != Some(identity.as_str()) {
         return Err(GrowthError::new(409, "账号身份已变化，请刷新后重试"));
     }
@@ -81,14 +83,25 @@ pub async fn state(store: &AccountStore, id: &str) -> Result<Value, GrowthError>
             json!({"schemaVersion":1,"id":id,"identity":target.identity,"fetchedAt":crate::server::logging::now_ms(),"supported":false,"reason":"国内个人成长福利不适用于该账号；国际日活沿用原签到功能","edition":target.account.get("edition"),"tasks":[],"capabilities":[],"errors":[],"travel":null,"streak":null,"lottery":null,"activities":[],"lastRun":null,"pending":null,"running":false}),
         );
     }
-    let client = Client::new(store.clone(), id, &target.identity);
-    let mut state = client.state().await?;
     let persisted =
         task_state::read(&key(&target.identity)).map_err(|e| GrowthError::new(500, e))?;
+    // 待核实记录必须离线可读，不能为恢复入口再依赖上游成功。
+    let mut state = if persisted.value.as_ref()
+        .and_then(|value| value.get("legacyPending")).is_some_and(|value| !value.is_null()) {
+        json!({"schemaVersion":1,"id":id,"identity":target.identity,
+            "fetchedAt":crate::server::logging::now_ms(),"edition":target.account.get("edition"),
+            "supported":true,"reason":null,"capabilities":[],"tasks":[],
+            "travel":null,"streak":null,"lottery":null,"activities":[],
+            "errors":[{"section":"legacy","code":"uncertain","message":"旧操作结果待核实；此处仅显示本地记录，未查询或重发上游"}],
+            "running":false,"lastRun":null,"pending":null})
+    } else {
+        Client::new(store.clone(), id, &target.identity).state().await?
+    };
     state["running"] = json!(persisted.running());
     if let Some(value) = persisted.value {
         state["lastRun"] = value.get("lastRun").cloned().unwrap_or(Value::Null);
         state["pending"] = value.get("pending").cloned().unwrap_or(Value::Null);
+        state["legacyPending"] = value.get("legacyPending").cloned().unwrap_or(Value::Null);
         if let Some(pending) = state["pending"].as_object_mut() {
             pending.remove("token");
         }
@@ -152,6 +165,9 @@ pub async fn action(store: AccountStore, body: Value) -> Result<Value, GrowthErr
         .map_err(|e| GrowthError::new(500, e))?
         .value
         .unwrap_or_else(|| json!({}));
+    if previous.get("legacyPending").is_some_and(|pending| !pending.is_null()) {
+        return Err(GrowthError::new(409, "旧成长操作结果待核实，请先确认原操作结果"));
+    }
     if let Some(result) = replay(&previous, &token, &logical)? {
         return Ok(result);
     }
@@ -185,6 +201,9 @@ pub async fn action(store: AccountStore, body: Value) -> Result<Value, GrowthErr
     };
     let job = tokio::spawn(async move {
         let mut journal = Journal::new(&identity)?;
+        if journal.value.get("legacyPending").is_some_and(|pending| !pending.is_null()) {
+            return Err(GrowthError::new(409, "旧成长操作结果待核实，请先确认原操作结果"));
+        }
         // 租约获取后再次判重，覆盖两个并发入口在占位前同时读取的窗口。
         if let Some(result) = replay(&journal.value, &token, &logical)? {
             guard
@@ -292,6 +311,99 @@ pub async fn action(store: AccountStore, body: Value) -> Result<Value, GrowthErr
     });
     job.await
         .map_err(|_| GrowthError::new(500, "成长福利执行中断，请刷新状态核对"))?
+}
+
+/// 旧入口保留原执行体和响应，但与新入口共用身份租约和操作记录。
+pub async fn legacy_action<F, Fut>(
+    store: AccountStore,
+    id: String,
+    mut request: Value,
+    operation: F,
+) -> Result<Value, GrowthError>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<Value, GrowthError>> + Send + 'static,
+{
+    let identity = target(&store, &id)?.identity;
+    let token = request["clientToken"].as_str().filter(|token| !token.is_empty())
+        .map(str::to_string).unwrap_or_else(super::upstream::request::new_request_id);
+    if token.len() > 128 || !token.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')) {
+        return Err(GrowthError::new(400, "clientToken 无效"));
+    }
+    request["clientToken"] = json!(token);
+    let logical = logical_key(&request);
+    let guard = match task_state::claim(&key(&identity), INTERVAL, true, ManualBackoff::Respect, 1000)
+        .map_err(|error| GrowthError::new(500, error))? {
+        Claim::Acquired(guard) => guard,
+        Claim::Deferred(state) => return Err(GrowthError::new(409, state.waiting_message())),
+    };
+    let mut journal = Journal::new(&identity)?;
+    if let Some(result) = replay(&journal.value, &token, &logical)? {
+        guard.finish(true, "已回放旧入口结果".into(), None, 0, INTERVAL)
+            .map_err(|error| GrowthError::new(500, error))?;
+        return Ok(result);
+    }
+    if ["pending", "legacyPending"].iter()
+        .any(|field| journal.value.get(*field).is_some_and(|value| !value.is_null())) {
+        return Err(GrowthError::new(409, "此前成长操作结果待核实，未重复发送"));
+    }
+    journal.value["legacyPending"] = json!({
+        "clientToken":token,"identity":identity,"request":request,"at":crate::server::logging::now_ms()
+    });
+    task_state::store_value(&journal.key, journal.value.clone())
+        .map_err(|error| GrowthError::new(500, error))?;
+    // HTTP 断开不取消已经接单的写操作；进程中断则保留 legacyPending。
+    tokio::spawn(async move {
+        let result = match target(&store, &id) {
+            Ok(current) if current.identity == identity => operation().await,
+            _ => Err(GrowthError::new(409, "账号身份或安全状态已变化，未执行旧成长操作")),
+        };
+        let success = result.as_ref().is_ok_and(legacy_succeeded);
+        if success {
+            journal.value["legacyPending"] = Value::Null;
+            let mut requests = journal.value["requests"].as_array().cloned().unwrap_or_default();
+            requests.push(json!({"clientToken":token,"logicalKey":logical,"result":result.as_ref().unwrap()}));
+            if requests.len() > 64 { requests.drain(..requests.len() - 64); }
+            journal.value["requests"] = json!(requests);
+        }
+        guard.finish(success, if success { "旧成长操作完成" } else {
+            "旧成长操作结果待核实，未自动重试"
+        }.into(), Some(journal.value), 0, INTERVAL)
+            .map_err(|error| GrowthError::new(500, error))?;
+        result
+    }).await.map_err(|_| GrowthError::new(500, "旧成长操作中断，结果待核实"))?
+}
+
+fn legacy_succeeded(value: &Value) -> bool {
+    let failed = |value: &Value| ["outcome", "status"].iter().any(|field|
+        matches!(value[*field].as_str(), Some("failed" | "error" | "uncertain")));
+    !failed(value)
+        && value["results"].as_array().map_or(true, |rows| rows.iter().all(|row| !failed(row)))
+        && value.get("lottery").filter(|lottery| !lottery.is_null())
+            .map_or(true, |lottery| lottery["success"] == true)
+}
+
+/// 管理员核对旧入口不确定结果后的本地确认；不重放上游操作。
+pub fn resolve_legacy(store: &AccountStore, id: &str, body: &Value) -> Result<Value, GrowthError> {
+    let target = target(store, id)?;
+    if body["confirmed"] != true || body["expectedIdentity"] != target.identity {
+        return Err(GrowthError::new(400, "请确认旧操作结果并提供当前账号身份"));
+    }
+    let guard = match task_state::claim(&key(&target.identity), INTERVAL, true, ManualBackoff::Bypass, 0)
+        .map_err(|error| GrowthError::new(500, error))? {
+        Claim::Acquired(guard) => guard,
+        Claim::Deferred(state) => return Err(GrowthError::new(409, state.waiting_message())),
+    };
+    let mut journal = Journal::new(&target.identity)?;
+    let token = body["clientToken"].as_str().filter(|token| !token.is_empty());
+    if token.is_none() || journal.value["legacyPending"]["clientToken"].as_str() != token {
+        return Err(GrowthError::new(409, "待核实操作已变化，请刷新后重新确认"));
+    }
+    journal.value["legacyPending"] = Value::Null;
+    journal.value["legacyResolvedAt"] = json!(crate::server::logging::now_ms());
+    guard.finish(true, "已人工核对旧成长操作结果；未重放".into(), Some(journal.value), 0, INTERVAL)
+        .map_err(|error| GrowthError::new(500, error))?;
+    Ok(json!({"resolved":true,"identity":target.identity}))
 }
 
 struct Journal {

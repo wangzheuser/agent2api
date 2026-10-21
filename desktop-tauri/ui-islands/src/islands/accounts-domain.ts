@@ -1293,6 +1293,9 @@ export type AccountTag = { text: string; kind: 'plain' | 'bad'; title: string }
  */
 export function accountTags(account: AccountRecord): AccountTag[] {
   return [
+    account.workbuddySafety?.paused
+      ? { text: '安全暂停', kind: 'bad' as const, title: account.workbuddySafety.reason || 'WorkBuddy 请求已暂停，请核对上游账号状态' }
+      : null,
     // 没有转发能力的家：它的启用开关对转发没有意义，这里如实说明，而不是留一片空白
     // 让人以为「没标记就是好的」。判据是后端的 chatSupported，正常配置下不会出现 ——
     // 留着是为了「将来某家处于只有账号管理的过渡期」时界面能自己说清楚

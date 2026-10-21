@@ -190,6 +190,55 @@ async function run() {
       await detail.waitFor({ state: 'detached' })
     }
     checks.push('request list and details cover native international provider, distinguish zero/null/absent fields, preserve six-decimal credits and charges on failed requests')
+    await page.goto(pathToFileURL(fixtureFile).href)
+    await page.locator('.credit-balance-trigger').first().waitFor()
+    await page.evaluate(() => {
+      fixture.resumes = []
+      fixture.accounts[0].workbuddySafety = { paused: true, identity: 'safe-A0', revision: 2, reason: 'fixture restriction' }
+      workbuddyDesktop.resumeWorkbuddySafety = async (id, payload) => {
+        fixture.resumes.push({ id, ...payload })
+        if (fixture.resumes.length === 1) throw new Error('安全状态已变化')
+        fixture.accounts[0].workbuddySafety.paused = false
+      }
+      wbApp.refresh = async () => wbAccountsView.render()
+      wbAccountsView.render()
+    })
+    await page.getByRole('button', { name: '解除安全暂停', exact: true }).click()
+    let safetyDialog = page.getByRole('dialog', { name: '确认恢复 WorkBuddy 请求', exact: true })
+    assert.match(await safetyDialog.innerText(), /不表示上游已解封/)
+    assert.equal(await page.evaluate(() => fixture.resumes.length), 0)
+    await safetyDialog.getByRole('button', { name: '取消', exact: true }).click()
+    assert.equal(await page.evaluate(() => fixture.resumes.length), 0)
+    await page.getByRole('button', { name: '解除安全暂停', exact: true }).click()
+    await safetyDialog.getByRole('button', { name: '已确认，恢复请求', exact: true }).click()
+    await page.waitForFunction(() => fixture.resumes.length === 1)
+    assert.equal(await safetyDialog.isVisible(), true)
+    await safetyDialog.getByRole('button', { name: '已确认，恢复请求', exact: true }).click()
+    await page.getByRole('button', { name: '解除安全暂停', exact: true }).waitFor({ state: 'detached' })
+    assert.deepEqual(await page.evaluate(() => fixture.resumes[1]), { id: 'A0', confirmed: true, identity: 'safe-A0', revision: 2 })
+    checks.push('safety resume requires confirmation, keeps stale-state failures visible, and submits identity plus revision')
+    await page.evaluate(() => {
+      fixture.base.legacyPending = { identity: 'identity-A0', clientToken: 'legacy-uncertain', at: Date.now() }
+      fixture.legacyResolves = []
+      workbuddyDesktop.resolveLegacyGrowth = async (id, payload) => {
+        fixture.legacyResolves.push({ id, ...payload })
+        fixture.base.legacyPending = null
+      }
+      wbAccountsView.applyBalances({ results: fixture.accounts.map(account => fixture.usage(account.id)) })
+    })
+    await page.locator('.credit-balance-trigger').first().dblclick()
+    dialog = page.getByRole('dialog')
+    await dialog.getByRole('radio', { name: '成长福利', exact: true }).click()
+    await dialog.getByRole('button', { name: '核对旧操作结果', exact: true }).waitFor()
+    assert.equal(await dialog.getByRole('button', { name: '领取已完成奖励', exact: true }).isDisabled(), true)
+    await dialog.getByRole('button', { name: '核对旧操作结果', exact: true }).click()
+    const legacyDialog = page.getByRole('dialog', { name: '确认已核对旧成长操作', exact: true })
+    assert.equal(await page.evaluate(() => fixture.legacyResolves.length), 0)
+    await legacyDialog.getByRole('button', { name: '已核对，解除待核实', exact: true }).click()
+    await page.waitForFunction(() => fixture.legacyResolves.length === 1)
+    assert.deepEqual(await page.evaluate(() => fixture.legacyResolves[0]), { id: 'A0', confirmed: true, expectedIdentity: 'identity-A0', clientToken: 'legacy-uncertain' })
+    assert.equal(await page.evaluate(() => fixture.actions.length), 0)
+    checks.push('uncertain legacy growth blocks new writes and explicit reconciliation performs no upstream action')
     assert.deepEqual(errors, [])
     const result = { passed: checks.length, checks, pageErrors: errors }
     fs.writeFileSync(path.join(evidence, 'growth-browser-result.json'), JSON.stringify(result, null, 2))

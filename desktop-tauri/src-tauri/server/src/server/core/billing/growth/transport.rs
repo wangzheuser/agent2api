@@ -43,6 +43,8 @@ impl Client {
         if target.identity != self.identity || !target.supported {
             return Err(GrowthError::new(409, "账号身份已变化，请重新打开成长福利"));
         }
+        crate::server::core::workbuddy_safety::check(&self.store, &target.session)
+            .map_err(|error| GrowthError::new(error.status_code, error.message))?;
         Ok(target.session)
     }
 
@@ -124,21 +126,6 @@ impl Client {
                 uncertain: method != "GET",
             })?;
             let status = response.status().as_u16();
-            if status == 401 && attempt == 0 {
-                self.session()?;
-                AuthService::for_store(self.store.clone())
-                    .refresh_account(&self.id)
-                    .await
-                    .map_err(|_| GrowthError::new(401, "登录态刷新失败"))?;
-                continue;
-            }
-            if !(200..300).contains(&status) {
-                return Err(GrowthError {
-                    status: status as i32,
-                    message: format!("成长中心请求 HTTP {status}"),
-                    uncertain: method != "GET" && status >= 500,
-                });
-            }
             let mut bytes = Vec::new();
             while let Some(chunk) = response.chunk().await.map_err(|_| GrowthError {
                 status: 502,
@@ -159,6 +146,22 @@ impl Client {
                 message: "成长中心响应格式异常".into(),
                 uncertain: method != "GET",
             })?;
+            let stopped = super::super::workbuddy_stop_error(&self.store, &session, status, &value);
+            if let Some(error) = stopped.as_ref().filter(|error| error.status_code != 401) {
+                return Err(GrowthError::new(error.status_code, error.message.clone()));
+            }
+            if status == 401 && attempt == 0 {
+                self.session()?;
+                AuthService::for_store(self.store.clone()).refresh_account(&self.id).await
+                    .map_err(|_| GrowthError::new(401, "登录态刷新失败"))?;
+                continue;
+            }
+            if let Some(error) = stopped {
+                return Err(GrowthError::new(error.status_code, error.message));
+            }
+            if !(200..300).contains(&status) {
+                return Err(GrowthError { status: status as i32, message: format!("成长中心请求 HTTP {status}"), uncertain: method != "GET" && status >= 500 });
+            }
             self.session().map_err(|mut error| {
                 error.uncertain = method != "GET";
                 error
@@ -205,15 +208,11 @@ impl Client {
             let response = crate::server::core::upstream::request::send_chat_request(&plan)
                 .await
                 .map_err(|_| GrowthError::new(502, "真实对话发送失败"))?;
-            if !response.status().is_success() {
-                return Err(GrowthError::new(
-                    response.status().as_u16() as i32,
-                    "真实对话上游拒绝请求",
-                ));
+            match super::super::activity::consume_workbuddy_activity_response(&self.store, &session, response).await {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(GrowthError::new(404, "真实对话模型不可用")),
+                Err(error) => Err(GrowthError::new(error.status_code, error.message)),
             }
-            super::super::activity_response::consume_activity_response(response, 1 << 20)
-                .await
-                .map_err(|_| GrowthError::new(502, "真实对话未返回完整内容及结束标记"))
         })
         .await;
         match result {

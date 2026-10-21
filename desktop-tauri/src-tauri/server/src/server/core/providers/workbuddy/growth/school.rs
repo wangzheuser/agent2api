@@ -575,8 +575,9 @@ pub async fn run_all(
             continue;
         }
         reports.push(process_task(account, code, task).await);
+        if account.is_stopped() { break; }
     }
-    let lottery_result = if lottery { Some(run_lottery(account, 20).await) } else { None };
+    let lottery_result = if lottery && !account.is_stopped() { Some(run_lottery(account, 20).await) } else { None };
     (reports, lottery_result)
 }
 

@@ -41,19 +41,21 @@ pub struct WorkBuddyAuthError {
     pub message: String,
     pub status_code: Option<i32>,
     pub upstream_code: Option<i64>,
+    /// 刷新收到明确风控终止时，调用方不得沿用旧 token 或换号。
+    pub terminal: bool,
 }
 
 impl WorkBuddyAuthError {
     pub fn new(message: impl Into<String>) -> Self {
-        Self { message: message.into(), status_code: None, upstream_code: None }
+        Self { message: message.into(), status_code: None, upstream_code: None, terminal: false }
     }
 
     pub fn with_status(status: i32, message: impl Into<String>) -> Self {
-        Self { message: message.into(), status_code: Some(status), upstream_code: None }
+        Self { message: message.into(), status_code: Some(status), upstream_code: None, terminal: false }
     }
 
     pub fn with_code(message: impl Into<String>, status: Option<i32>, code: Option<i64>) -> Self {
-        Self { message: message.into(), status_code: status, upstream_code: code }
+        Self { message: message.into(), status_code: status, upstream_code: code, terminal: false }
     }
 
     /// 归一后的 HTTP 状态码（无显式状态码 → 502，照抄 Node 版）
@@ -67,6 +69,7 @@ impl WorkBuddyAuthError {
         if let Some(code) = self.upstream_code {
             error = error.upstream_code(code);
         }
+        if self.terminal { error = error.with_code("workbuddy_terminal"); }
         error
     }
 }

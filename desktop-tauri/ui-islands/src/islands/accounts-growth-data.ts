@@ -16,6 +16,7 @@ export type GrowthState = {
   activities: { code: string; title: string; state: string; canClaim: boolean; canAttempt?: boolean; reason: string | null; actionUrl?: string | null }[]
   errors: { section: string; code: string; message: string }[]; running: boolean; lastRun: GrowthResult | null
   pending?: { clientToken: string; request: GrowthAction } | null
+  legacyPending?: { clientToken: string; identity: string; at: number } | null
 }
 export type GrowthResult = {
   id: string; action: string; at: number; status: string; message: string; rewards: Rewards
@@ -36,6 +37,7 @@ export type PolicyPatch = Pick<WorkBuddyPolicy, 'autoGrowth' | 'autoTravel'> & {
 type GrowthBridge = {
   getWorkBuddyGrowth(id: string): Promise<GrowthState>
   workBuddyGrowthAction(action: GrowthAction): Promise<GrowthResult>
+  resolveLegacyGrowth(id: string, payload: { confirmed: boolean; expectedIdentity: string; clientToken: string }): Promise<unknown>
   getWorkBuddyPolicy(id: string): Promise<WorkBuddyPolicy>
   updateWorkBuddyPolicy(id: string, patch: PolicyPatch): Promise<WorkBuddyPolicy>
 }
@@ -84,7 +86,7 @@ export function growthTodo(state: GrowthState): number {
   return state.tasks.filter(task => task.canClaim).length + (state.streak?.tiers.filter(tier => tier.claimable).length || 0) + (state.travel?.canClaim ? 1 : 0)
 }
 export function growthTaskProgressed(before: GrowthTask | undefined, state: GrowthState): boolean {
-  return !state.pending && finiteAmount(before?.current) !== null && state.tasks.some(task => task.code === before?.code && task.source === before?.source && finiteAmount(task.current) !== null && task.current! > before!.current!)
+  return !state.pending && !state.legacyPending && finiteAmount(before?.current) !== null && state.tasks.some(task => task.code === before?.code && task.source === before?.source && finiteAmount(task.current) !== null && task.current! > before!.current!)
 }
 export function checkedState(value: GrowthState, id: string): GrowthState {
   if (!value || value.schemaVersion !== 1 || value.id !== id || !value.identity || !Array.isArray(value.tasks) || !Array.isArray(value.errors)) throw new Error('成长福利响应不完整，请刷新核对。')

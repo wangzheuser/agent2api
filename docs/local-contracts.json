@@ -2,6 +2,62 @@
   "schema_version": 1,
   "contracts": [
     {
+      "id": "workbuddy-risk-terminal-safety",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "国内/国际 WorkBuddy 保留字符串与数字业务码；明确账号受限、渠道拒绝和上游队列繁忙不原地重试、不换号放大、不误触提示词降级。账号安全暂停按身份持久化，刷新和重启不解除，人工恢复绑定身份及状态版本；指定账号与默认会话同样受保护，配置并发上限原子占位，冷却和满载不强塞。",
+      "source_commits": ["067f19e863543cda6163d03aca8c98ad6d4ac9f1"],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/workbuddy_safety.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/providers/workbuddy/adapter.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/upstream/request.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/upstream/provider_loop.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/upstream/connections.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/upstream/completion_evidence.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/auth_http.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/models/mod.rs",
+        "desktop-tauri/src-tauri/server/src/server/db/schema.rs",
+        "desktop-tauri/src-tauri/server/src/server/api/accounts.rs"
+      ],
+      "tests": [
+        {"id":"case-workbuddy-risk-code-classification","kind":"rust","path":"desktop-tauri/src-tauri/server/tests/workbuddy_risk_routing.rs","name":"risk_classification_preserves_codes_and_separates_capacity"},
+        {"id":"case-workbuddy-risk-send-boundaries","kind":"rust","path":"desktop-tauri/src-tauri/server/tests/workbuddy_risk_routing.rs","name":"terminals_stop_replay_and_rotation_and_limits_release_on_drop"},
+        {"id":"case-workbuddy-safety-persist-cas","kind":"rust","path":"desktop-tauri/src-tauri/server/src/server/core/workbuddy_safety.rs","name":"server::core::workbuddy_safety::tests::safety_pause_persists_and_stale_resume_cannot_clear_new_restriction"},
+        {"id":"case-workbuddy-safety-region-default","kind":"rust","path":"desktop-tauri/src-tauri/server/src/server/core/workbuddy_safety.rs","name":"server::core::workbuddy_safety::tests::safety_is_region_scoped_and_default_identity_survives_token_change"},
+        {"id":"case-workbuddy-safety-config-isolation","kind":"rust","path":"desktop-tauri/src-tauri/server/src/server/config/sql.rs","name":"server::config::sql::safety_tests::configuration_cannot_read_overwrite_or_delete_account_safety"},
+        {"id":"case-workbuddy-env-catalog-safety","kind":"rust","path":"desktop-tauri/src-tauri/server/tests/workbuddy_risk_routing.rs","name":"environment_identity_and_catalog_pause_are_isolated"},
+        {"id":"case-workbuddy-refresh-late-sse-safety","kind":"rust","path":"desktop-tauri/src-tauri/server/tests/workbuddy_risk_routing.rs","name":"refresh_and_late_sse_restrictions_stop_without_replay"},
+        {"id":"case-workbuddy-catalog-terminal-safety","kind":"rust","path":"desktop-tauri/src-tauri/server/tests/workbuddy_catalog_safety.rs","name":"catalog_rejection_stops_enterprise_fallback_and_persists_restrictions"},
+        {"id":"case-workbuddy-atomic-concurrency","kind":"rust","path":"desktop-tauri/src-tauri/server/src/server/core/upstream/connections.rs","name":"server::core::upstream::connections::tests::hard_cap_is_atomic_and_handoff_releases_once"},
+        {"id":"case-workbuddy-safety-recovery-browser","kind":"browser","path":"desktop-tauri/ui-islands/tests/accounts-growth.browser.cjs"}
+      ]
+    },
+    {
+      "id": "workbuddy-background-risk-idempotency",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "国际活跃任务收到明确拒绝后停止后续模型、网页会话和上报；当天实际活跃成功独立于奖励到账记录并持久去重；自建会话创建意图与ID持久化，未知结果不自动新建或删除用户会话。旧成长与新入口共享身份租约和待核实保护，人工确认不重发业务；Token刷新取消后释放占位。",
+      "source_commits": ["067f19e863543cda6163d03aca8c98ad6d4ac9f1"],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/billing/activity.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/billing/web_activity.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/workbuddy_growth.rs",
+        "desktop-tauri/src-tauri/server/src/server/api/growth.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/auth.rs",
+        "desktop-tauri/ui-islands/src/islands/accounts-panels.tsx",
+        "desktop-tauri/ui-islands/src/islands/accounts-growth-panel.tsx"
+      ],
+      "tests": [
+        {"id":"case-workbuddy-activity-risk-daily-uncertain","kind":"rust","path":"desktop-tauri/src-tauri/server/tests/workbuddy_activity_safety.rs","name":"activity_stops_after_rejection_and_persists_daily_and_uncertain_boundaries"},
+        {"id":"case-workbuddy-legacy-growth-shared-lease","kind":"rust","path":"desktop-tauri/src-tauri/server/tests/workbuddy_legacy_guard.rs","name":"legacy_and_new_growth_share_a_lease_and_keep_uncertain_writes"},
+        {"id":"case-workbuddy-refresh-cancel-release","kind":"rust","path":"desktop-tauri/src-tauri/server/src/server/core/auth.rs","name":"server::core::auth::refresh_reservation_tests::cancelled_refresh_releases_its_reservation"},
+        {"id":"case-workbuddy-web-daily-persistence","kind":"rust","path":"desktop-tauri/src-tauri/server/src/server/core/billing/web_activity/tests.rs","name":"server::core::billing::web_activity::tests::web_activity_daily_success_and_uncertainty_survive_date_rollover"},
+        {"id":"case-workbuddy-web-unknown-create","kind":"rust","path":"desktop-tauri/src-tauri/server/src/server/core/billing/web_activity/tests.rs","name":"server::core::billing::web_activity::tests::web_activity_persists_before_create_and_never_recreates_unknown_result"},
+        {"id":"case-workbuddy-legacy-batch-terminal","kind":"rust","path":"desktop-tauri/src-tauri/server/src/server/core/providers/workbuddy/growth/mod.rs","name":"server::core::providers::workbuddy::growth::safety_tests::legacy_growth_rejection_stops_tasks_fallback_and_lottery_without_false_pause"},
+        {"id":"case-workbuddy-growth-success-shape","kind":"rust","path":"desktop-tauri/src-tauri/server/src/server/core/providers/workbuddy/growth/mod.rs","name":"server::core::providers::workbuddy::growth::safety_tests::growth_success_requires_zero_or_absent_business_code"}
+      ]
+    },
+    {
       "id": "public-model-name-matches-id",
       "level": "P1",
       "status": "必须保留",

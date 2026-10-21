@@ -15,9 +15,7 @@
 //!      `ErrContentBlocked` 语义 —— 那是审核误报，不是账号问题）；
 //!   4. [`UpstreamErrorClass::Fatal`]        → 原样透传给客户端。
 //!
-//! 这四档是转发编排唯一认识的错误处理方式，适配器只能在这四档里归类 ——
-//! 多出来的分类在编排层没有对应分支，只会静默落进 Fatal，
-//! 等于把「该轮换账号」的错误当成终态发给用户。
+//! `Terminal` 是安全终止：优先于重试、换号、提示词降级与限额记账。
 //!
 //! ── 注册表为什么是「静态实例 + match」而不是 HashMap ─────────
 //! 适配器是**无状态单例**（凭证在账号存储、目录在 `core::models` 的进程级句柄，
@@ -27,10 +25,8 @@
 //! 而那条路径在 panic=abort 的 release 里只能 panic —— 得不偿失。
 //!
 //! ── 契约之外的十一处扩展（都是带默认实现的加法，不改 §4.2 的方法）──
-//!   1. `retry_advice`：识别「可退避重试的错误」并给出间隔与日志文案。
-//!      §4.3 要求「11128 退避逻辑保持在转发层」——**循环**留在编排层，
-//!      但「哪个码要退避、退多久」是 provider 知识（11128 是 workbuddy 的
-//!      敏感词拦截码），放在这里才能让 upstream/ 一个 provider 分支都不留。
+//!   1. `retry_advice`：提供商判定可重试错误，编排层管理预算和退避；
+//!      WorkBuddy 渠道拒绝不进入此路径。
 //!   2. `refresh_access_token`：401 后的**强制**刷新。`ensure_access_token`
 //!      的语义是「取可用 token（含临期主动刷新）」，而 401 意味着 token
 //!      被服务端拒绝 —— 它可能远未到临期窗口，只调 ensure 不会真的刷新。
@@ -215,16 +211,17 @@ pub enum UpstreamResponse {
     AntigravityGemini,
 }
 
-/// 上游错误分类（架构文档 §4.2；三个动作的语义见模块头）。
-///
-/// ── 文案口径：`message` 是**客户端可见的最终文案**（含前缀）────
-/// 改造前客户端的错误体是 `上游返回 {status}: {上游原文}{提示}`，其中提示只在
-/// workbuddy 的 11128（敏感词拦截）时追加。三者合成为一条文案的规则是
-/// provider 知识（提示的措辞是 workbuddy 专属的），因此在适配器里拼好、
-/// 由编排层原样使用 —— 既有用户的错误文案因此**逐字不变**。
+/// 上游错误分类；客户端文案由适配器生成，编排层按分类执行。
+/// `Terminal` 优先于重试策略，账号限制仅在明确证据下持久化安全暂停。
 #[derive(Clone, Debug)]
 pub enum UpstreamErrorClass {
-    /// 限额/风控 → 标记账号冷却并换下一账号（workbuddy 的 429 / code 6004）
+    Terminal {
+        kind: UpstreamStopReason,
+        status: u16,
+        message: String,
+        upstream_code: Option<i64>,
+    },
+    /// 账号限额 → 标记账号冷却并换下一账号（如 WorkBuddy code 6004）
     QuotaLimited {
         /// 上游给出的恢复时间戳（毫秒）；解析不出时 None（调用方给兜底冷却）
         reset_at: Option<i64>,
@@ -249,7 +246,7 @@ pub enum UpstreamErrorClass {
     /// `upstream::provider_loop` 的「动作 0」。
     ContentBlocked {
         status: u16,
-        /// 客户端可见的完整文案（含 11-128 之类的 provider 提示）
+        /// 客户端可见的完整文案（含 provider 提示）
         message: String,
         /// 上游业务码（原样进 GatewayError 的 `upstream_code`）
         upstream_code: Option<i64>,
@@ -257,11 +254,18 @@ pub enum UpstreamErrorClass {
     /// 透传给客户端的错误
     Fatal {
         status: u16,
-        /// 客户端可见的完整文案（含 11-128 之类的 provider 提示）
+        /// 客户端可见的完整文案（含 provider 提示）
         message: String,
         /// 上游业务码（原样进 GatewayError 的 `upstream_code`）
         upstream_code: Option<i64>,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpstreamStopReason {
+    AccountRestricted,
+    ChannelRefused,
+    UpstreamBusy,
 }
 
 /// HTTP 2xx 响应首段的业务判定。
@@ -280,8 +284,7 @@ pub enum SuccessHead {
 /// 一次「可退避重试」的建议（见模块头扩展 1）。
 ///
 /// 适配器把「要不要退避重试」连同**原因**一起给出，编排层负责睡这一觉、
-/// 再发一次，并把这条建议记进请求日志的尝试明细 —— 于是 11128/「敏感词」
-/// 这类 provider 专属知识不会漏进 `upstream/`。
+/// 再发一次，并把这条建议记进请求日志的尝试明细。安全终止类不走重试建议。
 ///
 /// ── 为什么是 `reason` 而不是一整句 `log_message` ─────────────
 /// 改造前这里给的是**完整日志文案**（含「5 秒后重试（第 n/N 次）」那半句），
@@ -295,7 +298,7 @@ pub enum SuccessHead {
 pub struct RetryAdvice {
     /// 退避时长（毫秒）
     pub delay_ms: u64,
-    /// 重试原因（provider 专属措辞，如「上游敏感词拦截（11128）」）。
+    /// 重试原因（provider 专属措辞）。
     /// 编排层用它拼日志行与请求日志的重试链。
     pub reason: String,
 }

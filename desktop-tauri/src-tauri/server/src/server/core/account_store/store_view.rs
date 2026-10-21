@@ -351,6 +351,15 @@ pub fn referenced_pool_ids(&self) -> std::collections::HashSet<String> {
         };
         match shaped {
             Value::Object(mut fields) => {
+                if crate::server::core::providers::workbuddy::is_workbuddy_family(&record.provider()) {
+                    let safety = crate::server::core::workbuddy_safety::status(
+                        self, &Value::Object(fields.clone()),
+                    ).unwrap_or_else(|error| serde_json::json!({"paused":true,"reason":error.message}));
+                    if safety["paused"] == true {
+                        fields.insert("available".into(), Value::Bool(false));
+                    }
+                    fields.insert("workbuddySafety".into(), safety);
+                }
                 fields.insert(
                     "hasCredentials".to_string(),
                     Value::Bool(record.has_credentials()),

@@ -32,12 +32,7 @@
 //! 键上（那正是 2026-09 那次「映射生效了、请求却仍然打到已限额账号」的成因，
 //! 见 `routing::CooldownKeys` 的说明）。
 //!
-//! ── 11128 退避去哪了 ───────────────────────────────────────
-//! 改造前 `request_with_waf_retry` 在本文件里（含「11128 → 10s/25s」的判定）。
-//! 那个码是 workbuddy 的专属知识，已随转发改造搬进
-//! `providers::workbuddy::retry_advice`；**重试循环**留在编排层
-//! （`provider_loop::send_with_retry`），因为「重试几次、打什么日志」
-//! 是编排职责（架构文档 §4.3）。
+//! WorkBuddy 渠道拒绝和账号限制优先终止，不进入退避或轮换。
 
 use std::collections::HashMap;
 
@@ -66,6 +61,7 @@ pub(super) async fn session_for(
 ) -> Result<Value, GatewayError> {
     if let Some(id) = account_id {
         if let Some(entry) = service.store.get_session_by_id(id) {
+            if is_workbuddy(provider) { crate::server::core::workbuddy_safety::check(&service.store, &entry.session)?; }
             return Ok(entry.session);
         }
         // 账号删除后不能借用默认账号绕过限制器或指定账号测试。
@@ -75,13 +71,17 @@ pub(super) async fn session_for(
     if !filter_limiter_blocked(&accounts, None).1.is_empty() {
         return Err(GatewayError::with_status(503, "限制器已排除账号，不能回退到默认登录态"));
     }
-    let session = service
-        .auth
-        .get_current_session_for(provider)
-        .await
-        .map_err(|error| error.to_gateway_error())?;
+    let session = if is_workbuddy(provider) {
+        service.auth.default_session_snapshot_for(provider)
+    } else {
+        service.auth.get_current_session_for(provider).await
+            .map_err(|error| error.to_gateway_error())?
+    };
     match session {
-        Some(session) if has_access_token(&session) => Ok(session),
+        Some(session) if has_access_token(&session) => {
+            if is_workbuddy(provider) { crate::server::core::workbuddy_safety::check(&service.store, &session)?; }
+            Ok(session)
+        },
         _ => Err(GatewayError::with_status(
             401,
             "当前没有可用登录态：请先在桌面端完成登录",
@@ -107,8 +107,7 @@ pub(super) async fn session_for(
 ///
 /// `pinned` 是「这一轮只准用这个账号」（模型测试专用，见
 /// [`super::ForwardRequest::pinned_account`]）：候选池先被它收窄成一个账号，
-/// 上面那三级顺序对**那一个账号**照常生效 —— 它在限额冷却期时仍会被选中发一次，
-/// 这正是测试要的（把上游真实的 429 与恢复时间带回来，而不是换别人跑一遍）。
+/// WorkBuddy 的安全暂停、冷却与并发上限同样约束指定账号测试，不允许旁路。
 pub(super) async fn select_target_account(
     service: &UpstreamService,
     providers: &[&str],
@@ -120,6 +119,9 @@ pub(super) async fn select_target_account(
     let accounts = accounts_in_providers(service, providers, pinned);
     // 这些家都没有账号记录 → 用第一家的默认登录态（环境变量旁路等）
     if accounts.is_empty() {
+        if pinned.is_some() && providers.iter().any(|provider| is_workbuddy(provider)) {
+            return Err(GatewayError::with_status(503, "指定的 WorkBuddy 账号不存在，不能回退默认登录态"));
+        }
         return Ok(RouteTarget {
             provider: providers.first().copied().unwrap_or_default().to_string(),
             account_id: None,
@@ -132,7 +134,13 @@ pub(super) async fn select_target_account(
 
     // 限制器软跳过的候选先剔除（余额不足 / Token 限额，见 `filter_limiter_blocked`），
     // 三级选择共用
-    let (candidates, balance_blocked_ids) = filter_limiter_blocked(&accounts, pinned);
+    let (mut candidates, balance_blocked_ids) = filter_limiter_blocked(&accounts, pinned);
+    let had_workbuddy = candidates.iter().any(|account| is_workbuddy(provider_of(account)));
+    candidates.retain(|account| !is_workbuddy(provider_of(account))
+        || crate::server::core::workbuddy_safety::check(&service.store, account).is_ok());
+    if candidates.is_empty() && had_workbuddy {
+        return Err(GatewayError::with_status(503, "WorkBuddy 账号安全状态不允许转发，请检查安全暂停状态"));
+    }
 
     // 在途计数快照取一次（锁是纳秒级的内存操作，见 connections.rs）：
     // 第一级与第二级共用同一份，两级看到的「谁在忙」是同一时刻的事实。
@@ -150,6 +158,9 @@ pub(super) async fn select_target_account(
         for mut account in healthy {
             let Some(id) = routing::account_id(&account) else { continue; };
             let Some(entry) = service.store.get_session_by_id(id) else { continue; };
+            let limit = routing::max_concurrent_of(&account);
+            if is_workbuddy(provider_of(&account)) && limit > 0
+                && counts.get(id).copied().unwrap_or(0) as u64 >= limit { continue; }
             let session = entry.session;
             let identity = super::payload::affinity_target_identity(&service.store, &account, &session, context.body);
             account["_affinityIdentity"] = identity;
@@ -220,6 +231,7 @@ pub(super) async fn select_target_account(
         ));
     }
 
+    // WorkBuddy 不参与软兜底；其它提供商保持既有行为。
     // ── 第二级兜底（并发感知）──────────────────────────────────
     // 启用中的账号都在限额冷却期内 / 已达并发上限时，仍挑一个试一次：
     //   ① 先在「启用 + 未尝试 + 未达并发上限」的账号里挑**恢复最早**的
@@ -238,6 +250,7 @@ pub(super) async fn select_target_account(
     let mut best_effort: Option<Value> = None;
     let mut best_reset = f64::INFINITY;
     for account in &enabled {
+        if is_workbuddy(provider_of(account)) { continue; }
         let Some(id) = routing::account_id(account) else {
             continue;
         };
@@ -277,6 +290,9 @@ pub(super) async fn select_target_account(
     // 有账号被保底排除时，绝不通过默认登录态重新借到受保护账号。
     if !balance_blocked_ids.is_empty() {
         return Err(GatewayError::with_status(503, "余额不足账号已排除，没有未尝试的可用账号"));
+    }
+    if is_workbuddy(providers.first().copied().unwrap_or_default()) {
+        return Err(GatewayError::with_status(503, "WorkBuddy 账号处于冷却期或已达并发上限，请稍后重试"));
     }
     Ok(RouteTarget {
         provider: providers.first().copied().unwrap_or_default().to_string(),
@@ -478,6 +494,7 @@ fn squeeze_by_headroom(
     let mut best_headroom = i64::MIN;
     let mut best_reset = f64::INFINITY;
     for account in enabled {
+        if is_workbuddy(provider_of(account)) { continue; }
         let Some(id) = routing::account_id(account) else {
             continue;
         };
@@ -536,7 +553,9 @@ pub(super) fn pick_next_account(
     let accounts = accounts_in_providers(service, providers, pinned);
     // 换号顺延与第一级选路同一份候选剔除：被限制器拦下的账号不会在 429 之后
     // 被当作「下一个」重新塞进来
-    let (candidates, _balance_blocked) = filter_limiter_blocked(&accounts, pinned);
+    let (mut candidates, _balance_blocked) = filter_limiter_blocked(&accounts, pinned);
+    candidates.retain(|account| !is_workbuddy(provider_of(account))
+        || crate::server::core::workbuddy_safety::check(&service.store, account).is_ok());
     let counts = connection_counts(service);
     routing::pick_account_peek(&candidates, keys, &counts, tried_ids, logging::now_ms())
 }
@@ -634,13 +653,14 @@ mod policy_tests {
         let normal = select_target_account(&service,&["workbuddy"],&keys,&[],None,None).await.unwrap();
         assert_eq!(normal.account_id.as_deref(),Some(b_id));
         store.mark_rate_limited(b_id,"fixture-model",429,None,Some((now+60_000) as f64),"fixture cooldown");
-        let cooling = select_target_account(&service,&["workbuddy"],&keys,&[],None,None).await.unwrap();
-        assert_eq!(cooling.account_id.as_deref(),Some(b_id));
+        let cooling = select_target_account(&service,&["workbuddy"],&keys,&[],None,None).await;
+        assert!(matches!(cooling, Err(error) if error.status_code == 503));
+        store.clear_rate_limit(b_id,"fixture-model");
         store.update_account(b_id,&json!({"maxConcurrent":1})).unwrap();
         let mut connection = super::super::connections::ConnectionGuard::new(service.connections());
         connection.rebind(Some(b_id.to_string()));
-        let squeezed = select_target_account(&service,&["workbuddy"],&keys,&[],None,None).await.unwrap();
-        assert_eq!(squeezed.account_id.as_deref(),Some(b_id));
+        let squeezed = select_target_account(&service,&["workbuddy"],&keys,&[],None,None).await;
+        assert!(matches!(squeezed, Err(error) if error.status_code == 503));
         // 唯一未受保护的账号已经试过时，不能绕过限制器借回 A。
         let failed = select_target_account(&service,&["workbuddy"],&keys,&[b_id.to_string()],None,None).await;
         assert!(matches!(failed,Err(error) if error.status_code==503));
@@ -717,4 +737,8 @@ pub(super) fn report_limit_event(
             "resetAtText": if reset_at > 0 { format_reset_text(reset_at as f64) } else { String::new() },
         })),
     );
+}
+
+pub(super) fn is_workbuddy(provider: &str) -> bool {
+    matches!(provider, "workbuddy" | "workbuddy-intl")
 }

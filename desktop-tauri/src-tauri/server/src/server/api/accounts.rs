@@ -404,8 +404,19 @@ pub async fn dispatch(
         _ => {}
     }
 
+    if method == Method::GET {
+        if let Some(id) = rest.strip_suffix("/workbuddy-safety") {
+            return workbuddy_safety(&state, &decode_segment(id), None);
+        }
+    }
     // ③ POST + /move 结尾；POST + /rate-limits/clear 结尾
     if method == Method::POST {
+        if let Some(id) = rest.strip_suffix("/growth/legacy/resolve") {
+            return super::growth::resolve_legacy(&state, &decode_segment(id), body);
+        }
+        if let Some(id) = rest.strip_suffix("/workbuddy-safety/resume") {
+            return workbuddy_safety(&state, &decode_segment(id), Some(body));
+        }
         if let Some(id) = rest.strip_suffix("/move") {
             let id = decode_segment(id);
             if !id.is_empty() {
@@ -1952,6 +1963,44 @@ pub fn clear_rate_limits(state: &ServerState, id: &str, body: &Bytes) -> Respons
         );
     }
     ok_json(json!({ "cleared": cleared, "list": state.store().list_accounts() }))
+}
+
+/// 管理鉴权沿用 accounts 路由；恢复只允许重新尝试，不宣称上游已解封。
+fn workbuddy_safety(state: &ServerState, id: &str, body: Option<&Bytes>) -> Response {
+    use crate::server::core::{providers::workbuddy::is_workbuddy_family, workbuddy_safety};
+    let session = if is_workbuddy_family(id) {
+        // 必须与实际默认转发使用同一 UID/地区，且查询状态不触发 token 刷新。
+        state.auth().default_session_snapshot_for(id)
+            .unwrap_or_else(|| json!({"provider":id}))
+    } else if let Some(entry) = state.store().get_session_by_id(id) {
+        entry.session
+    } else {
+        return management_error(404, "账号不存在");
+    };
+    if !is_workbuddy_family(session["provider"].as_str().unwrap_or("workbuddy")) {
+        return management_error(400, "该账号不是 WorkBuddy 账号");
+    }
+    let result = match body {
+        None => workbuddy_safety::status(state.store(), &session),
+        Some(body) => {
+            let payload = match parse_json_body(body, "请求内容不是有效 JSON") {
+                Ok(value) => value,
+                Err(response) => return response,
+            };
+            if payload["confirmed"] != true {
+                return management_error(400, "必须确认上游限制已解除");
+            }
+            let (Some(identity), Some(revision)) =
+                (payload["identity"].as_str(), payload["revision"].as_u64()) else {
+                    return management_error(400, "缺少当前账号身份和安全状态版本");
+                };
+            workbuddy_safety::resume(state.store(), &session, identity, revision)
+        }
+    };
+    match result {
+        Ok(safety) => ok_json(json!({"safety":safety,"list":state.store().list_accounts()})),
+        Err(error) => management_error(error.status_code, error.message),
+    }
 }
 
 // ─── DELETE /api/accounts/{id} ──────────────────────────────

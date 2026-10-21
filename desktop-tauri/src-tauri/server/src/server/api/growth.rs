@@ -261,6 +261,13 @@ pub async fn status(state: &ServerState, account_id: &str) -> Response {
 /// 返回单条结果行（code / outcome / message / credit / energy）。界面的
 /// 「一键完成」在本地循环逐条调用本端点（见模块头的 60 秒超时说明）。
 pub async fn run_task(state: &ServerState, account_id: &str, body: &Bytes) -> Response {
+    if parse_request(body).code.is_empty() {
+        return management_error(400, "缺少任务码（code）");
+    }
+    legacy_action(state, account_id, "task", body.clone()).await
+}
+
+async fn run_task_inner(state: &ServerState, account_id: &str, body: &Bytes) -> Response {
     let account = match growth_account(state, account_id) {
         Ok(account) => account,
         Err(response) => return response,
@@ -338,6 +345,10 @@ pub async fn run_task(state: &ServerState, account_id: &str, body: &Bytes) -> Re
 /// school 任务体量小（4 个映射任务 × 每次几秒），一次请求的时长在管理 API 的
 /// 60 秒窗口内；若未来任务数增长导致超时，按单任务端点同款拆分。
 pub async fn school_run(state: &ServerState, account_id: &str, body: &Bytes) -> Response {
+    legacy_action(state, account_id, "school", body.clone()).await
+}
+
+async fn school_run_inner(state: &ServerState, account_id: &str, body: &Bytes) -> Response {
     let account = match growth_account(state, account_id) {
         Ok(account) => account,
         Err(response) => return response,
@@ -366,6 +377,10 @@ pub async fn school_run(state: &ServerState, account_id: &str, body: &Bytes) -> 
 ///
 /// 一趟只推进一步（无猫 → 领养；idle → 派出；arrived → 领奖；traveling → 跳过）。
 pub async fn travel_run(state: &ServerState, account_id: &str) -> Response {
+    legacy_action(state, account_id, "travel", Bytes::new()).await
+}
+
+async fn travel_run_inner(state: &ServerState, account_id: &str) -> Response {
     let account = match growth_account(state, account_id) {
         Ok(account) => account,
         Err(response) => return response,
@@ -377,4 +392,50 @@ pub async fn travel_run(state: &ServerState, account_id: &str) -> Response {
         "message": report.message,
         "credit": report.credit,
     }))
+}
+
+async fn legacy_action(state: &ServerState, id: &str, kind: &'static str, body: Bytes) -> Response {
+    use crate::server::core::{billing::growth::GrowthError, workbuddy_growth};
+    let request = parse_request(&body);
+    let payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let context = json!({
+        "id":id,"action":format!("legacy_{kind}"),
+        "code":request.code,"mode":request.mode,"only":request.only,"lottery":request.lottery,
+        "clientToken":payload.get("clientToken").and_then(Value::as_str),
+    });
+    let state = state.clone();
+    let id = id.to_string();
+    let store = state.store().clone();
+    let result = workbuddy_growth::legacy_action(store, id.clone(), context, move || async move {
+        let response = match kind {
+            "task" => run_task_inner(&state, &id, &body).await,
+            "school" => school_run_inner(&state, &id, &body).await,
+            _ => travel_run_inner(&state, &id).await,
+        };
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await
+            .map_err(|_| GrowthError::new(500, "旧成长操作响应读取失败，结果待核实"))?;
+        let value: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| GrowthError::new(500, "旧成长操作响应无效，结果待核实"))?;
+        if !status.is_success() {
+            return Err(GrowthError::new(status.as_u16() as i32,
+                value.pointer("/error/message").and_then(Value::as_str).unwrap_or("旧成长操作失败")));
+        }
+        Ok(value)
+    }).await;
+    match result {
+        Ok(value) => ok_json(value),
+        Err(error) => management_error(error.status, error.message),
+    }
+}
+
+pub fn resolve_legacy(state: &ServerState, id: &str, body: &Bytes) -> Response {
+    let payload = match serde_json::from_slice::<Value>(body) {
+        Ok(value) => value,
+        Err(_) => return management_error(400, "请求内容不是有效 JSON"),
+    };
+    match crate::server::core::workbuddy_growth::resolve_legacy(state.store(), id, &payload) {
+        Ok(value) => ok_json(value),
+        Err(error) => management_error(error.status, error.message),
+    }
 }

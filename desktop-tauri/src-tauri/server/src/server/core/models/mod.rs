@@ -436,6 +436,9 @@ impl ModelCatalog {
     /// 返回 `{refreshed, count, source}` 或 `{refreshed:false, reason}` 语义
     /// 与 Node 版逐字一致 —— 调用方据此决定打 ✅ 还是 verbose。
     pub async fn refresh(&self, params: RefreshParams<'_>) -> RefreshOutcome {
+        if let Err(error) = super::workbuddy_safety::check(params.store, params.session) {
+            return RefreshOutcome::not_refreshed(error.message);
+        }
         let base = params.endpoint.trim_end_matches('/').to_string();
         let has_auth = params.headers.iter().any(|(key, value)| {
             key.eq_ignore_ascii_case("authorization") && !value.trim().is_empty()
@@ -451,8 +454,17 @@ impl ModelCatalog {
                 vec![("User-Agent".to_string(), params.user_agent.to_string())];
             headers.extend(params.headers.iter().cloned());
             match send_raw("GET", &url, None, &headers, params.proxy, None).await {
-                // 不校验 HTTP 状态：与 Node 一致 —— 先按 JSON 解析，再看有没有可用模型
-                Ok(response) => match response.payload {
+                Ok(response) => {
+                    if let Some(error) = super::billing::workbuddy_stop_error(
+                        params.store, params.session, response.status,
+                        response.payload.as_ref().unwrap_or(&Value::Null),
+                    ) {
+                        return RefreshOutcome::not_refreshed(error.message);
+                    }
+                    if matches!(response.status, 401 | 403 | 405 | 429) {
+                        return RefreshOutcome::not_refreshed(format!("模型目录请求被拒绝（HTTP {}）", response.status));
+                    }
+                    match response.payload {
                     Some(payload) => {
                         let raw = payload
                             .get("data")
@@ -473,7 +485,8 @@ impl ModelCatalog {
                     None => {
                         logging::verbose("[Models]", "远程配置拉取失败: 响应不是合法 JSON");
                     }
-                },
+                    }
+                }
                 Err(error) => {
                     logging::verbose(
                         "[Models]",
@@ -493,8 +506,20 @@ impl ModelCatalog {
                     encode_uri_component(enterprise_id)
                 );
                 let headers: Vec<(String, String)> = params.headers.to_vec();
+                if let Err(error) = super::workbuddy_safety::check(params.store, params.session) {
+                    return RefreshOutcome::not_refreshed(error.message);
+                }
                 return match send_raw("GET", &url, None, &headers, params.proxy, None).await {
                     Ok(response) => {
+                        if let Some(error) = super::billing::workbuddy_stop_error(
+                            params.store, params.session, response.status,
+                            response.payload.as_ref().unwrap_or(&Value::Null),
+                        ) {
+                            return RefreshOutcome::not_refreshed(error.message);
+                        }
+                        if !response.ok {
+                            return RefreshOutcome::not_refreshed(format!("企业模型目录请求被拒绝（HTTP {}）", response.status));
+                        }
                         let raw = response
                             .payload
                             .as_ref()
@@ -625,16 +650,7 @@ impl ModelCatalog {
                     let proxy = crate::server::core::proxies::session_proxy(&entry.session);
                     (Some(entry.session), proxy)
                 }
-                None => match auth.get_current_session().await {
-                    Ok(session) => (session, None),
-                    Err(error) => {
-                        logging::verbose(
-                            "[Models]",
-                            &format!("模型目录刷新失败: {}", error.message),
-                        );
-                        return RefreshOutcome::not_refreshed(error.message);
-                    }
-                },
+                None => (auth.default_session_snapshot_for(self.region.provider_id()), None),
             }
         } else {
             match store.session_for_account(requested) {
@@ -655,6 +671,15 @@ impl ModelCatalog {
             logging::verbose("[Models]", &format!("模型目录未更新: {REASON_NO_SESSION}"));
             return RefreshOutcome::not_refreshed(REASON_NO_SESSION);
         };
+
+        if session.get("provider").and_then(Value::as_str).unwrap_or("workbuddy")
+            != self.region.provider_id()
+        {
+            return RefreshOutcome::not_refreshed("账号地区与模型目录不一致");
+        }
+        if let Err(error) = crate::server::core::workbuddy_safety::check(store, &session) {
+            return RefreshOutcome::not_refreshed(error.message);
+        }
 
         // 端点兜底按**本地区**取（账号记录里的 endpoint 仍是最高优先的覆盖项：
         // 它带着账号自己的站点，也正是 staging / 反向代理用户的落点）。
@@ -681,6 +706,8 @@ impl ModelCatalog {
 
         let outcome = self
             .refresh(RefreshParams {
+                store,
+                session: &session,
                 endpoint: &endpoint,
                 enterprise_id: Some(&enterprise_id),
                 headers: &headers,
@@ -705,6 +732,8 @@ impl ModelCatalog {
 
 /// 刷新入参（对应 Node 版 refresh 的 options 对象）
 pub struct RefreshParams<'a> {
+    pub store: &'a crate::server::core::account_store::AccountStore,
+    pub session: &'a Value,
     pub endpoint: &'a str,
     pub enterprise_id: Option<&'a str>,
     pub headers: &'a [(String, String)],

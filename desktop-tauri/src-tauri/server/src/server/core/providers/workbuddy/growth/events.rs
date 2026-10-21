@@ -111,7 +111,7 @@ fn web_event_headers(account: &GrowthAccount, page_url: &str) -> Vec<(String, St
     ]
 }
 
-/// web 域领奖头（fork ClaimReward 同款，claim web 降级用）。
+/// web 域领奖头（保留客户端形态；拒绝响应不再自动触发跨域降级）。
 pub fn web_claim_headers(account: &GrowthAccount) -> Vec<(String, String)> {
     vec![
         ("Accept".to_string(), "application/json, text/plain, */*".to_string()),
@@ -477,7 +477,7 @@ pub async fn light_up(
             }
             None
         }
-        // 五连 Buddy 事件；失败降级为单发 buddyapp_enter_click（旧形状兜底）
+        // 五连 Buddy 事件；拒绝后停止，不把未知错误当作旧格式兼容信号。
         "buddy5" => {
             let (buddy_id, buddy_name) = buddy_app_of(code);
             for _ in 0..need.max(1) {
@@ -485,16 +485,7 @@ pub async fn light_up(
                 match report_desktop_events(account, &events).await {
                     Ok(()) => {}
                     Err(error) => {
-                        // 降级单发（旧形状兜底，实测亦可点亮）
-                        let single = json!({
-                            "eventCode": "buddyapp_enter_click", "timestamp": now_ms(),
-                            "reportDelay": 0, "elementId": buddy_id,
-                            "elementName": buddy_name, "position": 1,
-                            "isFirstPage": "0", "userId": account.uid,
-                        });
-                        if let Err(error2) = report_desktop_events(account, &[single]).await {
-                            return Some(format!("{error}；降级单发亦失败：{error2}"));
-                        }
+                        return Some(error);
                     }
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(super::GROWTH_WRITE_GAP_MS))

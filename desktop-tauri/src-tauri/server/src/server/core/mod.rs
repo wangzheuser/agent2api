@@ -101,5 +101,6 @@ pub mod upstream;
 pub mod usage_query;
 pub mod workbuddy_growth;
 pub mod workbuddy_policy;
+pub mod workbuddy_safety;
 pub mod zcode_claim;
 pub mod usage_records;

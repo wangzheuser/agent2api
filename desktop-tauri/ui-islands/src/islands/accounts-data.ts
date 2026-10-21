@@ -1231,6 +1231,23 @@ export async function clearLimits(id: string, model?: string): Promise<void> {
   }
 }
 
+export async function resumeWorkbuddySafety(account: AccountRecord): Promise<boolean> {
+  const safety = account.workbuddySafety
+  try {
+    const resume = shared().workbuddyDesktop?.resumeWorkbuddySafety
+    if (!resume || !safety?.identity || typeof safety.revision !== 'number') {
+      throw new Error('安全状态不可用，请刷新后重试')
+    }
+    await resume(account.id, { confirmed: true, identity: safety.identity, revision: safety.revision })
+    toast('已解除本地安全暂停；这不表示上游已确认解封')
+    await shared().wbApp?.refresh?.()
+    return true
+  } catch (error) {
+    toast(`恢复失败：${errorMessage(error)}`, 'err')
+    return false
+  }
+}
+
 /**
  * 代理列下拉的保存。值只有两种：空串 = 直连（proxy 传 null），否则是 Clash 出口 uid
  * （`{source:'clash', listenerUid}`）——「自定义代理…」不是值而是动作：把下拉恢复成

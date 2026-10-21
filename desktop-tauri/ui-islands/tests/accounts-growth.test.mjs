@@ -44,5 +44,6 @@ test('a new task execution requires observed progress and no unresolved server o
   assert.equal(growthTaskProgressed(before, { tasks: [{ ...before, current: 1 }] }), true)
   for (const next of [{ ...before }, { ...before, current: null }, { ...before, current: 1, source: 'mini_program' }]) assert.equal(growthTaskProgressed(before, { tasks: [next] }), false)
   assert.equal(growthTaskProgressed(before, { tasks: [{ ...before, current: 1 }], pending: { clientToken: 'still-pending' } }), false)
+  assert.equal(growthTaskProgressed(before, { tasks: [{ ...before, current: 1 }], legacyPending: { clientToken: 'legacy-pending' } }), false)
   assert.equal(growthTaskProgressed(undefined, { tasks: [{ ...before, current: 1 }] }), false)
 })

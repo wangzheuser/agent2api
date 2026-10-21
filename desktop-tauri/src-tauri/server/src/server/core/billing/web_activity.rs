@@ -1,15 +1,14 @@
 //! 国际版网页任务：建会话后通过 ACP 真正执行一轮（参考 workbuddy2api-hub #90）。
 //! 会话完成只证明通道有效；奖励资格和次日到账仍以上游结算为准。
+//! UTC 日期仅用于本地日级去重，不代表上游奖励结算日。
 
-use std::collections::HashSet;
-use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use reqwest::{Client, RequestBuilder, Response};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::server::core::{egress, proxies::ResolvedProxy};
+use crate::server::core::{account_store::AccountStore, egress, proxies::ResolvedProxy, task_state};
 
 const ORIGIN: &str = "https://www.workbuddy.ai";
 const PROMPT: &str = "Reply with just OK. Do not use tools.";
@@ -17,43 +16,61 @@ const MAX_BYTES: usize = 1 << 20;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const TURN_TIMEOUT: Duration = Duration::from_secs(180);
 
-#[derive(Default, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct Outcome {
     pub success: bool,
     pub conversation_id: Option<String>,
     pub status: String,
     pub output_chunks: usize,
+    #[serde(default)]
+    pub turn_completed: bool,
     pub elapsed_ms: u128,
     pub error: Option<String>,
 }
 
-// 自动任务与手动入口共享在途去重；不持锁跨 await，也不把失败记成当天已完成。
-static INFLIGHT: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-struct Reservation(String);
-impl Drop for Reservation {
-    fn drop(&mut self) {
-        if let Ok(mut ids) = INFLIGHT.get_or_init(Default::default).lock() {
-            ids.remove(&self.0);
+fn state_key(session: &Value) -> Result<String, String> {
+    let identity = crate::server::core::workbuddy_policy::identity(session)
+        .ok_or_else(|| "账号身份缺失".to_string())?;
+    Ok(format!("workbuddy-web-activity:{identity}"))
+}
+
+fn saved_outcome(value: Option<&Value>, day: &str) -> Result<Option<Outcome>, String> {
+    let Some(value) = value else { return Ok(None) };
+    match value["phase"].as_str() {
+        Some("success") => {
+            let outcome: Outcome = serde_json::from_value(value["outcome"].clone())
+                .map_err(|_| "网页活跃持久化结果无效，未发送请求".to_string())?;
+            if !outcome.success || !outcome.turn_completed || outcome.status != "completed" || outcome.output_chunks == 0 {
+                return Err("网页活跃持久化结果不完整，未发送请求".to_string());
+            }
+            let saved_day = value["day"].as_str().and_then(|date| chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())
+                .ok_or_else(|| "网页活跃记录日期无效，未发送请求".to_string())?;
+            let today = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d")
+                .map_err(|_| "网页活跃当前日期无效".to_string())?;
+            if saved_day > today { return Err("网页活跃记录在未来，请核对系统时间".to_string()); }
+            Ok((saved_day == today).then_some(outcome))
         }
+        Some("rejected") if value["outcome"]["status"] == "CREATE_REJECTED"
+            && value["outcome"]["conversationId"].is_null() => Ok(None),
+        _ => Err("上次网页会话创建或执行结果待核对，不自动创建新会话".to_string()),
     }
 }
 
-pub(super) async fn run(session: &Value, model: &str) -> Outcome {
+pub(super) fn cached(session: &Value) -> Result<Option<Outcome>, String> {
+    let state = task_state::read(&state_key(session)?)?;
+    saved_outcome(state.value.as_ref(), &chrono::Utc::now().format("%Y-%m-%d").to_string())
+}
+
+pub(super) async fn run(store: &AccountStore, session: &Value, model: &str) -> Outcome {
+    run_with_origin(store, session, model, ORIGIN).await
+}
+
+async fn run_with_origin(store: &AccountStore, session: &Value, model: &str, origin: &str) -> Outcome {
     let start = Instant::now();
     let mut outcome = Outcome::default();
     let result = tokio::time::timeout(TURN_TIMEOUT, async {
         let uid = required(session.pointer("/account/uid"), "账号标识缺失")?;
-        let _reservation = {
-            let mut ids = INFLIGHT
-                .get_or_init(Default::default)
-                .lock()
-                .map_err(|_| "网页保活锁不可用".to_string())?;
-            if !ids.insert(uid.to_string()) {
-                return Err("该账号网页保活正在执行".to_string());
-            }
-            Reservation(uid.to_string())
-        };
         if session
             .get("proxyError")
             .is_some_and(|v| !v.is_null() && v != "")
@@ -65,7 +82,27 @@ pub(super) async fn run(session: &Value, model: &str) -> Outcome {
         let client = egress::client_without_redirects(proxy.as_ref())
             .map_err(|_| "网页保活客户端创建失败".to_string())?;
         let token = required(session.pointer("/auth/accessToken"), "账号未登录")?;
-        execute(&client, ORIGIN, uid, token, model, &mut outcome).await
+        crate::server::core::workbuddy_safety::check(store, session).map_err(|error| error.message)?;
+        let key = state_key(session)?;
+        let lease = match task_state::claim(&key, 0, true, task_state::ManualBackoff::Respect, 0)? {
+            task_state::Claim::Acquired(lease) => lease,
+            task_state::Claim::Deferred(_) => return Err("该账号网页保活正在执行或冷却中".to_string()),
+        };
+        if let Some(saved) = cached(session)? {
+            outcome = saved;
+            lease.finish(true, "今日网页活跃已完成".into(), None, 0, 0)?;
+            return Ok(());
+        }
+        let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        task_state::store_value(&key, json!({"day":day,"phase":"pending_create"}))?;
+        let result = execute(&client, origin, uid, token, model, &mut outcome, Some((store, session)), Some((&key, &day))).await;
+        outcome.success = result.is_ok();
+        let phase = if result.is_ok() { "success" }
+            else if outcome.status == "CREATE_REJECTED" && outcome.conversation_id.is_none() { "rejected" }
+            else { "uncertain" };
+        lease.finish(result.is_ok(), match phase { "success" => "网页活跃已完成", "rejected" => "创建请求已拒绝，未创建会话", _ => "网页活跃结果待核对" }.into(),
+            Some(json!({"day":day,"phase":phase,"outcome":outcome})), 0, 0)?;
+        result
     })
     .await;
     outcome.success = matches!(&result, Ok(Ok(())));
@@ -102,13 +139,26 @@ fn web_request(
         .timeout(HTTP_TIMEOUT)
 }
 
+#[cfg(test)]
 async fn send(request: RequestBuilder, stage: &str) -> Result<Response, String> {
+    send_checked(request, stage, None).await
+}
+
+async fn send_checked(request: RequestBuilder, stage: &str, safety: Option<(&AccountStore, &Value)>) -> Result<Response, String> {
     let response = tokio::time::timeout(HTTP_TIMEOUT, request.send())
         .await
         .map_err(|_| format!("{stage}超时"))?
         .map_err(|_| format!("{stage}网络请求失败"))?;
     if !response.status().is_success() {
-        return Err(format!("{stage} HTTP {}", response.status().as_u16()));
+        let status = response.status().as_u16();
+        if let Some((store, session)) = safety {
+            let body = read_body(response).await?;
+            let value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            if let Some(error) = super::workbuddy_stop_error(store, session, status, &value) {
+                return Err(error.message);
+            }
+        }
+        return Err(format!("{stage} HTTP {status}"));
     }
     Ok(response)
 }
@@ -124,10 +174,18 @@ async fn read_body(mut response: Response) -> Result<Vec<u8>, String> {
     Ok(body)
 }
 
-async fn console(request: RequestBuilder, stage: &str) -> Result<Value, String> {
-    let body = read_body(send(request, stage).await?).await?;
+async fn console(request: RequestBuilder, stage: &str, safety: Option<(&AccountStore, &Value)>) -> Result<Value, String> {
+    if let Some((store, session)) = safety {
+        crate::server::core::workbuddy_safety::check(store, session).map_err(|error| error.message)?;
+    }
+    let body = read_body(send_checked(request, stage, safety).await?).await?;
     let value: Value =
         serde_json::from_slice(&body).map_err(|_| format!("{stage}响应不是有效 JSON"))?;
+    if let Some((store, session)) = safety {
+        if let Some(error) = super::workbuddy_stop_error(store, session, 200, &value) {
+            return Err(error.message);
+        }
+    }
     if value.get("code").and_then(Value::as_i64) != Some(0) {
         return Err(format!(
             "{stage}业务失败（code={}）",
@@ -135,6 +193,52 @@ async fn console(request: RequestBuilder, stage: &str) -> Result<Value, String> 
         ));
     }
     Ok(value["data"].clone())
+}
+
+async fn create_conversation(
+    request: RequestBuilder,
+    outcome: &mut Outcome,
+    safety: Option<(&AccountStore, &Value)>,
+    persistence: Option<(&str, &str)>,
+) -> Result<String, String> {
+    if let Some((store, session)) = safety {
+        if let Err(error) = crate::server::core::workbuddy_safety::check(store, session) {
+            outcome.status = "CREATE_REJECTED".into();
+            return Err(error.message);
+        }
+    }
+    let response = tokio::time::timeout(HTTP_TIMEOUT, request.send()).await
+        .map_err(|_| "创建网页会话超时，创建结果待核对".to_string())?
+        .map_err(|_| "创建网页会话请求未确认，创建结果待核对".to_string())?;
+    let status = response.status().as_u16();
+    if matches!(status, 400 | 401 | 402 | 403 | 404 | 405 | 413 | 415 | 422 | 429) {
+        outcome.status = "CREATE_REJECTED".into();
+    }
+    let body = read_body(response).await?;
+    let value: Value = serde_json::from_slice(&body)
+        .map_err(|_| "创建网页会话响应不是有效 JSON".to_string())?;
+    if let Ok(id) = conversation_id(&value["data"]["id"]) {
+        outcome.conversation_id = Some(id);
+        outcome.status = "CREATING".into();
+        if let Some((key, day)) = persistence {
+            task_state::store_value(key, json!({"day":day,"phase":"conversation_created","conversationId":outcome.conversation_id}))?;
+        }
+    }
+    if let Some((store, session)) = safety {
+        if let Some(error) = super::workbuddy_stop_error(store, session, status, &value) {
+            if outcome.conversation_id.is_none() {
+                outcome.status = "CREATE_REJECTED".into();
+            }
+            return Err(error.message);
+        }
+    }
+    if !(200..300).contains(&status) {
+        return Err(format!("创建网页会话 HTTP {status}"));
+    }
+    if value["code"].as_i64() != Some(0) && value["code"].as_str() != Some("0") {
+        return Err("创建网页会话业务失败，结果待核对".into());
+    }
+    outcome.conversation_id.clone().ok_or_else(|| "会话 ID 缺失，创建结果待核对".into())
 }
 
 fn conversation_id(value: &Value) -> Result<String, String> {
@@ -174,14 +278,13 @@ async fn execute(
     token: &str,
     model: &str,
     outcome: &mut Outcome,
+    safety: Option<(&AccountStore, &Value)>,
+    persistence: Option<(&str, &str)>,
 ) -> Result<(), String> {
     let base = format!("{origin}/console/as/conversations/");
     let request = web_request(client, reqwest::Method::POST, &base, uid, token)
         .json(&json!({"prompt": PROMPT, "model": model, "conversationOrigin": "workbuddy-app"}));
-    let created = console(request, "创建网页会话").await?;
-    let id = conversation_id(&created["id"])?;
-    outcome.conversation_id = Some(id.clone());
-    outcome.status = "CREATING".to_string();
+    let id = create_conversation(request, outcome, safety, persistence).await?;
     let conversation_url = format!("{base}{id}");
     let mut session = Value::Null;
     for attempt in 0..12 {
@@ -194,6 +297,7 @@ async fn execute(
                 token,
             ),
             "取得网页沙箱",
+            safety,
         )
         .await?;
         if session
@@ -218,12 +322,13 @@ async fn execute(
         .get("cwd")
         .and_then(Value::as_str)
         .unwrap_or("/workspace");
-    let response = send(
+    let response = send_checked(
         client
             .get(link.clone())
             .bearer_auth(sandbox_token)
             .header("Accept", "text/event-stream"),
         "连接 ACP 事件流",
+        safety,
     )
     .await?;
     let connection = response
@@ -240,6 +345,7 @@ async fn execute(
         connection,
         events: Events::new(response),
         output_chunks: 0,
+        safety,
     };
     let initialized = channel.rpc(1, "initialize", json!({"protocolVersion": 1,
         "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false}})).await?;
@@ -269,11 +375,16 @@ async fn execute(
     {
         return Err("ACP 未收到非空回答或本轮未正常结束".to_string());
     }
+    outcome.turn_completed = true;
+    if let Some((key, day)) = persistence {
+        task_state::store_value(key, json!({"day":day,"phase":"conversation_created","conversationId":id,"outcome":outcome}))?;
+    }
     // RPC 的 end_turn 与控制台落库状态都要确认；只收到 HTTP 202 或一段文字不算完成。
     loop {
         let detail = console(
             web_request(client, reqwest::Method::GET, &conversation_url, uid, token),
             "核对网页会话",
+            safety,
         )
         .await?;
         outcome.status = detail
@@ -298,11 +409,15 @@ struct AcpChannel<'a> {
     connection: String,
     events: Events,
     output_chunks: usize,
+    safety: Option<(&'a AccountStore, &'a Value)>,
 }
 
 impl AcpChannel<'_> {
     async fn rpc(&mut self, id: u64, method: &str, params: Value) -> Result<Value, String> {
-        let response = send(
+        if let Some((store, session)) = self.safety {
+            crate::server::core::workbuddy_safety::check(store, session).map_err(|error| error.message)?;
+        }
+        let response = send_checked(
             self.client
                 .post(self.link.clone())
                 .bearer_auth(self.token)
@@ -310,6 +425,7 @@ impl AcpChannel<'_> {
                 .header("Accept", "application/json, text/event-stream")
                 .json(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})),
             method,
+            self.safety,
         )
         .await?;
         // ACP 可用 202 或空 200 确认接收，结果走 GET SSE；也可在 POST 上直接
@@ -346,6 +462,11 @@ impl AcpChannel<'_> {
                     None => self.events.next().await?,
                 },
             };
+            if let Some((store, session)) = self.safety {
+                if let Some(error) = super::workbuddy_stop_error(store, session, 200, event.get("error").unwrap_or(&event)) {
+                    return Err(error.message);
+                }
+            }
             if let Some(result) = process_event(&event, id, &mut self.output_chunks)? {
                 return Ok(result);
             }

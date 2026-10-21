@@ -254,3 +254,30 @@ pub(super) fn write_all(db: &Db, raw: &Map<String, Value>) -> Result<(), String>
         Some(result) => result,
     }
 }
+
+#[cfg(test)]
+mod safety_tests {
+    use super::*;
+    use crate::server::core::{account_store::AccountStore, workbuddy_safety};
+    use crate::server::db::test_temp::TempDb;
+    use serde_json::json;
+
+    #[test]
+    fn configuration_cannot_read_overwrite_or_delete_account_safety() {
+        let (db, _file) = TempDb::open("config-safety");
+        let store = AccountStore::with_db(Some(db.clone()));
+        let session = json!({"provider":"workbuddy","account":{"uid":"fixture"}});
+        workbuddy_safety::pause(&store, &session).unwrap();
+        let safety = workbuddy_safety::status(&store, &session).unwrap();
+        let key = format!("workbuddySafety:{}", safety["identity"].as_str().unwrap());
+        db.with(|conn| {
+            assert!(!read_conn(conn).unwrap().contains_key(&key));
+            write_conn(conn, &Map::new()).unwrap();
+            let mut forged = Map::new();
+            forged.insert(key.clone(), json!({"paused":false,"revision":99,"observedAt":0}));
+            assert!(write_conn(conn, &forged).is_err());
+        }).unwrap();
+        assert_eq!(workbuddy_safety::status(&store, &session).unwrap(), safety);
+        assert!(workbuddy_safety::check(&store, &session).is_err());
+    }
+}

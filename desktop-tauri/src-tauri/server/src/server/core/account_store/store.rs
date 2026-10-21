@@ -165,6 +165,11 @@ impl AccountStore {
         &self.inner.file_path
     }
 
+    /// 独立 KV 状态复用同一连接；不经此接口修改 accounts 表。
+    pub(crate) fn database(&self) -> Option<Db> {
+        self.inner.db.clone()
+    }
+
     pub fn file_string(&self) -> String {
         self.inner.file_path.to_string_lossy().to_string()
     }
