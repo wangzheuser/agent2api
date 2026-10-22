@@ -21,6 +21,7 @@ use crate::server::core::providers::refresh_flight::{Join, Table};
 use crate::server::core::proxies::ResolvedProxy;
 
 use super::credentials::Credential;
+use super::device::{public_pem_from_private, sign_der_base64};
 use super::headers::CLIENT_USER_AGENT;
 use super::http::{describe_candidates, post_json};
 
@@ -32,6 +33,46 @@ pub const MAX_ISSUE_AGE_MS: i64 = 15 * 24 * 3600 * 1000;
 /// 换证端点（相对各 OAuth host）。注意与**授权码**换证不是同一个路径：
 /// 那条是 `/trae/api/v3/oauth/ExchangeToken`，见 `oauth.rs`。
 pub const REFRESH_PATH: &str = "/cloudide/api/v3/trae/oauth/ExchangeToken";
+
+/// 客户端自己的续期端点（带 `DeviceInfo` + `DeviceProof`）。
+///
+/// ── 为什么要多这一条 ─────────────────────────────────────
+/// 上面那条 `/cloudide/…` 只报 `ClientID` + `RefreshToken`，换出来的 JWT
+/// **没有绑定设备**。Trae CN 的签到 `claim` 恰好认这一项：同一账号、
+/// 同一时刻、同一套请求头，客户端绑设备的令牌回 `code:0`，这条路径换出的
+/// 回 `9074 当前参与用户太多`（yetone/magpie#808 的双侧对照，2026-10-05）。
+/// 也就是说 `status` 一直是好的、`claim` 一直 9074 —— 与本仓线上看到的
+/// 形态一致。改头像、改 UA、改 body、换设备号都动不了它（同一贴里的控制变量）。
+///
+/// 官方客户端走的就是这条：`DeviceInfo` 里带设备公钥，`DeviceProof` 用
+/// 设备私钥签 `POST\n路径\nClientID\nRefreshToken\n时间戳\nNonce`。
+/// 2026-10-22 实测：这条路径**会**回一个新的 refreshToken（旧串在短窗口内仍
+/// 可重放，但落盘必须用新串）。magpie 那边把返回值当"可选"处理，两边一致。
+pub const DEVICE_REFRESH_PATH: &str = "/trae/api/v3/oauth/ExchangeToken";
+
+/// 设备续期的候选身份：先按 TRAE SOLO CN，被拒再按 Trae CN IDE。
+///
+/// 顺序来自客户端实测：magpie 0.2.4 用 SOLO 身份续期被回
+/// `400 10101 refresh token is not matched to the client`，换 IDE 身份即
+/// `200`。反过来的账号（SOLO 登录的）也要能续上，所以两把都试。
+pub struct DeviceIdentity {
+    pub client_id: &'static str,
+    pub platform: &'static str,
+    pub version: &'static str,
+}
+
+pub const DEVICE_IDENTITIES: [DeviceIdentity; 2] = [
+    DeviceIdentity {
+        client_id: super::oauth::SOLO_CLIENT_ID,
+        platform: "SOLO_PC",
+        version: "0.1.64",
+    },
+    DeviceIdentity {
+        client_id: super::oauth::IDE_CLIENT_ID,
+        platform: "IDE_PC",
+        version: super::headers::IDE_VERSION,
+    },
+];
 
 /// 兜底 host（凭据里的 `apiHost` 不可用时依次试这两个）。
 ///
@@ -185,6 +226,162 @@ fn attribution_reject(status: u16, body: &str) -> bool {
     text.contains("10101") || text.contains("not matched to the client")
 }
 
+/// `DeviceProof` 的待签原文：方法、路径、ClientID、refreshToken、时间戳、Nonce，
+/// 一行一段（客户端逐字如此）。
+///
+/// 顺序与分隔符都不是风格问题：服务端按同一串重新拼一次再验签，差一个字符
+/// 就是 `20403 Token device not match` / 401，而报错不会告诉你是哪一段错了。
+pub fn device_proof_message(
+    path: &str,
+    client_id: &str,
+    refresh_token: &str,
+    timestamp: i64,
+    nonce: &str,
+) -> String {
+    ["POST", path, client_id, refresh_token, &timestamp.to_string(), nonce].join("\n")
+}
+
+/// 16 字节随机数的十六进制（客户端的 Nonce 形状）。
+fn device_nonce() -> String {
+    let mut bytes = [0u8; 16];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        // 随机源不可用时退到纳秒时钟：Nonce 只用于防重放，不是安全凭证，
+        // 而"签不出 proof"会让整条续期链停摆，比一个弱 Nonce 更糟。
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        bytes.copy_from_slice(&(nanos as u128).to_le_bytes()[..16]);
+    }
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// 设备续期的请求体：官方客户端的形状。
+///
+/// `DevicePublicKey` 必须是 PEM（SPKI），空值会被判成设备绑定拒绝
+/// （HTTP 401 / `20405`，见 `device.rs` 模块头）。
+pub fn device_refresh_body(
+    identity: &DeviceIdentity,
+    credential: &Credential,
+    public_pem: &str,
+    timestamp: i64,
+    nonce: &str,
+) -> Value {
+    let path = DEVICE_REFRESH_PATH;
+    let refresh = credential.refresh_token.trim();
+    let signature = sign_der_base64(
+        credential.device_private_key.trim(),
+        device_proof_message(path, identity.client_id, refresh, timestamp, nonce).as_bytes(),
+    )
+    .unwrap_or_default();
+    json!({
+        "ClientID": identity.client_id,
+        "ClientSecret": "",
+        "RefreshToken": refresh,
+        "IDEVersion": identity.version,
+        "DeviceInfo": {
+            "DeviceID": credential.device_id.trim(),
+            "MachineID": credential.machine_id.trim(),
+            "PlatformCode": identity.platform,
+            "DeviceType": "PC",
+            "DeviceName": "",
+            "DeviceModel": "",
+            "ClientVersion": identity.version,
+            "DevicePublicKey": public_pem,
+            "DeviceBrand": super::oauth::device_brand_for_context("windows"),
+            "DeviceCPU": "",
+            "OSInfo": "windows",
+            "OSVersion": super::oauth::OS_VERSION,
+        },
+        "DeviceProof": {
+            "Signature": signature,
+            "Timestamp": timestamp,
+            "Nonce": nonce,
+        },
+    })
+}
+
+/// 这条凭据能不能走设备续期：私钥 + 设备号 + machineId 三件套都得在。
+///
+/// 手工粘贴的凭据通常没有这三样 —— 那种情况下硬发只会多一条 `20405`，
+/// 不如直接回退老路径（回退后行为与改动前完全一致）。
+pub fn can_device_refresh(credential: &Credential) -> bool {
+    !credential.refresh_token.trim().is_empty()
+        && !credential.device_private_key.trim().is_empty()
+        && !credential.device_id.trim().is_empty()
+        && !credential.machine_id.trim().is_empty()
+}
+
+/// 设备续期的候选 URL（`candidate_hosts` × 客户端那条路径）。
+pub fn device_refresh_candidates(api_host: &str) -> Vec<String> {
+    candidate_hosts(api_host)
+        .into_iter()
+        .map(|host| format!("{host}{DEVICE_REFRESH_PATH}"))
+        .collect()
+}
+
+/// 按客户端的方式续期：带上设备公钥与设备签名。
+///
+/// 成功时把**用过的**公钥一并回写（老凭据可能只有私钥），这样下一次续期
+/// 不必再推一遍。失败时返回 `None`，调用方据此回退 `/cloudide/…` ——
+/// 回退后与改动前的行为完全一致，不会比现状更差。
+pub async fn refresh_with_device(
+    credential: &Credential,
+    urls: &[String],
+    proxy: Option<&ResolvedProxy>,
+) -> Option<Credential> {
+    if !can_device_refresh(credential) {
+        return None;
+    }
+    let public_pem = if credential.device_public_key.trim().is_empty() {
+        public_pem_from_private(credential.device_private_key.trim())?
+    } else {
+        credential.device_public_key.clone()
+    };
+    let headers = vec![("User-Agent", CLIENT_USER_AGENT.to_string())];
+    // 归属优先用凭据里记着的那把：ClientID 是"这张 refreshToken 当初在哪个
+    // OAuth 应用里 mint"，与转发面的 variant 可以不一致（见 refresh_client_ids）。
+    let recorded = credential.auth_client_id.trim();
+    for identity in DEVICE_IDENTITIES.iter() {
+        if !recorded.is_empty() && recorded != identity.client_id {
+            continue;
+        }
+        let timestamp = crate::server::logging::now_ms() / 1000;
+        let nonce = device_nonce();
+        let body = device_refresh_body(identity, credential, &public_pem, timestamp, &nonce);
+        for url in urls {
+            let Ok(reply) = post_json(url, &body, &headers, Duration::from_secs(30), proxy).await else {
+                continue;
+            };
+            if reply.status >= 400 {
+                continue;
+            }
+            let Ok((access_token, refresh_token, expires_at_ms)) =
+                parse_refresh_response(&reply.body)
+            else {
+                continue;
+            };
+            let mut next = credential.clone();
+            next.access_token = access_token;
+            // 上游**会**回新串（2026-10-22 实测），落盘的必须是新的：
+            // 旧串只在短窗口内还能重放，之后作废。
+            if !refresh_token.is_empty() {
+                next.refresh_token = refresh_token;
+            }
+            next.expires_at = expires_at_ms;
+            next.device_public_key = public_pem.clone();
+            let acknowledged = response_client_id(&reply.body);
+            next.auth_client_id = if acknowledged.is_empty() {
+                identity.client_id.to_string()
+            } else {
+                acknowledged
+            };
+            return Some(next);
+        }
+    }
+    None
+}
+
 /// 打上游换新凭据（不含存储；调用方负责先落盘再继续）。
 ///
 /// 返回的是**新凭据**（原凭据的其余字段带过来），失败时原凭据不受影响。
@@ -255,16 +452,24 @@ pub async fn refresh_once(
 }
 
 /// 带单飞的续期：并发请求只打上游一次，其余等结果。
+///
+/// 顺序是「先带设备证明、失败再回退老路径」：签到 `claim` 只认绑了设备的
+/// 令牌（见 [`DEVICE_REFRESH_PATH`] 的说明），所以能签就不能退；而设备身份
+/// 缺失（手工粘贴的凭据）或上游不认时，回退后的行为与改动前一致。
 pub async fn refresh_shared(
     credential: &Credential,
     urls: &[String],
     proxy: Option<&ResolvedProxy>,
+    device_urls: &[String],
 ) -> Result<Credential, GatewayError> {
     let key = crate::server::core::providers::refresh_flight::fingerprint(&credential.refresh_token);
     match FLIGHTS.get_or_init(Table::new).join(&key) {
         Join::Waiter(waiter) => waiter.wait().await,
         Join::Leader(leader) => {
-            let result = refresh_once(credential, urls, proxy).await;
+            let result = match refresh_with_device(credential, device_urls, proxy).await {
+                Some(renewed) => Ok(renewed),
+                None => refresh_once(credential, urls, proxy).await,
+            };
             leader.finish(result.clone());
             result
         }
@@ -333,6 +538,100 @@ mod tests {
             serde_json::to_string(&body).unwrap().as_str(),
             "四个键一个不能少：ClientSecret 是占位串，UserID 空串而不是 null"
         );
+    }
+
+    /// 设备续期的候选表就是客户端那条路径，不能与 `/cloudide/…` 混在一起。
+    #[test]
+    fn the_device_refresh_candidates_use_the_clients_path() {
+        assert_eq!(
+            vec![
+                "https://api.trae.cn/trae/api/v3/oauth/ExchangeToken".to_string(),
+                "https://api.trae.com.cn/trae/api/v3/oauth/ExchangeToken".to_string(),
+            ],
+            device_refresh_candidates("https://api.trae.cn/")
+        );
+        // 与老路径的候选必须是两串不同的地址（回退逻辑依赖这一点）。
+        assert!(device_refresh_candidates("https://api.trae.cn")
+            .iter()
+            .all(|url| !refresh_candidates("https://api.trae.cn").contains(url)));
+    }
+
+    #[test]
+    fn the_device_proof_covers_exactly_the_six_lines_the_client_signs() {
+        assert_eq!(
+            "POST\n/trae/api/v3/oauth/ExchangeToken\nono9krqynydwx5\nRT-1\n1790000000\nabc",
+            device_proof_message(
+                DEVICE_REFRESH_PATH,
+                "ono9krqynydwx5",
+                "RT-1",
+                1_790_000_000,
+                "abc"
+            )
+        );
+    }
+
+    #[test]
+    fn only_a_credential_with_a_device_key_can_use_the_device_refresh() {
+        let pair = super::super::device::generate_device_key_pair().expect("生成应当成功");
+        let complete = Credential {
+            refresh_token: "RT".into(),
+            device_id: "1234567890123456".into(),
+            machine_id: "m-1".into(),
+            device_public_key: pair.public_pem.clone(),
+            device_private_key: pair.private_pem.clone(),
+            ..Default::default()
+        };
+        assert!(can_device_refresh(&complete));
+        // 任一件缺失都退回老路径（手工粘贴的凭据就是这样）。
+        for key in ["device_id", "machine_id", "device_private_key"] {
+            let mut missing = complete.clone();
+            match key {
+                "device_id" => missing.device_id.clear(),
+                "machine_id" => missing.machine_id.clear(),
+                _ => missing.device_private_key.clear(),
+            }
+            assert!(!can_device_refresh(&missing), "{key} 缺失时不该硬发");
+        }
+    }
+
+    #[test]
+    fn the_device_refresh_body_names_the_bound_device_and_carries_a_verifiable_proof() {
+        use base64::Engine;
+        use p256::ecdsa::signature::Verifier;
+        use p256::pkcs8::DecodePublicKey;
+
+        let pair = super::super::device::generate_device_key_pair().expect("生成应当成功");
+        let credential = Credential {
+            access_token: "AT".into(),
+            refresh_token: "RT-1".into(),
+            device_id: "1234567890123456".into(),
+            machine_id: "machine-1".into(),
+            device_public_key: pair.public_pem.clone(),
+            device_private_key: pair.private_pem.clone(),
+            variant: "solo".into(),
+            ..Default::default()
+        };
+        let identity = &DEVICE_IDENTITIES[0];
+        let body = device_refresh_body(identity, &credential, &pair.public_pem, 1_790_000_000, "n1");
+
+        // 客户端形状：设备身份三件套 + 公钥；空 `DevicePublicKey` 会被判 20405。
+        assert_eq!(body["DeviceInfo"]["DeviceID"], "1234567890123456");
+        assert_eq!(body["DeviceInfo"]["MachineID"], "machine-1");
+        assert_eq!(body["DeviceInfo"]["PlatformCode"], "SOLO_PC");
+        assert_eq!(body["DeviceInfo"]["DevicePublicKey"], pair.public_pem);
+        assert_eq!(body["ClientID"], identity.client_id);
+        // 请求里带的是原串；响应里的新串由 `parse_refresh_response` 取出后落盘。
+        assert_eq!(body["RefreshToken"], "RT-1");
+
+        // 签名必须能用同一把公钥验过，且覆盖六段原文 —— 换一段就验不过。
+        let message = device_proof_message(DEVICE_REFRESH_PATH, identity.client_id, "RT-1", 1_790_000_000, "n1");
+        let signature = base64::engine::general_purpose::STANDARD
+            .decode(body["DeviceProof"]["Signature"].as_str().unwrap_or_default())
+            .expect("签名是 base64");
+        let verifying = p256::ecdsa::VerifyingKey::from_public_key_pem(&pair.public_pem).expect("公钥可解");
+        let parsed = p256::ecdsa::Signature::from_der(&signature).expect("DER");
+        verifying.verify(message.as_bytes(), &parsed).expect("签名应当能验过");
+        assert!(verifying.verify(b"POST\n/other", &parsed).is_err());
     }
 
     #[test]
@@ -423,7 +722,12 @@ mod tests {
         for _ in 0..8 {
             let credential = credential.clone();
             let urls = urls.clone();
-            tasks.push(tokio::spawn(async move { refresh_shared(&credential, &urls, None).await.map(|value| value.access_token) }));
+            tasks.push(tokio::spawn(async move {
+                // 设备续期候选留空：这条用例钉的是单飞，不是签名链。
+                refresh_shared(&credential, &urls, None, &[])
+                    .await
+                    .map(|value| value.access_token)
+            }));
         }
         let mut tokens = Vec::new();
         for task in tasks {
@@ -432,6 +736,56 @@ mod tests {
         assert!(tokens.iter().all(|token| token == "NEW"), "所有等待者拿到的必须是同一份新串");
         // 单飞：8 个并发只打一次上游（mock 只排了一个响应，多打会拿到 500）
         assert_eq!(1, upstream.hits(), "并发应当合并成一次换发");
+    }
+
+    /// 「先带设备证明，失败再回退」这条顺序必须真的成立：
+    /// 设备路径成功时**一分钱都不该花在**老路径上，反之才回退。
+    #[tokio::test]
+    async fn the_device_refresh_is_tried_first_and_the_legacy_path_is_the_fallback() {
+        let pair = super::super::device::generate_device_key_pair().expect("生成应当成功");
+        let credential = Credential {
+            access_token: "OLD".into(),
+            refresh_token: "RT-DEVICE".into(),
+            device_id: "1234567890123456".into(),
+            machine_id: "machine-1".into(),
+            device_public_key: pair.public_pem.clone(),
+            device_private_key: pair.private_pem.clone(),
+            ..Default::default()
+        };
+        let renewed = r#"{"Result":{"Token":"BOUND","RefreshToken":"RT-DEVICE","TokenExpireAt":1900000000000}}"#;
+
+        // ① 设备路径接受：只打一发，且打的是客户端那条路径。
+        let upstream = MockUpstream::spawn(vec![(200, renewed.to_string())]).await;
+        let next = refresh_shared(
+            &credential,
+            &upstream.urls(&[0]),
+            None,
+            &upstream.urls(&[1]),
+        )
+        .await
+        .expect("设备续期应当成功");
+        assert_eq!("BOUND", next.access_token);
+        assert_eq!(1, upstream.hits(), "设备路径成功就不该再打老路径");
+        // 公钥随结果回写（老凭据可能只有私钥）。
+        assert_eq!(pair.public_pem, next.device_public_key);
+
+        // ② 设备路径被拒：回退老路径，结果与改动前一致。
+        let upstream = MockUpstream::spawn(vec![
+            (400, r#"{"Code":"10101","Message":"refresh token is not matched to the client"}"#.to_string()),
+            (400, r#"{"Code":"10101","Message":"refresh token is not matched to the client"}"#.to_string()),
+            (200, renewed.to_string()),
+        ])
+        .await;
+        let next = refresh_shared(
+            &credential,
+            &upstream.urls(&[0]),
+            None,
+            &upstream.urls(&[1]),
+        )
+        .await
+        .expect("回退后应当成功");
+        assert_eq!("BOUND", next.access_token);
+        assert_eq!(3, upstream.hits(), "两把设备身份都被拒之后才回退到老路径");
     }
 
     #[tokio::test]

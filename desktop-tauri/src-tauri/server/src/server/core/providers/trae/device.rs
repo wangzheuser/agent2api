@@ -15,6 +15,8 @@
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use p256::pkcs8::{EncodePrivateKey, EncodePublicKey};
+use p256::pkcs8::DecodePrivateKey;
+use p256::ecdsa::signature::Signer;
 
 /// 一对设备密钥（公钥进请求，私钥进凭据）。
 #[derive(Clone, Debug)]
@@ -70,6 +72,30 @@ fn pem(label: &str, der: &[u8]) -> String {
     out
 }
 
+/// 由落盘的私钥 PEM 反推公钥 PEM（SPKI）。
+///
+/// 续期要带 `DeviceInfo.DevicePublicKey`，而老凭据里可能只存了私钥
+/// （或公钥被上一轮"重建"抹掉）。公钥本来就能从私钥推出，没必要让
+/// 这种账号重新登录一次 —— 推不出来才算这份凭据坏了。
+pub fn public_pem_from_private(private_pem: &str) -> Option<String> {
+    let key = p256::ecdsa::SigningKey::from_pkcs8_pem(private_pem).ok()?;
+    Some(pem(
+        "PUBLIC KEY",
+        key.verifying_key().to_public_key_der().ok()?.as_bytes(),
+    ))
+}
+
+/// 用设备私钥签一段消息，返回 `base64(DER)`。
+///
+/// 官方的 `DeviceProof.Signature` 就是这个形态（ECDSA-SHA256 + ASN.1 DER，
+/// 不是 JWS 的 `r||s` 定长串）。`Signer::sign` 内部按 SHA-256 摘要并用
+/// RFC 6979 的确定性 k —— 服务端拿公钥验签，不比对字节，两种 k 都合法。
+pub fn sign_der_base64(private_pem: &str, message: &[u8]) -> Option<String> {
+    let key = p256::ecdsa::SigningKey::from_pkcs8_pem(private_pem).ok()?;
+    let signature: p256::ecdsa::Signature = key.sign(message);
+    Some(STANDARD.encode(signature.to_der().as_bytes()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +136,40 @@ mod tests {
             assert!(line.len() <= 64, "Go 的 pem 按 64 折行，超了就不是同一份字节：{}", line.len());
         }
         assert!(pair.private_pem.lines().count() > 3, "私钥 DER 足够长，必然出现折行");
+    }
+
+    #[test]
+    fn the_device_proof_signature_verifies_against_the_paired_public_key() {
+        use p256::ecdsa::signature::Verifier;
+        use p256::pkcs8::DecodePublicKey;
+
+        let pair = generate_device_key_pair().expect("生成应当成功");
+        let message = b"POST\n/trae/api/v3/oauth/ExchangeToken\nono9krqynydwx5\nrt\n1790000000\nnonce";
+        let encoded = sign_der_base64(&pair.private_pem, message).expect("签名应当成功");
+
+        // 官方要的是 DER 形态：以 0x30 开头的 ASN.1 SEQUENCE，不是 64 字节的 r||s。
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(&encoded)
+            .expect("base64 可解");
+        assert_eq!(0x30, der[0], "DeviceProof 用的是 DER 编码");
+        assert!(der.len() > 64 && der.len() <= 72, "P-256 DER 签名长度异常：{}", der.len());
+
+        let verifying = p256::ecdsa::VerifyingKey::from_public_key_pem(&pair.public_pem)
+            .expect("公钥可解");
+        let signature = p256::ecdsa::Signature::from_der(&der).expect("DER 可解");
+        verifying.verify(message, &signature).expect("签名应当能验过");
+        // 换一段消息必须验不过 —— 否则"验签通过"只是因为没验。
+        assert!(verifying.verify(b"other", &signature).is_err());
+    }
+
+    #[test]
+    fn the_public_key_can_be_derived_from_a_private_key_alone() {
+        // 老凭据可能只留下私钥：续期要带公钥，能推出来就不必让用户重登一次。
+        let pair = generate_device_key_pair().expect("生成应当成功");
+        assert_eq!(
+            Some(pair.public_pem.clone()),
+            public_pem_from_private(&pair.private_pem)
+        );
+        assert!(public_pem_from_private("not a pem").is_none());
     }
 }

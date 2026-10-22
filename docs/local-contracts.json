@@ -2325,7 +2325,7 @@
       "id": "checkin-center-provider-boundaries",
       "level": "P0",
       "status": "必须保留",
-      "behavior": "签到中心保留本地已领取、失败、活跃和待到账口径；旧地区选择兼容、新保存精确；新手任务只跟进实际完成的账号；Trae保留稳定设备与刷新、增加同设备回查。",
+      "behavior": "签到中心保留本地已领取、失败、活跃和待到账口径；旧地区选择兼容、新保存精确；新手任务只跟进实际完成的账号；Trae保留稳定设备与刷新、增加同设备回查。Trae 签到落在客户端在设备服务里登记过的那台设备上：优先用本机 Trae CN 客户端 storage.json 的 iCubeAuthInfo://icube-dc 设备号，且必须解出客户端登录态的 userId 与账号 uid 相等（不同号一律不借），取不到才回退到凭据自带的 15/16 位 deviceId，再不行才由 uid 与 device_id 稳定派生；一轮内不换号、跨轮不轮换。9074 一发即收口、不再表述为限流，并说明是设备身份不被认；9095 记为设备当日已完成；9004、4014 与 1001 一样要求重新登录；续期优先带 DeviceInfo 与 DeviceProof 走客户端 v3 端点，失败才回退 /cloudide 老路径。",
       "source_commits": [
         "f82308a9549ee4760f27e393058c3482056ec514",
         "94c674e7e3267bf1837afc44dc1860fe2dc6dc6c"
@@ -2336,6 +2336,9 @@
         "desktop-tauri/src-tauri/server/src/server/core/billing/activity.rs",
         "desktop-tauri/src-tauri/server/src/server/core/billing/checkin.rs",
         "desktop-tauri/src-tauri/server/src/server/core/providers/trae/checkin.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/providers/trae/refresh.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/providers/trae/device.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/providers/trae/client_device.rs",
         "desktop-tauri/ui-islands/src/islands/checkin-state.ts",
         "desktop-tauri/ui-islands/src/islands/checkin-page.tsx"
       ],
@@ -2573,6 +2576,96 @@
           "path": "desktop-tauri/src-tauri/server/src/server/core/providers/trae/checkin_merge_tests.rs",
           "name": "server::core::providers::trae::checkin::merge_tests::trae_driver_unconfirmed_does_not_export_claim_rewards_as_completion",
           "id": "case-80b8564e27af"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/upstream_checkin_merge.rs",
+          "name": "trae_checkin_uses_the_accounts_own_device_and_never_rotates_it",
+          "id": "case-843b6da9c986"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/upstream_checkin_merge.rs",
+          "name": "trae_device_signed_is_completion_and_the_backoff_wording_is_not_rate_limiting",
+          "id": "case-7ff8ddacd263"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/trae/checkin.rs",
+          "name": "server::core::providers::trae::checkin::tests::the_checkin_device_is_the_accounts_own_when_the_client_shape_is_known",
+          "id": "case-560c76bd25cd"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/trae/checkin.rs",
+          "name": "server::core::providers::trae::checkin::tests::the_device_signed_code_is_the_days_answer_not_a_failure",
+          "id": "case-102010571bbf"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/trae/checkin.rs",
+          "name": "server::core::providers::trae::checkin::tests::the_backoff_message_no_longer_calls_9074_a_rate_limit",
+          "id": "case-c0713be361d1"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/trae/refresh.rs",
+          "name": "server::core::providers::trae::refresh::tests::the_device_refresh_body_names_the_bound_device_and_carries_a_verifiable_proof",
+          "id": "case-b84f6ab7d49c"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/trae/refresh.rs",
+          "name": "server::core::providers::trae::refresh::tests::the_device_refresh_is_tried_first_and_the_legacy_path_is_the_fallback",
+          "id": "case-46b069227ce0"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/trae/device.rs",
+          "name": "server::core::providers::trae::device::tests::the_device_proof_signature_verifies_against_the_paired_public_key",
+          "id": "case-f399c4ce8ff3"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/trae/checkin_merge_tests.rs",
+          "name": "server::core::providers::trae::checkin::merge_tests::trae_e2e_checkin_renews_with_device_proof_then_claims_on_the_stored_device",
+          "id": "case-a5931cdf605f"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/trae/checkin_merge_tests.rs",
+          "name": "server::core::providers::trae::checkin::merge_tests::trae_e2e_9074_stops_after_one_request_without_rotating_the_device",
+          "id": "case-8b1beb4680f8"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/trae/checkin_merge_tests.rs",
+          "name": "server::core::providers::trae::checkin::merge_tests::trae_e2e_9095_is_reported_as_completed_not_failed",
+          "id": "case-0b4c7e7c2b92"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/trae/checkin.rs",
+          "name": "server::core::providers::trae::checkin::tests::the_client_registered_device_wins_only_for_the_same_account",
+          "id": "case-5c1a0f4b7e21"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/trae/client_device.rs",
+          "name": "server::core::providers::trae::client_device::tests::the_client_envelope_decodes_back_to_its_json",
+          "id": "case-5c1a0f4b7e22"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/trae/client_device.rs",
+          "name": "server::core::providers::trae::client_device::tests::a_missing_uid_never_borrows_another_accounts_device",
+          "id": "case-5c1a0f4b7e23"
+        },
+        {
+          "kind": "node",
+          "path": "desktop-tauri/ui-islands/tests/upstream-checkin-merge.test.cjs",
+          "name": "trae device backoff is shown as an upstream rejection, not as rate limiting",
+          "id": "case-322b8890b95b"
         },
         {
           "kind": "browser",

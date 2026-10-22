@@ -178,6 +178,11 @@ impl AccountStore {
     }
 
     /// 签到设备 generation。0 表示参考实现的默认设备号。
+    ///
+    /// ⚠️ 签到链**不再使用**这一对读写（2026-10 起）：9074 不是限流，
+    /// 换设备号属于伪造身份，上游也会照拒（yetone/magpie#808）。签到现在
+    /// 落在账号自己登录绑定的设备上（`trae::checkin::device_id`）。
+    /// 保留这两个方法只为读得懂旧库里可能存在的 `checkinGeneration` 字段。
     pub fn trae_checkin_generation(&self, account_id: &str) -> u64 {
         if account_id.trim().is_empty() {
             return 0;
@@ -190,7 +195,8 @@ impl AccountStore {
             .unwrap_or(0)
     }
 
-    /// 9074 后轮换签到设备号；下一次签到才使用新 generation。
+    /// ⚠️ 已停用：签到不再按 9074 轮换设备号（理由见
+    /// [`Self::trae_checkin_generation`]）。保留方法以免破坏既有调用/数据。
     pub fn bump_trae_checkin_generation(&self, account_id: &str) -> u64 {
         if account_id.trim().is_empty() {
             return 0;

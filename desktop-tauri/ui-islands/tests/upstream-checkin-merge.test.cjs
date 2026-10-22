@@ -562,6 +562,17 @@ test('single request rejection stays visible until the next result replaces it',
   assert.doesNotMatch(markup, /fixture single request failed/)
 })
 
+test('trae device backoff is shown as an upstream rejection, not as rate limiting', async () => {
+  // 9074 不是限流：后端文案（msg）必须原样透出，前端兜底也不能再写"限流"。
+  const backend = 'Trae 签到领取接口被上游拒绝（9074）：这一码不是限流'
+  const f = await fixture({ row: { id: 'A', claim: { success: false, status: 'backoff', code: 9074, msg: backend } } })
+  await f.api.signSingleAccount('A')
+  const markup = accountMarkup(f.api)
+  assert.match(markup, /9074/)
+  assert.match(markup, /不是限流/)
+  assert.doesNotMatch(markup, /签到触发限流/)
+})
+
 test('single result renders upstream text without treating it as HTML', async () => {
   const f = await fixture({ row: { id: 'A', error: '<img src=x onerror=alert(1)>' } })
   await f.api.signSingleAccount('A')

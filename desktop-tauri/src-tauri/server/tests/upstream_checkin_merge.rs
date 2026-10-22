@@ -167,15 +167,66 @@ fn trae_auth_expiry_and_device_backoff_remain_distinct() {
         (9074, Probe::NextBody),
         (1001, Probe::GiveUp),
         (500, Probe::NextScheme),
+        // 设备今日已签、缺设备号、凭证被拒：都不是"换个方案再打一发"能解决的。
+        (9095, Probe::GiveUp),
+        (9004, Probe::GiveUp),
+        (4014, Probe::GiveUp),
     ] {
         assert_eq!(trae::probe_for(code), expected);
     }
-    assert_eq!(trae::device_id("u1", 0), "4302850041909017");
-    let next = trae::device_id("u1", 1);
-    assert_ne!(next, trae::device_id("u1", 0));
-    assert_eq!(next, trae::device_id("u1", 1));
-    assert_eq!(next.len(), 16);
-    assert!(next.bytes().all(|byte| byte.is_ascii_digit()));
+}
+
+#[test]
+fn trae_checkin_uses_the_accounts_own_device_and_never_rotates_it() {
+    use agent2api_server::server::core::providers::trae::credentials::Credential;
+    let own = Credential {
+        uid: "u1".into(),
+        device_id: "1234567890123456".into(),
+        ..Default::default()
+    };
+    // 登录时上游认下的那台设备，签到原样复用（不是另造一个 16 位号）。
+    assert_eq!("1234567890123456", trae::device_id(&own));
+    // 同一凭据跨轮稳定 —— 每天都是同一台设备，不随日期或"代数"漂。
+    assert_eq!(trae::device_id(&own), trae::device_id(&own));
+    // 登录设备号是账本上的事实：同号就是同一台设备（不同账号各自登录时
+    // 会生成不同的 16 位号，这里不额外"改号"去制造差异）。
+    let other = Credential {
+        uid: "u2".into(),
+        device_id: "1234567890123456".into(),
+        ..Default::default()
+    };
+    assert_eq!(trae::device_id(&own), trae::device_id(&other));
+    // 派生出来的号必须按账号区分（否则两个老账号会互相吃掉当天的额度）。
+    let derived_a = Credential { uid: "u1".into(), ..Default::default() };
+    let derived_b = Credential { uid: "u2".into(), ..Default::default() };
+    assert_ne!(trae::device_id(&derived_a), trae::device_id(&derived_b));
+    // 老数据（19 位 / 空）派生成客户端形状，且 19 位不是被截短。
+    for legacy in ["1234567890123456789", ""] {
+        let credential = Credential {
+            uid: "u1".into(),
+            device_id: legacy.into(),
+            ..Default::default()
+        };
+        let derived = trae::device_id(&credential);
+        assert_eq!(16, derived.len(), "{legacy}");
+        assert!(derived.bytes().all(|byte| byte.is_ascii_digit()), "{legacy}");
+        assert_ne!("1234567890123456", derived, "{legacy}");
+    }
+}
+
+#[test]
+fn trae_device_signed_is_completion_and_the_backoff_wording_is_not_rate_limiting() {
+    // 9095 是"这台设备今天签过了"：当天已完成，不该算失败、也不该换号重试。
+    let done = json!({
+        "success": false, "status": "already_claimed", "code": 9095,
+        "alreadyClaimed": true, "alreadyCompleted": true,
+    });
+    let summary = json!({"results": [{"id": "trae-9095", "provider": "trae", "claim": done}]});
+    assert_eq!(
+        auto_checkin::completed_account_ids(&summary),
+        ["trae-9095"]
+    );
+    assert!(auto_checkin::failed_account_labels(&summary).is_empty());
 }
 
 #[test]

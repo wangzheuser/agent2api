@@ -32,7 +32,10 @@ use super::oauth::{
     exchange_auth_code, request_login_guidance, verification_uri, Callback, LoginContext, DEFAULT_LOGIN_HOST,
 };
 use super::profile::{callback_identity, get_user_info, Identity};
-use super::refresh::{refresh_candidates, refresh_once, response_client_id};
+use super::refresh::{
+    device_refresh_candidates, refresh_candidates, refresh_once, refresh_with_device,
+    response_client_id,
+};
 
 /// 登录落盘时写死的两个字段（参考实现 `selfCompleteCN` 同值）。
 ///
@@ -149,9 +152,18 @@ impl Session {
             machine_id: self.context.machine_id.clone(),
             device_id: self.context.device_id.clone(),
             variant: self.context.variant.clone(),
+            // 本轮登录刚生成的设备密钥：把它们交给续期链，换出来的 JWT
+            // 才是**绑在这台设备上**的（签到 claim 认这一项，见 refresh.rs）。
+            device_public_key: self.context.device_public_pem.clone(),
+            device_private_key: self.context.device_private_pem.clone(),
             ..Default::default()
         };
-        match refresh_once(&seed, &refresh_candidates(&seed.api_host), proxy).await {
+        let device_urls = device_refresh_candidates(&seed.api_host);
+        let renewed = match refresh_with_device(&seed, &device_urls, proxy).await {
+            Some(next) => Ok(next),
+            None => refresh_once(&seed, &refresh_candidates(&seed.api_host), proxy).await,
+        };
+        match renewed {
             // 第四个位置是上游承认的 ClientID：换证成功时 `refresh_once` 已经把它
             // 归并进新凭据，这里原样带出去落盘（丢了它，下一次续期又要猜）
             Ok(next) => (next.access_token, next.refresh_token, next.expires_at, next.auth_client_id),

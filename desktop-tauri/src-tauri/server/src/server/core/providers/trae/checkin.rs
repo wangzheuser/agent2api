@@ -2,8 +2,19 @@
 //!
 //! 这条链与模型额度查询都走 `api.trae.cn`，但签到钱包和模型积分池是两份账，
 //! 所以只把领取结果归一成签到结果，不把它混进 `usage` 的 credits pool。
-//! 上游会按设备指纹做软限流：状态探测允许换一代设备 id 再试一次，领取遇到
-//! 9074 则返回可读的退避状态，避免同一账号在短时间内连点造成更多风控。
+//!
+//! ── 9074 不是"限流" ────────────────────────────────────
+//! 这一码曾按"设备限流、稍后重试"处理（含换一代设备号再打一发）。2026-10-05
+//! 的双侧对照推翻了那个读法：同一账号、同一时刻、同一套头，绑了设备的令牌
+//! 回 `code:0`，没绑的回 9074；改 UA / body / 设备号都动不了它
+//! （yetone/magpie#808，magpie 插件 0.2.3 起改走带 `DeviceProof` 的续期）。
+//!
+//! 所以现在的口径是：
+//!   · 签到落在**客户端在设备服务里登记过的那台设备**上（见 [`device_id`] 与
+//!     `client_device`），一轮内不换号；
+//!   · 9074 一发即收口，文案不再说"限流"，也不再自动重试；
+//!   · 9095（设备今日已签）算当天的"已完成"，不是失败；
+//!   · 9004（缺设备号）与 4014 / 1001（凭证被拒/作废）只能重新登录。
 
 use std::future::Future;
 use std::time::Duration;
@@ -26,10 +37,28 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const DEVICE_MODULUS: u128 = 10_000_000_000_000_000;
 const AUTH_EXPIRED_CODE: i64 = 1001;
 const DEVICE_BUSY_CODE: i64 = 9074;
+/// 设备今天已经签过 —— 当天的最终答案，不是失败。
+const DEVICE_SIGNED_CODE: i64 = 9095;
+/// 缺 `x-device-id`（或格式不合法）时上游回这一码。
+const DEVICE_MISSING_CODE: i64 = 9004;
+/// 服务端拒绝认证（HTTP 200 + 业务码）：凭证被踢下线，只能重新登录。
+const AUTH_REJECTED_CODE: i64 = 4014;
 
 /// 查询并领取一次 Trae 每日积分。返回形状与其它签到 provider 对齐：
 /// `{success, msg, status, rewardPoints?, alreadyClaimed?}`。
 pub async fn claim_daily(store: &AccountStore, account_id: &str) -> Result<Value, GatewayError> {
+    claim_daily_at(store, account_id, UG_HOST).await
+}
+
+/// 与 [`claim_daily`] 同一条链，只是端点可注入。
+///
+/// 生产恒用 `UG_HOST`；测试用本地 mock，这样「账号落库 → 读凭据 → 续期 →
+/// status/claim/回查」能在真 SQLite + 真 HTTP 上跑通，而不是只测纯函数。
+pub(crate) async fn claim_daily_at(
+    store: &AccountStore,
+    account_id: &str,
+    base: &str,
+) -> Result<Value, GatewayError> {
     let record = read_record(store, account_id)?;
     let proxy = account_proxy(&record)?;
     let credential = Credential::from_payload(&record).map_err(GatewayError::new)?;
@@ -41,7 +70,7 @@ pub async fn claim_daily(store: &AccountStore, account_id: &str) -> Result<Value
         ));
     }
 
-    claim_with_refresh_at(credential, proxy, UG_HOST, || async {
+    claim_with_refresh_at(credential, proxy, base, || async {
         let fresh_record = read_record(store, account_id)?;
         let fresh_proxy = account_proxy(&fresh_record)?;
         let fresh = Credential::from_payload(&fresh_record).map_err(GatewayError::new)?;
@@ -101,33 +130,21 @@ async fn claim_once(
     proxy: Option<&crate::server::core::proxies::ResolvedProxy>,
     base: &str,
 ) -> Result<Value, ClaimError> {
-    let mut generation = 0u8;
-    let status = loop {
-        let device_id = device_id(&credential.uid, generation);
-        match request(&credential, &device_id, STATUS_PATH, proxy, base).await? {
-            ReplyKind::Auth => return Err(ClaimError::Auth),
-            ReplyKind::DeviceBusy if generation == 0 => {
-                generation = 1;
-                continue;
-            }
-            ReplyKind::DeviceBusy => {
-                return Ok(json!({
-                    "success": false,
-                    "status": "backoff",
-                    "code": DEVICE_BUSY_CODE,
-                    "checkinDeviceId": device_id,
-                    "msg": "Trae 签到状态接口触发设备限流，请稍后重试",
-                }));
-            }
-            ReplyKind::Body(body) => break body,
+    // 一轮一个号，status → claim → 回查三发之间保持不变；撞 9074 不换号再试
+    // （见 `device_id` 的说明）。
+    let device_id = checkin_device_id(&credential);
+    let status = match request(&credential, &device_id, STATUS_PATH, proxy, base).await? {
+        ReplyKind::Auth => return Err(ClaimError::Auth),
+        ReplyKind::DeviceBusy => {
+            return Ok(backoff(&device_id, "Trae 签到状态接口", DEVICE_BUSY_CODE))
         }
+        ReplyKind::Body(body) => body,
     };
 
     if status_code(&status) != 0 {
         return Err(classify_reply(status, "Trae 签到状态查询失败"));
     }
     let before = status_of(&status);
-    let device_id = device_id(&credential.uid, generation);
     if before.done_today() || !before.enable {
         return Ok(complete(
             decide(&before, &Status::default(), None),
@@ -136,17 +153,15 @@ async fn claim_once(
     }
     match request(&credential, &device_id, CLAIM_PATH, proxy, base).await? {
         ReplyKind::Auth => Err(ClaimError::Auth),
-        ReplyKind::DeviceBusy => Ok(json!({
-            "success": false,
-            "status": "backoff",
-            "code": DEVICE_BUSY_CODE,
-            "checkinDeviceId": device_id,
-            "msg": "Trae 签到领取触发设备限流，请稍后重试",
-        })),
+        ReplyKind::DeviceBusy => Ok(backoff(&device_id, "Trae 签到领取接口", DEVICE_BUSY_CODE)),
         ReplyKind::Body(body) => {
             let code = status_code(&body);
             if code == AUTH_EXPIRED_CODE {
                 return Err(ClaimError::Auth);
+            }
+            if code == DEVICE_SIGNED_CODE {
+                // 设备今天已经签过了：这是当天的最终答案，不是失败，也不能换号。
+                return Ok(device_signed(&device_id));
             }
             if code != 0 {
                 return Err(classify_reply(body, "Trae 签到领取失败"));
@@ -246,11 +261,24 @@ async fn request(
     let reply = post_json(&url, &json!({}), &headers, REQUEST_TIMEOUT, proxy).await?;
     let body = reply.json().unwrap_or(Value::Null);
     let code = body.get("code").and_then(Value::as_i64).unwrap_or(-1);
-    if reply.status == 401 || code == 401 || code == AUTH_EXPIRED_CODE {
+    // 4014 是 HTTP 200 里的业务码（"not able to authenticate you"），语义与
+    // 401 相同：凭证被服务端踢下线，重试无用，只能重新 OAuth。把它当普通
+    // 失败退避，只会让账号每天白撞一次。
+    if reply.status == 401
+        || code == 401
+        || code == AUTH_EXPIRED_CODE
+        || code == AUTH_REJECTED_CODE
+    {
         return Ok(ReplyKind::Auth);
     }
     if code == DEVICE_BUSY_CODE {
         return Ok(ReplyKind::DeviceBusy);
+    }
+    if code == DEVICE_MISSING_CODE {
+        return Ok(ReplyKind::Body(json!({
+            "code": DEVICE_MISSING_CODE,
+            "msg": "上游判定缺少或无法识别设备号（9004）：该账号没有可用的设备绑定，请重新登录后再签到",
+        })));
     }
     if reply.status >= 400 {
         return Ok(ReplyKind::Body(json!({
@@ -331,14 +359,56 @@ fn classify_reply(body: Value, fallback: &str) -> ClaimError {
     ))
 }
 
-/// 稳定的 16 位设备指纹。设备代数只在状态接口遇到 9074 时递增，
-/// 不写回账号，避免把一次风控退避永久改变登录设备绑定。
-pub fn device_id(uid: &str, generation: u8) -> String {
-    let seed = if generation == 0 {
-        uid.to_string()
-    } else {
-        format!("{uid}#gen{generation}")
-    };
+/// 一轮签到用的设备号：**账号自己的那台设备**。
+///
+/// ── 「自己的设备」有两种，签到只认后者 ────────────────────
+/// ① 登录时（`oauth.rs`）随机生成的 `DeviceInfo.DeviceID`（落盘在
+///    `credential.device_id`）：位数对，但**不是客户端在设备服务里登记过的那台**。
+/// ② 本机 Trae CN 客户端 `storage.json` 里 `iCubeAuthInfo://icube-dc:<号>` 的号：
+///    这才是 `claim` 认的设备。
+///
+/// 2026-10-22 同一账号实测：用 ① 时 `status` 回 `code:0` 而 `claim` 回 9074；
+/// 换成 ② 后 `claim` 当场 `code:0`、当日 200 积分到账（详见 `client_device`）。
+///
+/// 这里的 [`device_id`] 只做 ② 之后的形状处理（① 已经是 15/16 位就直接用，
+/// 老数据的 19 位/空值按 `uid + device_id` 稳定派生）—— 真正挑哪台设备是
+/// [`checkin_device_id`] 的事。
+///
+/// ── 9074 之后为什么不再换号 ───────────────────────────────
+/// 上一版在状态接口撞 9074 时换一代设备号再打一发。那既不是稳定身份
+/// （风控画像里的"同一账号换设备"），也让"当天到底签没签过"变得不可判定。
+/// 两家同族实现都不这么做：9074 一发即收口，9095 就是当天的答案。
+pub fn device_id(credential: &Credential) -> String {
+    derived_device_id(credential)
+}
+
+/// 一轮签到实际用的设备号：**客户端登记过的那台优先**。
+///
+/// 顺序（每一层都有明确理由，不要合并成一条兜底链）：
+///   1. 本机 Trae CN 客户端登录的**同一个 uid** 的设备号 —— 唯一被上游认的
+///      "这台设备"（见 `client_device` 模块头的实测）；
+///   2. 凭据里已经是客户端形状的 `deviceId` —— 手工粘贴/登录时带了真号；
+///   3. 用「凭据设备号 + uid」派生一个稳定的 16 位号 —— 老数据与无客户端环境
+///      的兜底，行为与改动前一致。
+///
+/// 第 1 层不放宽的代价是"没装客户端就只能继续 9074"，但放成"随便读一个设备号"
+/// 会退化得更严重：整个网关的多条账号会被塞进同一台设备，上游按设备每日去重，
+/// 除第一个之外全部失败。
+fn checkin_device_id(credential: &Credential) -> String {
+    if let Some(device) = super::client_device::device_for_uid(credential.uid.trim()) {
+        return device.device_id;
+    }
+    derived_device_id(credential)
+}
+
+/// 凭据自己带的设备号（客户端形状直接用，否则稳定派生）。
+fn derived_device_id(credential: &Credential) -> String {
+    let recorded = credential.device_id.trim();
+    if is_client_shaped(recorded) {
+        return recorded.to_string();
+    }
+    // 老数据：19 位或空。按「自己的设备号 + uid」派生，跨轮稳定。
+    let seed = format!("trae-cn-device\0{}\0{}", recorded, credential.uid.trim());
     let digest = Sha256::digest(seed.as_bytes());
     let mut number = 0u128;
     for byte in digest.iter() {
@@ -347,16 +417,145 @@ pub fn device_id(uid: &str, generation: u8) -> String {
     format!("{number:016}")
 }
 
+/// 客户端下发的设备号是 15 或 16 位纯数字（`iCubeAuthInfo://icube-dc:<id>`）。
+fn is_client_shaped(device_id: &str) -> bool {
+    matches!(device_id.len(), 15 | 16) && device_id.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// 9074：上游拒绝这次领取，但**不是限流**。
+///
+/// 2026-10-22 的真实账号实测把这一码定死：**同一 token、同一套头**，
+/// 用登录时随机生成的 `deviceId` → `claim` 回 9074（`status` 却是 `code:0`）；
+/// 换成本机客户端 `storage.json` 里登记的那台设备号 → `claim` 立刻 `code:0`。
+/// 期间改 UA / 头形状 / `{"req_source":1}` 请求体 / 出口 IP 都不改变结论。
+///
+/// 所以文案不能再写"限流，请稍后重试"（那会把人引向"过一会儿再点"），也
+/// 不该再提"先确认续期过" —— 续期解决的是令牌，不是设备登记。
+fn backoff(device_id: &str, where_: &str, code: i64) -> Value {
+    json!({
+        "success": false,
+        "status": "backoff",
+        "code": code,
+        "checkinDeviceId": device_id,
+        "msg": format!(
+            "{where_}被上游拒绝（{code}）。这一码不是限流，是设备身份不被认：该账号的签到\
+             必须落在 Trae CN 客户端登记过的那台设备上（当前用的是 {device_id}）。\
+             请在本机 Trae CN 客户端登录**这个账号**后重试，本次不再自动重试"
+        ),
+    })
+}
+
+/// 9095：这台设备今天已经签过 —— 落在「已完成」而不是「失败」。
+fn device_signed(device_id: &str) -> Value {
+    json!({
+        "success": false,
+        "status": "already_claimed",
+        "code": DEVICE_SIGNED_CODE,
+        "alreadyClaimed": true,
+        // 台账按"今日已完成"记，明天照常再试；当成失败会让它在当天反复重打。
+        "alreadyCompleted": true,
+        "checkinDeviceId": device_id,
+        "msg": "该设备今日已签到（上游按设备每日只计一次；同设备上的其他账号今天领不到）",
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn device_id_is_stable_and_16_digits() {
-        assert_eq!("4302850041909017", device_id("u1", 0));
-        assert_eq!(16, device_id("u1", 1).len());
-        assert!(device_id("u1", 0).bytes().all(|byte| byte.is_ascii_digit()));
-        assert_ne!(device_id("u1", 0), device_id("u1", 1));
+    fn the_checkin_device_is_the_accounts_own_when_the_client_shape_is_known() {
+        let credential = Credential {
+            uid: "u1".into(),
+            device_id: "1234567890123456".into(),
+            ..Default::default()
+        };
+        // 登录时上游认下的那台设备，原样用，不另造一个。
+        assert_eq!("1234567890123456", device_id(&credential));
+        // 15 位（真机实测存在）同样直接采用。
+        let fifteen = Credential {
+            uid: "u1".into(),
+            device_id: "123456789012345".into(),
+            ..Default::default()
+        };
+        assert_eq!("123456789012345", device_id(&fifteen));
+    }
+
+    #[test]
+    fn a_legacy_device_id_derives_one_stable_16_digit_number() {
+        for legacy in ["1234567890123456789", ""] {
+            let credential = Credential {
+                uid: "u1".into(),
+                device_id: legacy.into(),
+                ..Default::default()
+            };
+            let id = device_id(&credential);
+            assert_eq!(16, id.len(), "{legacy}");
+            assert!(id.bytes().all(|byte| byte.is_ascii_digit()), "{legacy}");
+            // 跨轮相同（不随日期/代数漂），且不与其他账号共用。
+            assert_eq!(id, device_id(&credential));
+            let other = Credential {
+                uid: "u2".into(),
+                device_id: legacy.into(),
+                ..Default::default()
+            };
+            assert_ne!(id, device_id(&other));
+        }
+        // 19 位不能被"截短成 16 位"糊弄过去：那是另一台设备的号。
+        let nineteen = Credential {
+            uid: "u1".into(),
+            device_id: "1234567890123456789".into(),
+            ..Default::default()
+        };
+        assert_ne!("1234567890123456", device_id(&nineteen));
+    }
+
+    #[test]
+    fn the_client_registered_device_wins_only_for_the_same_account() {
+        // 本机客户端登录的是哪个号，就只能给哪个号用它的设备号：
+        // 借用别的号的设备号会让上游按"同一台设备"去重，本号反而签不到。
+        let ours = Credential {
+            uid: "762424146795179".into(),
+            device_id: "7264783250393601".into(),
+            ..Default::default()
+        };
+        let client = crate::server::core::providers::trae::client_device::device_for_uid(&ours.uid);
+        match client {
+            // 没装客户端/没登录时，退回凭据自己的号 —— 行为与改动前一致。
+            None => assert_eq!("7264783250393601", checkin_device_id(&ours)),
+            Some(device) => {
+                assert_eq!(device.device_id, checkin_device_id(&ours));
+                assert_eq!(ours.uid, device.uid);
+                // 同一条凭据挂了别的 uid 时不能复用这台设备。
+                let other = Credential {
+                    uid: "7478516977494033416".into(),
+                    ..ours.clone()
+                };
+                assert_ne!(device.device_id, checkin_device_id(&other));
+            }
+        }
+    }
+
+    #[test]
+    fn the_device_signed_code_is_the_days_answer_not_a_failure() {
+        let row = device_signed("1234567890123456");
+        assert_eq!(row["code"], 9095);
+        assert_eq!(row["status"], "already_claimed");
+        assert_eq!(row["alreadyCompleted"], true);
+        assert!(row.get("awarded").is_none());
+        assert_eq!(Probe::GiveUp, probe_for(9095));
+    }
+
+    #[test]
+    fn the_backoff_message_no_longer_calls_9074_a_rate_limit() {
+        let row = backoff("1234567890123456", "Trae 签到领取接口", 9074);
+        let message = row["msg"].as_str().unwrap_or_default();
+        assert!(!message.contains("设备限流"), "{message}");
+        assert!(message.contains("不是限流"), "{message}");
+        assert_eq!(row["code"], 9074);
+        // 平台限流与凭证被拒都有各自的终点，不能都落到"换方案再试"。
+        assert_eq!(Probe::GiveUp, probe_for(9004));
+        assert_eq!(Probe::GiveUp, probe_for(4014));
     }
 
     #[test]
@@ -432,6 +631,9 @@ fn flag(payload: &Value, key: &str) -> bool {
 /// → 换下一个鉴权方案。比它多一档 `GiveUp`（1001）：既然这一码判为「服务端
 /// 已作废这张 JWT」，换 `Bearer` 重试还是拿同一张死令牌去打 —— 那一发不会
 /// 改变结果，只会把一次点击变成两发配额。换发在驱动那一层做。
+///
+/// 这一层现在**只用于分类**：9074 的"下一个探测体"是空集（`probe_bodies`
+/// 恒一发），所以真正的收口在 `claim_once` 里，不在这里重试。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Probe {
     /// 采纳这一发
@@ -440,7 +642,8 @@ pub enum Probe {
     NextBody,
     /// 其它非零码：换下一个鉴权方案（方案用尽则整体失败）
     NextScheme,
-    /// 1001：这一发就是终点 —— 真正的处置在驱动那一层（换发新令牌后重放整轮）
+    /// 终点：1001（JWT 已作废）、9095（设备今日已签）、9004（缺设备号）、
+    /// 4014（凭证被拒）。前两码的处置在驱动层或 `claim_once`，后两码只能重登。
     GiveUp,
 }
 
@@ -448,7 +651,9 @@ pub fn probe_for(code: i64) -> Probe {
     match code {
         CODE_OK => Probe::Accept,
         CODE_REJECTED => Probe::NextBody,
-        CODE_TOKEN_DEAD => Probe::GiveUp,
+        CODE_TOKEN_DEAD | DEVICE_SIGNED_CODE | DEVICE_MISSING_CODE | AUTH_REJECTED_CODE => {
+            Probe::GiveUp
+        }
         _ => Probe::NextScheme,
     }
 }

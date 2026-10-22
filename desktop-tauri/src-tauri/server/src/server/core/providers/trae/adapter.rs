@@ -35,7 +35,10 @@ use super::errors::{classify, ErrorKind};
 use super::headers::{solo_headers, HeaderIdentity};
 use super::models;
 use super::payload;
-use super::refresh::{refresh_candidates, refresh_shared, MAX_ISSUE_AGE_MS, REFRESH_LEAD_MS};
+use super::refresh::{
+    device_refresh_candidates, refresh_candidates, refresh_shared, MAX_ISSUE_AGE_MS,
+    REFRESH_LEAD_MS,
+};
 use super::{AGENT_BASE_URL, CHAT_PATH, PROVIDER_ID};
 
 /// Trae 适配器（无状态；身份全在账号记录里）。
@@ -341,7 +344,15 @@ async fn renew(
             "Trae 账号里没有 refreshToken，无法续期（请在「账号」页重新登录）",
         ));
     }
-    let renewed = refresh_shared(credential, &refresh_candidates(&credential.api_host), proxy).await?;
+    // 先按客户端的方式（带设备证明）续期：签到 claim 只认绑了设备的令牌，
+    // 而 `/cloudide/…` 换出来的不绑设备（见 refresh.rs 的 DEVICE_REFRESH_PATH）。
+    let renewed = refresh_shared(
+        credential,
+        &refresh_candidates(&credential.api_host),
+        proxy,
+        &device_refresh_candidates(&credential.api_host),
+    )
+    .await?;
     match store.update_trae_credentials_if_current(record, &renewed) {
         Ok(CredentialWrite::Written) => {}
         Ok(CredentialWrite::Stale) => {

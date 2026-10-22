@@ -651,7 +651,9 @@ export function checkinOutcomeOf(row: Record<string, unknown> | undefined): Chec
   if (claim.status === 'auth_expired') return { kind: 'failed', reason: String(claim.msg || '登录态已过期') }
   if (claim.status === 'task_not_found') return { kind: 'failed', reason: String(claim.msg || '签到任务不存在') }
   if (claim.status === 'unsupported') return { kind: 'failed', reason: String(claim.msg || '签到任务暂不可用') }
-  if (claim.status === 'backoff') return { kind: 'failed', reason: String(claim.msg || '签到触发限流，请稍后重试') }
+  // 9074 不是限流（同日同账号换绑设备的令牌就能领到）；后端一定会带 msg，
+  // 这里的兜底文案不能再说"限流"，否则会把人引向"过一会儿再点"。
+  if (claim.status === 'backoff') return { kind: 'failed', reason: String(claim.msg || '上游拒绝本次签到（9074）：请先确认登录态已绑定设备或该设备今日未被其他账号签到，必要时重新登录后再试') }
   const activity = row.activity as Record<string, unknown> | null | undefined
   if (activity?.pokeSucceeded === true) return { kind: 'active', reason: '' }
   return { kind: 'failed', reason: String(claim.msg || '未领取') }
