@@ -74,6 +74,8 @@ export type DatabaseImportResult = {
   tables?: DatabaseTableStat[]
   /** 替换前自动建的安全备份文件名（{config_dir}/backups/ 下） */
   safetyBackup?: string
+  /** 密钥指纹不一致时的警告；恢复本身不因此中断 */
+  warning?: string
 }
 
 /**

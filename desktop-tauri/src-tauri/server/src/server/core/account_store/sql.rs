@@ -562,11 +562,18 @@ pub(crate) fn save_state(conn: &mut Connection, state: &AccountState) -> rusqlit
     }
     // 新增 / 更新
     for record in &state.accounts {
-        let current = existing
-            .iter()
-            .find(|(id, _)| id == record.id())
-            .map(|(_, value)| value.as_ref())
-            .unwrap_or(None);
+        // 解不开的行不能当成「没有这行」：主键还在，INSERT 会撞 UNIQUE。
+        let current = existing.iter().find(|(id, _)| id == record.id());
+        if matches!(current, Some((_, None))) {
+            return Err(rusqlite::Error::ToSqlConversionFailure(
+                format!(
+                    "账号 id「{}」已在数据库中，但当前密钥无法解密。请换上导出这份数据的 account.key 后重启应用，不要重复导入。",
+                    record.id()
+                )
+                .into(),
+            ));
+        }
+        let current = current.and_then(|(_, value)| value.as_ref());
         match current {
             Some(value) if *value == record.to_value() => {}
             Some(_) => {
@@ -715,5 +722,38 @@ mod merge_crypto_tests {
         let tx = conn.transaction().unwrap();
         put(&tx, &record).unwrap();
         tx.commit().unwrap();
+    }
+
+    #[test]
+    fn save_state_refuses_unreadable_existing_id() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::server::db::schema::migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO accounts(id,provider,priority,data) VALUES('unreadable','custom-test',2,'enc1:invalid-fixture')",
+            [],
+        )
+        .unwrap();
+        let incoming = StoredAccount::from_value(json!({
+            "id": "unreadable",
+            "provider": "custom-test",
+            "apiKey": "new-secret",
+            "priority": 2
+        }))
+        .unwrap();
+        let error = save_state(
+            &mut conn,
+            &AccountState {
+                accounts: vec![incoming],
+                priority_scope: None,
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("无法解密"), "{error}");
+        let stored: String = conn
+            .query_row("SELECT data FROM accounts WHERE id='unreadable'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(stored, "enc1:invalid-fixture");
     }
 }

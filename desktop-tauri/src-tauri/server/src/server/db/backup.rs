@@ -502,7 +502,7 @@ fn account_key_warning(backup_marker: Option<String>) -> Option<String> {
     if backup_marker == KEY_FINGERPRINT_ABSENT {
         return Some(format!(
             "这份备份导出时账号加密密钥尚未生成，无法校验密钥是否一致：若账号数据无法解密（账号列表为空），\
-             请把备份那台机器的 {ACCOUNT_KEY_FILE} 一并带过来后重新导入。"
+            请把备份那台机器的 {ACCOUNT_KEY_FILE} 一并带过来；替换密钥后必须重启应用，再重新导入。"
         ));
     }
     let local = crypto::key_fingerprint(crypto::SecretScope::Accounts);
@@ -511,7 +511,7 @@ fn account_key_warning(backup_marker: Option<String>) -> Option<String> {
     }
     Some(format!(
         "这份备份是用另一把加密密钥加密的，导入后账号数据将无法解密（账号列表可能为空）。\
-         若要在别的机器恢复，请把备份那台机器的 {ACCOUNT_KEY_FILE} 一并带过来。"
+         请把备份那台机器的 {ACCOUNT_KEY_FILE} 一并带过来；替换密钥后必须重启应用。"
     ))
 }
 

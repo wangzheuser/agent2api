@@ -865,6 +865,7 @@ async function proceedDbRestore(): Promise<void> {
       ? t('，替换前的数据已备份为 {name}', { name: result.safetyBackup })
       : ''
     toast(t('✅ 已恢复 {n} 张表{note}', { n: tables, note }))
+    if (result?.warning?.trim()) toast(result.warning, 'err')
     // 重拉整页（含启动/托盘设置、保留期、提示词、存储概况等全部面板）
     await load()
     await shared().wbApp?.refresh?.()
