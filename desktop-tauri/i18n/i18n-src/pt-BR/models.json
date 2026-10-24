@@ -75,6 +75,7 @@
   "两边原因不一样时各自处理。如果": "Se os motivos forem diferentes em cada lado, trate cada um separadamente. Caso ",
   "中止测试": "Abortar teste",
   "仅本次测试临时生效，不修改账号保存的代理配置。可选「网络代理」页里的节点或强制直连。": "Válido apenas para este teste, sem alterar a configuração de proxy salva na conta. Escolha um nó da página Proxies de Rede ou force conexão direta.",
+  "从上游拉一次": "",
   "从这一家的上游拉一份模型清单，勾选要哪些再导入（已添加的不会重复导入）": "Buscar uma vez o catálogo de modelos no upstream deste provedor; marque os desejados e importe (os já adicionados não são importados de novo)",
   "代理池响应异常": "Resposta inválida do pool de proxies",
   "以模型本名直发": "Enviar direto com o nome real do modelo",

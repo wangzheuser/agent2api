@@ -789,9 +789,9 @@ fn resolve_choice(
     file: Option<String>,
     inline: Option<String>,
 ) -> ResolvedChoice {
-    use crate::server::core::prompt::{PromptMode, PromptSource, BUILT_IN_PROMPT};
+    use crate::server::core::prompt::{PromptSource, BUILT_IN_PROMPT};
 
-    if !matches!(mode, PromptMode::Custom | PromptMode::Append) {
+    if !mode.needs_text() {
         let stored = inline.clone().filter(|text| !text.trim().is_empty());
         return ResolvedChoice {
             mode,

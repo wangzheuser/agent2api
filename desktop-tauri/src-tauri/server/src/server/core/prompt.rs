@@ -1,10 +1,11 @@
-//! 网关自有系统提示词：`passthrough` / `custom` / `append` 三模式。
+//! 网关自有系统提示词：`passthrough` / `custom` / `append` / `prepend` 四模式。
 //!
 //! 照搬 workbuddy2api 的 `internal/prompt/prompt.go`（模式语义、插入位置、守卫
-//! 逐条对齐），它是脱敏之外的第二层防护 —— 两层**叠加、互不替代**：
+//! 逐条对齐；`prepend` 是本地新增的第四种，参考项目没有），它是脱敏之外的第二层
+//! 防护 —— 两层**叠加、互不替代**：
 //!
 //! ```text
-//!   ① 提示词层（本模块）：出站前用网关自有提示词**替换/追加** system 消息，
+//!   ① 提示词层（本模块）：出站前用网关自有提示词**替换/追加/前置** system 消息，
 //!      从源头消灭「system 来源」的指纹 —— 客户端注入的模板句根本没机会出站。
 //!   ② 指纹脱敏层（core::sanitize）：改写/剥离请求体里残留的指纹，覆盖
 //!      user / assistant / tool_calls / reasoning_content 这些**用户内容**，
@@ -18,20 +19,25 @@
 //! 冒出新的一句。`custom` 模式从根上解决：客户端 system 整段换成网关自己那份，
 //! 上游看到的 system 永远是网关写的、可控的一段文本。
 //!
-//! ── 三模式的语义（与参考项目逐条一致）───────────────────────
+//! ── 四模式的语义 ────────────────────────────────────────────
 //!   - `passthrough`（**默认**）：不动 system，客户端原样出站 —— 与改造前
 //!     的行为逐字相同。此时唯一生效的是脱敏层；
 //!   - `custom`：删除 messages 里**所有** `system` / `developer` 消息，在头部
 //!     插入一条网关自有提示词（客户端项目规范随之消失，适合「我要用网关的提示词」
 //!     的用户）；
 //!   - `append`：在**开头连续**的 `system` / `developer` 块之后插入一条网关
-//!     自有提示词，既有消息逐字不动（客户端项目规范与网关提示词并用）。
+//!     自有提示词，既有消息逐字不动（客户端项目规范优先，网关提示词做补充）；
+//!   - `prepend`：在 `messages[0]` 插入一条网关自有提示词，客户端消息（含它
+//!     自己的 system 块）整体后移（网关规则优先，客户端规范跟在它后面）。
+//!     `append` 与 `prepend` 只差插入位置；客户端本来就没有 system 时两者输出
+//!     完全相同。两者都**不**改变「会不会被拦」—— 指纹是逐字匹配、与位置无关，
+//!     它们解决的是「谁的规则优先」。
 //!
-//! ── 降级（`core::degrade`）只作用于 passthrough / append ─────
+//! ── 降级（`core::degrade`）只作用于 passthrough / append / prepend ─
 //! `custom` 模式下 system 已经由网关接管，再撞内容拦截就不是 system 指纹的问题
 //! 了（多半是用户内容本身触发审核），所以它**不进降级路径**（`degradable`）。
-//! `append` 在降级期退化为替换（`rewrite` + 中性提示词）：带着指纹原文重试是
-//! 确定性再撞墙，替换是一次性最小抢救。
+//! `append` / `prepend` 在降级期都退化为替换（`rewrite` + 中性提示词）：带着指纹
+//! 原文重试是确定性再撞墙，替换是一次性最小抢救。
 //!
 //! ── 本模块只做纯文本变换 ─────────────────────────────────────
 //! 模式与提示词文本从哪来（配置文件键 / 提示词文件 / 内置默认）由 `config` 决定，
@@ -67,7 +73,7 @@ something you did not actually run.
 - Do not run destructive commands (deleting data, resetting repositories, force-pushing) \
 without explicit confirmation from the user.";
 
-/// 系统提示词的三种模式（配置文件里的字符串就是契约，见 `config::KEY_PROMPT_MODE`）
+/// 系统提示词的四种模式（配置文件里的字符串就是契约，见 `config::KEY_PROMPT_MODE`）
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PromptMode {
     /// 透传客户端 system（默认；与改造前行为逐字相同）
@@ -77,14 +83,17 @@ pub enum PromptMode {
     Custom,
     /// 在开头连续的 system / developer 块之后追加一条网关自有提示词
     Append,
+    /// 在 messages 最前面插入一条网关自有提示词，客户端 system 排在它之后
+    Prepend,
 }
 
 impl PromptMode {
     /// 全部合法值（界面下拉与 400 文案共用一份，避免两处各写一遍）
-    pub const ALL: [PromptMode; 3] = [
+    pub const ALL: [PromptMode; 4] = [
         PromptMode::Passthrough,
         PromptMode::Custom,
         PromptMode::Append,
+        PromptMode::Prepend,
     ];
 
     /// 配置值与接口响应里的字符串形态
@@ -93,6 +102,7 @@ impl PromptMode {
             PromptMode::Passthrough => "passthrough",
             PromptMode::Custom => "custom",
             PromptMode::Append => "append",
+            PromptMode::Prepend => "prepend",
         }
     }
 
@@ -116,13 +126,24 @@ impl PromptMode {
             PromptMode::Passthrough => "透传客户端 system",
             PromptMode::Custom => "替换为网关提示词",
             PromptMode::Append => "追加网关提示词",
+            PromptMode::Prepend => "网关提示词在前（客户端 system 追加其后）",
         }
+    }
+
+    /// 该模式是否需要一份提示词文本（= 除了透传以外的所有模式）。
+    ///
+    /// 三处消费方都靠它决定「要不要读盘 / 要不要校验文件」：`config::resolve_choice`
+    /// （不读盘的话文本为空，模式会静默退化成透传）、`api::prompt` 的两处保存校验
+    /// （不校验的话坏路径能存进去）。写成 `!= Passthrough` 而不是穷举 `matches!`，
+    /// 是为了让以后新增模式**默认被包含**，不会因为漏改一处而静默失效。
+    pub fn needs_text(self) -> bool {
+        self != PromptMode::Passthrough
     }
 
     /// 该模式是否会在降级时改用中性提示词。
     ///
     /// `custom` 为假：system 已由网关接管，内容拦截不再指向 system 指纹
-    /// （见模块头「降级只作用于 passthrough / append」）。
+    /// （见模块头「降级只作用于 passthrough / append / prepend」）。
     pub fn degradable(self) -> bool {
         self != PromptMode::Custom
     }
@@ -343,9 +364,10 @@ impl<'a> PromptChoice<'a> {
                     None
                 }
             }
-            // 降级期：append 也退化为替换（见模块头）
+            // 降级期：append / prepend 也退化为替换（见模块头）
             PromptMode::Append if !degraded => append(body, text),
-            PromptMode::Custom | PromptMode::Append => rewrite(body, text),
+            PromptMode::Prepend if !degraded => prepend(body, text),
+            PromptMode::Custom | PromptMode::Append | PromptMode::Prepend => rewrite(body, text),
         }
     }
 }
@@ -407,6 +429,33 @@ pub fn append(body: &Value, text: &str) -> Option<Value> {
                 .take_while(|message| is_system_role(message))
                 .count();
             messages.insert(insert_at, gateway);
+        }
+        None => {
+            object.insert("messages".to_string(), Value::Array(vec![gateway]));
+        }
+    }
+    Some(next)
+}
+
+/// 前置：把网关提示词插到 `messages[0]`，客户端消息（含它自己的 system 块）
+/// 整体后移一位。
+///
+/// 与 [`append`] 的**唯一**差别是插入位置：append 把网关提示词放在开头连续
+/// system 块**之后**（客户端规范优先，网关只做补充），prepend 放在**最前**
+/// （网关规则优先，客户端规范跟在它后面）。客户端本来就没有 system 时两者
+/// 输出完全相同（append 的 `insert_at` 也是 0）。
+///
+/// 不合并成一条 system：两条并列才能在请求日志与调试报文里分清哪句是网关写的。
+pub fn prepend(body: &Value, text: &str) -> Option<Value> {
+    if text.is_empty() {
+        return None;
+    }
+    let mut next = body.clone();
+    let object = next.as_object_mut()?;
+    let gateway = gateway_message(text);
+    match object.get_mut("messages").and_then(Value::as_array_mut) {
+        Some(messages) => {
+            messages.insert(0, gateway);
         }
         None => {
             object.insert("messages".to_string(), Value::Array(vec![gateway]));
@@ -517,5 +566,131 @@ mod tests {
             .for_provider("provider", "model")
             .apply(&body, false);
         assert!(passthrough.is_none());
+    }
+
+    /// prepend 与 append 只差插入位置：客户端有 system 块时，网关提示词
+    /// 落在它**前面**（append 落在它后面）。
+    #[test]
+    fn prepend_puts_gateway_prompt_before_client_system() {
+        let models = BTreeMap::new();
+        let providers = BTreeMap::new();
+        let body = json!({
+            "messages": [
+                {"role": "system", "content": "client-a"},
+                {"role": "developer", "content": "client-b"},
+                {"role": "user", "content": "hello"}
+            ]
+        });
+
+        let prepended = plan(PromptMode::Prepend, "gateway", &models, &providers)
+            .for_provider("provider", "model")
+            .apply(&body, false)
+            .expect("prepend mode should add a message");
+        let messages = prepended["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0]["content"], "gateway");
+        assert_eq!(messages[0]["role"], "system");
+        // 客户端消息逐字不动、顺序不变，只是整体后移一位
+        assert_eq!(messages[1]["content"], "client-a");
+        assert_eq!(messages[2]["content"], "client-b");
+        assert_eq!(messages[3]["content"], "hello");
+
+        // 同一份 body 走 append：网关提示词落在开头连续 system 块之后
+        let appended = plan(PromptMode::Append, "gateway", &models, &providers)
+            .for_provider("provider", "model")
+            .apply(&body, false)
+            .expect("append mode should add a message");
+        let messages = appended["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["content"], "client-a");
+        assert_eq!(messages[2]["content"], "gateway");
+    }
+
+    /// 客户端本来就没有 system 时，prepend 与 append 输出完全相同（都插在 0 号位）
+    #[test]
+    fn prepend_matches_append_when_client_has_no_system() {
+        let models = BTreeMap::new();
+        let providers = BTreeMap::new();
+        let body = json!({ "messages": [{ "role": "user", "content": "hello" }] });
+
+        let prepended = plan(PromptMode::Prepend, "gateway", &models, &providers)
+            .for_provider("provider", "model")
+            .apply(&body, false)
+            .expect("prepend should add a message");
+        let appended = plan(PromptMode::Append, "gateway", &models, &providers)
+            .for_provider("provider", "model")
+            .apply(&body, false)
+            .expect("append should add a message");
+        assert_eq!(prepended, appended);
+    }
+
+    /// 没有 messages 字段时补一个只含网关提示词的数组（与 append / rewrite 同口径）
+    #[test]
+    fn prepend_creates_messages_when_absent() {
+        let models = BTreeMap::new();
+        let providers = BTreeMap::new();
+        let body = json!({ "model": "m" });
+        let prepended = plan(PromptMode::Prepend, "gateway", &models, &providers)
+            .for_provider("provider", "model")
+            .apply(&body, false)
+            .expect("prepend should add a message");
+        assert_eq!(prepended["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(prepended["messages"][0]["content"], "gateway");
+        assert_eq!(prepended["model"], "m");
+    }
+
+    /// 降级期 prepend 退化为替换：客户端 system 全删、只留中性提示词
+    #[test]
+    fn prepend_degrades_to_rewrite() {
+        let models = BTreeMap::new();
+        let providers = BTreeMap::new();
+        let body = json!({
+            "messages": [
+                {"role": "system", "content": "client"},
+                {"role": "user", "content": "hello"}
+            ]
+        });
+        let degraded = plan(PromptMode::Prepend, "gateway", &models, &providers)
+            .for_provider("provider", "model")
+            .apply(&body, true)
+            .expect("degraded prepend should rewrite");
+        let messages = degraded["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["content"], DEGRADED_PROMPT);
+        assert_eq!(messages[1]["content"], "hello");
+    }
+
+    /// 逐提供商覆盖：某家配成 prepend 时，全局是什么模式都不影响它
+    #[test]
+    fn provider_level_prepend_overrides_global_mode() {
+        let models = BTreeMap::new();
+        let providers = BTreeMap::from([(
+            "provider-a".to_string(),
+            crate::server::config::ProviderPrompt {
+                mode: PromptMode::Prepend,
+                file: None,
+                inline: Some("provider gateway".to_string()),
+                text: "provider gateway".to_string(),
+                source: PromptSource::Inline,
+                file_error: None,
+            },
+        )]);
+        let body = json!({
+            "messages": [
+                {"role": "system", "content": "client"},
+                {"role": "user", "content": "hello"}
+            ]
+        });
+        // 全局是 custom，但这家的覆盖是 prepend
+        let global_plan = plan(PromptMode::Custom, "global text", &models, &providers);
+        let prompt = global_plan.for_provider("provider-a", "model");
+        assert_eq!(prompt.mode, PromptMode::Prepend);
+        let applied = prompt.apply(&body, false).expect("prepend should add a message");
+        let messages = applied["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["content"], "provider gateway");
+        assert_eq!(messages[1]["content"], "client");
+
+        // 没配过的家仍走全局的 custom
+        let other = global_plan.for_provider("provider-b", "model");
+        assert_eq!(other.mode, PromptMode::Custom);
     }
 }

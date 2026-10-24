@@ -7,7 +7,7 @@
  * 把按钮摆到对应的行里。
  *
  * ── 三处编辑分别是什么 ───────────────────────────────────────
- *   ① 全局提示词正文（替换 / 追加模式下网关要发的那份文本）；
+ *   ① 全局提示词正文（替换 / 追加 / 前置模式下网关要发的那份文本）；
  *   ② 某一家的提示词正文（同一件事，但只对这一家生效）；
  *   ③ 某一家的**网关自带提示词**正文（网关自己装上去的官方三段，见
  *      `core::providers::zcode::OFFICIAL_PROMPT_NOTE`）。
@@ -111,11 +111,11 @@ function BodyEditor({ title, text, source, file, disabled, save, onClose }: {
           <DialogSection>
             <h3>{t('保存后以这里的文本为准')}</h3>
             <p>
-              {t('这一份就是「替换 / 追加」模式下网关要发的 system 正文。')}
+              {t('这一份就是「替换 / 追加 / 前置」模式下网关要发的 system 正文。')}
               {/* `source === 'none'` 与「当前是透传模式」等价：解析层只在透传时给
                   none（没有生效的正文）—— 见 `config::resolve_choice` */}
               {source === 'none'
-                ? t('当前是透传模式：存下来也不会发出，切成「替换 / 追加」之后才生效。')
+                ? t('当前是透传模式：存下来也不会发出，切成「替换 / 追加 / 前置」之后才生效。')
                 : t('当前生效的正文来自{source}{file}。保存后这一份会盖过提示词文件与内置默认{note}。', {
                     source: sourceText(source),
                     file: file.trim() && source !== 'inline' ? t('（文件：{path}）', { path: file.trim() }) : '',

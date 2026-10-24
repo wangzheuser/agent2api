@@ -1439,4 +1439,115 @@ mod live_upstream {
         // 复原全局口径，别影响同进程其它用例
         assert!(captcha::set_required(true));
     }
+
+    /// 四种系统提示词模式 × 两个模型各实连一次。
+    ///
+    /// 要回答的问题是「除了『替换为网关提示词』，另外三种模式还能不能通上游」。
+    /// 模式的作用点在 `core::prompt`（它改的是 messages 里的 `system` 消息），
+    /// 之后才由本通道把这些消息拼成 `system` 并折进第 3 块 —— 所以「三种模式的
+    /// 差别是否会被上游接受」只能在真上游上验，本地只能验到块数。
+    ///
+    /// 八次实连都带**客户端 system**（透传/追加/前置三种模式的常态）：修复前它们会
+    /// 多出第 4 块、一律 405/3012；修复后都应是 3 块 → 200。同时跑 `glm-5.3-flash`
+    /// 作对照，好把「提示词模式/块数」与「该模型在这条通道上可不可用」分开 ——
+    /// 套餐池通道的模型目录以客户端 provider 列表为准，不一定有 `glm-5.3`。
+    ///
+    /// 跑法（`--test-threads=1`：免码口径是进程级全局开关，并发会互相踩）：
+    ///
+    /// ```text
+    /// cargo test -p agent2api-server --locked zcode::plan::live_upstream -- --ignored --nocapture --test-threads=1
+    /// ```
+    #[test]
+    #[ignore = "实连上游：三模式×两模型各打一次，用真实账号与真实额度"]
+    fn three_prompt_modes_reach_the_upstream() {
+        use crate::server::core::prompt::{append, prepend, rewrite, PromptMode, BUILT_IN_PROMPT};
+
+        let Some(jwt) = local_plan_jwt() else {
+            eprintln!("跳过：本机没有 ZCode 套餐登录态（设 ZCODE_LIVE_JWT 或先登录客户端）");
+            return;
+        };
+        assert!(captcha::set_required(false), "临时切到免码口径");
+
+        let client_body = || {
+            json!({
+                "stream": false,
+                "max_tokens": 16,
+                "messages": [
+                    { "role": "system", "content": "你是测试助手，只回一个字。" },
+                    { "role": "user", "content": "只回一个字：好" },
+                ],
+            })
+        };
+        // 四种模式对 messages 的改动就是网关真实做的改动（`PromptChoice::apply` 的
+        // 三个分支直接调用这三个函数），所以这里不需要再模拟一层。
+        let shaped = |mode: PromptMode| match mode {
+            PromptMode::Passthrough => client_body(),
+            PromptMode::Custom => rewrite(&client_body(), BUILT_IN_PROMPT).expect("rewrite 返回 None"),
+            PromptMode::Append => append(&client_body(), BUILT_IN_PROMPT).expect("append 返回 None"),
+            PromptMode::Prepend => prepend(&client_body(), BUILT_IN_PROMPT).expect("prepend 返回 None"),
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("建 tokio 运行时");
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .expect("建 HTTP 客户端");
+
+        let mut failures: Vec<String> = Vec::new();
+        for model in ["glm-5.3", MODEL] {
+            for mode in PromptMode::ALL {
+                let mut body = shaped(mode);
+                body["model"] = Value::String(model.to_string());
+                let plan = build_request(
+                    Region::Intl,
+                    &json!({ "jwt": jwt, "deviceMid": "live-upstream-test", "zcodePlan": "start-plan" }),
+                    &body,
+                    &HeaderMap::new(),
+                )
+                .expect("装配不该失败");
+                let blocks = plan
+                    .body
+                    .get("system")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0);
+
+                let mut headers = reqwest::header::HeaderMap::new();
+                for (name, value) in &plan.headers {
+                    headers.insert(
+                        reqwest::header::HeaderName::from_bytes(name.as_bytes()).expect("头名合法"),
+                        reqwest::header::HeaderValue::from_str(value).expect("头值合法"),
+                    );
+                }
+                let (status, text) = runtime.block_on(async {
+                    let response = client
+                        .post(&plan.url)
+                        .headers(headers)
+                        .json(&plan.body)
+                        .send()
+                        .await
+                        .expect("请求上游");
+                    let status = response.status();
+                    (status, response.text().await.unwrap_or_default())
+                });
+                let snippet: String = text.chars().take(160).collect();
+                eprintln!(
+                    "[{}] {} 块={} → HTTP {} | {}",
+                    mode.as_str(),
+                    model,
+                    blocks,
+                    status.as_u16(),
+                    snippet
+                );
+                if status.as_u16() != 200 {
+                    failures.push(format!("{} / {} → HTTP {}", mode.as_str(), model, status.as_u16()));
+                }
+            }
+        }
+        assert!(captcha::set_required(true));
+        assert!(failures.is_empty(), "以下组合没通：{failures:?}");
+    }
 }

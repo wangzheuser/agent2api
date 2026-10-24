@@ -140,7 +140,7 @@ pub async fn put_prompt(State(_state): State<ServerState>, body: Bytes) -> Respo
     };
     // 新模式要用文件时才校验：passthrough 不读文件（与读侧一致），
     // 那时路径写错也不影响任何行为，拦下来只会挡住「先存着、以后切模式」的用法
-    if matches!(mode, PromptMode::Custom | PromptMode::Append) && inline.is_none() {
+    if mode.needs_text() && inline.is_none() {
         if let Some(path) = file.as_deref() {
             if let Err(message) = config::read_prompt_file(path) {
                 return errors::management_error(400, message);
@@ -261,9 +261,7 @@ pub async fn put_prompt(State(_state): State<ServerState>, body: Bytes) -> Respo
                     }
                 };
                 // 有界面正文时文件不参与本次生效（与全局那条同一口径，见上面的说明）
-                if matches!(entry_mode, PromptMode::Custom | PromptMode::Append)
-                    && entry_inline.is_none()
-                {
+                if entry_mode.needs_text() && entry_inline.is_none() {
                     if let Some(path) = entry_file.as_deref() {
                         if let Err(message) = config::read_prompt_file(path) {
                             return errors::management_error(400, format!("{id}: {message}"));

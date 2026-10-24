@@ -220,18 +220,18 @@ pub const KEY_MODELS_DEV_ENABLED: &str = "modelsDevEnabled";
 
 /// 系统提示词模式的键（config.json 键，对应 workbuddy2api 的 `prompt.mode`）。
 ///
-/// 取值 `passthrough` / `custom` / `append`（见 `core::prompt::PromptMode`）；
+/// 取值 `passthrough` / `custom` / `append` / `prepend`（见 `core::prompt::PromptMode`）；
 /// **默认 `passthrough`**（与参考项目同默认）：不动客户端 system，行为与改造前
-/// 逐字相同。`custom` / `append` 改用网关自有提示词替换/追加 system 消息 ——
-/// 那是脱敏之外的第二层防护：从**源头**消灭 system 来源的指纹，而不是等它
-/// 出站前再改（两层叠加、互不替代，见 `core::prompt` 的模块头）。
+/// 逐字相同。`custom` / `append` / `prepend` 改用网关自有提示词替换/追加/前置
+/// system 消息 —— 那是脱敏之外的第二层防护：从**源头**消灭 system 来源的指纹，
+/// 而不是等它出站前再改（两层叠加、互不替代，见 `core::prompt` 的模块头）。
 pub const KEY_PROMPT_MODE: &str = "promptMode";
 
 /// 系统提示词文件的键（config.json 键，对应 workbuddy2api 的 `prompt.file`）。
 ///
 /// 空串 / 缺失 = 用内置默认提示词（`core::prompt::BUILT_IN_PROMPT`）；
-/// 否则读该路径（UTF-8 文本）。只在 `custom` / `append` 模式下有意义 ——
-/// `passthrough` 不读文件。
+/// 否则读该路径（UTF-8 文本）。只在 `custom` / `append` / `prepend` 模式下有意义
+/// —— `passthrough` 不读文件。
 pub const KEY_PROMPT_FILE: &str = "promptFile";
 
 /// **界面里直接编辑**的系统提示词正文（config.json 键）。
@@ -318,7 +318,7 @@ pub const KEY_PROMPT_GATEWAY_TEXT: &str = "promptGatewayText";
 /// 将来加字段时不必再挨个改调用点的解构。
 #[derive(Clone, Debug)]
 pub struct ProviderPromptPatch {
-    /// 模式（透传 / 替换 / 追加）
+    /// 模式（透传 / 替换 / 追加 / 前置）
     pub mode: crate::server::core::prompt::PromptMode,
     /// 提示词文件（`None` / 空白 = 用内置默认提示词）
     pub file: Option<String>,
@@ -334,7 +334,7 @@ pub struct ProviderPromptPatch {
 /// 逐请求克隆它纯属浪费 —— 转发层拿的是借用视图（`core::prompt::PromptPlan`）。
 #[derive(Clone, Debug)]
 pub struct PromptSettings {
-    /// 模式（透传 / 替换 / 追加）
+    /// 模式（透传 / 替换 / 追加 / 前置）
     pub mode: crate::server::core::prompt::PromptMode,
     /// 用户指定的提示词文件（`None` = 未指定）
     pub file: Option<String>,
@@ -391,7 +391,7 @@ impl Default for PromptSettings {
 /// 界面上「这家配了什么」与「实际用了什么」必须一眼对得上。
 #[derive(Clone, Debug)]
 pub struct ProviderPrompt {
-    /// 模式（透传 / 替换 / 追加）
+    /// 模式（透传 / 替换 / 追加 / 前置）
     pub mode: crate::server::core::prompt::PromptMode,
     /// 用户指定的提示词文件（`None` = 未指定，用内置默认）
     pub file: Option<String>,

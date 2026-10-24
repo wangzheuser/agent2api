@@ -711,6 +711,16 @@ function PromptFileRow({ prompt, locked, busy }: {
   )
 }
 
+/** 模式在状态行里的短说法（「替换生效：…」「追加生效：…」「前置生效：…」）。
+ *  写成映射而不是 `custom ? 替换 : 追加` 的三元：三元在新增模式时会**静默**把新模式
+ *  说成「追加」（就是 prepend 加进来时的样子），兜底返回原值至少能看出没映射。 */
+function promptModeVerb(mode: string): string {
+  if (mode === 'custom') return t('替换')
+  if (mode === 'append') return t('追加')
+  if (mode === 'prepend') return t('前置')
+  return mode
+}
+
 /** 提示词状态行：模式说明 + 来源与行数 + 文件读取告警 */
 function promptStateText(prompt: PromptState): string {
   if (prompt.status === 'loading') return STATES.appLoading
@@ -722,7 +732,7 @@ function promptStateText(prompt: PromptState): string {
   } else {
     parts.push(
       t('{mode}生效：上游收到的 system 来自{source}{lines}。', {
-        mode: prompt.mode === 'custom' ? t('替换') : t('追加'),
+        mode: promptModeVerb(prompt.mode),
         source,
         lines: prompt.lines ? t('（{n} 行）', { n: prompt.lines }) : '',
       }),
@@ -796,7 +806,7 @@ function providerStateText(item: ProviderPromptState, configured: boolean): stri
   }
   if (item.mode === 'passthrough') return t('客户端 system 原样出站。')
   const head = t('{mode}生效：上游收到的 system 来自{source}{lines}。', {
-    mode: item.mode === 'custom' ? t('替换') : t('追加'),
+    mode: promptModeVerb(item.mode),
     source: promptSourceText(item.source),
     lines: item.lines ? t('（{n} 行）', { n: item.lines }) : '',
   })
@@ -1188,7 +1198,7 @@ function PromptPanel({ snap }: { snap: SettingsSnapshot }) {
               {prompt.source === 'inline'
                 ? t('（当前生效的就是这一份，{n} 行）', { n: prompt.lines })
                 : prompt.text.trim()
-                  ? t('（已存一份正文，{n} 行；切成「替换 / 追加」后生效）', { n: prompt.lines })
+                  ? t('（已存一份正文，{n} 行；切成「替换 / 追加 / 前置」后生效）', { n: prompt.lines })
                   : ''}
             </div>
           </div>

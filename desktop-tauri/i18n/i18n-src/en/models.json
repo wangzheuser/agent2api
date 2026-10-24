@@ -75,6 +75,7 @@
   "两边原因不一样时各自处理。如果": "Handle each cause separately when they differ. If ",
   "中止测试": "Abort test",
   "仅本次测试临时生效，不修改账号保存的代理配置。可选「网络代理」页里的节点或强制直连。": "Applies to this test only without changing the account's saved proxy setting. Choose a node from the Network Proxies page or force a direct connection.",
+  "从上游拉一次": "",
   "从这一家的上游拉一份模型清单，勾选要哪些再导入（已添加的不会重复导入）": "Pull a model catalog from this provider's upstream, check the ones you want, then import them (models already added won't be imported again)",
   "代理池响应异常": "Invalid proxy pool response",
   "以模型本名直发": "Sent under the model's own name",
