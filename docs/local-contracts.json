@@ -1306,6 +1306,51 @@
       ]
     },
     {
+      "id": "zcode-start-plan-system-shape",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "套餐池（Start Plan）通道出站的 system 恰好 3 块：透传 / 替换 / 追加三种提示词模式以及任意客户端 system 都折进第 3 块，不新增块、不丢正文、丢弃客户端自带断点；块数就是上游 3012 的判据（多一块即 405/3012，全部账号一起失败）。",
+      "source_commits": [
+        "a21cdbc62"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/plan.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/mod.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/plan.rs",
+          "name": "server::core::providers::zcode::plan::system_shape::passthrough_folds_the_client_system_into_the_third_block",
+          "id": "case-3b9e1a7c5d02"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/plan.rs",
+          "name": "server::core::providers::zcode::plan::system_shape::replace_mode_keeps_the_gateway_text_and_drops_the_client_one",
+          "id": "case-7c4f2d81ab39"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/plan.rs",
+          "name": "server::core::providers::zcode::plan::system_shape::append_mode_keeps_both_gateway_and_client_text_in_three_blocks",
+          "id": "case-95d0c6f3e21b"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/plan.rs",
+          "name": "server::core::providers::zcode::plan::system_shape::a_client_array_system_still_yields_three_blocks_without_its_cache_control",
+          "id": "case-b18a4e07c93f"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/plan.rs",
+          "name": "server::core::providers::zcode::plan::system_shape::no_client_system_is_still_exactly_three_blocks",
+          "id": "case-d62c90b4f8e5"
+        }
+      ]
+    },
+    {
       "id": "zcode-reasoning-binding",
       "level": "P1",
       "status": "必须保留",

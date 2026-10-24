@@ -24,9 +24,17 @@
 //!
 //!   1. `system` = **恰好 3 块**（`cliPrefix` / 其余稳定段 `\n\n` 拼接 /
 //!      动态段以 `\n\n` 开头），每块都带 `cache_control:{type:"ephemeral"}`；
-//!      客户端自己的 system 排在这 3 块**之后**，且**去掉**它的 cache_control
-//!      （Anthropic 的缓存断点上限是 4：官方 3 块 + 最后一条消息 1 个，客户端
-//!      再带就超了，而真实客户端因为自己拥有整份 body 从不产生外来断点）；
+//!      **块数就是上游的判据**：多一块或少一块都直接 3012（见下条实测），所以
+//!      客户端自带（或网关自有 `custom` 模式灌进来）的 system **折进第 3 块**，
+//!      不新开块，并**去掉**它的 cache_control（Anthropic 的缓存断点上限是 4：
+//!      官方 3 块 + 最后一条消息 1 个，客户端再带就超了，而真实客户端因为自己
+//!      拥有整份 body 从不产生外来断点）；
+//!
+//!      2026-10-24 用真实账号在同一出口、同一令牌上做的单变量对照（此前
+//!      `super::OFFICIAL_PROMPT_NOTE` 里「官方三段 + 客户端自带 → 200」的结论
+//!      已随上游收紧失效）：官方三段 **200**；官方三段 + 任意第 4 块（哪怕内容
+//!      只是 `"Test."`）**405/3012**；官方三段把外来文本并进第 3 块（仍是 3 块）
+//!      **200**；只剩 1 块 **405/3012**。文本内容不参与判定 —— 只数块。
 //!   2. 动态段里的 Environment 段要用**真实运行值**（cwd / platform / shell /
 //!      osVersion），并以 `- You are powered by the model named {provider}/{model}.`
 //!      收尾（`{provider}` 由地区给出：国内 `bigmodel-api`、国际 `zai-api`）；
@@ -620,54 +628,73 @@ fn merged_texts(
     }
 }
 
-/// 官方三块 + 客户端自带 system（去掉缓存断点）。
+/// 官方三块；客户端自带 system **折进第 3 块**。
+///
+/// 不新开第 4 块的理由见模块头：上游 2026-10 起按**块数量**认身份，`system` 必须
+/// 恰好 3 个 block —— 多一块（哪怕内容只是 `"Test."`）直接 405/`3012`。折进动态段
+/// 则保持 3 块且正文照旧送达（同一次对照里实测 200）。
 fn system_blocks(texts: &GatewayBlocks, existing: Option<&Value>) -> Vec<Value> {
     let ephemeral = json!({ "type": "ephemeral" });
-    let mut blocks = vec![
+    let mut dynamic = format!("\n\n{}", texts.dynamic);
+    // 外来正文与官方动态段本来不是同一段，接上时补一个空行分隔。
+    for extra in user_system_texts(existing) {
+        dynamic.push_str("\n\n");
+        dynamic.push_str(&extra);
+    }
+    vec![
         text_block(texts.identity.clone(), Some(ephemeral.clone())),
         text_block(texts.stable.clone(), Some(ephemeral.clone())),
         // 动态块以 `\n\n` 开头，是官方装配的形状（不是排版疏忽）
-        text_block(format!("\n\n{}", texts.dynamic), Some(ephemeral)),
-    ];
-    blocks.extend(user_system_blocks(existing));
-    blocks
+        text_block(dynamic, Some(ephemeral)),
+    ]
 }
 
 /// 客户端自带 system → 文本块数组（**丢弃** cache_control，理由见模块头）。
 ///
-/// 三种输入形态都要认：字符串（本网关翻译器的常规输出）、块数组（客户端自己
-/// 带的断点会走到这里）、以及 null / 其它（什么都不加）。
+/// 只在「官方三段关掉」那条路径上用得到（那时客户端 system 是唯一的内容，没有
+/// 官方块可折）。
 fn user_system_blocks(existing: Option<&Value>) -> Vec<Value> {
+    user_system_texts(existing)
+        .into_iter()
+        .map(|text| text_block(text, None))
+        .collect()
+}
+
+/// 客户端自带 system → 纯文本片段（三种输入形态都认：字符串、块数组、其它）。
+///
+/// 三种形态都要认：字符串（本网关翻译器的常规输出）、块数组（客户端自己带的
+/// 断点会走到这里）、以及 null / 其它（什么都不加）。
+fn user_system_texts(existing: Option<&Value>) -> Vec<String> {
     let Some(existing) = existing else {
         return Vec::new();
     };
-    let mut blocks = Vec::new();
+    let mut texts = Vec::new();
     match existing {
         Value::String(text) => {
             let text = text.trim();
             if !text.is_empty() {
-                blocks.push(text_block(text.to_string(), None));
+                texts.push(text.to_string());
             }
         }
         Value::Array(items) => {
             for item in items {
                 if let Some(text) = item.as_str() {
                     if !text.trim().is_empty() {
-                        blocks.push(text_block(text.trim().to_string(), None));
+                        texts.push(text.trim().to_string());
                     }
                     continue;
                 }
                 let is_text = item.get("type").and_then(Value::as_str) == Some("text");
                 if let Some(text) = item.get("text").and_then(Value::as_str) {
                     if is_text && !text.trim().is_empty() {
-                        blocks.push(text_block(text.trim().to_string(), None));
+                        texts.push(text.trim().to_string());
                     }
                 }
             }
         }
         _ => {}
     }
-    blocks
+    texts
 }
 
 fn text_block(text: String, cache_control: Option<Value>) -> Value {
@@ -1115,6 +1142,301 @@ mod token_free_channel {
         assert_eq!(0, captcha::ready(), "免码时不该消耗任何令牌");
 
         // 复原：这条用例之后跑的用例都假定「要码」是默认结论
+        assert!(captcha::set_required(true));
+    }
+}
+
+#[cfg(test)]
+mod system_shape {
+    //! `system` 必须**恰好 3 块**，而三种提示词模式都只能「折」、不能「加块」。
+    //!
+    //! 判据来自 2026-10-24 的真实账号对照（见模块头）：多出第 4 块就 405/3012，
+    //! 同一段正文并进第 3 块则 200。之前的实现是 `blocks.extend(客户端块)`，于是
+    //! **任何**带 system 的客户端、以及「替换 / 追加」两种模式（它们都会往
+    //! `messages` 头插一条 system 消息、被转换层折进 `system`）都会稳定发 4 块
+    //! 出去 —— 每次都被上游拦，且表现为「所有账号都失败」。
+    //!
+    //! 所以这里按**模式**分组断言，而不是只测装配函数：走真实的
+    //! [`rewrite`] / [`append`]，与转发链上那条加工顺序一致（提示词模式 → chat →
+    //! anthropic 转换 → 官方三段装配）。
+
+    use serde_json::{json, Value};
+
+    use super::super::region::Region;
+    use super::{apply_start_plan, system_blocks, user_system_texts, GatewayBlocks};
+    use crate::server::core::prompt::{append, rewrite};
+    use crate::server::core::protocol::anthropic_outbound::anthropic_request_from_chat;
+
+    const CLIENT_TEXT: &str = "客户端的身份提示词";
+    const GATEWAY_TEXT: &str = "网关自己的提示词正文";
+
+    /// 一条带客户端 system 的 chat 请求（`system` 走消息而不是顶层字段 ——
+    /// 三种模式都作用在 `messages` 上，转换层再从那里折出 `system`）。
+    fn client_body() -> Value {
+        json!({
+            "model": "glm-5.3",
+            "stream": true,
+            "messages": [
+                { "role": "system", "content": CLIENT_TEXT },
+                { "role": "user", "content": "只回一个字" },
+            ],
+        })
+    }
+
+    /// 走完整装配链，返回最终发出去的 `system` 块。
+    fn assembled(body: &Value) -> Vec<Value> {
+        let mut payload = anthropic_request_from_chat(body, "glm-5.3")
+            .expect("chat → anthropic 转换不该失败");
+        apply_start_plan(
+            &mut payload,
+            "glm-5.3",
+            Region::Cn,
+            "mid-under-test",
+            true,
+            None,
+        )
+        .expect("官方段装配不该失败");
+        payload
+            .get("system")
+            .and_then(Value::as_array)
+            .cloned()
+            .expect("装配之后 system 必须是块数组")
+    }
+
+    /// 三块拼起来的正文（用来断言「哪段文本确实送到了」）。
+    fn joined(blocks: &[Value]) -> String {
+        blocks
+            .iter()
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn assert_three(blocks: &[Value]) {
+        assert_eq!(
+            3,
+            blocks.len(),
+            "上游按块数量认身份：多一块就 405/3012，实际 {} 块",
+            blocks.len()
+        );
+        for block in blocks {
+            assert_eq!(
+                Some("ephemeral"),
+                block
+                    .get("cache_control")
+                    .and_then(|cache| cache.get("type"))
+                    .and_then(Value::as_str),
+                "三块各自带断点（第 4 个断点留给最后一条消息）"
+            );
+        }
+    }
+
+    #[test]
+    fn passthrough_folds_the_client_system_into_the_third_block() {
+        // 透传 = 加工层不动 body（`PromptChoice::apply` 返回 None），客户端那份
+        // system 原样留在消息里，于是折进第 3 块是**唯一**保持 3 块的办法。
+        let blocks = assembled(&client_body());
+        assert_three(&blocks);
+        assert!(
+            joined(&blocks).contains(CLIENT_TEXT),
+            "透传必须把客户端正文送出去（折进第 3 块，不是丢掉）"
+        );
+    }
+
+    #[test]
+    fn replace_mode_keeps_the_gateway_text_and_drops_the_client_one() {
+        let replaced = rewrite(&client_body(), GATEWAY_TEXT).expect("替换模式应产出副本");
+        let blocks = assembled(&replaced);
+        assert_three(&blocks);
+        let text = joined(&blocks);
+        assert!(text.contains(GATEWAY_TEXT), "替换模式的正文必须送到：{text}");
+        assert!(
+            !text.contains(CLIENT_TEXT),
+            "替换模式删掉客户端 system 这件事不能被折块改回去"
+        );
+    }
+
+    #[test]
+    fn append_mode_keeps_both_gateway_and_client_text_in_three_blocks() {
+        let appended = append(&client_body(), GATEWAY_TEXT).expect("追加模式应产出副本");
+        let blocks = assembled(&appended);
+        assert_three(&blocks);
+        let text = joined(&blocks);
+        assert!(text.contains(GATEWAY_TEXT), "追加的网关正文必须送到：{text}");
+        assert!(
+            text.contains(CLIENT_TEXT),
+            "追加模式保留客户端正文这件事不能被折块改回去"
+        );
+    }
+
+    #[test]
+    fn a_client_array_system_still_yields_three_blocks_without_its_cache_control() {
+        // 客户端自带的块数组（Anthropic 形态、自带断点）也是外来正文：折进第 3
+        // 块，断点丢弃（断点预算由装配统一管，客户端可能已经带满 4 个）。
+        let existing = json!([
+            { "type": "text", "text": "客户端块一", "cache_control": { "type": "ephemeral" } },
+            { "type": "text", "text": "客户端块二" },
+        ]);
+        assert_eq!(
+            2,
+            user_system_texts(Some(&existing)).len(),
+            "两块外来正文都要认出来（漏一块等于悄悄丢客户端内容）"
+        );
+        let texts = GatewayBlocks {
+            identity: "身份".to_string(),
+            stable: "稳定".to_string(),
+            dynamic: "动态".to_string(),
+        };
+        let blocks = system_blocks(&texts, Some(&existing));
+        assert_three(&blocks);
+        let text = joined(&blocks);
+        assert!(text.contains("客户端块一") && text.contains("客户端块二"));
+    }
+
+    #[test]
+    fn no_client_system_is_still_exactly_three_blocks() {
+        let body = json!({
+            "model": "glm-5.3",
+            "stream": true,
+            "messages": [{ "role": "user", "content": "只回一个字" }],
+        });
+        assert_three(&assembled(&body));
+    }
+}
+
+#[cfg(test)]
+mod live_upstream {
+    //! 真发一次上游：**用本机 ZCode 客户端登录态里的套餐 JWT**，走生产装配函数
+    //! [`build_request`]，断言上游收下（200）。
+    //!
+    //! 为什么值得留一条实连用例：3012 那一类拦截**只在真上游判定**，本地怎么断言
+    //! 都只是「形状对了」。而这条用例的请求体**带客户端 system**（透传模式的常态）
+    //! —— 修复前它会变成第 4 块、被 405/3012 拦下，修复后折进第 3 块才 200。
+    //! 也就是说它跑绿 = 这次修复在上游那里是真的。
+    //!
+    //! 默认**不跑**（`#[ignore]`）：用真实账号、真实网络、真实额度（每次一两个
+    //! token）。人工验收时的跑法：
+    //!
+    //! ```text
+    //! cargo test -p agent2api-server --locked zcode::plan::live_upstream -- --ignored --nocapture
+    //! ```
+    //!
+    //! JWT 取值顺序：环境变量 `ZCODE_LIVE_JWT` → 本机客户端配置
+    //! （`~/.zcode/v2/config.json` 的 `provider["builtin:zai-start-plan"].options.apiKey`）。
+    //! 两处都没有时用例**跳过**（打印原因后返回），不 panic —— 换台没装客户端的机器
+    //! 跑全量测试不该因此变红。
+
+    use std::time::Duration;
+
+    use axum::http::HeaderMap;
+    use serde_json::{json, Value};
+
+    use super::super::region::Region;
+    use super::build_request;
+    use crate::server::core::providers::zcode::captcha;
+
+    const MODEL: &str = "glm-5.3-flash";
+
+    /// 本机客户端的套餐 JWT（找不到就是 `None`）。
+    fn local_plan_jwt() -> Option<String> {
+        if let Ok(jwt) = std::env::var("ZCODE_LIVE_JWT") {
+            let jwt = jwt.trim().to_string();
+            if !jwt.is_empty() {
+                return Some(jwt);
+            }
+        }
+        let home = std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .ok()?;
+        let path = std::path::Path::new(&home)
+            .join(".zcode")
+            .join("v2")
+            .join("config.json");
+        let text = std::fs::read_to_string(path).ok()?;
+        let config: Value = serde_json::from_str(&text).ok()?;
+        config
+            .get("provider")
+            .and_then(|provider| provider.get("builtin:zai-start-plan"))
+            .and_then(|entry| entry.get("options"))
+            .and_then(|options| options.get("apiKey"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|jwt| !jwt.is_empty())
+            .map(str::to_string)
+    }
+
+    #[test]
+    #[ignore = "实连上游：用真实账号与真实额度，人工验收时显式跑"]
+    fn the_upstream_accepts_a_request_that_carries_a_client_system() {
+        let Some(jwt) = local_plan_jwt() else {
+            eprintln!("跳过：本机没有 ZCode 套餐登录态（设 ZCODE_LIVE_JWT 或先登录客户端）");
+            return;
+        };
+        // 人机验证：上游当前口径是「推理不必附令牌」（见模块头），这里显式关掉，
+        // 免得用例因为令牌池为空而走本地 556 分支 —— 那测的就不是上游了。
+        assert!(captcha::set_required(false), "临时切到免码口径");
+        // 带客户端 system：透传模式的常态，也正是修复前会多出第 4 块的那种请求。
+        let body = json!({
+            "model": MODEL,
+            "stream": false,
+            "max_tokens": 16,
+            "messages": [
+                { "role": "system", "content": "你是测试助手，只回一个字。" },
+                { "role": "user", "content": "只回一个字：好" },
+            ],
+        });
+        let plan = build_request(
+            Region::Intl,
+            &json!({ "jwt": jwt, "deviceMid": "live-upstream-test", "zcodePlan": "start-plan" }),
+            &body,
+            &HeaderMap::new(),
+        )
+        .expect("装配不该失败");
+        let blocks = plan
+            .body
+            .get("system")
+            .and_then(Value::as_array)
+            .expect("system 必须是块数组");
+        assert_eq!(3, blocks.len(), "发出去之前就得是 3 块（多一块必被 3012 拦）");
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        for (name, value) in &plan.headers {
+            let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                .expect("头名合法");
+            headers.insert(name, reqwest::header::HeaderValue::from_str(value).expect("头值合法"));
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("建 tokio 运行时");
+        let (status, text) = runtime.block_on(async move {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(60))
+                .build()
+                .expect("建 HTTP 客户端");
+            let response = client
+                .post(&plan.url)
+                .headers(headers)
+                .json(&plan.body)
+                .send()
+                .await
+                .expect("请求上游");
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            (status, text)
+        });
+        let snippet: String = text.chars().take(400).collect();
+        assert_eq!(
+            200,
+            status.as_u16(),
+            "上游没接受这份装配（块数 3）。响应：{snippet}"
+        );
+        assert!(
+            text.contains("usage") || text.contains("content"),
+            "200 但没有正文，说明装配仍有问题：{snippet}"
+        );
+        eprintln!("上游 200：{}", text.chars().take(200).collect::<String>());
+        // 复原全局口径，别影响同进程其它用例
         assert!(captcha::set_required(true));
     }
 }

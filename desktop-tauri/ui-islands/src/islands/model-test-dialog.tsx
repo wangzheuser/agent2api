@@ -156,11 +156,21 @@ const SOURCE_LABEL: Record<string, string> = {
 }
 
 /**
- * 失败原因 → 下一步。**只按 HTTP 状态分类**，不猜上游的文案：429 与 401 指向完全不同的处置
+ * 失败原因 → 下一步。分类以 HTTP 状态为准，**只在 3012 这一条上看文案**：
+ * 上游把「风控拦截」塞进 405 + 一句 `unusual activity`，与「路径不认识」共用一个
+ * 状态码，但处置完全相反（一个换出口、一个查映射）。429 与 401 也指向不同处置
  * （一个等一会儿自己会好，一个换账号也救不回来），5xx / 404 又是另外两件事。
  * 后端给的 `error` 原样展示在上一行，这里只补「接下来做什么」。
  */
-const STATUS_HINT: Array<{ test: (status: number) => boolean; hint: string }> = [
+const STATUS_HINT: Array<{ test: (status: number, message: string) => boolean; hint: string }> = [
+  {
+    test: (status, message) => status === 405 && /unusual activity|3012/i.test(message),
+    hint: '上游风控拦了这次请求（ZCode 3012）：换一个网络出口再测（关掉代理或换节点），先别连点重试 —— 重复重试会延长冷却；也可以把这条账号切到编码套餐，确认登录态本身没坏。',
+  },
+  {
+    test: status => status === 405,
+    hint: '上游不认这个请求形态（405）：先确认这条通道的端点与协议没被映射表改掉，再测一次。',
+  },
   {
     test: status => status === 429,
     hint: '该账号对这个模型正在限额冷却，等一会儿自己会好；也可以先测别的账号。',
@@ -501,7 +511,8 @@ export function ModelTestDialog({ target, onClose }: { target: ModelTestTarget; 
     const result = slot.result
     if (!isOk(slot)) {
       const status = Number(result?.status) || 0
-      const hint = STATUS_HINT.find(item => item.test(status))?.hint
+      const message = String(result?.error ?? '')
+      const hint = STATUS_HINT.find(item => item.test(status, message))?.hint
         ?? (slot.transport ? '确认桌面端还在运行，再重试一次。' : '')
       return (
         <div key={slot.testId} className='rounded-md border border-border bg-surface-2'>
