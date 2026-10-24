@@ -43,7 +43,8 @@ use serde_json::{json, Map, Value};
 use crate::server::logging;
 
 pub use version::{
-    assert_downloadable, compare_versions, installer_kind, pick_installer, safe_file_name,
+    assert_downloadable, compare_versions, installer_kind, parse_version, pick_installer,
+    safe_file_name,
     UpdateError, DEFAULT_REPO, GITHUB_API, MAX_INSTALLER_BYTES,
 };
 /// 「更新设置」弹窗的 GitHub 令牌接口（api::update 走这两条；加解密本体

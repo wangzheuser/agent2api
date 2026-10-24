@@ -125,6 +125,7 @@ pub(super) async fn refresh(
     credential: Option<&str>,
     proxy: Option<&ResolvedProxy>,
 ) -> Result<(usize, bool), GatewayError> {
+    super::claim::refresh_app_version().await;
     let url = format!(
         "{}{AGENT_CONFIGS_PATH}?app_version={}&platform={}",
         region.zcode_origin(),

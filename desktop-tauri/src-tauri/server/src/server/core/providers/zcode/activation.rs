@@ -92,6 +92,7 @@ pub async fn report(
     device_mid: &str,
     proxy: Option<&ResolvedProxy>,
 ) -> Result<(), String> {
+    super::claim::refresh_app_version().await;
     let user_id = user_id.trim();
     if user_id.is_empty() {
         return Err(

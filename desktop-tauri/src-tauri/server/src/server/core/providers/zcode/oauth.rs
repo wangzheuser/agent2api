@@ -88,6 +88,7 @@ impl CliLogin {
     /// 登录时机还没有任何账号上下文，因此**直连**（与其余各家的登录链路
     /// 同一取舍：账号级代理是给转发长请求准备的出口）。
     pub async fn start(region: Region) -> Result<Self, GatewayError> {
+        super::claim::refresh_app_version().await;
         let poll_token = random_hex_32();
         let url = format!("{}/api/v1/oauth/cli/init", region.zcode_origin());
         let headers: Vec<(String, String)> = vec![

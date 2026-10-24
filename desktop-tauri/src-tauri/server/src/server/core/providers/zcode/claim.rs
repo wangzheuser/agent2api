@@ -58,11 +58,15 @@
 //! ── 硬约束 ──────────────────────────────────────────────────
 //! release 是 `panic=abort`：本文件零 unwrap/expect/panic。
 
+use regex::Regex;
 use serde_json::{json, Value};
+use std::sync::{Mutex, OnceLock};
 
 use crate::server::core::auth_http::send_raw;
 use crate::server::core::proxies::ResolvedProxy;
+use crate::server::core::update::client::{fetch_public, github_headers};
 use crate::server::errors::GatewayError;
+use crate::server::logging;
 
 use super::region::Region;
 
@@ -76,14 +80,169 @@ const REQUEST_TIMEOUT_MS: u64 = 15_000;
 ///
 /// 上游拿它判「这个客户端够不够新」（`1004 ineligible` 就包含版本不达标），
 /// 活动也可能要求最低版本。参考实现把它做成配置项（`identity.appVersion`，
-/// 环境变量 `ZCODE_APP_VERSION` 可覆盖），默认值是 **ZCode 客户端当前版本**
-/// `3.14.0`。
+/// 环境变量 `ZCODE_APP_VERSION` 可覆盖）。没有覆盖时，进入 ZCode 低频入口后按
+/// 「官方下载安装页 → GitHub Release → GitHub main/package.json」取第一份有效值；
+/// 网络不可用时回落到最后一次成功值和 `3.16.3`。
 ///
 /// ★ 别拿参考项目自己的版本号（它 `package.json` 里那个 `4.6.9`）—— 那个数字
 /// 冒充不了客户端，`app_version` 与 `X-ZCode-App-Version` 都会对不上，症状是
 /// 领取被判 `1004 ineligible`（而这看起来像「账号没资格」，极易误判）。
 /// 上游抬门槛时用户可以用环境变量覆盖，不必等发版。
-const DEFAULT_APP_VERSION: &str = "3.14.0";
+const DEFAULT_APP_VERSION: &str = "3.16.3";
+const APP_VERSION_REFRESH_MS: i64 = 30 * 60_000;
+const OFFICIAL_DOWNLOAD_PAGE: &str = "https://zcode.z.ai/cn";
+const GITHUB_RELEASE: &str = "https://api.github.com/repos/zai-org/ZCode/releases/latest";
+const GITHUB_MAIN_PACKAGE: &str =
+    "https://raw.githubusercontent.com/zai-org/ZCode/main/package.json";
+
+#[derive(Clone, Debug)]
+struct AppVersionCache {
+    version: String,
+    checked_at_ms: i64,
+}
+
+static APP_VERSION_CACHE: OnceLock<Mutex<Option<AppVersionCache>>> = OnceLock::new();
+
+fn app_version_cache() -> &'static Mutex<Option<AppVersionCache>> {
+    APP_VERSION_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn normalize_dynamic_version(value: &str) -> Option<String> {
+    let [major, minor, patch] = crate::server::core::update::parse_version(value)?;
+    Some(format!("{major}.{minor}.{patch}"))
+}
+
+fn configured_app_version() -> Option<String> {
+    std::env::var("ZCODE_APP_VERSION")
+        .ok()
+        .and_then(|value| normalize_dynamic_version(value.trim()))
+}
+
+fn parse_official_download_page(html: &str) -> Option<String> {
+    let html = html.replace("\\\"", "\"");
+    let pattern = Regex::new(r#""version"\s*:\s*"([^"]+)""#).ok()?;
+    let mut highest: Option<String> = None;
+    for capture in pattern.captures_iter(&html) {
+        let Some(candidate) = capture
+            .get(1)
+            .and_then(|value| normalize_dynamic_version(value.as_str()))
+        else {
+            continue;
+        };
+        if highest
+            .as_deref()
+            .and_then(|current| crate::server::core::update::compare_versions(&candidate, current))
+            .map(|order| order > 0)
+            .unwrap_or(true)
+        {
+            highest = Some(candidate);
+        }
+    }
+    highest
+}
+
+fn parse_github_release(payload: &Value) -> Option<String> {
+    payload
+        .get("tag_name")
+        .and_then(Value::as_str)
+        .and_then(normalize_dynamic_version)
+}
+
+fn parse_github_package(payload: &Value) -> Option<String> {
+    payload
+        .get("version")
+        .and_then(Value::as_str)
+        .and_then(normalize_dynamic_version)
+}
+
+async fn fetch_public_text(url: &str, headers: &[(String, String)]) -> Result<String, String> {
+    let response = fetch_public(url, headers, Some(REQUEST_TIMEOUT_MS)).await?;
+    if !response.status().is_success() {
+        return Err(format!("HTTP {}", response.status()));
+    }
+    response
+        .text()
+        .await
+        .map_err(|error| format!("读取响应失败: {error}"))
+}
+
+/// 按固定来源优先级刷新客户端版本，不跨来源取最大值。
+pub async fn refresh_app_version() -> String {
+    if let Some(version) = configured_app_version() {
+        return version;
+    }
+
+    let now = logging::now_ms();
+    let cached = match app_version_cache().lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    if let Some(entry) = cached.as_ref() {
+        if now.saturating_sub(entry.checked_at_ms) < APP_VERSION_REFRESH_MS {
+            return entry.version.clone();
+        }
+    }
+
+    let official_headers = vec![(
+        "User-Agent".to_string(),
+        "agent2api-local-proxy".to_string(),
+    )];
+    let github_headers = github_headers();
+    let mut resolved: Option<(&str, String)> = None;
+
+    if let Ok(body) = fetch_public_text(OFFICIAL_DOWNLOAD_PAGE, &official_headers).await {
+        if let Some(version) = parse_official_download_page(&body) {
+            resolved = Some(("官方下载安装页", version));
+        }
+    }
+    if resolved.is_none() {
+        if let Ok(body) = fetch_public_text(GITHUB_RELEASE, &github_headers).await {
+            if let Ok(payload) = serde_json::from_str::<Value>(&body) {
+                if let Some(version) = parse_github_release(&payload) {
+                    resolved = Some(("GitHub releases/latest", version));
+                }
+            }
+        }
+    }
+    if resolved.is_none() {
+        if let Ok(body) = fetch_public_text(GITHUB_MAIN_PACKAGE, &github_headers).await {
+            if let Ok(payload) = serde_json::from_str::<Value>(&body) {
+                if let Some(version) = parse_github_package(&payload) {
+                    resolved = Some(("GitHub main/package.json", version));
+                }
+            }
+        }
+    }
+
+    let (source, version) = resolved.unwrap_or_else(|| {
+        (
+            "缓存/兜底",
+            cached
+                .map(|entry| entry.version)
+                .unwrap_or_else(|| DEFAULT_APP_VERSION.to_string()),
+        )
+    });
+    match app_version_cache().lock() {
+        Ok(mut guard) => {
+            *guard = Some(AppVersionCache {
+                version: version.clone(),
+                checked_at_ms: now,
+            });
+        }
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            *guard = Some(AppVersionCache {
+                version: version.clone(),
+                checked_at_ms: now,
+            });
+        }
+    }
+    logging::verbose(
+        "[ZCode]",
+        &format!("客户端版本解析为 {version}（来源：{source}）"),
+    );
+    version
+}
 
 /// 探测与领取的路径（参考实现 `client.ts` 的常量）
 const PREVIEW_PATH: &str = "/api/v1/zcode-plan/billing/preview";
@@ -159,6 +318,7 @@ pub async fn captcha_config(
     region: Region,
     proxy: Option<&ResolvedProxy>,
 ) -> Result<Option<CaptchaConfig>, GatewayError> {
+    refresh_app_version().await;
     let url = format!(
         "{}{CLIENT_CONFIGS_PATH}?app_version={}&platform={}",
         region.zcode_origin(),
@@ -196,11 +356,20 @@ pub fn captcha_hint(config: &CaptchaConfig) -> String {
 
 /// 客户端版本号（`ZCODE_APP_VERSION` 可覆盖）
 pub fn app_version() -> String {
-    std::env::var("ZCODE_APP_VERSION")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_APP_VERSION.to_string())
+    if let Some(version) = configured_app_version() {
+        return version;
+    }
+    match app_version_cache().lock() {
+        Ok(guard) => guard
+            .as_ref()
+            .map(|entry| entry.version.clone())
+            .unwrap_or_else(|| DEFAULT_APP_VERSION.to_string()),
+        Err(poisoned) => poisoned
+            .into_inner()
+            .as_ref()
+            .map(|entry| entry.version.clone())
+            .unwrap_or_else(|| DEFAULT_APP_VERSION.to_string()),
+    }
 }
 
 /// 平台标识（参考实现的 `${process.platform}-${process.arch}`）。
@@ -451,6 +620,7 @@ pub async fn preview(
     device_mid: Option<&str>,
     proxy: Option<&ResolvedProxy>,
 ) -> Result<PreviewOutcome, GatewayError> {
+    refresh_app_version().await;
     let url = format!(
         "{}{PREVIEW_PATH}?app_version={}&platform={}",
         region.zcode_origin(),
@@ -520,6 +690,7 @@ pub async fn claim(
     device_mid: Option<&str>,
     proxy: Option<&ResolvedProxy>,
 ) -> Result<ClaimOutcome, GatewayError> {
+    refresh_app_version().await;
     if jwt.trim().is_empty() {
         return Ok(ClaimOutcome::Failed {
             plan_id: plan_id.to_string(),
@@ -786,6 +957,42 @@ mod tests {
         );
         assert_eq!(business_code(&json!({"code": "not-a-code"})), None);
     }
+
+    #[test]
+    fn normalizes_client_build_versions() {
+        assert_eq!(
+            normalize_dynamic_version("3.16.3"),
+            Some("3.16.3".to_string())
+        );
+        assert_eq!(
+            normalize_dynamic_version("3.16.3.8992"),
+            Some("3.16.3".to_string())
+        );
+        assert_eq!(normalize_dynamic_version("not-a-version"), None);
+    }
+
+    #[test]
+    fn official_page_parser_uses_highest_embedded_release() {
+        let html = r#"{"version":"3.14.0"} \"version\":\"3.16.3\" {"version":"bad"}"#;
+        assert_eq!(
+            parse_official_download_page(html),
+            Some("3.16.3".to_string())
+        );
+    }
+
+    #[test]
+    fn github_parsers_read_the_expected_fields() {
+        assert_eq!(
+            parse_github_release(&json!({"tag_name": "v3.14.3"})),
+            Some("3.14.3".to_string())
+        );
+        assert_eq!(
+            parse_github_package(&json!({"version": "3.16.2"})),
+            Some("3.16.2".to_string())
+        );
+        assert_eq!(parse_github_release(&json!({"name": "3.14.3"})), None);
+    }
+
 }
 
 

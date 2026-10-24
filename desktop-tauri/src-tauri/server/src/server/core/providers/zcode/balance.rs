@@ -131,6 +131,7 @@ pub(super) async fn query_usage(
     store: &AccountStore,
     account_id: &str,
 ) -> Result<Value, GatewayError> {
+    claim::refresh_app_version().await;
     let record = store.zcode_account_record(account_id).ok_or_else(|| {
         GatewayError::with_status(404, "找不到该 ZCode 账号".to_string())
     })?;
