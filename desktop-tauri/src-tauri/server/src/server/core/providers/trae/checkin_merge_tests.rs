@@ -552,6 +552,7 @@ async fn trae_e2e_checkin_renews_with_device_proof_then_claims_on_the_stored_dev
 
     // 签到三发：同一设备号、空体。
     for request in &requests[1..] {
+        assert_eq!(request.method, "POST", "签到端点一律 POST");
         assert_eq!(request.headers["x-device-id"], "6273884102398761");
         assert_eq!(request.body, "{}", "签到体恒为空对象");
         assert_eq!(

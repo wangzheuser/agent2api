@@ -158,30 +158,6 @@ pub(crate) fn max_concurrent_public(value: Option<&Value>) -> u64 {
     value.and_then(Value::as_u64).unwrap_or(0)
 }
 
-/// 公开形态出口的 `maxConcurrent`：在 [`max_concurrent_public`] 之上套上
-/// 「本家默认并发」的口径。
-///
-/// 只有 CodeArts 一家有默认值：它**没有「不限」这个选项**，记录上的 0（含从未
-/// 设置过）由上游解释成「按默认并发」（`providers::codearts::session::
-/// DEFAULT_SESSION_LIMIT`，准入闸 `SessionGate::limit_for` 读的是同一个数），
-/// 所以公开形态要报出 3 而不是 0 —— 否则选路读到的 0 等于不限，
-/// `routing::at_concurrency_limit` 不会在本家满员时跳过这个账号，请求照发、
-/// 第 4 个被上游回 **409**，而 409 是账号级冲突、不触发降级换号，客户端拿到一个
-/// 「明明有别家空着却报错」的结果。
-///
-/// 别家 0 就是 0（不限）—— 两家的差别只在这一个函数里，各家的公开形态
-/// 不必各写一遍。
-pub(crate) fn max_concurrent_public_for(provider: &str, value: Option<&Value>) -> u64 {
-    let configured = max_concurrent_public(value);
-    if provider == super::codearts_accounts::CODEARTS_PROVIDER_ID {
-        configured.max(
-            crate::server::core::providers::codearts::session::DEFAULT_SESSION_LIMIT as u64,
-        )
-    } else {
-        configured
-    }
-}
-
 /// 取对象成员；非对象（含数组）一律当空表 —— 对 `payload.auth` / `payload.account`
 /// 这类访问而言，与 Node 读出 undefined 的结果等价。
 pub(super) fn object_or_empty(value: Option<&Value>) -> Map<String, Value> {

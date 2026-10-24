@@ -1,8 +1,14 @@
 //! 活跃保活必须收到有效回答并正常结束；HTTP 200 或读到 EOF 都不代表成功。
 
+#[cfg(test)]
 use futures::StreamExt;
 use serde_json::Value;
 
+/// 测试辅助：把整个响应体读进内存，再交给 [`validate_activity_sse`]。
+///
+/// 生产路径是 [`super::activity::consume_workbuddy_activity_response`]，它是这里
+/// 的超集（1MB 上限 + 错误分类 + 同一套末尾校验），所以这个简化版只留在测试里。
+#[cfg(test)]
 pub(super) async fn consume_activity_response(
     response: reqwest::Response,
     max_bytes: usize,

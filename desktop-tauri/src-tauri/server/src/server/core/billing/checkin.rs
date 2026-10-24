@@ -190,21 +190,6 @@ fn is_available(account: &Value) -> bool {
         .unwrap_or(true)
 }
 
-/// 这条会话是不是企业版账号（`account.enterpriseId` 非空）。
-///
-/// 企业版没有个人成长 / 补偿体系：上游对签到、活动补偿这类个人计费端点
-/// 固定回 400 code 10001（参考实现 workbuddy2api-panel 的 A/B 实测，
-/// 2026-10-07）。活动补偿那一步据此直接跳过，省一次注定失败的请求 ——
-/// 判据只此一份，与 `AuthService`「enterpriseId 为 null 就不显示企业标记」
-/// 同一口径（空串按个人版处理）。
-fn is_enterprise_session(session: &Value) -> bool {
-    session
-        .get("account")
-        .and_then(|account| account.get("enterpriseId"))
-        .and_then(Value::as_str)
-        .is_some_and(|value| !value.is_empty())
-}
-
 /// 账号列表快照（`store.listAccounts().accounts`）
 fn accounts_of(store: &AccountStore) -> Vec<Value> {
     store

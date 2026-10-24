@@ -204,9 +204,6 @@ pub(crate) fn is_monkeycode_family(provider_id: &str) -> bool {
     provider_id == MONKEYCODE_PROVIDER_ID || provider_id == MONKEYCODE_INTL_PROVIDER_ID
 }
 
-pub(crate) const QODER_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
-    crate::server::core::providers::ProviderKind::Qoder,
-);
 /// OfficeAce（华为云果办 / OfficeClaw）provider id（从注册表推导）。
 pub(crate) const OFFICEACE_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
     crate::server::core::providers::ProviderKind::OfficeAce,

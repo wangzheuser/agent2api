@@ -11,12 +11,6 @@ use server::db::{schema, Db};
 #[path = "../src/server/core/account_store/store_util.rs"]
 pub(crate) mod store_util;
 
-// `store_util.rs` is loaded as a frozen source fixture below. Keep only the
-// provider constants needed to type-check unrelated helpers in that fixture.
-mod codearts_accounts {
-    pub const CODEARTS_PROVIDER_ID: &str = "codearts";
-}
-
 mod server {
     pub use agent2api_server::server::{config, db, logging};
 
@@ -25,13 +19,6 @@ mod server {
         pub mod account_store {
             pub(crate) use crate::store_util;
             pub use agent2api_server::server::core::account_store::state;
-        }
-        pub mod providers {
-            pub mod codearts {
-                pub mod session {
-                    pub const DEFAULT_SESSION_LIMIT: usize = 3;
-                }
-            }
         }
     }
 }

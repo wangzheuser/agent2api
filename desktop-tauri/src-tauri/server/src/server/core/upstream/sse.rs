@@ -696,7 +696,6 @@ mod tests {
         assert!(text.contains("\"completion_tokens\":4"));
     }
 
-    use super::*;
     use serde_json::json;
 
     fn raw(value: Value) -> String {

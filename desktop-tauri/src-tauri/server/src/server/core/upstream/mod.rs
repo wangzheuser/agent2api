@@ -92,7 +92,7 @@ use crate::server::errors::GatewayError;
 use crate::server::logging;
 
 use self::connections::{ConnectionGuard, Connections};
-use self::sse::{FramePolicy, ModelRewrite, ReasoningCoalescer};
+use self::sse::{FramePolicy, ReasoningCoalescer};
 
 #[cfg(test)]
 mod capture_tests;
@@ -594,12 +594,17 @@ impl ForwardStream {
         stream
     }
 
+    /// 仅测试用：把「未翻译的原始流」包成带模型回写的 `ForwardStream`。
+    ///
+    /// 生产路径一律走 [`Self::from_translated`]（各家的协议适配层先翻译成标准
+    /// chat SSE 再进来），所以这个便利构造只在测试里用。
+    #[cfg(test)]
     pub(super) fn from_stream(
         inner: futures::stream::BoxStream<'static, Result<Bytes, std::io::Error>>,
         slot: Option<InFlightGuard>,
         connection: ConnectionGuard,
         telemetry: Arc<usage::RequestTelemetry>,
-        model_rewrite: Option<ModelRewrite>,
+        model_rewrite: Option<sse::ModelRewrite>,
     ) -> Self {
         let guarded = stall::idle_guard(
             inner,
