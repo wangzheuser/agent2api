@@ -64,6 +64,28 @@
 .asst-model-pick .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-3); flex: none; }
 .asst-model-pick .dot.ok { background: var(--ok); }
 
+/* 模型下拉浮层：宽度按最长模型名展开（SelectContent 自带 min-w 跟随触发器，
+   这里只放开上限，超出视口时回到收缩布局）。条目内的 ItemText 自带 truncate，
+   会把长模型名截断 —— 在浮层里放开它，保证「模型名称能完全显示」。 */
+.asst-model-menu { width: max-content; max-width: min(92vw, 560px); }
+.asst-model-menu [data-slot='select-item'] > :first-child {
+  overflow: visible;
+  text-overflow: clip;
+}
+/* 浮层 Portal 在 body 下，.asst-model-pick .mono 够不到，这里单独给字体 */
+.asst-model-menu .mono { font-family: var(--font-mono); font-size: 11.5px; }
+/* 「免费」徽标：free（credits 倍率为 0）的模型排在前面，加个角标便于辨认 */
+.asst-model-free {
+  flex: none;
+  margin-left: 8px;
+  padding: 1px 5px;
+  border-radius: 999px;
+  background: var(--ok-soft);
+  color: var(--ok);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
 /* ─── 消息区 ─── */
 .asst-scroll {
   flex: 1;

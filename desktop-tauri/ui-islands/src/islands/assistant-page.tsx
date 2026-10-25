@@ -30,12 +30,13 @@ import {
   DEFAULT_SYSTEM_PROMPT,
   gatewayBase,
   loadAssistantConfig,
-  loadModelNames,
+  loadModelOptions,
   parseToolArguments,
   saveAssistantConfig,
   streamChat,
   type AssistantConfig,
   type ChatMessage,
+  type ModelOption,
   type ToolCall,
 } from './assistant-state'
 import {
@@ -179,7 +180,7 @@ function ToolCard({ item, onConfirm }: { item: ToolCardItem; onConfirm: (run: bo
 
 function AssistantPage() {
   const [config, setConfig] = React.useState<AssistantConfig | null>(null)
-  const [models, setModels] = React.useState<string[]>([])
+  const [models, setModels] = React.useState<ModelOption[]>([])
   const [ui, setUi] = React.useState<UiMessage[]>([])
   const [busy, setBusy] = React.useState(false)
   const [awaiting, setAwaiting] = React.useState(false)
@@ -245,9 +246,9 @@ function AssistantPage() {
         setTimeout(() => { void activate() }, 4000)
       }
     }
-    // ② 模型清单（助手自己只能选「可请求的名字」：启用的模型 ID + 启用的映射名）
+    // ② 模型清单（助手只能选「可请求的名字」：口径 = /v1/models，免费的排前面）
     try {
-      setModels(await loadModelNames())
+      setModels(await loadModelOptions())
     } catch (error) {
       setStatus(prev => prev || t('读取模型清单失败：{message}', { message: errorText(error) }))
     }
@@ -503,7 +504,7 @@ function AssistantPage() {
       <div className='asst-top'>
         <Select value={currentModel ?? ''}
           onValueChange={value => void pickModel(String(value))}>
-          <SelectTrigger className='asst-model-pick' aria-label={t('对话模型')}>
+          <SelectTrigger className='asst-model-pick' aria-label={t('对话模型')} title={currentModel ?? undefined}>
             <SelectValue>
               {currentModel
                 ? <span className='flex items-center gap-2'>
@@ -513,11 +514,12 @@ function AssistantPage() {
                 : t('选择模型…')}
             </SelectValue>
           </SelectTrigger>
-          <SelectContent>
+          <SelectContent className='asst-model-menu'>
             {models.length === 0 && <SelectItem value='none' disabled>{t('没有可用的模型')}</SelectItem>}
-            {models.map(name => (
-              <SelectItem key={name} value={name}>
-                {name}
+            {models.map(option => (
+              <SelectItem key={option.name} value={option.name}>
+                <span className='mono'>{option.name}</span>
+                {option.free && <span className='asst-model-free'>{t('免费')}</span>}
               </SelectItem>
             ))}
           </SelectContent>

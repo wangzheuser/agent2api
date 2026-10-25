@@ -139,48 +139,94 @@ export type AssistantConfig = {
   tools: Record<string, boolean>
 }
 
+/** 选择器里的一项：`name` 是对外模型名（可直接发请求），`free` = 倍率为 0 */
+export type ModelOption = { name: string; free: boolean }
+
+/** credits 展示串（"x0.0"、"x0 credits"、"x0.5 credits"、"低"…）→ 倍率数字；
+ *  读不出数字给 NaN（不算免费）。空串 / null 同样按「未声明」处理。 */
+function creditMultiplier(raw: unknown): number {
+  if (typeof raw !== 'string') return Number.NaN
+  const matched = raw.trim().match(/^x\s*(\d+(?:\.\d+)?)/i)
+  return matched ? Number.parseFloat(matched[1]) : Number.NaN
+}
+
 /**
- * 从壳的桥组装**对外可请求的模型名列表**（选择器的数据源）。
+ * 组装**对外可请求的模型名列表**（选择器的数据源），口径 = `/v1/models`。
  *
- * 口径与 `/v1/models` 对齐（那就是客户端能请求的名字）：
- *   · 已启用模型的 ID（默认绑定）；
- *   · 已启用模型之上的**已启用映射名**（用户建的 `ca/xxx` 这类，同样可请求）。
- * 走桥而不是直连 `/v1/models`：桥在桌面形态稳定可用（其它页面全在用它），
- * 而直连 fetch 是助手自己的通道，配置接口不通时列表没必要跟着陪葬。
+ * 不直接 fetch `/v1/models`：那条挂在 `/v1/*` 上，吃网关的 CORS 开关 —— 开关
+ * 关着时桌面形态（跨源）连预检都过不去，整个选择器会整表失败。所以继续走桥
+ * 的 `getModelManage`（面板路由，无条件 CORS），在本地把 `/v1/models` 的广告
+ * 口径复算一遍。镜像的是 `catalog::public_builtin_items` + `builtin_target`
+ * （改后端口径时必须同步这里）：
+ *   · 默认绑定：`enabled === true` 的模型行 → 广告它的原始 ID；
+ *   · 别名：`enabled === true` 且 alias ≠ target 的映射，且指向的 target 能在
+ *     该家当前清单里解析（先按原始 ID、再按展示名）—— **不要求目标行启用**，
+ *     这正是 /v1/models 比旧的「严格启用」口径宽的那部分；
+ *   · 跨家按对外名小写去重，先到先得（models[] 已按家分组、家序即广告序）。
+ * 每项附带 free（credits 倍率为 0），列表按免费优先排序。
  */
-export async function loadModelNames(): Promise<string[]> {
-  const bridge = (window as unknown as {
+export async function loadModelOptions(): Promise<ModelOption[]> {
+  const bridgeApi = (window as unknown as {
     workbuddyDesktop?: { getModelManage?: () => Promise<unknown> }
   }).workbuddyDesktop
-  const manage = (await bridge?.getModelManage?.()) as {
+  const manage = (await bridgeApi?.getModelManage?.()) as {
     models?: Array<Record<string, unknown>>
     mappings?: Array<Record<string, unknown>>
   } | undefined
-  const models = Array.isArray(manage?.models) ? manage.models : []
+  const rows = Array.isArray(manage?.models) ? manage.models : []
   const mappings = Array.isArray(manage?.mappings) ? manage.mappings : []
-  // 先记「provider×id 是启用的」—— 映射名能不能请求，取决于它指向的模型开没开
-  const enabledKeys = new Set<string>()
-  const names: string[] = []
-  const seen = new Set<string>()
-  for (const row of models) {
-    if (row.enabled !== true) continue
-    const provider = String(row.provider ?? '')
-    const id = String(row.id ?? '')
+
+  // 每家一张可解析表（原始 ID 与展示名 → 行）。manage_view 只含**当前可用**
+  // 的提供商（有启用账号的家），与 /v1/models 逐家广告的范围一致
+  const perProvider = new Map<string, {
+    byId: Map<string, Record<string, unknown>>
+    byName: Map<string, Record<string, unknown>>
+  }>()
+  for (const row of rows) {
+    const provider = typeof row.provider === 'string' ? row.provider : ''
+    const id = typeof row.id === 'string' ? row.id : ''
     if (!provider || !id) continue
-    enabledKeys.add(`${provider}\u0001${id}`)
-    if (!seen.has(id)) { seen.add(id); names.push(id) }
+    let table = perProvider.get(provider)
+    if (!table) {
+      table = { byId: new Map(), byName: new Map() }
+      perProvider.set(provider, table)
+    }
+    if (!table.byId.has(id)) table.byId.set(id, row)
+    const name = typeof row.name === 'string' ? row.name : ''
+    if (name && !table.byName.has(name)) table.byName.set(name, row)
   }
-  for (const mapping of mappings) {
-    if (mapping.enabled !== true || mapping.isDefault === true) continue
-    const provider = String(mapping.provider ?? '')
-    const target = String(mapping.target ?? '')
-    const alias = String(mapping.alias ?? '')
-    if (!alias || !seen.has(alias) && enabledKeys.has(`${provider}\u0001${target}`)) {
-      seen.add(alias)
-      names.push(alias)
+
+  const options: ModelOption[] = []
+  const seen = new Set<string>()
+  const advertise = (name: string, credits: unknown): void => {
+    if (!name || seen.has(name)) return
+    seen.add(name)
+    options.push({ name, free: creditMultiplier(credits) === 0 })
+  }
+
+  // ① 默认绑定：行启用 = 广告原始 ID（/v1/models 的 default 分支）
+  for (const row of rows) {
+    if (row.enabled !== true) continue
+    advertise(String(row.id ?? ''), row.credits)
+  }
+  // ② 别名：启用映射 + 目标能在该家清单解析（/v1/models 的 alias 分支）。
+  //    provider 为空 = 通配所有家（Rust 侧 mapping.provider == None 的语义）
+  for (const [provider, table] of perProvider) {
+    for (const mapping of mappings) {
+      if (mapping.enabled !== true || mapping.isDefault === true) continue
+      const owner = mapping.provider
+      if (owner != null && owner !== provider) continue
+      const alias = String(mapping.alias ?? '')
+      const target = String(mapping.target ?? '')
+      if (!alias || alias === target) continue
+      const targetRow = table.byId.get(target) ?? table.byName.get(target)
+      if (targetRow) advertise(alias, targetRow.credits)
     }
   }
-  return names
+
+  // ③ 免费的排前面（稳定排序：组内保持广告序）
+  options.sort((a, b) => Number(b.free) - Number(a.free))
+  return options
 }
 
 /** 内置默认系统提示词（与后端 `DEFAULT_SYSTEM_PROMPT` 逐字相同：编辑弹窗里的

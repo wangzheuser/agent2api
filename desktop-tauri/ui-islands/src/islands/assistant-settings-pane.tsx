@@ -42,9 +42,10 @@ import { t } from '../i18n'
 import {
   DEFAULT_SYSTEM_PROMPT,
   loadAssistantConfig,
-  loadModelNames,
+  loadModelOptions,
   saveAssistantConfig,
   type AssistantConfig,
+  type ModelOption,
 } from './assistant-state'
 import { ASSISTANT_TOOLS, errorText, TOOL_META } from './assistant-tools'
 
@@ -71,7 +72,7 @@ function SwitchLine({ id, label, checked, disabled, onCheckedChange }: {
 
 export function AssistantSettingsPane() {
   const [config, setConfig] = React.useState<AssistantConfig | null>(null)
-  const [models, setModels] = React.useState<string[]>([])
+  const [models, setModels] = React.useState<ModelOption[]>([])
   const [status, setStatus] = React.useState('')
   const [failed, setFailed] = React.useState(false)
   const [busy, setBusy] = React.useState(false)
@@ -91,11 +92,11 @@ export function AssistantSettingsPane() {
         setFailed(true)
         setStatus(t('加载助手设置失败：{message}', { message: errorText(error) }))
       }
-      // ② 模型清单（走壳的桥，口径与 /v1/models 一致）：与 ① 各自独立 ——
+      // ② 模型清单（走壳的桥，口径 = /v1/models，免费的排前面）：与 ① 各自独立 ——
       //    配置读不到（后端版本旧）时，模型选择器仍应尽量把列表填上，
       //    两件事混在一个 try 里会一起废掉
       try {
-        const list = await loadModelNames()
+        const list = await loadModelOptions()
         if (!alive) return
         setModels(list)
       } catch (error) {
@@ -151,7 +152,7 @@ export function AssistantSettingsPane() {
         <div className='panel-body'>
           <div className='asst-row'>
             <label>{t('模型')}</label>
-            {/* 列表口径与 /v1/models 一致：能请求的名字（启用的模型 ID + 启用的映射名） */}
+            {/* 列表口径 = /v1/models：客户端能请求的名字（免费的排前面） */}
             <Select
               value={config?.model ?? ''}
               disabled={!ready || busy}
@@ -162,22 +163,23 @@ export function AssistantSettingsPane() {
                 void save({ ...config, model: name }, t('对话模型已切换'))
               }}
             >
-              <SelectTrigger className='asst-model-pick' aria-label={t('对话模型')}>
+              <SelectTrigger className='asst-model-pick' aria-label={t('对话模型')} title={config?.model ?? undefined}>
                 <SelectValue>
                   {config?.model ?? t('选择模型…')}
                 </SelectValue>
               </SelectTrigger>
-              <SelectContent>
+              <SelectContent className='asst-model-menu'>
                 {models.length === 0 && <SelectItem value='none' disabled>{t('没有可用的模型')}</SelectItem>}
-                {models.map(name => (
-                  <SelectItem key={name} value={name}>
-                    {name}
+                {models.map(option => (
+                  <SelectItem key={option.name} value={option.name}>
+                    <span className='mono'>{option.name}</span>
+                    {option.free && <span className='asst-model-free'>{t('免费')}</span>}
                   </SelectItem>
                 ))}
               </SelectContent>
             </Select>
             <span className='hint'>
-              {t('列表 = 模型管理页里所有已启用的模型。助手走本地网关发起对话，消耗所选账号的额度。')}
+              {t('列表 = 本地网关 /v1/models 广告的全部模型（免费的排前面）。助手走本地网关发起对话，消耗所选账号的额度。')}
             </span>
           </div>
         </div>
