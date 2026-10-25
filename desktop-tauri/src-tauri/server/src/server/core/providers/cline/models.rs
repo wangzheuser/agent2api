@@ -448,7 +448,7 @@ pub fn entries() -> Vec<ModelEntry> {
 /// `supportsToolCall` 是 wire 协议级事实（这家就是 agent 网关）；`supportsReasoning`
 /// 是上游字段 + 实测注记（见 `reasoning_for`）。
 fn to_raw(entry: &ModelEntry) -> Value {
-    json!({
+    let mut raw = json!({
         "id": entry.id,
         "name": entry.name,
         // 聚合层认这两个键名（见 shape.rs 的模块头）
@@ -457,7 +457,17 @@ fn to_raw(entry: &ModelEntry) -> Value {
         "supportsReasoning": entry.reasoning,
         "isDefault": false,
         "kind": "chat",
-    })
+    });
+    // 免费池要报免费：`credits` 是聚合目录与前端共用的倍率列（缺了就兜成
+    // 空串 = 未知），而免费池「分文不取」是实测事实（见模块头第 2 条），
+    // 不标出来客户端就认不出这批模型是免费的。形态对齐别家的零倍率
+    // （officeace/trae 的 `credits_text(0.0)` 都是 `"x0 credits"`，
+    // `growth::known_free` 认的也是这个串）。订阅池上游按量计费但没有
+    // 逐模型倍率，维持「不出键 = 未知」，不编一个数。
+    if entry.pool == Pool::Free {
+        raw["credits"] = Value::String("x0 credits".to_string());
+    }
+    raw
 }
 
 /// 某个池的模型清单（供聚合目录 / 路由判定）。
@@ -652,4 +662,79 @@ pub fn parse_recommended(payload: &Value) -> Vec<ModelEntry> {
 /// 返回给日志的摘要；没有新动作时返回 None（不落盘）。
 pub fn seed_cline_defaults(pool: Pool, ids: &[String]) -> Option<String> {
     crate::server::core::model_rules::seed_cline_defaults(pool.provider_id(), ids)
+}
+
+#[cfg(test)]
+mod tests {
+    //! 目录条目的纯函数测试（不起网络、不碰 catalog_cache 的全局槽位）。
+    //! `entries()` / `list()` 会先读远程槽位（首次访问触发 `catalog_cache::load`
+    //! 的数据库读取），测试一律从 `parse_recommended` / `to_raw` 走。
+    use serde_json::json;
+
+    use super::*;
+
+    /// 免费池条目必须带零倍率：聚合层与 `growth::known_free`、前端
+    /// `formatCredits` 都读这一列，漏标等于「该免费认不出来」。
+    #[test]
+    fn a_free_pool_entry_carries_the_zero_rate() {
+        let entry = ModelEntry {
+            id: "z-ai/glm-5.3-flash".to_string(),
+            name: "glm-5.3-flash".to_string(),
+            pool: Pool::Free,
+            context_window: 1_000_000,
+            reasoning: true,
+        };
+        let raw = to_raw(&entry);
+        assert_eq!(raw["credits"], "x0 credits");
+        // 形态要能被 known_free 判成免费（x 前缀 + credits 后缀剥掉后是 0）
+        let text = raw["credits"].as_str().expect("credits 应是字符串");
+        let parsed: f64 = text
+            .trim()
+            .trim_start_matches('x')
+            .trim_end_matches("credits")
+            .trim()
+            .parse()
+            .expect("零倍率文本应可解析为数字");
+        assert_eq!(parsed, 0.0);
+    }
+
+    /// 订阅池没有逐模型倍率：保持「不出键」（聚合层兜成空串 = 未知），
+    /// 不能编一个数出来。
+    #[test]
+    fn a_pass_pool_entry_does_not_fabricate_a_rate() {
+        let entry = ModelEntry {
+            id: "cline-pass/glm-5.3".to_string(),
+            name: "cline-pass/glm-5.3".to_string(),
+            pool: Pool::Pass,
+            context_window: 200_000,
+            reasoning: true,
+        };
+        let raw = to_raw(&entry);
+        assert!(raw.get("credits").is_none());
+    }
+
+    /// 端到端（纯函数段）：上游 `free` 组的裸 id 条目（不带 cline-free/
+    /// 前缀）进解析后也要落到零倍率 —— 它们是免费池成员，别按前缀误判。
+    #[test]
+    fn the_upstream_free_group_lands_the_zero_rate_even_for_bare_ids() {
+        let payload = json!({
+            "free": [
+                {"id": "cline-free/deepseek-v4.1-flash", "name": "Deepseek-v4.1-Flash"},
+                {"id": "z-ai/glm-5.3-flash", "name": "glm-5.3-flash"},
+            ],
+            "clinePass": [
+                {"id": "cline-pass/glm-5.3", "name": "cline-pass/glm-5.3"},
+            ],
+        });
+        let entries = parse_recommended(&payload);
+        assert_eq!(entries.len(), 3);
+        for entry in &entries {
+            let raw = to_raw(entry);
+            if entry.pool == Pool::Free {
+                assert_eq!(raw["credits"], "x0 credits", "{} 应标免费", entry.id);
+            } else {
+                assert!(raw.get("credits").is_none(), "{} 不应编倍率", entry.id);
+            }
+        }
+    }
 }

@@ -164,9 +164,19 @@ fn map_entry(row: &Value) -> Option<Value> {
         "isDefault".to_string(),
         Value::Bool(row.get("is_default").and_then(Value::as_bool).unwrap_or(false)),
     );
-    // 免费 / 订阅档：非聚合层字段，但账号页与排障会看（保留原样）
+    // 免费 / 订阅档：非聚合层字段，但账号页与排障会看（保留原样）。
+    // `isFree` 本体聚合层不认识，免费的模型要在 `/v1/models` 上标出来还得落
+    // 在共用的倍率列 `credits` 上 —— 否则聚合层兜成空串，`known_free` 与前端
+    // `formatCredits` 都认不出这批模型是免费的。形态与别家零倍率对齐
+    // （`"x0 credits"`，`growth::known_free` 可解析）。
     if let Some(is_free) = row.get("is_free").and_then(Value::as_bool) {
         item.insert("isFree".to_string(), Value::Bool(is_free));
+        if is_free {
+            item.insert(
+                "credits".to_string(),
+                Value::String("x0 credits".to_string()),
+            );
+        }
     }
     let access_level = text_of(row, "access_level");
     if !access_level.is_empty() {
@@ -341,4 +351,46 @@ pub fn unavailable_error() -> GatewayError {
         503,
         "MonkeyCode 模型目录尚未拉取：请先在模型管理页点「刷新模型清单」",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    //! 目录解析的纯函数测试（不起网络、不碰 catalog_cache / 全局槽位，
+    //! 一律从 `parse_models` 走）。
+    use serde_json::json;
+
+    use super::*;
+
+    /// 上游标了 `is_free: true` 的模型要落零倍率：`isFree` 本体聚合层不认识，
+    /// 免费标识必须落在共用的 `credits` 列上（`"x0 credits"`）。
+    #[test]
+    fn a_free_model_carries_the_zero_rate() {
+        let payload = json!({
+            "code": 0,
+            "data": {"models": [
+                {"model": "kimi-k3", "provider": "monkeycode", "display_name": "Kimi K3",
+                 "id": "uuid-k3", "interface_type": "claude", "is_free": true},
+            ]}
+        });
+        let models = parse_models(&payload);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0]["isFree"], true);
+        assert_eq!(models[0]["credits"], "x0 credits");
+    }
+
+    /// 非免费模型不编倍率（聚合层兜成空串 = 未知，界面显示 `—`）；
+    /// 上游没给 `is_free` 字段时同样不出键。
+    #[test]
+    fn paid_and_unmarked_models_do_not_fabricate_a_rate() {
+        let payload = json!({"models": [
+            {"model": "glm-5.3", "provider": "monkeycode", "is_free": false},
+            {"model": "deepseek-v4.1-flash", "provider": "monkeycode"},
+        ]});
+        let models = parse_models(&payload);
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0]["isFree"], false);
+        assert!(models[0].get("credits").is_none());
+        assert!(models[1].get("isFree").is_none());
+        assert!(models[1].get("credits").is_none());
+    }
 }
