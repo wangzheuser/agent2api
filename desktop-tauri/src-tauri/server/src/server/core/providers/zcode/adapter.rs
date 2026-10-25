@@ -43,6 +43,7 @@ use super::super::adapter::{
 };
 use super::super::content_block;
 use super::super::ProviderKind;
+use super::edge;
 use super::models;
 use super::region::Region;
 
@@ -330,6 +331,21 @@ impl ProviderAdapter for ZcodeAdapter {
             Some(hint) => format!("上游返回 {status}: {raw}（{hint}）"),
             None => format!("上游返回 {status}: {raw}"),
         };
+        // ── 边缘拦截页（HTML，非业务 JSON）───────────────────────────
+        // 2026-10-25 的生产故障就在这里被判错：那一页 HTML
+        // （`<!doctypehtml>…<title>405</title>…data-spm="a3c0e"`）没有 `code`
+        // 字段，于是落到兜底的 `Fatal`，编排层据此「换个账号再试」—— 而这类
+        // 拦截按**出口/源站**生效，换账号只是把第二个账号也喂给拦截器一次
+        // （`requests` 表里那轮 36 条 405 全是 `attempts=2`，两个账号各中一次）。
+        // 现在改判 `Terminal/ChannelRefused`：不换号、不原地重发，并升起这道
+        // 通道的本地闸门（详见 `super::edge` 的模块头）。
+        //
+        // 判据刻意不认具体状态码：同一层还会回 403 / 502 / 503，而「响应体是
+        // 一页 HTML」才是它区别于业务响应的稳定特征。体里一旦解析出业务码，
+        // 就说明业务层答过话，继续走下面的常规分类。
+        if edge::is_edge_page(status, code, &raw) {
+            return edge::blocked_class(self.region.provider_id(), status, code);
+        }
         if status == 401 {
             return UpstreamErrorClass::TokenExpired { message };
         }
@@ -353,11 +369,13 @@ impl ProviderAdapter for ZcodeAdapter {
     /// account cooldown and rotation path can run.
     fn inspect_success_head(&self, body: &[u8]) -> SuccessHead {
         let Some(value) = first_json_value(body) else {
-            return if body.len() >= SUCCESS_HEAD_LIMIT {
-                SuccessHead::Ready
-            } else {
-                SuccessHead::Pending
-            };
+            if body.len() >= SUCCESS_HEAD_LIMIT {
+                // 真的答上话了：边缘层没拦我们，之前那道闸门可以撤了。
+                // （只在这一刻撤，逐请求撤是空操作，且会把「挡着」的理由丢掉）
+                edge::note_recovered(self.region.provider_id());
+                return SuccessHead::Ready;
+            }
+            return SuccessHead::Pending;
         };
         let code = value.get("code").and_then(Value::as_i64);
         let message = value
@@ -374,6 +392,9 @@ impl ProviderAdapter for ZcodeAdapter {
                 status: 429,
             });
         }
+        // 业务层答了话（哪怕是 200 里的业务错误）：这一家此刻通着，
+        // 边缘闸门没有继续挡着的理由 —— 等它自然过期只会白绕开一轮。
+        edge::note_recovered(self.region.provider_id());
         SuccessHead::Ready
     }
 

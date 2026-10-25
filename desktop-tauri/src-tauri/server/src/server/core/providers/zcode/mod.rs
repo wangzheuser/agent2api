@@ -99,6 +99,7 @@ pub mod claim;
 pub mod coding_key;
 pub mod config_sync;
 pub mod credentials;
+pub mod edge;
 pub mod endpoint_mapping;
 pub mod models;
 pub mod monitor;

@@ -270,6 +270,16 @@ fn build_payload(
     body: &Value,
     client_headers: &HeaderMap,
 ) -> Result<ChatRequestPlan, GatewayError> {
+    // ── 先看这道通道是不是刚被上游边缘层拦过 ──────────────────────
+    // 拦截按**出口/源站**生效，换账号换不出结果；闸门在挡着的时候这份请求
+    // 一发出去必被同一页 HTML 拒掉，连套餐 JWT 都会白用一次。所以判在
+    // **任何取令牌、装配、发网动作之前**（见 `super::edge` 的模块头）。
+    //
+    // 返回的是「本机就没发出去」那一档状态码（556），编排层据此顺延给下一个
+    // 能承载的家，而不是终止整份请求 —— 这正是它与「上游回了 405」的区别。
+    if let Some(error) = super::edge::gate_error(region.provider_id()) {
+        return Err(error);
+    }
     let text_of = |key: &str| {
         session
             .get(key)
