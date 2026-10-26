@@ -76,6 +76,13 @@ fn risk_classification_preserves_codes_and_separates_capacity() {
                 json!({"code":6021,"msg":"queue.full"}),
                 UpstreamStopReason::UpstreamBusy,
             ),
+            // 实测真实响应（2026-10-26 16:06）：排队等待也是「队列繁忙」，
+            // 不是账号额度耗尽 —— 判成 QuotaLimited 会给账号打上冷却。
+            (
+                429,
+                json!({"code":6020,"msg":"queue.waiting.title","requestId":"fixture","data":{"queue_position":4028,"queue_size":"999+","retry_after":40,"estimated_wait":20140,"client_user_type":"free"}}),
+                UpstreamStopReason::UpstreamBusy,
+            ),
         ] {
             assert!(
                 matches!(adapter.classify_error(status, &body), UpstreamErrorClass::Terminal { kind, .. } if kind == expected),
@@ -168,9 +175,92 @@ fn risk_classification_preserves_codes_and_separates_capacity() {
     }
 }
 
+/// 排队（6020/`queue.waiting`）与额度耗尽（6004）必须是两条路径：
+/// 前者不罚账号，后者的冷却时长要尽量取上游给的恢复时间。
+///
+/// 背景（实测事故 2026-10-26 16:06）：上游对免费用户排队，原始响应是
+/// `{"code":6020,"msg":"queue.waiting.title","data":{"retry_after":40,...}}`。
+/// 当时 6020 掉进了 `QuotaLimited`，文案里又解析不出恢复时间，于是
+/// `mark_rate_limited` 用兜底值把整个账号池锁了 10 分钟 —— 上游说 40 秒，
+/// 本地挂 10 分钟，后续请求全在选路阶段被秒拒。
+#[test]
+fn queue_waiting_stays_queued_and_retry_after_shortens_cooldown() {
+    for kind in [ProviderKind::WorkBuddy, ProviderKind::WorkBuddyIntl] {
+        let adapter = adapter_for(kind);
+        // ① 6020 + queue.waiting → 排队，不是限额
+        let queued = json!({
+            "code": 6020,
+            "msg": "queue.waiting.title",
+            "requestId": "fixture",
+            "data": {"queue_position": 4028, "queue_size": "999+", "retry_after": 40, "estimated_wait": 20140, "client_user_type": "free"},
+        });
+        assert!(
+            matches!(
+                adapter.classify_error(429, &queued),
+                UpstreamErrorClass::Terminal { kind: UpstreamStopReason::UpstreamBusy, status: 503, .. }
+            ),
+            "6020 queue.waiting must stay queued: {kind:?}"
+        );
+
+        // ①' `code` 被上游换掉时，文案是唯一信号（仍限定 HTTP 429 ——
+        //     200 正文块里出现「排队」字样不能当成业务错误）
+        assert!(
+            matches!(
+                adapter.classify_error(429, &json!({"code": 7001, "msg": "queue.waiting.title"})),
+                UpstreamErrorClass::Terminal { kind: UpstreamStopReason::UpstreamBusy, .. }
+            ),
+            "queue text alone must still stop as busy: {kind:?}"
+        );
+        assert!(
+            matches!(
+                adapter.inspect_success_head(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"请排队等待\"}}]}\n\n".as_bytes()
+                ),
+                SuccessHead::Ready
+            ),
+            "ordinary content must not be read as a queue error: {kind:?}"
+        );
+
+        // ② 真限额（6004）带结构化 retry_after → 用它当恢复时间，
+        //    不再落到「缺失即 10 分钟」的兜底
+        let before = logging::now_ms();
+        let quota = json!({"code": 6004, "msg": "too many requests", "data": {"retry_after": 40}});
+        let UpstreamErrorClass::QuotaLimited { reset_at, .. } = adapter.classify_error(429, &quota) else {
+            panic!("6004 must stay QuotaLimited: {kind:?}");
+        };
+        let reset_at = reset_at.expect("retry_after must yield a reset time");
+        assert!(
+            (reset_at - before - 40_000).abs() <= 5_000,
+            "retry_after=40s should become ~40s cooldown, got {}ms",
+            reset_at - before
+        );
+
+        // ③ 没有结构化建议值时才走兜底（交给 mark_rate_limited），这里保持 None
+        assert!(matches!(
+            adapter.classify_error(429, &json!({"code": 6004, "msg": "quota"})),
+            UpstreamErrorClass::QuotaLimited { reset_at: None, .. }
+        ));
+
+        // ④ 异常建议值不放大冷却：超上限截断到 10 分钟、过小视为没给
+        let huge = json!({"code": 6004, "msg": "quota", "data": {"retry_after": 86400}});
+        let UpstreamErrorClass::QuotaLimited { reset_at: Some(reset_at), .. } =
+            adapter.classify_error(429, &huge)
+        else {
+            panic!("huge retry_after must still be QuotaLimited: {kind:?}");
+        };
+        assert!(
+            reset_at - logging::now_ms() <= 600_000,
+            "retry_after must be capped at the 10min fallback"
+        );
+        assert!(matches!(
+            adapter.classify_error(429, &json!({"code": 6004, "msg": "quota", "data": {"retry_after": 0}})),
+            UpstreamErrorClass::QuotaLimited { reset_at: None, .. }
+        ));
+    }
+}
+
 #[tokio::test]
-async fn terminals_stop_replay_and_rotation_and_limits_release_on_drop() {
-    let dir = std::env::temp_dir().join(format!(
+async fn terminals_stop_replay_and_rotation_and_limits_release_on_drop() {    let dir = std::env::temp_dir().join(format!(
         "workbuddy-risk-{}-{}",
         std::process::id(),
         logging::now_ms()
@@ -258,6 +348,12 @@ async fn terminals_stop_replay_and_rotation_and_limits_release_on_drop() {
             ),
             (400, json!({"code":11128,"msg":"unapproved channel"}), false),
             (429, json!({"code":6021,"msg":"queue.full"}), false),
+            // 6020 排队：一次发送即停（不换号放大），且**不得**写限额冷却
+            (
+                429,
+                json!({"code":6020,"msg":"queue.waiting.title","data":{"queue_position":4028,"queue_size":"999+","retry_after":40,"estimated_wait":20140}}),
+                false,
+            ),
             (200, json!({"code":11140,"msg":"request illegal"}), true),
             (
                 200,

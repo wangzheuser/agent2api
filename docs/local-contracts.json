@@ -22,6 +22,7 @@
       "tests": [
         {"id":"case-workbuddy-risk-code-classification","kind":"rust","path":"desktop-tauri/src-tauri/server/tests/workbuddy_risk_routing.rs","name":"risk_classification_preserves_codes_and_separates_capacity"},
         {"id":"case-workbuddy-risk-send-boundaries","kind":"rust","path":"desktop-tauri/src-tauri/server/tests/workbuddy_risk_routing.rs","name":"terminals_stop_replay_and_rotation_and_limits_release_on_drop"},
+        {"id":"case-workbuddy-queue-waiting-not-quota","kind":"rust","path":"desktop-tauri/src-tauri/server/tests/workbuddy_risk_routing.rs","name":"queue_waiting_stays_queued_and_retry_after_shortens_cooldown"},
         {"id":"case-workbuddy-safety-persist-cas","kind":"rust","path":"desktop-tauri/src-tauri/server/src/server/core/workbuddy_safety.rs","name":"server::core::workbuddy_safety::tests::safety_pause_persists_and_stale_resume_cannot_clear_new_restriction"},
         {"id":"case-workbuddy-safety-region-default","kind":"rust","path":"desktop-tauri/src-tauri/server/src/server/core/workbuddy_safety.rs","name":"server::core::workbuddy_safety::tests::safety_is_region_scoped_and_default_identity_survives_token_change"},
         {"id":"case-workbuddy-safety-config-isolation","kind":"rust","path":"desktop-tauri/src-tauri/server/src/server/config/sql.rs","name":"server::config::sql::safety_tests::configuration_cannot_read_overwrite_or_delete_account_safety"},

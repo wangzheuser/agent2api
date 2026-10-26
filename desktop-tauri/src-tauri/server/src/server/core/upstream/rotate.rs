@@ -292,7 +292,7 @@ pub(super) async fn select_target_account(
         return Err(GatewayError::with_status(503, "余额不足账号已排除，没有未尝试的可用账号"));
     }
     if is_workbuddy(providers.first().copied().unwrap_or_default()) {
-        return Err(GatewayError::with_status(503, "WorkBuddy 账号处于冷却期或已达并发上限，请稍后重试"));
+        return Err(GatewayError::with_status(503, workbuddy_exhausted_text(&enabled, keys, now)));
     }
     Ok(RouteTarget {
         provider: providers.first().copied().unwrap_or_default().to_string(),
@@ -302,6 +302,33 @@ pub(super) async fn select_target_account(
         priority: None,
         proxy_notice: None,
     })
+}
+
+/// 全池都挑不出 WorkBuddy 账号时的 503 文案。
+///
+/// ── 为什么不再写「或已达并发上限」────────────────────────────
+/// 并发上限在这一档**根本没参与判定**：WorkBuddy 不参与软兜底（见
+/// `select_target_account` 里「永不为并发上限 503」的取舍），只要还有账号没到
+/// 并发上限就会被强行选中，走不到这一行。实际落在这里的只有两类原因：账号都在
+/// 限额冷却中，或账号没有可用的登录态（全禁用更早就单独报过了）。文案指向一个
+/// 没发生的条件，排障就会被带偏到并发配置上 —— 实测事故里就是这样。
+///
+/// 能算出最近的恢复时刻时写进文案：上游限额/排队通常只有几十秒到几分钟，
+/// 用户看到「约 N 秒」就知道等一下即可，而不是反复重试。
+fn workbuddy_exhausted_text(enabled: &[Value], keys: &routing::CooldownKeys<'_>, now: i64) -> String {
+    let soonest = enabled
+        .iter()
+        .filter(|account| is_workbuddy(provider_of(account)))
+        .map(|account| routing::rate_limit_reset_at(account, keys, now))
+        .filter(|reset| *reset > now)
+        .min();
+    match soonest {
+        Some(reset) => {
+            let seconds = (reset - now + 999) / 1000;
+            format!("WorkBuddy 账号均在限额冷却中，最早约 {seconds} 秒后恢复，请稍后重试")
+        }
+        None => "WorkBuddy 暂无可转发的账号（登录态缺失或被排除），请到账号页检查".to_string(),
+    }
 }
 
 /// 账号记录上的 provider id（缺失按默认 provider）。

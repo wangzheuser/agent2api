@@ -80,6 +80,58 @@ pub(crate) const DAILY_ACTIVITY_FREE_MODELS: &[&str] =
 /// —— 恢复时间只在文本里，由 `errors::parse_quota_reset_at` 解析。
 const QUOTA_LIMIT_CODE: i64 = 6004;
 
+/// 上游排队码 6020（HTTP 429）：`msg` 形如 `queue.waiting.title`，`data` 里带
+/// `queue_position` / `queue_size` / `retry_after`（秒）/ `estimated_wait`（毫秒）。
+///
+/// 它是**排队等待**，不是账号额度耗尽 —— 账号本身健康，队伍排到就能继续用。
+/// 实测一次真实排队：`queue_position=4028`、`queue_size="999+"`、`retry_after=40`。
+///
+/// ── 为什么必须和 6004 分开（一次实测事故）────────────────────
+/// 只把 6021/`queue.full` 认作「队列繁忙」时，6020/`queue.waiting` 会一路掉进
+/// `QuotaLimited`：上游文案「queue.waiting.title」里没有人话恢复时间，
+/// `mark_rate_limited` 就按兜底给账号打上 **10 分钟**冷却 —— 上游说 40 秒，
+/// 本地锁 10 分钟，而且锁的是整个账号池。之后每个请求都在选路阶段被秒拒，
+/// 客户端看到一串「账号处于冷却期或已达并发上限」的 503，账号明明健康。
+const QUEUE_WAITING_CODE: i64 = 6020;
+
+/// 「上游队列繁忙」的文本线索（`details` 已在 `classify_error` 里转小写）。
+///
+/// `code` 缺失、或被上游换成别的数字时，文案是唯一信号；两个队列码走的是
+/// 同一个动作（不原地重试、不换号、不罚账号），所以判定入口合成一处。
+fn queue_busy_hint(details: &str) -> bool {
+    [
+        "queue.full",
+        "queue full",
+        "queue is full",
+        "queue.waiting",
+        "queue waiting",
+        "排队",
+    ]
+    .iter()
+    .any(|hint| details.contains(hint))
+}
+
+/// 上游 `data` 里给出的「多久之后再来」，返回毫秒偏移。
+///
+/// `retry_after` 是**秒**（实测 40），`estimated_wait` 是**毫秒**（实测 20140，
+/// 同一次排队）。两者都是建议值：优先用更明确的 `retry_after`，其次才是估算；
+/// 小于 1 秒视为没给，超过 10 分钟按 10 分钟截断 —— 上限与
+/// `mark_rate_limited` 的兜底冷却一致，异常值不至于把账号锁得比兜底更久。
+fn retry_after_delay_ms(error_body: &Value) -> Option<i64> {
+    const MIN_MS: f64 = 1_000.0;
+    const MAX_MS: f64 = 600_000.0;
+    let data = error_body.get("data")?;
+    let pick = |keys: &[&str]| -> Option<f64> {
+        keys.iter()
+            .find_map(|key| data.get(*key).and_then(Value::as_f64))
+            .filter(|value| value.is_finite() && *value > 0.0)
+    };
+    let millis = pick(&["retry_after", "retryAfter"])
+        .map(|seconds| seconds * 1000.0)
+        .or_else(|| pick(&["estimated_wait", "estimatedWait"]))?;
+    (millis >= MIN_MS).then(|| millis.min(MAX_MS) as i64)
+}
+
 /// WorkBuddy 适配器（无状态单例，见 `adapter::adapter_for`）。
 ///
 /// 唯一的字段是地区：两端协议一致，地区决定端点兜底、客户端身份（UA /
@@ -288,8 +340,10 @@ impl ProviderAdapter for WorkBuddyAdapter {
         } else if status == 403 && !rate_limited && details.contains("request illegal") {
             Some((UpstreamStopReason::ChannelRefused, 403,
                 "WorkBuddy 拒绝本次请求，已停止重试；上游未明确限制账号，未持久暂停。"))
-        } else if code != Some(QUOTA_LIMIT_CODE) && (status == 429 || code == Some(6021))
-            && (code == Some(6021) || details.contains("queue.full") || details.contains("queue full")) {
+        } else if code != Some(QUOTA_LIMIT_CODE)
+            && (status == 429 || code == Some(6021) || code == Some(QUEUE_WAITING_CODE))
+            && (code == Some(6021) || code == Some(QUEUE_WAITING_CODE) || queue_busy_hint(&details))
+        {
             Some((UpstreamStopReason::UpstreamBusy, 503,
                 "WorkBuddy 上游队列繁忙，请稍后重试；未标记账号限额或切换账号。"))
         } else { None };
@@ -300,7 +354,18 @@ impl ProviderAdapter for WorkBuddyAdapter {
             return UpstreamErrorClass::TokenExpired { message: format!("上游返回 {status}: {raw}") };
         }
         if status == 429 || code == Some(QUOTA_LIMIT_CODE) {
-            let reset_at = crate::server::errors::parse_quota_reset_at(raw);
+            // 恢复时间优先按上游文案解析（6004 的人话「将在 … UTC+8 重置」）；
+            // 文案里没有时再看 `data` 里的结构化建议值。两者都拿不到才交给
+            // `mark_rate_limited` 的 10 分钟兜底 —— 原先一律落到那个兜底，
+            // 一次几十秒的上游等待会被本地放大成十分钟账号冷却。
+            let parsed = crate::server::errors::parse_quota_reset_at(raw);
+            let reset_at = if parsed > 0 {
+                parsed
+            } else {
+                retry_after_delay_ms(error_body)
+                    .map(|delay| crate::server::logging::now_ms() + delay)
+                    .unwrap_or(0)
+            };
             return UpstreamErrorClass::QuotaLimited {
                 reset_at: if reset_at > 0 { Some(reset_at) } else { None },
                 message: format!("上游返回 {status}: {raw}"), upstream_code: code,
