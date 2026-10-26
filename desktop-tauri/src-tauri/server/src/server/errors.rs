@@ -17,6 +17,7 @@
 //! 都会直接带走整个桌面应用，所以错误一律走 Result + 本模块的类型，
 //! 不用 unwrap/expect。
 
+use axum::http::header::{HeaderValue, RETRY_AFTER};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -39,6 +40,21 @@ pub struct GatewayError {
     pub status_code: i32,
     pub upstream_code: Option<i64>,
     pub code: Option<String>,
+    /// 给下游的 `Retry-After`（秒）。
+    ///
+    /// ── 为什么需要它 ──────────────────────────────────────
+    /// 「此刻没有可用账号」是**本机的短周期状态**（账号冷却、并发释放、请求排队），
+    /// 与「这个模型到某个时刻为止都没额度」不是一回事。上游 429 里的恢复时间
+    /// 可能是十几小时后，原样透传（429 + `reset_at`）会让下游网关把它记成后者：
+    /// 实测 magpie 据此把一条通道冻结了 17 小时（`routing/*.jsonl` 里
+    /// `rest.by=resets`），本机账号早已恢复也不再重试。
+    ///
+    /// 所以这类错误改成 503 + 短 `Retry-After`：状态码本身说明「服务暂时不可用」，
+    /// 头部给出一个「过多久值得再问一次」的短窗口（见
+    /// `upstream::provider_loop::pool_exhausted_error`）。
+    ///
+    /// 只有显式挂上时才发这个头 —— 其余错误（含上游真的 429）保持原样。
+    pub retry_after_secs: Option<u64>,
 }
 
 impl GatewayError {
@@ -49,6 +65,7 @@ impl GatewayError {
             status_code: 500,
             upstream_code: None,
             code: None,
+            retry_after_secs: None,
         }
     }
 
@@ -59,6 +76,7 @@ impl GatewayError {
             status_code: status,
             upstream_code: None,
             code: None,
+            retry_after_secs: None,
         }
     }
 
@@ -85,6 +103,16 @@ impl GatewayError {
         if let Some(code) = code {
             self.upstream_code = Some(code);
         }
+        self
+    }
+
+    /// 挂 `Retry-After`（秒）：告诉下游「多久之后值得再来问一次」。
+    ///
+    /// 只给**本机短周期**原因用（候选账号都在冷却里、并发满了），不要拿上游的
+    /// 恢复时间来填 —— 那是「这个模型到某时刻为止都没额度」，语义不同，透传会把
+    /// 下游网关冻结到那个时刻（见字段注释）。
+    pub fn with_retry_after(mut self, seconds: u64) -> Self {
+        self.retry_after_secs = Some(seconds);
         self
     }
 
@@ -149,8 +177,23 @@ impl GatewayError {
     /// 转发链路里 `Err(error) => error.payload_response()` 比
     /// `IntoResponse::into_response(error)` 可读。
     pub fn payload_response(self) -> Response {
-        let status = self.http_status();
-        (status, Json(self.payload())).into_response()
+        self.build_response()
+    }
+
+    /// 组装最终响应：状态码 + body + （挂过才发）`Retry-After`。
+    ///
+    /// 两条出口（`payload_response` 与 `IntoResponse`）都走这里，
+    /// 否则「同一个错误经不同调用点返回时头不一样」会成为下一个坑。
+    fn build_response(&self) -> Response {
+        let mut response = (self.http_status(), Json(self.payload())).into_response();
+        if let Some(seconds) = self.retry_after_secs {
+            // 秒数解析不出 HeaderValue 的概率近乎为零；真解析不出就只是少一个头，
+            // 不该为它 panic（release 是 panic=abort）
+            if let Ok(value) = HeaderValue::from_str(&seconds.max(1).to_string()) {
+                response.headers_mut().insert(RETRY_AFTER, value);
+            }
+        }
+        response
     }
 
     /// HTTP 状态码
@@ -171,8 +214,7 @@ impl std::error::Error for GatewayError {}
 /// 状态码 + OpenAI 风格 body（无需每个 handler 手写转换）。
 impl IntoResponse for GatewayError {
     fn into_response(self) -> Response {
-        let status = self.http_status();
-        (status, Json(self.payload())).into_response()
+        self.build_response()
     }
 }
 
@@ -388,5 +430,55 @@ fn format_reset_at_text(reset_at: i64) -> String {
             .format("%Y/%m/%d %H:%M:%S")
             .to_string(),
         None => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Retry-After` 只在显式挂过时才出现：没挂的错误（含上游真的 429）
+    /// 必须与改造前逐字节一致，否则下游会按一个我们没打算给的等待时间行事。
+    #[test]
+    fn retry_after_header_only_appears_when_requested() {
+        let with = GatewayError::with_status(503, "暂时没有可用账号")
+            .with_retry_after(60)
+            .payload_response();
+        assert_eq!(with.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            with.headers().get(RETRY_AFTER).and_then(|value| value.to_str().ok()),
+            Some("60")
+        );
+
+        let without = GatewayError::with_status(429, "上游返回 429").payload_response();
+        assert_eq!(without.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(without.headers().get(RETRY_AFTER).is_none());
+    }
+
+    /// 两条出口（`payload_response` 与 `IntoResponse`）必须发出同样的头 ——
+    /// 调用点各写一份是这类响应最容易长歪的地方。
+    #[test]
+    fn into_response_matches_payload_response() {
+        let response = GatewayError::with_status(503, "x").with_retry_after(7).into_response();
+        assert_eq!(
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("7")
+        );
+    }
+
+    /// 秒数为 0 时不能让 `Retry-After: 0` 变成「立刻重试」的自旋指令。
+    #[test]
+    fn retry_after_never_renders_zero() {
+        let response = GatewayError::with_status(503, "x").with_retry_after(0).into_response();
+        assert_eq!(
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
     }
 }

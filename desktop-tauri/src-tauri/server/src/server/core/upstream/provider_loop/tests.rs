@@ -816,3 +816,62 @@ fn that_one_argument_is_the_divider_between_a_day_and_ten_minutes() {
         (after - before) / 60_000
     );
 }
+
+// ── 全池耗尽时给下游的形状（503 + 短 `Retry-After`）────────────────────────
+//
+// 这两条钉的是「本机短周期状态」不能被写成「这个模型到某时刻为止都没额度」：
+// 旧写法把上游 429 连 `reset_at` 一起透传，下游网关（magpie）据此把通道冻到
+// 上游给的那个时刻 —— 实测 17 小时，而本机账号十几分钟前就已恢复。
+
+#[test]
+fn pool_exhausted_turns_a_far_away_upstream_reset_into_a_short_retry() {
+    let now = logging::now_ms();
+    let far = now + 17 * 60 * 60 * 1000;
+    let error = pool_exhausted_error("workbuddy-cn/kimi-k3.1-pro", far, now);
+    assert_eq!(error.status_code, 503, "全池耗尽不是 429");
+    assert_eq!(
+        error.retry_after_secs,
+        Some(POOL_EXHAUSTED_RETRY_AFTER_SECS),
+        "十几小时后的恢复点只表现成按上限等"
+    );
+    assert_eq!(error.code.as_deref(), Some("no_available_account"));
+    assert!(!error.is_quota_limit(), "503 不该再被判定成账号限额");
+    let payload = error.payload();
+    assert!(payload["error"].get("reset_at").is_none(), "不能长出 reset_at");
+    assert!(
+        payload["error"].get("upstream_code").is_none(),
+        "上游业务码一挂上就又变成限额错误"
+    );
+    assert_eq!(payload["error"]["type"], "proxy_error");
+    let message = payload["error"]["message"].as_str().unwrap();
+    assert!(
+        !message.contains("UTC+8"),
+        "文案带上日期形态就会被 parse_quota_reset_at 解回 reset_at: {message}"
+    );
+    assert!(message.contains("60 秒后重试"), "要给出可操作的等待提示: {message}");
+}
+
+#[test]
+fn pool_exhausted_retry_window_follows_a_nearby_reset_within_bounds() {
+    let now = logging::now_ms();
+    assert_eq!(
+        pool_exhausted_error("m", now + 12_000, now).retry_after_secs,
+        Some(12),
+        "冷却只剩十几秒时跟着它走"
+    );
+    assert_eq!(
+        pool_exhausted_error("m", now + 1_000, now).retry_after_secs,
+        Some(POOL_EXHAUSTED_RETRY_AFTER_MIN_SECS),
+        "过短的窗口没有意义，抬到下限"
+    );
+    assert_eq!(
+        pool_exhausted_error("m", 0, now).retry_after_secs,
+        Some(POOL_EXHAUSTED_RETRY_AFTER_SECS),
+        "恢复时刻未知时按上限"
+    );
+    assert_eq!(
+        pool_exhausted_error("m", now - 5_000, now).retry_after_secs,
+        Some(POOL_EXHAUSTED_RETRY_AFTER_SECS),
+        "已经过去的恢复时刻同样按上限"
+    );
+}

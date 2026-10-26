@@ -25,6 +25,15 @@
 //! `Terminal` 优先终止，不进入换号、降级或退避；其它分类沿用原有动作。
 //! 适配器判定业务错误，编排层管理重试预算和生命周期。
 //!
+//! ── 全池耗尽不是「上游说这个模型没额度」───────────────────────
+//! 动作 1 换不到下一个账号时，本机已经没有可转发对象了 —— 这是**本机的短周期
+//! 状态**（账号都在冷却里、或被禁用），不是「这个模型到某时刻为止都没额度」。
+//! 旧版把上游 429 连它的 `reset_at` 一起透传，下游网关据此把通道冻结到那个
+//! 时刻：实测 magpie 把 `agent2api-local/workbuddy-cn/kimi-k3.1-pro` 冻了 17 小时
+//! （`routing/*.jsonl` 的 `rest.by=resets`），而本机账号十几分钟前就已经恢复。
+//! 现在这一档回 503 + 短 `Retry-After`，上游原文只进运行日志与尝试明细
+//! （见 [`pool_exhausted_error`]）。
+//!
 //! ── 有状态 provider 的分流（W5-T-d4，架构文档 §4.2.1）─────────
 //! 有状态 provider（CatPaw）**只替换「一次发送」，不替换账号循环**：选路、
 //! telemetry 记账全部共用；不走 `build_chat_request` 那条路，因为会话式协议的
@@ -1339,10 +1348,6 @@ async fn attempt_queue(
                                     continue 'accounts;
                                 }
                                 None => {
-                                    let message = format!(
-                                        "{}（所有候选账号对模型 {model} 均已限额或禁用）",
-                                        failure.error.message
-                                    );
                                     rotate::report_limit_event(
                                         "error",
                                         &format!(
@@ -1359,11 +1364,27 @@ async fn attempt_queue(
                                         None,
                                         provider_id,
                                     );
-                                    return Err(GatewayError::with_status(
-                                        *status as i32,
-                                        message,
-                                    )
-                                    .with_optional_code(*upstream_code));
+                                    // 钉住账号（模型测试、指定账号）时下游问的就是
+                                    // 「这一个账号行不行」—— 429 是准确答案，透传。
+                                    // 放开选路时才是「本机此刻没有可用账号」，走 503
+                                    // + 短 Retry-After，不把上游的恢复时间交给下游
+                                    // 当「别再问」的凭据（见 `pool_exhausted_error`）。
+                                    if ctx.pinned_account.is_some() {
+                                        return Err(GatewayError::with_status(
+                                            *status as i32,
+                                            format!(
+                                                "{}（指定账号对模型 {model} 已限额，\
+                                                 本次未尝试其它账号）",
+                                                failure.error.message
+                                            ),
+                                        )
+                                        .with_optional_code(*upstream_code));
+                                    }
+                                    return Err(pool_exhausted_error(
+                                        &model,
+                                        limit_at,
+                                        logging::now_ms(),
+                                    ));
                                 }
                             }
                         }
@@ -2138,6 +2159,55 @@ fn gateway_error_from_class(class: &UpstreamErrorClass) -> GatewayError {
             GatewayError::with_status(401, message.clone())
         }
     }
+}
+
+/// 全池耗尽时给下游的 `Retry-After` 上限（秒）。
+///
+/// ── 为什么用常量而不是上游的恢复时刻 ─────────────────────────
+/// 上游 429 里带的「将在 … UTC+8 重置」可能是十几个小时后，而本机恢复的典型
+/// 时长是几十秒到几分钟（账号冷却到期、并发槽释放）。把它当 `Retry-After`
+/// 会得到与「429 + reset_at」同样糟的效果：对端在该多久之后回来问这件事上
+/// 完全听我们的，写长了就等于替它放弃。
+const POOL_EXHAUSTED_RETRY_AFTER_SECS: u64 = 60;
+
+/// 全池耗尽时 `Retry-After` 的下限（秒）：比这更短的窗口没有意义（对端刚收到
+/// 就可能立刻重问，而本地状态几乎没有变化）。
+const POOL_EXHAUSTED_RETRY_AFTER_MIN_SECS: u64 = 5;
+
+/// 全池耗尽（动作 1 已经换不到下一个账号）：给下游 503 + 短 `Retry-After`。
+///
+/// ── 为什么不是把上游 429 原样透传 ───────────────────────────
+/// 「本机此刻没有可用账号」与「这个模型到某时刻为止都没额度」是两件事，
+/// 而 429 + `reset_at` 的形状只表达得了后者。下游网关（如 magpie）会按它把
+/// 通道记成 `rest.by=resets` 并冻结到那个时刻 —— 本机账号恢复之后也不会再被
+/// 问到，用户看到的就是「明明还有别的账号，怎么一直 429」。实测这条通道被
+/// 冻了 17 小时。上游原文仍然完整保留在运行日志（`report_limit_event`）与
+/// 请求日志的尝试明细里，排障信息一点没丢。
+///
+/// `limit_at` 是**刚被限额的那个账号**的恢复时刻（0 = 未知）：它只是「多久之后
+/// 值得再问」的一个参考，因此被夹在 5 秒到 60 秒之间 —— 上游那种以小时计的
+/// 恢复点在这里只表现成「按上限等」。
+fn pool_exhausted_error(model: &str, limit_at: i64, now: i64) -> GatewayError {
+    let remaining = if limit_at > now {
+        ((limit_at - now) / 1000).max(1) as u64
+    } else {
+        POOL_EXHAUSTED_RETRY_AFTER_SECS
+    };
+    let retry_after = remaining.clamp(
+        POOL_EXHAUSTED_RETRY_AFTER_MIN_SECS,
+        POOL_EXHAUSTED_RETRY_AFTER_SECS,
+    );
+    // 文案里刻意不出现任何日期形态（`YYYY-MM-DD HH:MM:SS UTC+8`）：那是
+    // `errors::parse_quota_reset_at` 的口径，写进去就会重新长出 `reset_at`。
+    GatewayError::with_status(
+        503,
+        format!(
+            "模型 {model} 当前没有可用账号（候选账号均在限额冷却中或已被排除），\
+             请约 {retry_after} 秒后重试"
+        ),
+    )
+    .with_code("no_available_account")
+    .with_retry_after(retry_after)
 }
 
 /// 读取需要首包判定的提供商响应，并把已读前缀重新接回剩余流。

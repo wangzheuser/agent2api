@@ -765,3 +765,110 @@ fn refresh_and_late_sse_restrictions_stop_without_replay() {
         server.abort();
     });
 }
+
+/// 全池耗尽：候选账号都在同一模型的冷却里时，下游拿到的是 **503 + 短
+/// `Retry-After`**，而不是上游那条带恢复时间的 429。
+///
+/// 为什么这是一条契约而不是细节：429 + `reset_at` 的形状只能表达「这个模型到
+/// 某个时刻为止都没额度」。下游网关（magpie）照它把通道写成
+/// `rest:{why:"quota",by:"resets",until:<上游的恢复时间>}` 并冻结 —— 本机账号
+/// 十几分钟前就恢复了，对端也不会再来问。实测一条通道被冻了 17 小时
+/// （`~/.config/magpie/routing/*.jsonl` 里 `try_ms` 从 1296 掉到 2）。
+///
+/// 同一处还要钉住：**钉住账号**（模型测试 / 指定账号）仍然透传 429 —— 那时下游
+/// 问的就是「这一个账号行不行」，429 是准确答案，换成 503 反而在撒谎。
+#[tokio::test]
+async fn exhausted_pool_answers_503_with_a_short_retry_after() {
+    let dir = std::env::temp_dir().join(format!(
+        "workbuddy-pool-exhausted-{}-{}",
+        std::process::id(),
+        logging::now_ms()
+    ));
+    std::env::set_var("AGENT2API_PROXY_HOME", &dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = agent2api_server::server::db::Db::open(&dir.join("agent2api.db")).unwrap();
+    config::init(Some(db.clone()));
+    agent2api_server::server::core::task_state::install(Some(db.clone()));
+    agent2api_server::server::core::usage_records::install(Some(db.clone()));
+    agent2api_server::server::core::limiter::install(Some(db.clone()));
+    let store = AccountStore::with_db(Some(db.clone()));
+    let auth = AuthService::new(
+        store.clone(),
+        agent2api_server::server::core::endpoints::default_context(),
+    );
+    let upstream = UpstreamService::new(store.clone(), auth);
+
+    // 上游恒定：这条账号对这个模型已限额，恢复时间在**十几小时后**
+    let hits = Arc::new(Mutex::new(0usize));
+    let counter = hits.clone();
+    let app = Router::new().fallback_service(post(move || {
+        let counter = counter.clone();
+        async move {
+            *counter.lock().unwrap() += 1;
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({
+                    "code": 6004,
+                    "msg": "您的使用量已超出频率限制，将在 2026-10-27 15:38:27 UTC+8 重置，您也可以切换其他模型继续使用。"
+                })),
+            )
+                .into_response()
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let provider = "workbuddy";
+    let mut ids = Vec::new();
+    for side in ["a", "b", "c"] {
+        let uid = format!("{provider}-exhausted-{side}");
+        let account = store
+            .add_account(
+                &json!({"account":{"uid":uid},"auth":{"accessToken":uid},"endpoint":endpoint}),
+                None,
+                Some(provider),
+            )
+            .unwrap();
+        ids.push(account["id"].as_str().unwrap().to_string());
+    }
+
+    // ① 钉住账号：仍是上游那条 429（下游问的是「这一个账号行不行」）
+    let pinned = upstream
+        .forward(request(provider, Some(&ids[0]), false))
+        .await
+        .err()
+        .expect("指定账号撞限额时必须失败");
+    assert_eq!(pinned.status_code, 429, "钉住账号不该被改写成 503");
+    assert!(pinned.message.contains("指定账号"), "{}", pinned.message);
+    assert!(pinned.retry_after_secs.is_none(), "钉住账号不挂 Retry-After");
+    assert_eq!(*hits.lock().unwrap(), 1);
+
+    // ② 放开选路：两个还冷却着的账号都被试过之后，池子空了
+    let error = upstream
+        .forward(request(provider, None, false))
+        .await
+        .err()
+        .expect("全池耗尽时必须失败");
+    assert_eq!(
+        *hits.lock().unwrap(),
+        3,
+        "剩下的两个账号应各试一次（换号本身没坏，坏的是最后的回包形状）"
+    );
+    assert_eq!(error.status_code, 503, "全池耗尽对下游是 503");
+    assert_eq!(error.retry_after_secs, Some(60), "给一个短窗口让对端自己回来");
+    assert_eq!(error.code.as_deref(), Some("no_available_account"));
+    assert!(!error.is_quota_limit(), "503 不该再被当成账号限额");
+    let payload = error.payload();
+    assert!(
+        payload["error"].get("reset_at").is_none(),
+        "带 reset_at 就会被下游当成「到那时为止别再问」"
+    );
+    let message = payload["error"]["message"].as_str().unwrap();
+    assert!(
+        !message.contains("UTC+8"),
+        "上游的恢复时间只该进日志，不该进回包: {message}"
+    );
+
+    server.abort();
+}
