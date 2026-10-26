@@ -2897,6 +2897,39 @@
           "id": "officeace-control-token-expiry-0"
         }
       ]
+    },
+    {
+      "id": "pool-exhausted-short-retry",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "放开选路时换不到下一个账号（本机账号均在限额冷却或已被排除）不把上游 429 连同恢复时刻原样透传给下游：改回 503 + code=no_available_account + Retry-After（5~60 秒，按刚被限额账号的剩余冷却夹逼），正文不含任何可被 parse_quota_reset_at 解析的日期形态，也不挂 upstream_code。钉住账号（模型测试、指定账号）时仍透传上游 429，并注明本次未尝试其它账号。上游原文继续完整落在运行日志与请求尝试明细。其余错误的响应头与正文保持逐字节不变。",
+      "source_commits": [
+        "503294b707a2169a2fbb87ae2ec19c67739bd842"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/upstream/provider_loop.rs",
+        "desktop-tauri/src-tauri/server/src/server/errors.rs"
+      ],
+      "tests": [
+        {
+          "id": "case-pool-exhausted-503-shape",
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/workbuddy_risk_routing.rs",
+          "name": "exhausted_pool_answers_503_with_a_short_retry_after"
+        },
+        {
+          "id": "case-pool-exhausted-retry-after-bounds",
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/provider_loop/tests.rs",
+          "name": "server::core::upstream::provider_loop::tests::pool_exhausted_turns_a_far_away_upstream_reset_into_a_short_retry"
+        },
+        {
+          "id": "case-retry-after-header-render",
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/errors.rs",
+          "name": "server::errors::tests::retry_after_header_only_appears_when_requested"
+        }
+      ]
     }
   ],
   "replay_patches": [
