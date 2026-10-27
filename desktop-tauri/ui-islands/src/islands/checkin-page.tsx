@@ -470,7 +470,14 @@ function OnboardingRow({ row }: { row: { id: string; name: string; provider?: st
  * （一次性新人礼仍在「新手福利」，那是另一条链。）
  */
 function PlanRow({ row }: {
-  row: { id: string; name: string; claimAt?: number | null; claimPlans?: Record<string, number> | null }
+  row: {
+    id: string
+    name: string
+    claimAt?: number | null
+    claimPlans?: Record<string, number> | null
+    /** 自动领取任务最近一次对这个账号的结论（后端 `zcodeClaim:<id>` 任务状态） */
+    lastClaimResult?: string | null
+  }
 }) {
   // ZCode 的逐份领取台账（只算今天、按北京时间判；`row.claimPlans` 是后端落盘事实）
   const claimedIds = claimedPlanIdsToday({ claimPlans: row.claimPlans } as never)
@@ -490,9 +497,14 @@ function PlanRow({ row }: {
         <div className='ck-prov-desc'>
           {claimed
             ? t('点「套餐明细」看领到了哪几份、什么时候生效；活动期内每天可再领')
-            : row.claimAt
-              ? t('上次领取 {time} · 领取需通过滑块验证码', { time: formatTime(row.claimAt) })
-              : t('限时体验套餐（start-plan），活动期内每天一份 · 领取需滑块验证码')}
+            // 自动领取任务的结论优先：它能说清「上游今天没放新套餐 / 上游未开放 /
+            // 本地领取失败」，比只说「上次领取 X」有用得多（任务还没跑过时回落到
+            // 原来那句）。
+            : row.lastClaimResult
+              ? row.lastClaimResult
+              : row.claimAt
+                ? t('上次领取 {time} · 领取需通过滑块验证码', { time: formatTime(row.claimAt) })
+                : t('限时体验套餐（start-plan），活动期内每天一份 · 领取需滑块验证码')}
         </div>
       </div>
       <div className='ck-prov-right'>

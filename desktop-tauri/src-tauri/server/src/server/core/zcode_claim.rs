@@ -142,6 +142,12 @@ struct Report {
     already: usize,
     skipped: usize,
     failed: usize,
+    /// 探测成功但上游 `plans[]` 为空。与「已领过」「没资格」「上游没开活动」都不是
+    /// 一码事：上游不给新套餐时本地无可动作，但**必须说出来**，否则一轮自动领取
+    /// 只留下一句「领取 0 份」，用户分不清是排队等着、已经领过了，还是逻辑坏了。
+    empty_preview: usize,
+    /// 上游对该地区根本没部署领取接口（preview 404），与「探测为空」区分开。
+    not_deployed: usize,
     error: Option<String>,
 }
 
@@ -157,11 +163,53 @@ fn failure_detail(failure: ClaimFailure, code: i64, message: &str) -> String {
 }
 
 impl Report {
+    /// 整轮口径：定时任务页的那一行、`run_auto` 的日志。
     fn summary(&self) -> String {
-        format!(
+        let base = format!(
             "检查 {} 个账号，领取 {} 份，已领取 {} 份，跳过 {} 项，失败 {} 项",
             self.checked, self.claimed, self.already, self.skipped, self.failed
-        )
+        );
+        // 两个「什么都没发生」的分支单列出来：它们是上游状态，不是本地失败，
+        // 但恰恰是用户最需要看见的那句话（以前这里一律显示「领取 0 份」）。
+        if self.not_deployed > 0 {
+            return format!("{base}，上游未开放领取 {} 个（preview 404）", self.not_deployed);
+        }
+        if self.empty_preview > 0 {
+            return format!(
+                "{base}，无可领套餐 {} 个（上游 preview 返回空列表：今日可能已领过，或新一期尚未放出）",
+                self.empty_preview
+            );
+        }
+        base
+    }
+
+    /// 账号口径：签到中心那张卡上的一行字，要短、要能直接回答「为什么没领到」。
+    ///
+    /// 与 [`Report::summary`] 分开是因为两者出现的容器完全不同：卡片放不下
+    /// 「检查 1 个账号，领取 0 份，…」这种整轮计数。
+    fn account_note(&self) -> String {
+        if let Some(error) = &self.error {
+            return error.clone();
+        }
+        if self.not_deployed > 0 {
+            return "上游未开放套餐领取（preview 404）".to_string();
+        }
+        if self.empty_preview > 0 {
+            return "本期无可领套餐（上游没发新套餐：已领过或尚未放出）".to_string();
+        }
+        if self.claimed > 0 {
+            return format!("已领取 {} 份", self.claimed);
+        }
+        if self.already > 0 {
+            return format!("本期已领过 {} 份", self.already);
+        }
+        if self.skipped > 0 {
+            return format!("{} 份仍在重试冷却中", self.skipped);
+        }
+        if self.failed > 0 {
+            return format!("领取失败 {} 份", self.failed);
+        }
+        "本轮无可动作".to_string()
     }
 }
 
@@ -202,6 +250,28 @@ async fn request_claim(
     .map_err(|error| format!("套餐领取请求失败（HTTP {}）", error.status_code))
 }
 
+/// 「本期为什么没领到」的最后一块拼图：这个账号上一次领取是什么时候、哪一份。
+///
+/// 只写进账号级状态（`last_result`，界面可见），不进汇总日志 —— 每 10 分钟一轮
+/// 就写一遍太吵，而那句话本身在账号页上是要长期看的东西。
+fn last_claim_note(store: &AccountStore, id: &str) -> String {
+    let Some(record) = store.zcode_account_record(id) else {
+        return "账号记录已不存在".to_string();
+    };
+    let at = record.get("claimAt").and_then(Value::as_i64).unwrap_or(0);
+    if at <= 0 {
+        return "本地尚无领取记录".to_string();
+    }
+    let plan = record
+        .get("claimPlanId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("未知套餐");
+    let hours = (logging::now_ms() - at).max(0) / 3_600_000;
+    format!("最近一次领取：{hours} 小时前（{plan}）")
+}
+
 async fn scan_account(
     store: &AccountStore,
     id: &str,
@@ -210,6 +280,12 @@ async fn scan_account(
 ) -> Result<Report, String> {
     let target = load_target(store, id).map_err(|(_, message)| message)?;
     let proxy = claim_proxy(store, id);
+    // 探测成功就算「检查过这个账号」。这个计数以前只在 `run_auto` 外层累加，
+    // `scan_account` 返回的子报告里恒为 0，于是账号级状态永远显示「检查 0 个账号」。
+    let mut report = Report {
+        checked: 1,
+        ..Report::default()
+    };
     let mut plans = match claim::preview(
         target.region,
         &target.jwt,
@@ -219,12 +295,19 @@ async fn scan_account(
     .await
     {
         Ok(PreviewOutcome::Plans(plans)) => plans,
-        Ok(PreviewOutcome::NotDeployed) => return Ok(Report::default()),
+        Ok(PreviewOutcome::NotDeployed) => {
+            report.not_deployed = 1;
+            return Ok(report);
+        }
         Err(error) => return Err(format!("套餐探测失败（HTTP {}）", error.status_code)),
     };
     plans.sort_by(|a, b| b.priority.cmp(&a.priority));
     retry.retain(|id, _| plans.iter().any(|plan| &plan.plan_id == id));
-    let mut report = Report::default();
+    // 上游这次没给任何套餐：本地无可动作，但要如实记一笔（见 `empty_preview`）。
+    if plans.is_empty() {
+        report.empty_preview = 1;
+        return Ok(report);
+    }
     for plan in plans {
         if !manual && !config::scheduled_settings().zcode_auto_claim.enabled {
             break;
@@ -371,7 +454,17 @@ pub async fn run_auto(store: &AccountStore, manual: bool) -> Result<String, Stri
             },
         };
         total.checked += 1;
-        let summary = report.error.clone().unwrap_or_else(|| report.summary());
+        // 账号级状态写的是**卡片口径**（短句 + 上次台账），不是整轮计数：
+        // 它会被签到中心的账号行原样带出来，放不下「检查 1 个账号，领取 0 份…」。
+        let summary = match (&report.error, report.empty_preview) {
+            (Some(error), _) => error.clone(),
+            // 探测为空时补一句「上次领到的是哪一份、多久以前」，界面才能回答
+            // 「是已经领过了还是今天根本没放新套餐」。
+            (None, empty) if empty > 0 => {
+                format!("{}；{}", report.account_note(), last_claim_note(store, id))
+            }
+            _ => report.account_note(),
+        };
         guard.finish(
             report.error.is_none(),
             summary.clone(),
@@ -386,6 +479,8 @@ pub async fn run_auto(store: &AccountStore, manual: bool) -> Result<String, Stri
         total.already += report.already;
         total.skipped += report.skipped;
         total.failed += report.failed;
+        total.empty_preview += report.empty_preview;
+        total.not_deployed += report.not_deployed;
     }
     let summary = total.summary();
     logging::log_with_level(
@@ -467,6 +562,142 @@ mod tests {
             assert!(already_recorded(&record, "plan-two"));
         }
         assert!(complete(&store, "missing", "plan").is_err());
+    }
+
+    #[test]
+    fn summary_separates_empty_preview_from_not_deployed() {
+        // 有套餐在列时是原来的口径，不会被两个「什么都没发生」分支污染
+        let claimed = Report {
+            checked: 1,
+            claimed: 1,
+            already: 2,
+            ..Report::default()
+        };
+        assert_eq!(
+            claimed.summary(),
+            "检查 1 个账号，领取 1 份，已领取 2 份，跳过 0 项，失败 0 项"
+        );
+        assert!(claimed.error.is_none());
+
+        // 探测成功但上游没给套餐：明确说出来，且不算失败
+        let empty = Report {
+            checked: 1,
+            empty_preview: 1,
+            ..Report::default()
+        };
+        let text = empty.summary();
+        assert!(text.starts_with("检查 1 个账号，领取 0 份"), "{text}");
+        assert!(text.contains("无可领套餐 1 个"), "{text}");
+        assert!(text.contains("preview 返回空列表"), "{text}");
+        assert!(empty.error.is_none());
+
+        // 上游压根没部署领取接口：与「探测为空」分开说
+        let missing = Report {
+            checked: 1,
+            not_deployed: 1,
+            ..Report::default()
+        };
+        let text = missing.summary();
+        assert!(text.contains("上游未开放领取 1 个（preview 404）"), "{text}");
+        assert!(!text.contains("无可领套餐"), "{text}");
+
+        // 两种「什么都没发生」不会同时出现（探测只有一条路径）
+        let both = Report {
+            checked: 1,
+            empty_preview: 1,
+            not_deployed: 1,
+            ..Report::default()
+        };
+        assert!(both.summary().contains("上游未开放领取 1 个（preview 404）"));
+    }
+
+    /// 账号卡片上的那一行是**另一套口径**：它放进签到中心的账号行，
+    /// 放不下整轮计数，所以每条分支都给一句能独立读懂的话。
+    #[test]
+    fn account_note_speaks_in_one_short_sentence() {
+        // 正常领到了
+        let claimed = Report {
+            checked: 1,
+            claimed: 2,
+            ..Report::default()
+        };
+        assert_eq!(claimed.account_note(), "已领取 2 份");
+
+        // 就是本轮要解释的那种情况：preview 空，不是本地失败
+        let empty = Report {
+            checked: 1,
+            empty_preview: 1,
+            ..Report::default()
+        };
+        let note = empty.account_note();
+        assert!(note.contains("本期无可领套餐"), "{note}");
+        assert!(note.contains("已领过或尚未放出"), "{note}");
+        // 卡片口径不带整轮计数（那是 `summary` 的事）
+        assert!(!note.contains("检查 1 个账号"), "{note}");
+
+        let missing = Report {
+            checked: 1,
+            not_deployed: 1,
+            ..Report::default()
+        };
+        assert_eq!(missing.account_note(), "上游未开放套餐领取（preview 404）");
+
+        // 台账里已有本期记录 / 仍在退避 / 真失败
+        let already = Report {
+            checked: 1,
+            already: 1,
+            ..Report::default()
+        };
+        assert_eq!(already.account_note(), "本期已领过 1 份");
+        let skipped = Report {
+            checked: 1,
+            skipped: 1,
+            ..Report::default()
+        };
+        assert_eq!(skipped.account_note(), "1 份仍在重试冷却中");
+        let failed = Report {
+            checked: 1,
+            failed: 1,
+            ..Report::default()
+        };
+        assert_eq!(failed.account_note(), "领取失败 1 份");
+
+        // 账号级错误原文优先：那才是用户要的答案，不能被计数盖掉
+        let broken = Report {
+            checked: 1,
+            failed: 1,
+            error: Some("登录态已失效".into()),
+            ..Report::default()
+        };
+        assert_eq!(broken.account_note(), "登录态已失效");
+
+        // 什么都没有（理论上走不到这里，但不能返回空串把卡片留白）
+        assert_eq!(Report::default().account_note(), "本轮无可动作");
+    }
+
+    #[test]
+    fn last_claim_note_reports_the_ledger_state() {
+        use super::super::providers::zcode::credentials::ZcodeCredentials;
+        use crate::server::db::test_temp::TempDb;
+        let (db, _temp) = TempDb::open("zcode-auto-claim-last-note");
+        let store = AccountStore::with_db(Some(db));
+        let credentials = ZcodeCredentials {
+            region: Region::ALL[0],
+            user_id: "test".into(),
+            jwt: "fixture".into(),
+            access_token: "fixture".into(),
+            device_mid: String::new(),
+        };
+        store
+            .add_zcode_account(&credentials, Some("fixture"), "test")
+            .unwrap();
+        let id = credentials.account_id();
+        assert_eq!(last_claim_note(&store, &id), "本地尚无领取记录");
+        let at = logging::now_ms() - 3 * 3_600_000;
+        assert!(store.mark_zcode_claim(&id, "plan-x", at));
+        let note = last_claim_note(&store, &id);
+        assert!(note.contains("最近一次领取：3 小时前（plan-x）"), "{note}");
+        assert_eq!(last_claim_note(&store, "missing"), "账号记录已不存在");
     }
 
     #[test]

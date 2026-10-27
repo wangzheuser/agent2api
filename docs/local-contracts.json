@@ -1277,13 +1277,15 @@
       "id": "zcode-claim-dedup",
       "level": "P0",
       "status": "必须保留",
-      "behavior": "两地区领取资格与开关有效，历史套餐去重不阻挡新套餐，领取成功后持久化通道切换和账本。",
+      "behavior": "两地区领取资格与开关有效，历史套餐去重不阻挡新套餐，领取成功后持久化通道切换和账本。上游 preview 返回空列表、上游未部署领取接口、确实领取成功这三种结果必须在账号状态里分开表述，且空列表不算失败。同一结论必须能在签到中心的账号行看到（任务状态 `zcodeClaim:<id>` → `lastClaimResult`），卡片口径用短句，不带整轮计数。",
       "source_commits": [
         "9973da5",
         "2562e7e"
       ],
       "implementation": [
-        "desktop-tauri/src-tauri/server/src/server/core/zcode_claim.rs"
+        "desktop-tauri/src-tauri/server/src/server/core/zcode_claim.rs",
+        "desktop-tauri/src-tauri/server/src/server/api/checkin_center.rs",
+        "desktop-tauri/ui-islands/src/islands/checkin-page.tsx"
       ],
       "tests": [
         {
@@ -1303,6 +1305,24 @@
           "path": "desktop-tauri/src-tauri/server/src/server/core/zcode_claim.rs",
           "name": "server::core::zcode_claim::tests::completion_persists_plan_switch_and_ledger_for_both_regions",
           "id": "case-e8d8e59e1d03"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/zcode_claim.rs",
+          "name": "server::core::zcode_claim::tests::summary_separates_empty_preview_from_not_deployed",
+          "id": "case-zcode-claim-empty-preview-reported"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/zcode_claim.rs",
+          "name": "server::core::zcode_claim::tests::last_claim_note_reports_the_ledger_state",
+          "id": "case-zcode-claim-last-claim-note"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/zcode_claim.rs",
+          "name": "server::core::zcode_claim::tests::account_note_speaks_in_one_short_sentence",
+          "id": "case-zcode-claim-account-note"
         }
       ]
     },

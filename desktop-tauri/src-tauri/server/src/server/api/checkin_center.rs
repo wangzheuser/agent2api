@@ -55,6 +55,7 @@ use crate::server::core::beijing;
 use crate::server::core::billing::checkin;
 use crate::server::core::checkin_history;
 use crate::server::core::checkin_records;
+use crate::server::core::task_state;
 use crate::server::core::usage_records;
 use crate::server::http::ok_json;
 use crate::server::ServerState;
@@ -267,6 +268,11 @@ pub async fn get_center(State(state): State<ServerState>) -> Response {
     // （CodeArts 曾也有一条同样的 welfare 行，2026-10 它的每日福利并入每日签到后
     // 撤掉了：那一组在 `daily` 里已经是普通分组，「活动福利」再列一遍就是同一个
     // 账号两处入口。一块 UI 只留一个入口，领与看都 unambiguous。）
+    // 自动领取任务把每个账号的探测结论写在 `zcodeClaim:<账号 id>` 这条任务状态里
+    // （`run_auto` 的 per-account `guard.finish`）。带出来是**零上游请求**的本地
+    // 事实，正好回答界面那句「今天怎么没领到」：上游没放新套餐、上游未开放、
+    // 还是本地领取失败 —— 以前这层信息只写在日志里，卡片上只能看到「今天未领」。
+    let claim_states = task_state::read_all().unwrap_or_default();
     let plan_rows: Vec<Value> = accounts
         .iter()
         .filter(|account| {
@@ -274,14 +280,27 @@ pub async fn get_center(State(state): State<ServerState>) -> Response {
             provider == "zcode" || provider == "zcode-intl"
         })
         .map(|account| {
+            let id = account_text(account, "id");
+            let last_claim_result = claim_states
+                .get(&format!("zcodeClaim:{id}"))
+                .and_then(|state| {
+                    state
+                        .last_result
+                        .clone()
+                        .or_else(|| state.last_error.clone())
+                })
+                .map(Value::from)
+                .unwrap_or(Value::Null);
             json!({
-                "id": account_text(account, "id"),
+                "id": id,
                 "name": Value::from(account_text(account, "name")),
                 "claimAt": account.get("claimAt").cloned().unwrap_or(Value::Null),
                 // 领取台账（{planId: 毫秒}）原样带出：界面「今天领过哪几份」按
                 // 逐份比对（claimPlans 的日界判定在前端已有同款实现，复用它，
                 // 后端不再抄一份北京时间的日界逻辑）
                 "claimPlans": account.get("claimPlans").cloned().unwrap_or(Value::Null),
+                // 自动任务最近一次对这个账号的结论（短句，见 `Report::account_note`）
+                "lastClaimResult": last_claim_result,
             })
         })
         .collect();
