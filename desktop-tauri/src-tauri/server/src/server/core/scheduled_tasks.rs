@@ -426,7 +426,11 @@ async fn run_backend(
                 // skipped（未到间隔 / 设置里关了）不写进摘要：那是常态，写进去只是噪音
                 _ => String::new(),
             };
-            (format!("{summary}{metadata_note}"), failed == 0)
+            // 与凭证维护 / 积分查询同一口径：某一家刷新失败只让它自己退避，
+            // 只要有至少一家真拿到了新清单，整轮不算失败 —— 否则一条永久性的
+            // 配置缺失（如「尚未添加 OfficeAce 账号」）会把整条任务指数退避到
+            // 24 小时，其余 25 家的缓存跟着一起停更（实测 2026-10-27 华为云）。
+            (format!("{summary}{metadata_note}"), round_succeeded(refreshed, failed))
         }
         TASK_USAGE_QUERY => {
             let report = crate::server::core::usage_query::query_all(store, None).await.map_err(|error| error.message)?;
@@ -515,4 +519,18 @@ pub fn spawn(store: AccountStore, update: UpdateManager) {
             tokio::time::sleep(Duration::from_millis(TICK_MS)).await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::round_succeeded;
+
+    /// 模型目录刷新沿用「部分失败不算整轮失败」的判据：个别家的失败只让它
+    /// 自己退避；只要至少一家拿到了新清单，整轮就不退避（全失败才退）。
+    #[test]
+    fn round_success_keeps_partial_progress_and_only_backs_off_when_all_failed() {
+        assert!(round_succeeded(1, 1), "有一家真刷新过，整轮不算失败");
+        assert!(round_succeeded(0, 0), "无事可做的轮次不算失败");
+        assert!(!round_succeeded(0, 1), "全失败仍退避");
+    }
 }

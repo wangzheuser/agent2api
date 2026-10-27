@@ -195,10 +195,22 @@ impl ProviderAdapter for OfficeAceAdapter {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ModelRefreshOutcome> + Send + 'a>> {
         Box::pin(async move {
             let record = store.officeace_account_record(account_id);
-            if record.is_none() && !account_id.is_empty() {
-                return ModelRefreshOutcome::failed("指定的账号不存在或不可用，请重新选择");
-            }
-            models::refresh_from_record(record.as_ref(), force).await
+            let Some(record) = record else {
+                // 点名了不存在的账号 → 失败（用户选错了）；**默认账号也没有** →
+                // 只是「还没添加账号」这个配置状态，不是刷新失败。把它当失败会让
+                // `modelRefresh:officeace` 一路指数退避到 24 小时，并把「模型目录
+                // 刷新」整轮拖成失败（实测华为云 2026-10-27：目录缓存因此停更
+                // 20 小时）。跳过即可：账号页加了账号后下一轮自然恢复。
+                if !account_id.is_empty() {
+                    return ModelRefreshOutcome::failed("指定的账号不存在或不可用，请重新选择");
+                }
+                crate::server::logging::verbose(
+                    "[Models]",
+                    "OfficeAce 模型目录刷新跳过：尚未添加账号",
+                );
+                return ModelRefreshOutcome::unchanged();
+            };
+            models::refresh_from_record(Some(&record), force).await
         })
     }
 
@@ -337,5 +349,32 @@ mod tests {
                 "这条不该算超限：{body}"
             );
         }
+    }
+
+    /// 「还没有任何账号」是配置状态，不是刷新失败：自动路径该跳过这一家，
+    /// 否则 `modelRefresh:officeace` 会把整条目录刷新任务拖进指数退避
+    /// （华为云实测：永久缺席的一家让整轮 24 小时停摆）。
+    #[tokio::test]
+    async fn refresh_without_any_account_is_a_skip_not_a_failure() {
+        let adapter = adapter_for(ProviderKind::OfficeAce);
+        let store = crate::server::core::account_store::AccountStore::with_db(None);
+        let outcome = adapter.refresh_models(&store, "", true).await;
+        assert!(
+            !outcome.refreshed && outcome.message.is_none(),
+            "没有账号应返回 unchanged（跳过），实际 {outcome:?}"
+        );
+    }
+
+    /// 用户点名了一条不存在的账号时仍是失败 —— 那是「选错了」，
+    /// 与「根本没加账号」不是一回事，文案要保留指引。
+    #[tokio::test]
+    async fn refresh_with_an_explicit_missing_account_still_reports_failure() {
+        let adapter = adapter_for(ProviderKind::OfficeAce);
+        let store = crate::server::core::account_store::AccountStore::with_db(None);
+        let outcome = adapter.refresh_models(&store, "missing-account", true).await;
+        assert!(
+            !outcome.refreshed && outcome.message.is_some(),
+            "点名的账号不存在要如实失败，实际 {outcome:?}"
+        );
     }
 }
