@@ -1150,7 +1150,7 @@
       "id": "qoder-intl-device-quota",
       "level": "P1",
       "status": "必须保留",
-      "behavior": "每日积分按「人」发放（同一台机器/同一出口 IP 算一个人）：领取成功后写设备台账（只落账号哈希，保留最近 14 天），国内版与国际版都写；同机其它账号当日归因为「名额已被占用」并停止自动重试，不冒充窗口未开、也不冒充「今日已领取」；批量签到按最久未签到轮换，两个地区都轮换（国内版在自己原有的位置上换位，不影响其它提供商的相对顺序）；领取响应的 409 必须按业务码区分 ALREADY_CLAIMED（今日已领）与 CAMPAIGN_NOT_ACTIVE（活动批次过期，留给盲发兜底换候选），不能把 409 整体当成已领取；BLOCKED + SAME_PERSON_ALREADY_CLAIMED 记为「本机名额已被占用」而非「已签到」；设备身份按账号持久分配，缺失账号身份时退回设备级。",
+      "behavior": "每日积分按「人」发放（同一台机器/同一出口 IP 算一个人）：领取成功后写设备台账（只落账号哈希，保留最近 14 天），国内版与国际版都写；同机其它账号当日归因为「名额已被占用」并停止自动重试，不冒充窗口未开、也不冒充「今日已领取」；批量签到按最久未签到轮换，两个地区都轮换（国内版在自己原有的位置上换位，不影响其它提供商的相对顺序）；领取响应的 409 必须按业务码区分 ALREADY_CLAIMED（今日已领）与 CAMPAIGN_NOT_ACTIVE（活动批次过期，留给盲发兜底换候选），不能把 409 整体当成已领取；BLOCKED + SAME_PERSON_ALREADY_CLAIMED 记为「本机名额已被占用」而非「已签到」；设备身份按账号持久分配，缺失账号身份时退回设备级；合成身份必须复刻官方组件形态（令牌 3f5800 头、类型 91 标记、代码 00 标记），缺任一标记上游会把设备定向活动行静默过滤。",
       "source_commits": [
         "15a54a2431cbb34818001d576d28dc2d082b83af"
       ],
@@ -1244,6 +1244,12 @@
           "path": "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/machine.rs",
           "name": "server::core::providers::qoder::machine::tests::synthetic_identity_is_stable_and_account_scoped",
           "id": "case-9c8484b0db83"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/machine.rs",
+          "name": "server::core::providers::qoder::machine::tests::synthetic_identity_keeps_official_markers",
+          "id": "qoder-identity-official-markers"
         },
         {
           "kind": "rust",

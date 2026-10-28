@@ -246,20 +246,77 @@ pub fn device_id(region: Region, uid: &str) -> Result<String, GatewayError> {
 /// D（合成身份），确认合成身份能另开一份名额再打开。即便合成身份不被活动域
 /// 接受，`checkin.rs` 的盲发直领兜底（学习 campaign id 后每账号直领）也不依赖
 /// 这个开关 —— 它用本机真值三件套 + 按账号的 `device_id` 完成「每账号一台设备」。
+///
+/// ── 2026-10-28 补记（交叉验证后的边界）────────────────────────
+/// [`synthetic_identity`] 的输出形态已按官方组件逐字节对齐（标记位齐全），
+/// 但**形态对齐不等于能用**：`mmqz/cpa-multi-plugins` 的取证结论是「国际版
+/// sash 域对**派生/轮换**身份是身份级过滤，与形态无关」——换回官方形态的
+/// 派生值仍会被过滤；`LiSeafood/AiCheckin` 的实测也印证了同一条业务规则
+/// （国际版多账号每天合计 100 Credits、按「人」去重）。所以国际版不要指望
+/// 这个开关绕过名额，它的正当用途只有「本机没有 UMID 组件时给一份形态合法
+/// 的兜底身份」。
 pub fn synthetic_identity_enabled() -> bool {
     std::env::var("AGENT2API_QODER_SYNTHETIC_IDENTITY")
         .map(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false)
 }
 
-/// 按账号派生的三件套，长度/字符集对齐官方组件的真实输出
-/// （token 88 位 base64url、code 18 位 hex、type 18 位 hex）。
+/// 官方 UMID 组件的 `machineToken` 固定头：`3f 58 00` 三字节（base64url
+/// 渲染恒为字面量前缀 `P1gA`）。
+///
+/// 这个头不是装饰。`mmqz/cpa-multi-plugins` 对官方 `runtime-info` 的取证
+/// （`plugins/qoder/machine_identity.go`，v0.8.44，9 次官方桥实跑）记录：上游
+/// 反风控层会识别「形态不像官方」的令牌，把**设备定向活动行静默丢弃**——每日
+/// 100 Credits 正是设备定向行之一。旧派生方案（43 位无头令牌）被称为「派生
+/// 身份被过滤」的根因就在这里：不是派生值不被接受，是形态被判定为非官方。
+const MACHINE_TOKEN_HEADER: [u8; 3] = [0x3f, 0x58, 0x00];
+
+/// 官方 `machineType` 的固定中段标记（18 hex = 8hex + `91` + 8hex）。
+const MACHINE_TYPE_MARKER: &str = "91";
+
+/// 官方 `machineCode` 的固定中段标记（18 hex = 8hex + `00` + 8hex）。
+const MACHINE_CODE_MARKER: &str = "00";
+
+/// 按账号稳定派生的三件套，**逐字节复刻官方组件的输出形态**。
+///
+/// | 字段 | 长度 | 形态 |
+/// |---|---|---|
+/// | `machineToken` | 88（base64url 无填充） | 66 字节 = `3f 58 00` 固定头 + 63 字节派生体 |
+/// | `machineType` | 18（小写 hex） | 8hex + `91` + 8hex |
+/// | `machineCode` | 18（小写 hex） | 8hex + `00` + 8hex |
+///
+/// 只复刻形态、不复刻取值：三个字段仍按 `(region, uid)` 稳定派生，所以
+/// **同一账号长期固定在同一台「设备」上、不同账号天然落在不同设备**。
+///
+/// ⚠️ 形态正确≠上游一定认：`intl` 侧对**非真实**身份的过滤是身份级的
+/// （见 [`synthetic_identity_enabled`] 的说明）。这里只保证不再因为「形态
+/// 畸形」被当成非官方身份。
 pub fn synthetic_identity(region: Region, uid: &str) -> (String, String, String) {
     let seed = format!("{}:{}", region.id(), uid.trim());
-    let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(derived_bytes(&seed, "token", 66));
-    let code = hex_of(&derived_bytes(&seed, "code", 9));
-    let kind = hex_of(&derived_bytes(&seed, "type", 9));
+    let token = synthetic_machine_token(&seed);
+    let code = synthetic_machine_code(&seed);
+    let kind = synthetic_machine_type(&seed);
     (token, code, kind)
+}
+
+/// `machineToken`：66 字节 = 固定头 + 63 字节派生体 → 88 字符 base64url。
+fn synthetic_machine_token(seed: &str) -> String {
+    let mut raw = [0u8; 66];
+    raw[..MACHINE_TOKEN_HEADER.len()].copy_from_slice(&MACHINE_TOKEN_HEADER);
+    raw[MACHINE_TOKEN_HEADER.len()..].copy_from_slice(&derived_bytes(seed, "token", 63));
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
+}
+
+/// `machineType`：8hex + `91` + 8hex。
+fn synthetic_machine_type(seed: &str) -> String {
+    let bytes = derived_bytes(seed, "type", 8);
+    format!("{}{MACHINE_TYPE_MARKER}{}", hex_of(&bytes[..4]), hex_of(&bytes[4..]))
+}
+
+/// `machineCode`：8hex + `00` + 8hex。
+fn synthetic_machine_code(seed: &str) -> String {
+    let bytes = derived_bytes(seed, "code", 8);
+    format!("{}{MACHINE_CODE_MARKER}{}", hex_of(&bytes[..4]), hex_of(&bytes[4..]))
 }
 
 /// 从种子流派生指定字节数（sha256 链，确定性 → 同账号每次都一样）
@@ -297,6 +354,28 @@ mod tests {
         assert!(code.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         assert_eq!(kind.len(), 18);
         assert!(kind.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
+    /// 官方形态的**标记位**不能丢：`3f 58 00` 头（→ `P1gA` 前缀）、type 的 `91`、
+    /// code 的 `00`。缺任何一个都会被上游判成非官方身份，设备定向活动行被静默
+    /// 丢弃（每日 100 Credits 就是其中之一）。
+    #[test]
+    fn synthetic_identity_keeps_official_markers() {
+        for region in [Region::Cn, Region::Global] {
+            for uid in ["account-a", "account-b"] {
+                let (token, code, kind) = synthetic_identity(region, uid);
+                let label = region.label();
+                assert!(token.starts_with("P1gA"), "{label}/{uid} token 缺 3f5800 头：{token}");
+                assert_eq!(&kind[8..10], MACHINE_TYPE_MARKER, "{label}/{uid} type 缺 91 标记：{kind}");
+                assert_eq!(&code[8..10], MACHINE_CODE_MARKER, "{label}/{uid} code 缺 00 标记：{code}");
+            }
+        }
+        // 固定头逐字节成立（不是碰巧的字符串前缀）
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(synthetic_identity(Region::Cn, "account-a").0)
+            .expect("token 必须是合法 base64url");
+        assert_eq!(raw.len(), 66);
+        assert_eq!(&raw[..3], &MACHINE_TOKEN_HEADER);
     }
 
     #[test]
