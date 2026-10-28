@@ -362,7 +362,9 @@ impl BillingService {
                 crate::server::core::task_state::ManualBackoff::Respect, 1000,
             ).map_err(|error| BillingError::new(error, 503))? {
                 crate::server::core::task_state::Claim::Acquired(lease) => lease,
-                crate::server::core::task_state::Claim::Deferred(_) => return Err(BillingError::new("活跃任务正在执行或冷却中", 409)),
+                crate::server::core::task_state::Claim::Deferred(state) => {
+                    return Err(BillingError::new(state.waiting_message(), 409))
+                }
             };
             let result = self.run_workbuddy_daily_activity(session, mode, &mut completed_claim).await;
             lease.finish(result.is_ok(), if result.is_ok() { "活跃任务完成" } else { "活跃任务停止" }.into(), None, 0, 0)
@@ -379,7 +381,13 @@ impl BillingService {
 
     async fn run_workbuddy_daily_activity(&self, session: &Value, mode: WorkbuddyActivity, completed_claim: &mut Value) -> Result<Value, BillingError> {
         let cached_web = if mode != WorkbuddyActivity::Claim {
-            super::web_activity::cached(session).map_err(|error| BillingError::new(error, 409))?
+            match super::web_activity::cached(session) {
+                Ok(value) => value,
+                Err(error) => {
+                    logging::verbose("[Checkin]", &format!("WorkBuddy 国际版网页会话待核对：{error}"));
+                    None
+                }
+            }
         } else { None };
         let balance_before = self.log_workbuddy_activity_balance(session, "前").await?;
 
@@ -399,18 +407,12 @@ impl BillingService {
 
         match status {
             Ok(result) => {
-                let status_available = result.code == Some(RESPONSE_CODE_OK) && !result.data.is_null();
-                let active = status_available && result
-                    .data
-                    .get("active")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                let today_checked_in = status_available && result
-                    .data
-                    .get("today_checked_in")
-                    .or_else(|| result.data.get("todayCheckedIn"))
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
+                // 判定与对外状态共用同一份归一化结果，避免「面板说活动可用、领取分支却当活动已关闭」
+                // 这类自相矛盾（缺失的 active 按参考客户端视为可领取）。
+                let status_value = normalize_activity_status(&result);
+                let status_available = status_value["statusAvailable"].as_bool().unwrap_or(false);
+                let active = status_value["active"].as_bool().unwrap_or(false);
+                let today_checked_in = status_value["todayCheckedIn"].as_bool().unwrap_or(false);
                 if !status_available {
                     logging::verbose(
                         "[Checkin]",
@@ -425,7 +427,7 @@ impl BillingService {
                     status_available,
                     active,
                     today_checked_in,
-                    normalize_activity_status(&result),
+                    status_value,
                 )
             }
             Err(error) => {
@@ -485,7 +487,9 @@ impl BillingService {
 
         let (api_poke_succeeded, poke_model, web) = if mode != WorkbuddyActivity::Claim {
             if let Some(web) = cached_web {
-                (None, None, Some(web))
+                // Web success is cached independently; retry the growth report without
+                // creating another API/ACP conversation.
+                (Some(true), None, Some(web))
             } else {
             let (api, model) = self.poke_daily_activity(session).await?;
             let models = super::keepalive::models();
@@ -494,15 +498,32 @@ impl BillingService {
                 "WorkBuddy 国际版网页保活（status={}，outputChunks={}，success={}，error={}）",
                 web.status, web.output_chunks, web.success, web.error.as_deref().unwrap_or("none"),
             ));
-            if !web.success {
-                return Err(BillingError::new(web.error.unwrap_or_else(|| "网页保活未完成".into()), 502));
-            }
             (Some(api), model, Some(web))
             }
         } else {
             (None, None, None)
         };
-        let report = if mode != WorkbuddyActivity::Claim && api_poke_succeeded.is_some() { self.report_chat_activity(session).await? } else { Value::Null };
+        let report = if mode != WorkbuddyActivity::Claim && api_poke_succeeded.is_some() {
+            match self.report_chat_activity(session).await {
+                Ok(value) => value,
+                Err(error) => json!({
+                    "succeeded": false,
+                    "streakDays": Value::Null,
+                    "error": error.message,
+                }),
+            }
+        } else { Value::Null };
+        let report_required = mode != WorkbuddyActivity::Claim && api_poke_succeeded.is_some();
+        let report_succeeded = report.get("succeeded").and_then(Value::as_bool) == Some(true);
+        if report_required && !report_succeeded {
+            return Err(BillingError::new(
+                report
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("活跃上报失败"),
+                502,
+            ));
+        }
         let poke_succeeded = web.as_ref().map(|result| result.success);
         let balance_after = self.log_workbuddy_activity_balance(session, "执行后").await?;
         let balance_delta = balance_before
@@ -518,6 +539,8 @@ impl BillingService {
         if mode == WorkbuddyActivity::Full && status_available && !claim_succeeded && !today_checked_in && !active {
             claim["msg"] = Value::String(if poke_succeeded == Some(true) {
                 "网页会话完成，日活奖励尚未确认".to_string()
+            } else if report.get("succeeded").and_then(Value::as_bool) == Some(true) {
+                "活跃上报完成，网页会话未确认".to_string()
             } else {
                 format!("网页保活失败：{}", web.as_ref().and_then(|result| result.error.as_deref()).unwrap_or("会话未完成"))
             });
@@ -583,8 +606,8 @@ impl BillingService {
             "conversationId": conversation_id,
             "requestId": conversation_id,
             "inputLength": 12,
-            "requestModelId": "deepseek-v4.1-flash",
-            "requestModelName": "DeepSeek V4.1 Flash",
+            "requestModelId": "deepseek-v4-flash",
+            "requestModelName": "DeepSeek V4 Flash",
             "isPlan": false,
             "isAutoExecuteTerminal": false,
             "isAutoModify": false,
@@ -636,19 +659,19 @@ impl BillingService {
             }
         };
         // 回读连登天数（只读 oracle）：上报 200 ≠ 计分，闭环验证用。
-        let streak_days = if succeeded {
+        let (streak_days, streak_error) = if succeeded {
             match self.read_growth_streak(session).await {
-                Ok(days) => Some(days),
+                Ok(days) => (Some(days), Value::Null),
                 Err(error) => {
                     logging::verbose(
                         "[Checkin]",
                         &format!("WorkBuddy 国际版连登回读失败（上报本身已成功）: {}", error.message),
                     );
-                    return Err(error);
+                    (None, Value::String(error.message))
                 }
             }
         } else {
-            None
+            (None, Value::Null)
         };
         let streak_text = streak_days
             .map(|days| format!("，连登 {days} 天"))
@@ -656,6 +679,7 @@ impl BillingService {
         Ok(json!({
             "succeeded": succeeded,
             "streakDays": streak_days.map(Value::from).unwrap_or(Value::Null),
+            "streakError": streak_error,
             "msg": if succeeded {
                 format!("活跃上报成功{streak_text}")
             } else {

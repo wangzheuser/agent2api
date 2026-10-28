@@ -619,7 +619,8 @@ fn normalize_activity_status(result: &BillingCall) -> Value {
         "active": available && data
             .get("active")
             .and_then(Value::as_bool)
-            .unwrap_or(false),
+            // 参考客户端把缺失的 active 当作可领取；只有明确 false 才表示活动关闭。
+            .unwrap_or(true),
         "todayCheckedIn": available && data
             .get("today_checked_in")
             .or_else(|| data.get("todayCheckedIn"))
@@ -854,5 +855,17 @@ mod tests {
         assert_eq!(status["dailyCredit"], 100);
         assert_eq!(status["statusAvailable"], true);
 
+    }
+
+    #[test]
+    fn missing_activity_active_defaults_to_available() {
+        let result = BillingCall {
+            code: Some(RESPONSE_CODE_OK),
+            msg: None,
+            request_id: None,
+            data: json!({"today_checked_in": false}),
+            raw: None,
+        };
+        assert_eq!(normalize_activity_status(&result)["active"], true);
     }
 }

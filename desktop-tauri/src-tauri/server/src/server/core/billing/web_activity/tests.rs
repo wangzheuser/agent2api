@@ -1,6 +1,6 @@
 use super::*;
 use axum::{
-    body::Body, http::StatusCode, response::Response as HttpResponse, routing::get, Router,
+    body::Body, http::{StatusCode, Uri}, response::Response as HttpResponse, routing::get, Router,
 };
 use tokio::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -29,6 +29,25 @@ fn web_activity_daily_success_and_uncertainty_survive_date_rollover() {
     assert!(saved_outcome(Some(&invalid), "2026-10-21").is_err());
     let rejected = json!({"phase":"rejected","outcome":{"status":"CREATE_REJECTED","conversationId":null}});
     assert!(saved_outcome(Some(&rejected), "2026-10-21").unwrap().is_none());
+}
+
+#[test]
+fn only_rejections_without_a_conversation_stay_retryable() {
+    for status in ["CREATE_REJECTED", "ACTIVE_LIMIT", "RECONCILED_FAILED"] {
+        let state = json!({"day":"2026-10-21","phase":"rejected",
+            "outcome":{"status":status,"conversationId":null}});
+        assert!(
+            saved_outcome(Some(&state), "2026-10-21").unwrap().is_none(),
+            "{status} 没留下会话，不能占掉当天机会"
+        );
+        // 只要记录里带会话 ID，就必须继续按「待核对」处理，不能重复创建。
+        let with_id = json!({"day":"2026-10-21","phase":"rejected",
+            "outcome":{"status":status,"conversationId":"fixture"}});
+        assert!(saved_outcome(Some(&with_id), "2026-10-21").is_err(), "{status}");
+    }
+    let unknown = json!({"day":"2026-10-21","phase":"rejected",
+        "outcome":{"status":"SOMETHING_NEW","conversationId":null}});
+    assert!(saved_outcome(Some(&unknown), "2026-10-21").is_err());
 }
 
 #[test]
@@ -66,11 +85,14 @@ async fn web_activity_persists_before_create_and_never_recreates_unknown_result(
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let seen = hits.clone();
         let persisted_key = key.clone();
-        let app = Router::new().fallback(move |method: axum::http::Method| {
+        let app = Router::new().fallback(move |method: axum::http::Method, uri: Uri| {
             let seen = seen.clone();
             let key = persisted_key.clone();
             let payload = payload.clone();
             async move {
+                if uri.path().ends_with("/stop") || uri.path().ends_with("/delete") {
+                    return (StatusCode::OK, json!({"code":0,"data":{}}).to_string());
+                }
                 seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let state = task_state::read(&key).unwrap().value.unwrap();
                 if method == axum::http::Method::GET {
@@ -99,10 +121,72 @@ async fn web_activity_persists_before_create_and_never_recreates_unknown_result(
         task_state::clear_cooldown(&key).unwrap();
         let restored_store = AccountStore::with_db(Some(db.clone()));
         assert!(!run_with_origin(&restored_store, &session, "fixture", &origin).await.success);
-        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst),
-            if phase == "rejected" && !paused { 3 } else { first_hits }, "{name}");
+        let expected_hits = if paused {
+            first_hits
+        } else if phase == "uncertain" && matches!(name, "unknown-502" | "missing-id") {
+            first_hits
+        } else if phase == "uncertain" {
+            first_hits + 2
+        } else {
+            3
+        };
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), expected_hits, "{name}");
         server.abort();
     }
+}
+
+#[tokio::test]
+async fn web_activity_reconciles_completed_saved_conversation_without_recreating() {
+    static DATABASE: std::sync::OnceLock<(crate::server::db::Db, crate::server::db::test_temp::TempDb)> = std::sync::OnceLock::new();
+    let (db, _) = DATABASE.get_or_init(|| crate::server::db::test_temp::TempDb::open("web-activity-reconcile"));
+    task_state::install(Some(db.clone()));
+    let store = AccountStore::with_db(Some(db.clone()));
+    let session = json!({"provider":"workbuddy-intl","account":{"uid":"reconcile-success"},"auth":{"accessToken":"fixture"}});
+    let key = state_key(&session).unwrap();
+    let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    task_state::store_value(
+        &key,
+        json!({"day":day,"phase":"conversation_created","conversationId":"fixture-completed-id"}),
+    )
+    .unwrap();
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = hits.clone();
+    let persisted_key = key.clone();
+    let app = Router::new().fallback(move |method: axum::http::Method, uri: Uri| {
+        let seen = seen.clone();
+        let key = persisted_key.clone();
+        async move {
+            if uri.path().ends_with("/stop") || uri.path().ends_with("/delete") {
+                return (StatusCode::OK, json!({"code":0,"data":{}}).to_string());
+            }
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(method, axum::http::Method::GET);
+            let state = task_state::read(&key).unwrap().value.unwrap();
+            assert_eq!(state["phase"], "conversation_created");
+            assert_eq!(state["conversationId"], "fixture-completed-id");
+            (
+                StatusCode::OK,
+                json!({"code":0,"data":{"status":"completed"}}).to_string(),
+            )
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let outcome = run_with_origin(&store, &session, "fixture", &origin).await;
+
+    assert!(outcome.success);
+    assert!(outcome.reconciled);
+    assert_eq!(outcome.status, "completed");
+    assert_eq!(outcome.conversation_id.as_deref(), Some("fixture-completed-id"));
+    assert_eq!(outcome.output_chunks, 0);
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let value = task_state::read(&key).unwrap().value.unwrap();
+    assert_eq!(value["phase"], "success");
+    assert_eq!(value["outcome"]["reconciled"], true);
+    assert_eq!(value["outcome"]["outputChunks"], 0);
+    server.abort();
 }
 
 #[test]
@@ -178,6 +262,26 @@ fn validates_console_ids_and_sandbox_addresses() {
     }
 }
 
+#[test]
+fn detects_only_active_conversation_limit_rejections() {
+    assert!(active_conversation_limit(
+        429,
+        &json!({"code":10105,"msg":"maximum number of active conversations(10)"})
+    ));
+    assert!(active_conversation_limit(
+        429,
+        &json!({"msg":"you have reached the maximum number of active conversations"})
+    ));
+    assert!(!active_conversation_limit(
+        429,
+        &json!({"code":6021,"msg":"rate limited"})
+    ));
+    assert!(!active_conversation_limit(
+        500,
+        &json!({"code":10105,"msg":"maximum number of active conversations"})
+    ));
+}
+
 // 真正用 HTTP/SSE 验证：POST 202 后从长连接读取 RPC 结果，严格按握手顺序发送。
 #[tokio::test]
 async fn acp_waits_for_rpc_ack_and_consumes_fragmented_sse() {
@@ -212,7 +316,7 @@ async fn acp_waits_for_rpc_ack_and_consumes_fragmented_sse() {
                         .unwrap()
                         .push(body["method"].as_str().unwrap().to_string());
                     let mut data = String::new();
-                    if body["id"] == 3 {
+                    if body["id"] == 4 {
                         data.push_str(&format!(
                             "data: {}\r\n\r\n",
                             json!({"method":"session/update","params":{"update":{
@@ -229,7 +333,7 @@ async fn acp_waits_for_rpc_ack_and_consumes_fragmented_sse() {
                         json!({"jsonrpc":"2.0","id":body["id"],"result":result})
                     ));
                     // 实际沙箱的 session/prompt 在 POST 上返回 200 SSE，不走 GET 事件流。
-                    if body["id"] == 3 {
+                    if body["id"] == 4 {
                         return HttpResponse::builder()
                             .header("content-type", "text/event-stream")
                             .body(Body::from(data))
@@ -273,8 +377,16 @@ async fn acp_waits_for_rpc_ack_and_consumes_fragmented_sse() {
     tokio::time::timeout(Duration::from_secs(5), async {
         channel.rpc(1, "initialize", json!({})).await.unwrap();
         channel.rpc(2, "session/load", json!({})).await.unwrap();
+        channel
+            .rpc(
+                3,
+                "session/set_model",
+                json!({"sessionId":"fixture-session","modelId":"deepseek-v4.1-flash"}),
+            )
+            .await
+            .unwrap();
         assert_eq!(
-            channel.rpc(3, "session/prompt", json!({})).await.unwrap()["stopReason"],
+            channel.rpc(4, "session/prompt", json!({})).await.unwrap()["stopReason"],
             "end_turn"
         );
     })
@@ -283,7 +395,7 @@ async fn acp_waits_for_rpc_ack_and_consumes_fragmented_sse() {
     assert_eq!(channel.output_chunks, 1);
     assert_eq!(
         *methods.lock().unwrap(),
-        vec!["initialize", "session/load", "session/prompt"]
+        vec!["initialize", "session/load", "session/set_model", "session/prompt"]
     );
     server.abort();
 }

@@ -136,17 +136,23 @@ async fn activity_stops_after_rejection_and_persists_daily_and_uncertain_boundar
         let account = session(phase);
         task_state::store_value(&format!("workbuddy-web-activity:{}", workbuddy_policy::identity(&account).unwrap()), json!({"day":"2020-01-01","phase":phase})).unwrap();
         assert_eq!(billing.workbuddy_daily_activity(&account, WorkbuddyActivity::Full).await["activity"]["stopped"], true);
-        assert!(seen.lock().unwrap().is_empty());
+        let calls = seen.lock().unwrap().clone();
+        assert!(!calls.is_empty());
+        assert!(!calls.iter().any(|path| path.contains("/console/as/conversations/")));
     }
     seen.lock().unwrap().clear();
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let completed = json!({"day":today,"phase":"success","outcome":{
         "success":true,"conversationId":"fixture","status":"completed","outputChunks":1,"turnCompleted":true,"elapsedMs":1,"error":null}});
     task_state::store_value(&format!("workbuddy-web-activity:{}", workbuddy_policy::identity(&session("completed")).unwrap()), completed).unwrap();
+    *response.lock().unwrap() = ("/v2/report".into(), 200, json!({"code":0,"data":{}}));
     let restarted = BillingService::new(AuthService::for_store(AccountStore::with_db(Some(Db::open(&dir.join("fixture.db")).unwrap()))));
     let result = restarted.workbuddy_daily_activity(&session("completed"), WorkbuddyActivity::Keepalive).await;
     assert_eq!(result["activity"]["pokeSucceeded"], true, "{result}");
-    assert!(seen.lock().unwrap().iter().all(|path| path.ends_with("get-user-resource")));
+    let calls = seen.lock().unwrap().clone();
+    assert!(calls.iter().any(|path| path.ends_with("get-user-resource")));
+    assert!(calls.iter().any(|path| path.ends_with("/v2/report")));
+    assert!(!calls.iter().any(|path| path.ends_with("/v2/chat/completions")));
 
     seen.lock().unwrap().clear();
     let lease = match task_state::claim(&format!("workbuddy-daily-activity:{}", workbuddy_policy::identity(&session("concurrent")).unwrap()), 0, true, task_state::ManualBackoff::Respect, 0).unwrap() {

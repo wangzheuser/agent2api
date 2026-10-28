@@ -801,6 +801,12 @@ pub async fn run_checkin(
             }
         }
         results.push(row);
+        if provider_of(account) == "workbuddy-intl"
+            || (provider_of(account) == "workbuddy"
+                && account.get("edition").and_then(Value::as_str) == Some("intl"))
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        }
     }
     // 「真实领取」与「今日已领取」都表示本日成功领到分，计入 succeeded；
     // 活跃链路（保活对话 / 活跃上报 / 网页会话）单独统计在 `active` ——

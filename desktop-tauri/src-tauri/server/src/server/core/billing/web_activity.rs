@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::server::core::{account_store::AccountStore, egress, proxies::ResolvedProxy, task_state};
+use crate::server::logging;
 
 const ORIGIN: &str = "https://www.workbuddy.ai";
 const PROMPT: &str = "Reply with just OK. Do not use tools.";
@@ -25,6 +26,8 @@ pub(super) struct Outcome {
     pub output_chunks: usize,
     #[serde(default)]
     pub turn_completed: bool,
+    #[serde(default)]
+    pub reconciled: bool,
     pub elapsed_ms: u128,
     pub error: Option<String>,
 }
@@ -41,7 +44,11 @@ fn saved_outcome(value: Option<&Value>, day: &str) -> Result<Option<Outcome>, St
         Some("success") => {
             let outcome: Outcome = serde_json::from_value(value["outcome"].clone())
                 .map_err(|_| "网页活跃持久化结果无效，未发送请求".to_string())?;
-            if !outcome.success || !outcome.turn_completed || outcome.status != "completed" || outcome.output_chunks == 0 {
+            if !outcome.success
+                || !outcome.turn_completed
+                || outcome.status != "completed"
+                || (outcome.output_chunks == 0 && !outcome.reconciled)
+            {
                 return Err("网页活跃持久化结果不完整，未发送请求".to_string());
             }
             let saved_day = value["day"].as_str().and_then(|date| chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())
@@ -51,15 +58,86 @@ fn saved_outcome(value: Option<&Value>, day: &str) -> Result<Option<Outcome>, St
             if saved_day > today { return Err("网页活跃记录在未来，请核对系统时间".to_string()); }
             Ok((saved_day == today).then_some(outcome))
         }
-        Some("rejected") if value["outcome"]["status"] == "CREATE_REJECTED"
-            && value["outcome"]["conversationId"].is_null() => Ok(None),
+        Some("rejected")
+            if retryable_without_conversation(value["outcome"]["status"].as_str())
+                && value["outcome"]["conversationId"].is_null() =>
+        {
+            Ok(None)
+        }
         _ => Err("上次网页会话创建或执行结果待核对，不自动创建新会话".to_string()),
     }
+}
+
+/// 没有留下会话的状态都允许下一轮重新创建：上游明确拒绝、活跃会话数达到上限，
+/// 或重启后核对确认上次会话已终止。只要记录里带会话 ID，就必须按「待核对」处理，
+/// 不能因为用户后来手动结束了会话就重复创建。
+fn retryable_without_conversation(status: Option<&str>) -> bool {
+    matches!(
+        status,
+        Some("CREATE_REJECTED" | "ACTIVE_LIMIT" | "RECONCILED_FAILED")
+    )
 }
 
 pub(super) fn cached(session: &Value) -> Result<Option<Outcome>, String> {
     let state = task_state::read(&state_key(session)?)?;
     saved_outcome(state.value.as_ref(), &chrono::Utc::now().format("%Y-%m-%d").to_string())
+}
+
+enum ReconcileDecision {
+    Completed(Outcome, String),
+    Retry,
+    Unresolved,
+}
+
+async fn reconcile_saved_conversation(
+    client: &Client,
+    origin: &str,
+    uid: &str,
+    token: &str,
+    saved: Option<&Value>,
+    safety: Option<(&AccountStore, &Value)>,
+) -> ReconcileDecision {
+    let Some(saved) = saved else { return ReconcileDecision::Retry };
+    let Some(saved_id) = saved["conversationId"]
+        .as_str()
+        .or_else(|| saved["outcome"]["conversationId"].as_str())
+    else {
+        return ReconcileDecision::Unresolved;
+    };
+    let Ok(conversation_id) = conversation_id(&Value::String(saved_id.to_string())) else {
+        return ReconcileDecision::Retry;
+    };
+    let saved_day = saved["day"].as_str().unwrap_or_default().to_string();
+    let url = format!("{origin}/console/as/conversations/{conversation_id}");
+    let detail = console(
+        web_request(client, reqwest::Method::GET, &url, uid, token),
+        "核对未完成网页会话",
+        safety,
+    )
+    .await;
+    let status = detail
+        .ok()
+        .and_then(|value| value.get("status").and_then(Value::as_str).map(str::to_string));
+    match status.as_deref() {
+        Some("completed") => {
+            let mut outcome = serde_json::from_value::<Outcome>(saved["outcome"].clone())
+                .unwrap_or_default();
+            outcome.success = true;
+            outcome.conversation_id = Some(conversation_id);
+            outcome.status = "completed".into();
+            outcome.turn_completed = true;
+            outcome.reconciled = true;
+            ReconcileDecision::Completed(outcome, saved_day)
+        }
+        Some("failed") | Some("error") | Some("cancelled") | Some("canceled") => {
+            ReconcileDecision::Retry
+        }
+        _ if saved_day < chrono::Utc::now().format("%Y-%m-%d").to_string() => {
+            // A prior day's non-terminal conversation cannot satisfy today's daily task.
+            ReconcileDecision::Retry
+        }
+        _ => ReconcileDecision::Unresolved,
+    }
 }
 
 pub(super) async fn run(store: &AccountStore, session: &Value, model: &str) -> Outcome {
@@ -86,19 +164,74 @@ async fn run_with_origin(store: &AccountStore, session: &Value, model: &str, ori
         let key = state_key(session)?;
         let lease = match task_state::claim(&key, 0, true, task_state::ManualBackoff::Respect, 0)? {
             task_state::Claim::Acquired(lease) => lease,
-            task_state::Claim::Deferred(_) => return Err("该账号网页保活正在执行或冷却中".to_string()),
+            task_state::Claim::Deferred(state) => return Err(state.waiting_message()),
         };
-        if let Some(saved) = cached(session)? {
-            outcome = saved;
-            lease.finish(true, "今日网页活跃已完成".into(), None, 0, 0)?;
-            return Ok(());
-        }
         let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let saved_state = task_state::read(&key)?.value;
+        match saved_outcome(saved_state.as_ref(), &day) {
+            Ok(Some(saved)) => {
+                outcome = saved;
+                lease.finish(true, "今日网页活跃已完成".into(), None, 0, 0)?;
+                return Ok(());
+            }
+            Ok(None) => {}
+            Err(error) => {
+                match reconcile_saved_conversation(
+                    &client,
+                    origin,
+                    uid,
+                    token,
+                    saved_state.as_ref(),
+                    Some((store, session)),
+                )
+                .await
+                {
+                    ReconcileDecision::Completed(reconciled, saved_day) => {
+                        task_state::store_value(
+                            &key,
+                            json!({"day":saved_day,"phase":"success","outcome":reconciled}),
+                        )?;
+                        if saved_day == day {
+                            outcome = reconciled;
+                            lease.finish(true, "网页活跃已完成（重启后核对）".into(), None, 0, 0)?;
+                            return Ok(());
+                        }
+                    }
+                    ReconcileDecision::Retry => {
+                        task_state::store_value(
+                            &key,
+                            json!({"day":day,"phase":"rejected","outcome":{
+                                "success":false,
+                                "conversationId":Value::Null,
+                                "status":"RECONCILED_FAILED",
+                                "outputChunks":0,
+                                "turnCompleted":false,
+                                "reconciled":true,
+                                "elapsedMs":0,
+                                "error":"上次网页会话已终止，允许重新创建"
+                            }}),
+                        )?;
+                    }
+                    ReconcileDecision::Unresolved => return Err(error),
+                }
+            }
+        }
         task_state::store_value(&key, json!({"day":day,"phase":"pending_create"}))?;
-        let result = execute(&client, origin, uid, token, model, &mut outcome, Some((store, session)), Some((&key, &day))).await;
+        let result = execute(
+            &client,
+            origin,
+            uid,
+            token,
+            model,
+            &mut outcome,
+            Some((store, session)),
+            Some((&key, &day)),
+        )
+        .await;
         outcome.success = result.is_ok();
         let phase = if result.is_ok() { "success" }
-            else if outcome.status == "CREATE_REJECTED" && outcome.conversation_id.is_none() { "rejected" }
+            // 没留下会话（上游拒绝或活跃会话已达上限）不占用今天的机会，下一轮可以重建。
+            else if outcome.conversation_id.is_none() && retryable_without_conversation(Some(&outcome.status)) { "rejected" }
             else { "uncertain" };
         lease.finish(result.is_ok(), match phase { "success" => "网页活跃已完成", "rejected" => "创建请求已拒绝，未创建会话", _ => "网页活跃结果待核对" }.into(),
             Some(json!({"day":day,"phase":phase,"outcome":outcome})), 0, 0)?;
@@ -186,13 +319,107 @@ async fn console(request: RequestBuilder, stage: &str, safety: Option<(&AccountS
             return Err(error.message);
         }
     }
-    if value.get("code").and_then(Value::as_i64) != Some(0) {
+    if value.get("code").and_then(Value::as_i64) != Some(0)
+        && value.get("code").and_then(Value::as_str) != Some("0")
+    {
         return Err(format!(
             "{stage}业务失败（code={}）",
             value.get("code").and_then(Value::as_i64).unwrap_or(-1)
         ));
     }
     Ok(value["data"].clone())
+}
+
+async fn release_conversation(
+    client: &Client,
+    origin: &str,
+    uid: &str,
+    token: &str,
+    conversation_id: &str,
+    delete: bool,
+    safety: Option<(&AccountStore, &Value)>,
+) {
+    let url = format!("{origin}/console/as/conversations/{conversation_id}");
+    let stop = web_request(client, reqwest::Method::POST, &format!("{url}/stop"), uid, token)
+        .json(&json!({}));
+    let _ = console(stop, "结束网页会话", safety).await;
+    if delete {
+        let remove =
+            web_request(client, reqwest::Method::POST, &format!("{url}/delete"), uid, token)
+                .json(&json!({}));
+        let _ = console(remove, "删除失败网页会话", safety).await;
+    }
+}
+
+fn active_conversation_limit(status: u16, value: &Value) -> bool {
+    if status != 429 {
+        return false;
+    }
+    let code = value["code"]
+        .as_i64()
+        .map(|code| code.to_string())
+        .or_else(|| value["code"].as_str().map(str::to_string))
+        .unwrap_or_default();
+    let message = value["msg"]
+        .as_str()
+        .or_else(|| value["message"].as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    code == "10105" || message.contains("maximum number of active conversations")
+}
+
+async fn prune_active_conversations(
+    client: &Client,
+    origin: &str,
+    uid: &str,
+    token: &str,
+    safety: Option<(&AccountStore, &Value)>,
+) {
+    let url = format!("{origin}/console/as/conversations/?page=1&pageSize=50");
+    let Ok(data) = console(
+        web_request(client, reqwest::Method::GET, &url, uid, token),
+        "读取网页会话列表",
+        safety,
+    )
+    .await
+    else {
+        return;
+    };
+    let mut active = data["conversations"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|conversation| {
+            matches!(
+                conversation["status"].as_str(),
+                Some("working" | "creating" | "pending")
+            )
+        })
+        .collect::<Vec<_>>();
+    if active.len() < 10 {
+        return;
+    }
+    active.sort_by_key(|conversation| {
+        conversation["createdAt"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    });
+    let mut stopped = 0usize;
+    for conversation in active {
+        if 10usize.saturating_sub(stopped) <= 8 {
+            break;
+        }
+        if conversation["name"].as_str() != Some(PROMPT) {
+            continue;
+        }
+        let Some(id) = conversation["id"].as_str() else {
+            continue;
+        };
+        release_conversation(client, origin, uid, token, id, false, None).await;
+        stopped += 1;
+    }
 }
 
 async fn create_conversation(
@@ -211,12 +438,14 @@ async fn create_conversation(
         .map_err(|_| "创建网页会话超时，创建结果待核对".to_string())?
         .map_err(|_| "创建网页会话请求未确认，创建结果待核对".to_string())?;
     let status = response.status().as_u16();
-    if matches!(status, 400 | 401 | 402 | 403 | 404 | 405 | 413 | 415 | 422 | 429) {
-        outcome.status = "CREATE_REJECTED".into();
-    }
     let body = read_body(response).await?;
     let value: Value = serde_json::from_slice(&body)
         .map_err(|_| "创建网页会话响应不是有效 JSON".to_string())?;
+    if active_conversation_limit(status, &value) {
+        outcome.status = "ACTIVE_LIMIT".into();
+    } else if matches!(status, 400 | 401 | 402 | 403 | 404 | 405 | 413 | 415 | 422 | 429) {
+        outcome.status = "CREATE_REJECTED".into();
+    }
     if let Ok(id) = conversation_id(&value["data"]["id"]) {
         outcome.conversation_id = Some(id);
         outcome.status = "CREATING".into();
@@ -281,10 +510,60 @@ async fn execute(
     safety: Option<(&AccountStore, &Value)>,
     persistence: Option<(&str, &str)>,
 ) -> Result<(), String> {
+    let result = execute_inner(
+        client,
+        origin,
+        uid,
+        token,
+        model,
+        outcome,
+        safety,
+        persistence,
+    )
+    .await;
+    // 只清理失败/中断留下的会话：`completed` 的会话不再占用「活跃会话」名额，
+    // 成功后再补一次 /stop 既没有收益，还可能吃掉本轮剩余的时间预算把成功翻成超时。
+    if let (true, Some(conversation_id)) = (result.is_err(), outcome.conversation_id.as_deref()) {
+        release_conversation(
+            client,
+            origin,
+            uid,
+            token,
+            conversation_id,
+            true,
+            None,
+        )
+        .await;
+    }
+    result
+}
+
+async fn execute_inner(
+    client: &Client,
+    origin: &str,
+    uid: &str,
+    token: &str,
+    model: &str,
+    outcome: &mut Outcome,
+    safety: Option<(&AccountStore, &Value)>,
+    persistence: Option<(&str, &str)>,
+) -> Result<(), String> {
     let base = format!("{origin}/console/as/conversations/");
-    let request = web_request(client, reqwest::Method::POST, &base, uid, token)
-        .json(&json!({"prompt": PROMPT, "model": model, "conversationOrigin": "workbuddy-app"}));
-    let id = create_conversation(request, outcome, safety, persistence).await?;
+    let create = || {
+        web_request(client, reqwest::Method::POST, &base, uid, token).json(&json!({
+            "prompt": PROMPT,
+            "model": model,
+            "conversationOrigin": "workbuddy-app"
+        }))
+    };
+    let id = match create_conversation(create(), outcome, safety, persistence).await {
+        Ok(id) => id,
+        Err(_error) if outcome.status == "ACTIVE_LIMIT" => {
+            prune_active_conversations(client, origin, uid, token, safety).await;
+            create_conversation(create(), outcome, safety, persistence).await?
+        }
+        Err(error) => return Err(error),
+    };
     let conversation_url = format!("{base}{id}");
     let mut session = Value::Null;
     for attempt in 0..12 {
@@ -359,10 +638,27 @@ async fn execute(
             json!({"sessionId":session_id,"cwd":cwd,"mcpServers":[]}),
         )
         .await?;
+    // 建会话体里的 model 只是 manifest；网页端还会在 ACP 中显式钉住本轮模型，
+    // 否则上游可能按账号默认模型执行，保活会误扣积分。
+    // 不认这个方法的实现可能既不回包也不报错，所以给它单独的短上限——
+    // 设置失败只是回到「按账号默认模型执行」，不能让整轮保活拖到 TURN_TIMEOUT。
+    let pinned = tokio::time::timeout(
+        Duration::from_secs(15),
+        channel.rpc(
+            3,
+            "session/set_model",
+            json!({"sessionId":session_id,"modelId":model}),
+        ),
+    )
+    .await
+    .unwrap_or_else(|_| Err("设置模型请求超时，本轮继续".to_string()));
+    if let Err(error) = pinned {
+        logging::verbose("[Checkin]", &format!("网页保活设置免费模型失败，本轮继续：{error}"));
+    }
     channel.output_chunks = 0;
     let result = channel
         .rpc(
-            3,
+            4,
             "session/prompt",
             json!({"sessionId":session_id,
         "prompt":[{"type":"text","text":PROMPT}]}),
