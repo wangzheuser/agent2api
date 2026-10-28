@@ -1,7 +1,7 @@
-# AGENTS.md — 开发、us2 部署与正式发版流程
+# AGENTS.md — 开发、华为云部署与正式发版流程
 
-> 本文档面向维护者与 AI 代理：Agent2API（workbuddy）桌面端、Docker 镜像和 us2 部署流程。
-> 日常 us2 部署与正式 GitHub/Docker Hub 发版是两条不同流程，必须按对应章节执行。
+> 本文档面向维护者与 AI 代理：Agent2API（workbuddy）桌面端、Docker 镜像和华为云部署流程。
+> 日常华为云部署与正式 GitHub/Docker Hub 发版是两条不同流程，必须按对应章节执行。
 
 ## 0. 版本号约定
 
@@ -32,133 +32,82 @@ cargo check               # 或前端有改动时做一次构建自检
 - 内容取「上个 tag 以来的全部提交」综合整理（`git log vX.Y.Z..HEAD --oneline`），纯 CI/临时的调试提交归并成一条流程性描述即可；
 - 本次没有代码改动时用空提交承载：`git commit --allow-empty -F 更新日志.txt`（历史发版两种做法都有先例）。
 
-## 3. 日常 us2 部署
+## 3. 日常华为云部署
 
-us2 的日常部署以远程 `dev/pr-integration` 分支为唯一代码来源。项目本地分支名为
-`pr-integration`，不要把本地分支名误写成远程分支名。
+华为云（ssh-manager 服务器名 `huaweiyun`，1.95.124.238，国内节点）的日常部署以远程
+`dev/pr-integration` 分支为唯一代码来源。项目本地分支名为 `pr-integration`，不要把
+本地分支名误写成远程分支名。
+
+**部署形态与旧 us2 流程不同**：服务器项目目录 `/opt/docker_projects/agent2api` 不是
+git 仓库，服务器上没有 `update_version.sh`，也不在服务器内构建。镜像是「本地/构建机
+构建 → `docker save/load` 传输 → 固定 tag 替换」；实际生效的 Compose 文件是
+`.deploy/docker-compose.huawei.yml`（端口 `0.0.0.0:19050→3065`，`TZ=Asia/Shanghai`，
+数据卷 `./data`）。服务器只有 2 核 / 1.7GB 内存，禁止在服务器内做 Rust 构建或测试。
 
 ### 3.1 本地提交与推送
 
 1. 在本地完成代码修改、必要测试和审查。
 2. 将变更提交到本地 `pr-integration`；其他分支的变更先合并到该分支。
-3. 确认工作区没有未提交的业务改动后，推送到 us2 使用的远程分支：
+3. 确认工作区没有未提交的业务改动后，推送到部署使用的远程分支：
 
    ```bash
    git status --short
    git push origin HEAD:dev/pr-integration
    ```
 
-   推送目标必须是 `origin/dev/pr-integration`。不得通过直接修改服务器源码来绕过 Git 推送流程。
+   推送目标必须是 `origin/dev/pr-integration`。不得通过直接修改服务器文件来绕过 Git 推送流程。
 
-### 3.2 us2 服务器更新
+### 3.2 华为云镜像发布与替换
 
-登录 us2 后，只在项目目录执行项目提供的更新入口：
-
-```bash
-cd /opt/docker_projects/agent2api
-./update_version.sh
-```
-
-`update_version.sh` 是服务器上的部署入口，不要求它存在于本地源码仓库。它负责调用项目的构建、替换和启动流程；不得在服务器上手工执行不受记录的容器替换、数据库卷删除或源码修改。
-
-更新过程可能包含候选镜像构建和容器内 Rust 测试，持续数分钟，并可能在 SSH 通道已经返回部分输出时仍在服务器后台继续执行。必须使用持久 SSH 会话、远程日志或进程轮询等待更新入口的实际进程结束；SSH 工具的退出码、部分构建输出或「命令已启动」不能视为部署完成。发现已有 `update_version.sh` / `.deploy/update-agent2api.sh` / BuildKit / `cargo test` 进程时，不得并发再次执行更新。
-
-服务器项目目录可能保留项目维护的未跟踪运行材料（例如 `backups/`、`update_version.sh`）；只要更新脚本的受控检查允许，不得为了清理工作区删除或覆盖这些材料。部署脚本会先创建版本化数据库与配置备份，再构建候选镜像；如果构建或候选测试失败而 `release.env`、运行容器仍指向旧版本，必须保留备份和失败现场，按失败流程处理。
-
-### 3.2.1 SSH 300 秒限制下的异步更新流程
-
-`update_version.sh` 包含拉取代码、数据库备份、候选 builder 镜像构建、容器内 Rust 测试、正式镜像构建、容器替换和健康等待。完整过程可能超过 SSH 工具的 300 秒等待上限；SSH 请求超时只表示控制连接停止等待，不能表示远端任务失败，也不能触发第二次更新。
-
-以后每次 us2 更新固定采用“启动与等待分离”的方式：SSH 请求只负责启动一个脱离会话的远端 worker，worker 将完整输出写入项目 `.deploy/status/`，并在结束时原子写入退出码文件；后续 SSH 请求以不超过 180 秒的窗口轮询文件和进程。`update_version.sh` 仍是唯一部署入口，不能绕过它直接执行 Compose 替换。
-
-启动前在同一 SSH 请求内完成目标和并发预检：
-
-```bash
-cd /opt/docker_projects/agent2api
-target=$(git ls-remote origin refs/heads/dev/pr-integration | awk 'NR == 1 {print $1}')
-test -n "$target"
-test -x ./update_version.sh
-ps -eo pid=,etime=,args= | grep -E 'update_version\.sh|update-agent2api\.sh|docker build .*agent2api:test-|cargo test -p agent2api-server' | grep -v grep && exit 3 || true
-run_id="$(date -u +%Y%m%dT%H%M%SZ)-update-$(printf '%s' "$target" | cut -c1-8)"
-status_dir=.deploy/status
-log="$status_dir/$run_id.log"
-exit_file="$status_dir/$run_id.exit"
-pid_file="$status_dir/$run_id.pid"
-mkdir -p "$status_dir"
-rm -f "$exit_file"
-nohup sh -c '
-  cd /opt/docker_projects/agent2api || exit 125
-  ./update_version.sh >"$1" 2>&1
-  rc=$?
-  printf "%s\n" "$rc" >"$2.tmp"
-  mv "$2.tmp" "$2"
-  exit "$rc"
-' sh "$log" "$exit_file" </dev/null >/dev/null 2>&1 &
-pid=$!
-printf '%s\n' "$pid" >"$pid_file"
-printf 'run_id=%s\npid=%s\nlog=%s\nexit_file=%s\ntarget=%s\n' "$run_id" "$pid" "$log" "$exit_file" "$target"
-```
-
-启动请求返回后，必须保存 `run_id`、PID、日志路径和退出码路径。每次轮询只等待一个短窗口，例如 `timeout=180000`，并执行：
-
-```bash
-cd /opt/docker_projects/agent2api
-run_id='<启动请求返回的 run_id>'
-status_dir=.deploy/status
-log="$status_dir/$run_id.log"
-exit_file="$status_dir/$run_id.exit"
-pid_file="$status_dir/$run_id.pid"
-if test -f "$exit_file"; then
-  printf 'exit='; cat "$exit_file"
-  tail -n 80 "$log"
-else
-  printf 'running='; if kill -0 "$(cat "$pid_file")" 2>/dev/null; then echo true; else echo unknown; fi
-  ps -eo pid=,ppid=,etime=,stat=,args= | grep -E 'update_version\.sh|update-agent2api\.sh|docker build .*agent2api:test-|cargo test -p agent2api-server' | grep -v grep || true
-  tail -n 80 "$log"
-fi
-```
-
-若 SSH 工具在轮询期间再次超时，重新建立 SSH 会话后只检查同一个 `run_id` 的退出码、日志和进程；不得重新执行启动命令。只有退出码文件存在、对应 worker 和构建/测试子进程均已结束，且退出码为 `0` 时，才进入部署验收。退出码非零时保留日志、备份和容器现场，按第 3.4 节处理。
-
-异步 worker 结束后仍必须执行完整验收：
-
-```bash
-cd /opt/docker_projects/agent2api
-target=$(git ls-remote origin refs/heads/dev/pr-integration | awk 'NR == 1 {print $1}')
-test "$(git rev-parse HEAD)" = "$target"
-grep -E '^(AGENT2API_IMAGE|AGENT2API_COMMIT|AGENT2API_VERSION)=' .deploy/release.env
-docker image inspect "$(sed -n 's/^AGENT2API_IMAGE=//p' .deploy/release.env)" >/dev/null
-docker compose -f .deploy/docker-compose.us2.yml config -q
-docker inspect agent2api --format 'status={{.State.Status}} health={{.State.Health.Status}} image={{.Config.Image}} started={{.State.StartedAt}} restarts={{.RestartCount}}'
-curl --fail --silent --show-error http://172.17.0.1:19050/health >/dev/null
-```
-
-验收时必须记录更新前后提交、版本、镜像标签、容器 `StartedAt` 和本批次 `RestartCount`，并按第 3.3 节完成 `/v1/models`、管理面板、认证边界、一次授权范围内真实业务请求以及服务日志检查。启动请求返回、SSH 请求退出 0、HTTP 200 或容器健康中的任一项都不能单独结案。
-
-长期优化方向是让服务器维护的 `update_version.sh` 原生提供 `start/status/wait` 三个动作，并复用上述 `.deploy/status/<run_id>.*` 协议；在该入口尚未实现前，项目级标准流程以本节的 `nohup` worker 和退出码文件作为固定适配层。
+1. 在本地（或构建机）从要发布的提交构建镜像，tag 必须带版本与提交短哈希：
+   `agent2api:<版本>-<提交前8位>`（如 `agent2api:3.0.9-43accea5`）。
+2. 传输并加载到服务器后，**先做版本化备份**，再替换：
+   - 备份 `data/`（SQLite 库）与 `.deploy/docker-compose.huawei.yml` 到
+     `backups/agent2api-pre-<tag>-<UTC时间戳>/`（沿用既有命名）；
+   - 更新 `.deploy/docker-compose.huawei.yml` 的 `image:` 为新 tag；
+   - `docker compose -f .deploy/docker-compose.huawei.yml up -d` 替换容器。
+3. 替换前确认服务器上没有正在运行的部署操作；不得执行 `docker compose down -v`、
+   全局 prune 或删除未知备份。
+4. 镜像内 `AGENT2API_SELF_UPDATE` 在华为云应保持默认关闭口径：面板内自更新只替换
+   容器文件、不更新 compose 镜像 tag，会造成版本漂移；版本一律走第 3.2 节的镜像替换。
+5. `update_version.sh`、`release.env`、`.deploy/status/` 等 us2 时代机制已废弃，
+   不适用于华为云。
 
 ### 3.3 部署验收
 
-更新脚本成功退出后，必须确认：
+替换完成后运行 `bash scripts/deploy-hw.sh verify <预期tag>`，并人工确认：
 
-- 服务器工作区已更新到预期的 `dev/pr-integration` 提交；
-- `.deploy/release.env` 中的提交、版本和镜像标签与目标提交一致；目标镜像确实存在；
-- `docker inspect agent2api` 的镜像标签已切换到目标镜像，容器 `StartedAt` 已更新且 `RestartCount` 从本批次基线重新核对；
-- Compose 配置可渲染，目标容器处于运行/健康状态；
-- `/health`、`/v1/models`、管理面板和认证边界符合预期；
-- 至少完成一次授权范围内的真实 API 验证，并检查服务日志无新增 fatal 错误；
-- 原有数据卷、持久化配置和共享入口未被替换。
+- `docker images` 中目标镜像 tag 存在；`docker inspect agent2api` 的
+  `Config.Image` 已切换到目标 tag，`StartedAt` 已更新，`RestartCount` 从本批次基线核对；
+- 容器处于运行/健康状态；`/health`、`/v1/models`、管理面板和认证边界符合预期；
+- 至少完成一次授权范围内的真实 API 验证，并检查服务日志无新增 fatal/panic；
+- 原有数据卷 `./data`、持久化配置和 `backups/` 未被替换或删除。
 
 健康检查、页面 200 或认证成功只能证明对应层级，不得单独宣称真实模型请求成功。
-容器仍使用旧镜像、`release.env` 仍记录旧提交、目标镜像不存在，或更新进程尚未结束时，均判定为「尚未完成」，不能按脚本退出码结案。
+容器仍使用旧镜像、目标镜像不存在、或替换进程尚未结束时，均判定为「尚未完成」，
+不能按脚本退出码结案。
 
 ### 3.4 失败与回滚
 
-部署失败时保留现场，先确认没有残留更新进程，再记录失败阶段（备份、候选构建、候选测试、正式镜像或容器替换）。优先使用服务器项目提供的版本化回滚入口恢复程序和配置；不得执行 `docker compose down -v`、全局 prune 或删除未知备份。回滚后重新验证容器、健康端点、认证边界和既有业务路径。
+部署失败时保留现场，记录失败阶段（构建、传输、备份或容器替换）。回滚 = 把
+`.deploy/docker-compose.huawei.yml` 的 `image:` 改回上一个 tag 后
+`docker compose -f .deploy/docker-compose.huawei.yml up -d`；数据库异常时优先用
+`backups/` 里最近的版本化备份恢复 `data/`。不得删除未知备份，不得全局 prune。
+回滚后重新验证容器、健康端点、认证边界和既有业务路径。
 
-### 3.5 分支口径维护
+### 3.5 ZCode 直连开关（华为云口径待重验）
 
-当前部署入口的正常更新目标是 `origin/dev/pr-integration`。如果服务器脚本改为使用其他远程分支，必须先同步更新本节、服务器更新脚本及验证命令，不能只修改其中一处。
+`ZCODE_INTL_CLAIM_DIRECT=1` / `ZCODE_INTL_START_PLAN_DIRECT=1` 是 **us2（海外节点）
+实测代理领取 405/3012、直连 200 后得出的结论**。华为云是国内节点，实测直连
+`api.workbuddy.pro` 不通（超时），当前容器两开关均为 `0`（沿用账号代理出口）。
+us2 的直连结论**不能**照搬到华为云：改动开关前必须先用授权账号在面板做一次真实
+领取/推理对照，确认到账后才能写入 `.env` / compose。
+
+### 3.6 部署口径维护
+
+当前部署目标是华为云 `huaweiyun`；分支口径、compose 路径、端口、镜像命名或部署方式
+变化时，必须先同步更新本节、`scripts/deploy-hw.sh`、`scripts/verify-hw.sh` 与
+`scripts/HW_DEPLOYMENT.md`，不能只修改其中一处。
 
 ## 4. 正式版本发布：打 tag 并推送
 
