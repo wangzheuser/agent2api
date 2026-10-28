@@ -34,7 +34,7 @@ cargo check               # 或前端有改动时做一次构建自检
 
 ## 3. 日常华为云部署
 
-华为云（ssh-manager 服务器名 `huaweiyun`，1.95.124.238，国内节点）的日常部署以远程
+华为云（ssh-manager 服务器名 `huaweiyun`，<华为云IP-见本地ssh-manager配置>，国内节点）的日常部署以远程
 `dev/pr-integration` 分支为唯一代码来源。项目本地分支名为 `pr-integration`，不要把
 本地分支名误写成远程分支名。
 

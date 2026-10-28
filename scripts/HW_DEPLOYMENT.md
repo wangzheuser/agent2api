@@ -1,6 +1,6 @@
 # 华为云日常部署
 
-华为云（ssh-manager 服务器名 `huaweiyun`，1.95.124.238，国内节点）的部署形态：
+华为云（ssh-manager 服务器名 `huaweiyun`，<华为云IP-见本地ssh-manager配置>，国内节点）的部署形态：
 **服务器不拉代码、不在服务器内构建**。镜像在本地/构建机构建后 `docker save/load`
 传输上去，再由 `.deploy/docker-compose.huawei.yml` 固定 tag 替换。服务器只有
 2 核 / 1.7GB 内存，禁止在服务器内做 Rust 构建或测试。
@@ -27,8 +27,8 @@
 3. 传输到服务器并加载：
 
    ```bash
-   scp dist/agent2api-3.0.9-43accea5.tar.gz root@1.95.124.238:/tmp/
-   ssh root@1.95.124.238 'gunzip -c /tmp/agent2api-3.0.9-43accea5.tar.gz | docker load'
+   scp dist/agent2api-3.0.9-43accea5.tar.gz root@<华为云IP>:/tmp/
+   ssh root@<华为云IP> 'gunzip -c /tmp/agent2api-3.0.9-43accea5.tar.gz | docker load'
    ```
 
 4. 服务器上一条命令完成「备份 → 改 compose image → up -d → 验收」：
