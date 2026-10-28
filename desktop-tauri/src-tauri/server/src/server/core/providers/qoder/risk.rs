@@ -147,16 +147,34 @@ fn runtime_info_in(resources: &Path) -> Option<PathBuf> {
     exists(&path).then_some(path)
 }
 
-/// 客户端（app 来源）的组件：先找本 variant 的安装目录，找不到再看另一
-/// variant —— 协议一致只有 env 编号不同（CreditDaddy `apps.find || apps[0]`）。
+/// 跨地区回落开关：允许拿另一地区客户端的 UMID 组件生成本地区身份。
+///
+/// **默认关闭**，与参考实现（`mmqz/cpa-multi-plugins` 严格按地区取组件）对齐。
+/// 需要如实记住的是：本机实测「用 `.qoder-cn` 的组件 + 国际版 env=3」与
+/// 「用 `.qoder` 的组件 + env=3」产出的三件套**逐字节相同**，所以“跨区产物
+/// 带错地区指纹”在这台机器上并没有被复现 —— 这条收紧是防御性对齐，不是在修
+/// 一个已观测到的缺陷。代价是：只装了另一地区客户端的用户会拿不到身份，
+/// 那种情况用 `AGENT2API_QODER_UMID_CROSS_REGION=1` 恢复旧行为。
+fn cross_region_fallback_enabled() -> bool {
+    std::env::var("AGENT2API_QODER_UMID_CROSS_REGION")
+        .map(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+/// 客户端（app 来源）的组件：默认只认本 region 的安装目录。
+///
+/// 旧行为是「先找本 variant，找不到就回落另一 variant」（CreditDaddy
+/// `apps.find || apps[0]`）。收紧成严格同地区的依据与代价见
+/// `cross_region_fallback_enabled`。
 fn app_component(region: Region) -> Option<Component> {
     let env = if region == Region::Global { 3 } else { 0 };
-    // (installName, macOS app 名)：本 variant 在前
-    let variants: &[(&str, &str)] = if region == Region::Global {
-        &[("Qoder", "Qoder"), ("Qoder CN", "Qoder CN")]
-    } else {
-        &[("Qoder CN", "Qoder CN"), ("Qoder", "Qoder")]
-    };
+    // (installName, macOS app 名)
+    let own: (&str, &str) = if region == Region::Global { ("Qoder", "Qoder") } else { ("Qoder CN", "Qoder CN") };
+    let other: (&str, &str) = if region == Region::Global { ("Qoder CN", "Qoder CN") } else { ("Qoder", "Qoder") };
+    let mut variants: Vec<(&str, &str)> = vec![own];
+    if cross_region_fallback_enabled() {
+        variants.push(other);
+    }
     for (install_name, mac_name) in variants {
         let mut candidates: Vec<PathBuf> = Vec::new();
         if cfg!(windows) {
@@ -182,7 +200,9 @@ fn app_component(region: Region) -> Option<Component> {
 }
 
 /// qodercli 解压出的组件（cli 来源）：`~/.qoder/.bin/umid-*/runtime-info`
-/// （国内版 `~/.qoder-cn`），本 variant 优先、缺失回落另一 variant。
+/// （国内版 `~/.qoder-cn`）。默认只认本 region 的 home，理由见
+/// `cross_region_fallback_enabled`；`AGENT2API_QODER_UMID_CROSS_REGION=1` 时
+/// 恢复「缺失回落另一 variant」。
 /// env 用 qodercli 的取值：国际版 4（SINGAPORE）/ 中国版 0。
 ///
 /// 注意布局与客户端不同：qodercli 把 runtime-info 直接解在 `umid-<平台>-<哈希>/`
@@ -190,11 +210,11 @@ fn app_component(region: Region) -> Option<Component> {
 /// `resources/umid/`，两边不能共用同一个查找函数。
 fn cli_component(region: Region) -> Option<Component> {
     let env = if region == Region::Global { 4 } else { 0 };
-    let homes: &[&str] = if region == Region::Global {
-        &[".qoder", ".qoder-cn"]
-    } else {
-        &[".qoder-cn", ".qoder"]
-    };
+    let (own, other) = if region == Region::Global { (".qoder", ".qoder-cn") } else { (".qoder-cn", ".qoder") };
+    let mut homes: Vec<&str> = vec![own];
+    if cross_region_fallback_enabled() {
+        homes.push(other);
+    }
     let exe_name = if cfg!(windows) { "runtime-info.exe" } else { "runtime-info" };
     let home = home_dir();
     for dir in homes {
@@ -220,15 +240,19 @@ fn cli_component(region: Region) -> Option<Component> {
 }
 
 /// 网关数据目录里安装的组件（data 来源，Linux/Docker 的
-/// `install_component` 落地路径）。env 与 cli 来源一致。
-fn data_component() -> Option<Component> {
+/// `install_component` 落地路径）。env 与 cli 来源保持一致：这里以前写死 4
+/// （SINGAPORE），国内版账号会拿到国际版的 env 编号，和上面两个来源的口径不一致，
+/// 所以改成按 region 取。实测该 env 不影响三件套的值（见
+/// `cross_region_fallback_enabled`），这里属于口径统一。
+fn data_component(region: Region) -> Option<Component> {
+    let env = if region == Region::Global { 4 } else { 0 };
     let exe = crate::server::config::config_dir().join("qoder-umid").join("runtime-info");
-    exists(&exe).then(|| Component { exe, env: 4, source: "data" })
+    exists(&exe).then(|| Component { exe, env, source: "data" })
 }
 
 /// 组件发现（按 app → cli → data 的顺序，同 variant 优先）。
 pub(crate) fn find_component(region: Region) -> Option<Component> {
-    app_component(region).or_else(|| cli_component(region)).or_else(|| data_component())
+    app_component(region).or_else(|| cli_component(region)).or_else(|| data_component(region))
 }
 
 /// 本机是否能生成风控身份（界面提示用）
@@ -408,36 +432,79 @@ struct CacheEntry {
 
 static CACHE: Mutex<Option<HashMap<String, CacheEntry>>> = Mutex::new(None);
 
-fn identity_cache_key(region: Region, uid: &str) -> String {
-    let digest = sha2::Sha256::digest(uid.as_bytes());
-    let account = digest.iter().take(12).map(|byte| format!("{byte:02x}")).collect::<String>();
-    format!("{}:{}", region.id(), account)
+/// 缓存键 = 地区本身。
+///
+/// 桥产出的三件套是**机器级**的：同一台机器上不同账号的 `machineToken` /
+/// `machineCode` / `machineType` 完全相同（本机实测三个国际版账号的持久化文件
+/// 内容逐字节一致）。按账号做键只会在桥缓存失效、某个账号先刷新时让同一台机器
+/// 出现两份身份 —— 即“身份漂移”，而上游按机器去重，漂移会让部分账号突然领不到
+/// 设备定向活动。所以按地区共用一份。
+fn identity_cache_key(region: Region) -> String {
+    region.id().to_string()
 }
 
-fn persisted_identity_path(region: Region, uid: &str) -> PathBuf {
-    let cache_key = identity_cache_key(region, uid);
-    let account = cache_key
-        .split_once(':')
-        .map(|(_, value)| value)
-        .unwrap_or("unknown");
-    crate::server::config::config_dir()
-        .join("qoder-umid")
-        .join(format!("identity-{}-{}.json", region.id(), account))
+/// 设备级身份落盘路径：每地区一个文件，所有账号共用。
+fn persisted_identity_path(region: Region) -> PathBuf {
+    crate::server::config::config_dir().join("qoder-umid").join(format!("machine-{}.json", region.id()))
 }
 
-fn load_persisted_identity(region: Region, uid: &str, now: i64) -> Option<RiskIdentity> {
-    let text = std::fs::read_to_string(persisted_identity_path(region, uid)).ok()?;
+/// 旧版按账号落盘的文件（`identity-<region>-<账号哈希>.json`）。
+///
+/// 只为迁移用：首次升级时把已有的身份认下来，避免因为换缓存口径让同一台机器
+/// “换了一台设备”。注意 `identity-<region>.json`（无账号后缀）是更早版本留下的
+/// 另一份值，**不在**迁移范围内 —— 它可能早于当前硬件，认它会真的换身份。
+fn legacy_identity_paths(dir: &Path, region: Region) -> Vec<PathBuf> {
+    let prefix = format!("identity-{}-", region.id());
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".json"))
+        })
+        .collect()
+}
+
+fn read_persisted(path: &Path, now: i64) -> Option<PersistedIdentity> {
+    let text = std::fs::read_to_string(path).ok()?;
     let saved = serde_json::from_str::<PersistedIdentity>(&text).ok()?;
-    (now.saturating_sub(saved.at) < RISK_TTL_MS).then_some(saved.identity)
+    (now.saturating_sub(saved.at) < RISK_TTL_MS).then_some(saved)
 }
 
-fn persist_identity(region: Region, uid: &str, identity: &RiskIdentity, at: i64) {
-    let path = persisted_identity_path(region, uid);
+/// 从旧版按账号文件里挑最新的、仍在有效期内的那份身份。
+fn adopt_legacy_identity(dir: &Path, region: Region, now: i64) -> Option<PersistedIdentity> {
+    legacy_identity_paths(dir, region)
+        .into_iter()
+        .filter_map(|path| read_persisted(&path, now))
+        .max_by_key(|saved| saved.at)
+}
+
+fn load_persisted_identity(region: Region, now: i64) -> Option<RiskIdentity> {
+    if let Some(saved) = read_persisted(&persisted_identity_path(region), now) {
+        return Some(saved.identity);
+    }
+    // 迁移：认下最新的一份旧按账号身份，并写成设备级文件。
+    let dir = crate::server::config::config_dir().join("qoder-umid");
+    let adopted = adopt_legacy_identity(&dir, region, now)?;
+    persist_identity(region, &adopted.identity, adopted.at);
+    logging::verbose(
+        "[Qoder]",
+        &format!("设备风控身份迁移到设备级缓存（地区={}，{}）", region.label(), identity_summary(&adopted.identity)),
+    );
+    Some(adopted.identity)
+}
+
+fn persist_identity(region: Region, identity: &RiskIdentity, at: i64) {
+    let path = persisted_identity_path(region);
     let Some(parent) = path.parent() else { return };
     if std::fs::create_dir_all(parent).is_err() {
         return;
     }
-    let temp = parent.join(format!("identity-{}.{}.tmp", region.id(), std::process::id()));
+    let temp = parent.join(format!("machine-{}.{}.tmp", region.id(), std::process::id()));
     let saved = PersistedIdentity { at, identity: identity.clone() };
     let Ok(text) = serde_json::to_vec_pretty(&saved) else { return };
     if std::fs::write(&temp, text).is_err() {
@@ -483,7 +550,7 @@ pub async fn identity(region: Region, uid: &str) -> Option<RiskIdentity> {
     if uid.is_empty() {
         return None;
     }
-    let key = identity_cache_key(region, uid);
+    let key = identity_cache_key(region);
     let now = logging::now_ms();
     if let Ok(guard) = CACHE.lock() {
         if let Some(entry) = guard.as_ref().and_then(|map| map.get(&key)) {
@@ -492,7 +559,7 @@ pub async fn identity(region: Region, uid: &str) -> Option<RiskIdentity> {
             }
         }
     }
-    if let Some(value) = load_persisted_identity(region, uid, now) {
+    if let Some(value) = load_persisted_identity(region, now) {
         if let Ok(mut guard) = CACHE.lock() {
             guard.get_or_insert_with(HashMap::new).insert(key, CacheEntry { value: value.clone(), at: now });
         }
@@ -518,7 +585,7 @@ pub async fn identity(region: Region, uid: &str) -> Option<RiskIdentity> {
         );
         return None;
     };
-    persist_identity(region, uid, &value, now);
+    persist_identity(region, &value, now);
     if let Ok(mut guard) = CACHE.lock() {
         guard.get_or_insert_with(HashMap::new).insert(key, CacheEntry { value: value.clone(), at: now });
     }
@@ -814,6 +881,7 @@ impl<R: std::io::Read> BytesToVec for flate2::read::GzDecoder<R> {
 #[cfg(test)]
 mod tests {
     use super::{identity_cache_key, majority_identity, persisted_identity_path, RiskIdentity};
+    use crate::server::logging;
 
     fn identity(brand: &str, vm_type_code: i64) -> RiskIdentity {
         RiskIdentity {
@@ -846,16 +914,42 @@ mod tests {
     }
 
     #[test]
-    fn risk_identity_cache_isolated_per_account_and_region() {
-        let cn_a = identity_cache_key(super::Region::Cn, "account-a");
-        let cn_b = identity_cache_key(super::Region::Cn, "account-b");
-        let intl_a = identity_cache_key(super::Region::Global, "account-a");
-        assert_ne!(cn_a, cn_b);
-        assert_ne!(cn_a, intl_a);
-        assert!(persisted_identity_path(super::Region::Cn, "account-a")
+    fn risk_identity_cache_keyed_by_region_only() {
+        // 桥产出的身份是机器级的：同地区不同账号必须命中同一份缓存，
+        // 否则桥缓存失效时会让同一台机器出现两份身份。
+        assert_eq!(identity_cache_key(super::Region::Cn), identity_cache_key(super::Region::Cn));
+        assert_ne!(identity_cache_key(super::Region::Cn), identity_cache_key(super::Region::Global));
+        assert!(persisted_identity_path(super::Region::Cn)
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("identity-cn-") && name.ends_with(".json")));
+            .is_some_and(|name| name.starts_with("machine-cn") && name.ends_with(".json")));
+    }
+
+    #[test]
+    fn legacy_per_account_identity_is_adopted_not_rotated() {
+        // 换缓存口径不能让同一台机器"换一台设备"：升级后必须认下旧的按账号身份。
+        let dir = std::env::temp_dir().join(format!("qoder-risk-adopt-{}-{}", std::process::id(), logging::now_ms()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let now = logging::now_ms();
+        let cn = super::Region::Cn;
+        let write = |name: &str, at: i64, code: &str| {
+            let saved = super::PersistedIdentity { at, identity: identity(code, 50) };
+            std::fs::write(dir.join(name), serde_json::to_vec(&saved).unwrap()).unwrap();
+        };
+        // 更早版本留下的无后缀文件：不在迁移范围
+        write("identity-cn.json", now, "unstamped");
+        // 旧按账号文件：较新的一份应被选中
+        write("identity-cn-aaaaaaaaaaaa.json", now - 1_000, "older-account");
+        write("identity-cn-bbbbbbbbbbbb.json", now, "newest-account");
+        // 过期的一份即使更晚也不该被认下（有效期语义与线上一致）
+        write("identity-cn-cccccccccccc.json", now - super::RISK_TTL_MS - 1_000, "expired");
+        // 其它地区不参与
+        write("identity-global-dddddddddddd.json", now, "other-region");
+
+        let adopted = super::adopt_legacy_identity(&dir, cn, now).expect("should adopt a legacy identity");
+        assert_eq!(adopted.identity.machine_code, "code-newest-account");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

@@ -120,7 +120,7 @@ impl Default for DeviceIdFile {
     }
 }
 
-/// 账号标识的哈希（不落明文 uid；与 `risk::identity_cache_key` 同口径的前 16 位）
+/// 账号标识的哈希（不落明文 uid；与 `device_claims` 的账号哈希同口径）
 fn account_hash(uid: &str) -> String {
     let digest = sha2::Sha256::digest(uid.as_bytes());
     digest.iter().take(12).map(|byte| format!("{byte:02x}")).collect()
