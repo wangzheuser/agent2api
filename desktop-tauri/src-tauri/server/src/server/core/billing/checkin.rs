@@ -246,38 +246,64 @@ pub fn resolve_checkin_targets(
         .filter(|account| supports_checkin(account) || supports_reward_checkin(store, account))
         .filter(|account| matches_provider_filter(account, providers))
         .collect();
-    rotate_qoder_intl(&mut eligible);
+    rotate_qoder_claims(&mut eligible);
     let skipped = total - eligible.len();
     Ok((eligible, skipped))
 }
 
-/// Qoder 国际版的**设备名额轮换**。
+/// Qoder 每日积分的**名额轮换**（两个地区都要）。
 ///
-/// ── 为什么必须排序（2026-10-19 实测）────────────────────────
-/// 国际版的每日 100 Credits 按**设备**发放：一台设备一天只会给一个账号下发
-/// 可领取活动，第一个领取的账号拿到 `CLAIMED`，其它账号的活动行**整条消失**。
-/// 批量签到如果按固定优先级顺序跑，排在前面的账号每天都会先抢到名额，
-/// 排在后面的账号**永远领不到** —— 这不是「限制」而是调度缺陷。
+/// ── 为什么必须排序（2026-10-19 / 2026-10-28 实测）───────────
+/// 上游的每日 100 Credits 按「人」发放：同一台机器（同一出口 IP）一天只会给
+/// 一个账号下发可领取的活动，第一个领取的账号拿到 `CLAIMED`，其它账号要么活动行
+/// **整条消失**（国际版），要么领取返回 `BLOCKED` +
+/// `SAME_PERSON_ALREADY_CLAIMED`（国内版实测同样如此）。批量签到如果按固定顺序
+/// 跑，排在前面的账号每天都会先抢到名额，排在后面的账号**永远领不到** ——
+/// 这不是「限制」而是调度缺陷。
 ///
-/// 这里把国际版账号按「最久没签到」排到前面（`checkinAt` 升序，从未签到 = 0
-/// 最先），于是设备名额在账号之间轮换：今天 A、明天 B、后天 C。
+/// 这里把账号按「最久没签到」排到前面（`checkinAt` 升序，从未签到 = 0 最先），
+/// 于是每日名额在账号之间轮换：今天 A、明天 B、后天 C。
+///  - 国际版整组排到最前（先抢当天名额），组内轮换；
+///  - 国内版在**自己原有的位置上**轮换取值，不影响其它提供商的相对顺序。
 /// 其它提供商不受影响（保持原有相对顺序）。
 ///
 /// 单账号手动签到（`resolve_checkin_targets` 的 `id` 分支）不经过这里，
 /// 用户点哪个就签哪个。
-fn rotate_qoder_intl(eligible: &mut [Value]) {
+fn rotate_qoder_claims(eligible: &mut [Value]) {
+    // 国际版优先（先抢当天名额），组内按 checkinAt 升序轮换
     eligible.sort_by_key(|account| {
-        let intl = provider_of(account) == "qoder-intl";
-        // 国际版优先（先抢当天设备名额），组内按 checkinAt 升序轮换
-        let last = account.get("checkinAt").and_then(Value::as_i64).unwrap_or(0);
-        let priority = account.get("priority").and_then(Value::as_i64).unwrap_or(0);
-        if intl {
-            (0u8, last, priority)
+        if provider_of(account) == "qoder-intl" {
+            (0u8, rotation_key(account))
         } else {
-            // 非国际版不参与轮换：用固定键保持它们原有的相对顺序
-            (1u8, 0, 0)
+            (1u8, (0, 0))
         }
     });
+    rotate_within(eligible, "qoder");
+}
+
+/// 轮换排序键：`(上次签到时间, 优先级)` —— 越久没签的越靠前。
+fn rotation_key(account: &Value) -> (i64, i64) {
+    let last = account.get("checkinAt").and_then(Value::as_i64).unwrap_or(0);
+    let priority = account.get("priority").and_then(Value::as_i64).unwrap_or(0);
+    (last, priority)
+}
+
+/// 把某个提供商的账号在它们**已占据的位置上**按轮换键重新分配。
+///
+/// 换位而不换区：其它提供商项一个都不动，避免为了国内版轮换把 unrelated 的
+/// 账号顺序也改掉（那会让用户的批次顺序莫名其妙地变）。
+fn rotate_within(eligible: &mut [Value], provider: &str) {
+    let slots: Vec<usize> = (0..eligible.len())
+        .filter(|&index| provider_of(&eligible[index]) == provider)
+        .collect();
+    if slots.len() < 2 {
+        return;
+    }
+    let mut ordered: Vec<Value> = slots.iter().map(|&index| eligible[index].clone()).collect();
+    ordered.sort_by_key(rotation_key);
+    for (slot, value) in slots.into_iter().zip(ordered) {
+        eligible[slot] = value;
+    }
 }
 
 /// 单个账号签到。已签到（上游非 0 code）不算错误，原样返回结果 ——
@@ -740,8 +766,14 @@ pub fn claim_pending(claim: &Value) -> bool {
     if checkin_completed_today(claim) {
         return false;
     }
-    // 「本设备今日名额已被别的账号用掉」= 今天这个账号注定领不到，重试只会打上游
-    if claim.get("deviceLimited").and_then(Value::as_bool) == Some(true) {
+    // 「本机今日名额已被别的账号用掉」= 今天这个账号注定领不到，重试只会打上游。
+    // `samePersonLimited` 是同一件事的上游原话形态：Qoder 的领取响应直接回
+    // `BLOCKED` + `failureCode: SAME_PERSON_ALREADY_CLAIMED`，没有经过
+    // `no_claim` 的台账归因，所以必须在这里单独认一次 —— 只靠「文案不匹配
+    // pending 关键词」来兜是脆的，改个措辞就会变成整天重试。
+    if claim.get("deviceLimited").and_then(Value::as_bool) == Some(true)
+        || claim.get("samePersonLimited").and_then(Value::as_bool) == Some(true)
+    {
         return false;
     }
     // error 字段非空 = 执行出错（网络 / 凭证），那不是「等窗口」能解决的
@@ -886,7 +918,7 @@ mod tests {
             json!({"id": "intl-c", "provider": "qoder-intl", "priority": 12, "checkinAt": 1_600_000_000_000i64}),
             json!({"id": "cn-1", "provider": "qoder", "priority": 1}),
         ];
-        rotate_qoder_intl(&mut rows);
+        rotate_qoder_claims(&mut rows);
         let order: Vec<&str> = rows.iter().filter_map(|row| row.get("id").and_then(Value::as_str)).collect();
         // 从未签到的最先，其次是最久没签到的；国内版保持原顺序
         assert_eq!(order, vec!["intl-b", "intl-c", "intl-a", "cn-1"]);
@@ -899,7 +931,7 @@ mod tests {
             json!({"id": "wb-2", "provider": "workbuddy", "priority": 9}),
             json!({"id": "intl-a", "provider": "qoder-intl", "priority": 1, "checkinAt": 5}),
         ];
-        rotate_qoder_intl(&mut rows);
+        rotate_qoder_claims(&mut rows);
         let order: Vec<&str> = rows.iter().filter_map(|row| row.get("id").and_then(Value::as_str)).collect();
         // 国际版优先抢设备名额；其它提供商相对顺序不变
         assert_eq!(order, vec!["intl-a", "wb-1", "wb-2"]);
@@ -911,10 +943,68 @@ mod tests {
             json!({"id": "intl-a", "provider": "qoder-intl", "priority": 20}),
             json!({"id": "intl-b", "provider": "qoder-intl", "priority": 10}),
         ];
-        rotate_qoder_intl(&mut rows);
+        rotate_qoder_claims(&mut rows);
         let order: Vec<&str> = rows.iter().filter_map(|row| row.get("id").and_then(Value::as_str)).collect();
         // 都没签过 → 按优先级
         assert_eq!(order, vec!["intl-b", "intl-a"]);
+    }
+
+    /// 国内版也是「每天按人一份」：不轮换的话排在最前的账号天天先领，
+    /// 后面的账号永远拿不到（2026-10-28 实测：三个国内版账号同分钟只有一个
+    /// `CLAIMED`，其余 `BLOCKED`+`SAME_PERSON_ALREADY_CLAIMED`）。
+    #[test]
+    fn qoder_cn_rotation_shares_the_daily_quota() {
+        let mut rows = vec![
+            json!({"id": "wb-1", "provider": "workbuddy", "priority": 1}),
+            json!({"id": "cn-a", "provider": "qoder", "priority": 7, "checkinAt": 1_700_000_000_000i64}),
+            json!({"id": "wb-2", "provider": "workbuddy", "priority": 2}),
+            json!({"id": "cn-b", "provider": "qoder", "priority": 9}),
+        ];
+        rotate_qoder_claims(&mut rows);
+        let order: Vec<&str> = rows.iter().filter_map(|row| row.get("id").and_then(Value::as_str)).collect();
+        // 从未领过的 cn-b 顶到 cn-a 原来的位置；其它提供商一个都没动
+        assert_eq!(order, vec!["wb-1", "cn-b", "wb-2", "cn-a"]);
+    }
+
+    /// 轮换只看「谁最久没领」：刚领过的账号自动排到国内版末尾，保证名额在
+    /// 账号之间轮转（否则固定优先级会让同一账号天天先领）。
+    #[test]
+    fn qoder_cn_rotation_moves_the_freshest_claim_last() {
+        let mut rows = vec![
+            json!({"id": "cn-old", "provider": "qoder", "checkinAt": 1_600_000_000_000i64}),
+            json!({"id": "cn-new", "provider": "qoder", "checkinAt": 1_700_000_000_000i64}),
+            json!({"id": "cn-never", "provider": "qoder"}),
+        ];
+        rotate_qoder_claims(&mut rows);
+        let order: Vec<&str> = rows.iter().filter_map(|row| row.get("id").and_then(Value::as_str)).collect();
+        assert_eq!(order, vec!["cn-never", "cn-old", "cn-new"]);
+    }
+
+    /// 「上游按人每天一份，今天已被别的账号领走」不是「等窗口」也不是「已签到」：
+    /// 前者会让调度整天重试打上游，后者会冒称领取成功（用户看到已领取、实际没到账）。
+    #[test]
+    fn same_person_limit_neither_pends_nor_claims_success() {
+        // 领取响应直接回 `BLOCKED` + `failureCode: SAME_PERSON_ALREADY_CLAIMED`
+        // 时 `providers::qoder::checkin` 给出的形状（见该处的构造与单测）。
+        let claim = json!({
+            "success": false,
+            "samePersonLimited": true,
+            "failureCode": "SAME_PERSON_ALREADY_CLAIMED",
+            "msg": "上游按「人」每天只发一份每日积分（SAME_PERSON_ALREADY_CLAIMED）：今天这份已被本机另一个账号领走，本账号今天领不到",
+        });
+        assert!(!claim_pending(&claim), "注定领不到，重试只会打上游风控");
+        assert!(
+            !checkin_completed_today(&claim),
+            "不能冒称今天已领取 —— 这一分没到账"
+        );
+        // 台账归因形态（`no_claim` 的 holder 分支）同理。
+        let by_holder = json!({
+            "success": false,
+            "deviceLimited": true,
+            "msg": "本机今日的中国版每日积分名额已被另一个账号（#a1b2c3）领走",
+        });
+        assert!(!claim_pending(&by_holder));
+        assert!(!checkin_completed_today(&by_holder));
     }
 
     #[test]

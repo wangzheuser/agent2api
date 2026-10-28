@@ -93,6 +93,8 @@ const RESULT_ALREADY_CLAIMED: &str = "ALREADY_CLAIMED";
 const DEFAULT_REWARD: f64 = 100.0;
 /// 上游 409 的「活动批次已过期」业务码（活动批次轮换，id 需重学）
 const CAMPAIGN_NOT_ACTIVE_TAG: &str = "CAMPAIGN_NOT_ACTIVE";
+/// 上游领取响应的「同一人今天已经领过」业务码（见 [`FAILURE_SAME_PERSON`] 的说明）
+const FAILURE_SAME_PERSON_TAG: &str = "SAME_PERSON_ALREADY_CLAIMED";
 /// 盲发直领的候选上限（防上游异常返回一大串活动时打爆请求）
 const BLIND_CLAIM_MAX: usize = 5;
 /// 本地学习表每地区保留的候选条数
@@ -540,6 +542,10 @@ async fn claim_from(
                         if success || already {
                             return Ok(value);
                         }
+                        // 上游按「人」拦了这份每日积分：换候选也不会变，直接收工。
+                        if value.get("samePersonLimited").and_then(Value::as_bool) == Some(true) {
+                            return Ok(value);
+                        }
                         // 未完成/未确认：记失败，试下一个候选
                         let message = value.get("msg").and_then(Value::as_str).unwrap_or("未完成");
                         failures.push(format!("{campaign_id}：{}", truncate_str(message, 80)));
@@ -568,18 +574,15 @@ async fn claim_from(
                 truncate_str(&failures.join("；"), 200)
             ));
         }
-        // 「盲发也没领到」的归因：本设备今天是否已经被**另一个账号**领走。
-        // 只有国际版存在设备级名额（实测：第一个账号领取后，其它账号的活动行
-        // 整条消失；国内版是按账号发放，两个账号当天都能领到）。
-        let holder = if region == Region::Global {
-            match device_key() {
-                Some(device) => device_claims::today(region, &device)
-                    .filter(|claim| !device_claims::claimed_by(claim, account_id))
-                    .map(|claim| claim.account.chars().take(6).collect::<String>()),
-                None => None,
-            }
-        } else {
-            None
+        // 「盲发也没领到」的归因：本机今天是否已经被**另一个账号**领走。
+        // 两个地区都存在「每天每台机器只发一份」的名额（2026-10-28 实测：国内版
+        // 三个账号同分钟只有一个 `CLAIMED`，其余返回 `BLOCKED`
+        // +`SAME_PERSON_ALREADY_CLAIMED`），所以归因对两个地区都做。
+        let holder = match device_key() {
+            Some(device) => device_claims::today(region, &device)
+                .filter(|claim| !device_claims::claimed_by(claim, account_id))
+                .map(|claim| claim.account.chars().take(6).collect::<String>()),
+            None => None,
         };
         return Ok(no_claim(region, claimed, risk_note, holder, blind_note));
     };
@@ -638,11 +641,16 @@ async fn claim_one(
         headers = augmented;
     }
     let mut claim = claim_campaign(&url, credentials, proxy, &headers).await?;
+    // 上游 409 有两种完全不同的含义：`ALREADY_CLAIMED`（今天已经领过）与
+    // `CAMPAIGN_NOT_ACTIVE`（活动批次已轮换，id 过期）。以前把「409」整体当成
+    // 「已领取」，于是盲发兜底试到过期 id 时，会把「上游拒绝了这次领取」误报成
+    // 「今日已领取」—— 用户看到的是「已领取」，实际一分没到账（2026-10-28 实测：
+    // 同一账号先拿到 `BLOCKED/SAME_PERSON_ALREADY_CLAIMED`，紧接着过期 id 的
+    // 409 把结果覆盖成「今日已领取」）。
+    let not_active = campaign_not_active(&claim);
     // 上游并发/重放时给 409 + `{"result":"ALREADY_CLAIMED"}`（参考实现实测），
     // 那不是失败，是「今天已经领过了」。
-    if !claim.ok
-        && (claim.status == 409 || result_of(&claim).as_deref() == Some(RESULT_ALREADY_CLAIMED))
-    {
+    if !claim.ok && !not_active && already_claimed_response(&claim) {
         logging::log(
             "[Checkin]",
             &format!(
@@ -688,13 +696,40 @@ async fn claim_one(
             .get("status")
             .and_then(Value::as_str)
             .unwrap_or("未知");
+        let failure = claim_body
+            .get("failureCode")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        // `BLOCKED` + `SAME_PERSON_ALREADY_CLAIMED`：上游按「人」发每日积分
+        // （同一出口 IP / 同一台机器算同一个人），本机今天已经有一个账号领走了
+        // 那唯一一份，其余账号当天一律被拦。这不是「本账号已签到」，也不是可以
+        // 重试的失败 —— 换候选、换时间都不会改变判定，所以直接给出归因结果。
+        if failure.eq_ignore_ascii_case(FAILURE_SAME_PERSON_TAG) {
+            logging::log(
+                "[Checkin]",
+                &format!(
+                    "Qoder 签到结果（账号={}，地区={}，状态=same_person_blocked，失败码={}）",
+                    display,
+                    region.label(),
+                    failure
+                ),
+            );
+            return Ok(json!({
+                "success": false,
+                "samePersonLimited": true,
+                "failureCode": failure,
+                "msg": "上游按「人」每天只发一份每日积分（SAME_PERSON_ALREADY_CLAIMED）：今天这份已被本机另一个账号领走，本账号今天领不到；同机多账号需每天轮换谁先领，明天会自动换下一个账号",
+            }));
+        }
         logging::log(
             "[Checkin]",
             &format!(
-                "Qoder 签到结果（账号={}，地区={}，状态=claim_not_completed，上游状态={}）",
+                "Qoder 签到结果（账号={}，地区={}，状态=claim_not_completed，上游状态={}，失败码={}）",
                 display,
                 region.label(),
-                status
+                status,
+                if failure.is_empty() { "无" } else { failure }
             ),
         );
         return Ok(json!({ "success": false, "msg": format!("签到未完成（上游状态 {status}）") }));
@@ -764,12 +799,12 @@ async fn claim_one(
     };
     // 学习表：两种形态都看不到活动行的账号（或下次运行）凭这个 id 直领
     campaign_ids::remember(region, campaign_id);
-    // 台账只记国际版：国内版按账号发放，同设备多账号本来都能领到，
-    // 记了反而会让下一个账号被误判成「名额被占」。
-    if region == Region::Global {
-        if let Some(device) = device_key() {
-            device_claims::record(region, &device, account_id, campaign_id);
-        }
+    // 台账记两个地区：上游按「人」发每日积分（同一台机器/同一出口 IP 算一个人），
+    // 国内版和国际版都一样（2026-10-28 实测国内版也是「先到先得、其余 BLOCKED」）。
+    // 记下今天这台机器的名额归谁，本机其它账号才能被准确归因成「名额已被 #x 领走」，
+    // 而不是被当成「窗口没开」反复重试。
+    if let Some(device) = device_key() {
+        device_claims::record(region, &device, account_id, campaign_id);
     }
     logging::log(
         "[Checkin]",
@@ -839,15 +874,31 @@ async fn claim_campaign(
     auth::request("POST", url, Some(&json!({})), &headers, proxy).await
 }
 
-/// 领取响应的 `result` 字段（并发/重放标记），拿不到给 None。
-fn result_of(response: &ApiResponse) -> Option<String> {
-    let payload = response.payload.as_ref()?;
-    let value = nested_data(payload).get("result")?.as_str()?.trim();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
-    }
+/// 响应体里是否带某个业务码（`result` / `errorCode` / `failureCode` / `status`）。
+///
+/// 上游在两个位置表达同一种业务结果：`200` 时放在 `status`（`CLAIMED` /
+/// `BLOCKED`）+ `failureCode`，`4xx` 时放在 `errorCode`。分类必须读业务码，
+/// 不能只看 HTTP 状态码 —— 409 同时用于「已领」和「活动过期」。
+fn has_business_code(response: &ApiResponse, code: &str) -> bool {
+    let Some(payload) = response.payload.as_ref() else {
+        return false;
+    };
+    let body = nested_data(payload);
+    ["result", "errorCode", "failureCode", "status"]
+        .iter()
+        .filter_map(|key| body.get(*key).and_then(Value::as_str))
+        .any(|value| value.trim().eq_ignore_ascii_case(code))
+}
+
+/// 409 = 「活动批次已过期」（id 需重学，换个候选还有机会）。
+fn campaign_not_active(response: &ApiResponse) -> bool {
+    has_business_code(response, CAMPAIGN_NOT_ACTIVE_TAG)
+}
+
+/// 「今天已经领过了」的两种上游形态：`result: ALREADY_CLAIMED`（4xx）与
+/// `status: CLAIMED` 的重放（由调用方单独判定）。
+fn already_claimed_response(response: &ApiResponse) -> bool {
+    has_business_code(response, RESULT_ALREADY_CLAIMED)
 }
 
 /// 上游部分版本把领取结果放在 `data` 下，部分版本直接返回顶层对象。
@@ -896,9 +947,9 @@ fn campaign_timestamp(value: Option<&Value>) -> Option<i64> {
 /// 「这次没领到」的结果：区分「今天已领」「没有可领的活动」「缺风控身份」
 /// 「本设备名额已被另一个账号领走」与「盲发直领也被上游拒绝」。
 ///
-/// `holder` 是本设备今日领取者的账号哈希前缀（只有国际版会有：实测国际版的
-/// 每日活动按设备发放，第一个账号领取后其它账号的活动行整条消失；国内版按账号
-/// 发放，同设备两个账号当天都能领到）。
+/// `holder` 是本机今日领取者的账号哈希前缀（两个地区都有：实测国际版与国内版
+/// 的每日积分都按「人」发放 —— 同一台机器/同一出口 IP 只有一个账号能领到，
+/// 其余账号当天拿到 `BLOCKED`+`SAME_PERSON_ALREADY_CLAIMED`）。
 ///
 /// `blind_note` 是盲发直领兜底的失败摘要（候选 id 直领也全被拒绝时带上，
 /// 让用户知道「不只是列表看不到，是直领也被拒」）。
@@ -921,19 +972,21 @@ fn no_claim(
             "msg": "今日已领取",
         });
     }
+    // 本机今天的名额已经被另一个账号用掉：两个地区都是这个结论，文案只按地区
+    // 说明各自的窗口/来源差异。
+    if let Some(holder) = holder {
+        return json!({
+            "success": false,
+            "deviceLimited": true,
+            "msg": with_note(format!(
+                "本机今日的{}每日积分名额已被另一个账号（#{holder}）领走：Qoder 每天按「人」只发一份，同机多账号只能轮换领取（签到中心会按最久未领自动换账号）；本账号今天不会再自动重试",
+                region.label()
+            )),
+        });
+    }
     if region == Region::Global {
-        // 国际版：要么缺 UMID 组件（风控头没带上，上游不下发积分活动），
-        // 要么本设备今日名额已被别的账号用掉（盲发直领同样被 409 拒绝），
-        // 要么窗口还没开。
-        if let Some(holder) = holder {
-            return json!({
-                "success": false,
-                "deviceLimited": true,
-                "msg": with_note(format!(
-                    "本设备今日的国际版名额已被另一个账号（#{holder}）领取：Qoder 国际版按设备每天只发一个账号的积分活动，换设备或用该账号明天再领；本账号今天不会再自动重试"
-                )),
-            });
-        }
+        // 国际版剩下的两种原因：缺 UMID 组件（风控头没带上，上游不下发积分
+        // 活动），或者窗口还没开。
         if let Some(note) = risk_note {
             return json!({
                 "success": false,
@@ -942,12 +995,11 @@ fn no_claim(
         }
         return json!({
             "success": false,
-            "msg": with_note("上游暂未给该账号下发每日积分活动；国际版按设备每天限领一次，本机其他账号可能已占用今日名额。若确认未领取，请在官方活动窗口（北京时间 10:00 后）重试".to_string()),
+            "msg": with_note("上游暂未给该账号下发每日积分活动；国际版每天按人限领一次，本机其他账号可能已占用今日名额。若确认未领取，请在官方活动窗口（北京时间 10:00 后）重试".to_string()),
         });
     }
-    // 中国版没有活动是账号侧状态（实测 Free 套餐账号如此，Pro/试用账号才有），
-    // 明确说「没有可领的」而不是报错。
-
+    // 中国版没有活动是账号侧状态（实测 Free 套餐账号如此，Pro/试用账号才有）；
+    // 「本机名额已被别的账号领走」已在上面按 holder 归因，不落到这里。
     json!({
         "success": false,
         "msg": with_note("当前没有可领取的签到活动".to_string()),
@@ -989,24 +1041,42 @@ mod tests {
     }
 
     #[test]
-    fn intl_no_claim_explains_shared_device_daily_limit() {
+    fn no_claim_explains_shared_daily_limit() {
         let result = no_claim(Region::Global, false, None, None, None);
         let message = result.get("msg").and_then(Value::as_str).unwrap_or("");
-        assert!(message.contains("按设备每天限领一次"));
+        assert!(message.contains("每天按人限领一次"));
         assert!(message.contains("其他账号可能已占用"));
     }
 
+    /// 名字里的 `intl` 是历史名（`docs/local-contracts.json` 按完整用例名绑定，
+    /// 不能随语义扩展改名）：2026-10-28 实测确认国内版同样是「每天按人一份」，
+    /// 所以断言覆盖两个地区。
     #[test]
     fn intl_no_claim_names_the_device_holder() {
-        let result = no_claim(Region::Global, false, None, Some("a1b2c3".to_string()), None);
-        assert_eq!(result.get("deviceLimited").and_then(Value::as_bool), Some(true));
-        let message = result.get("msg").and_then(Value::as_str).unwrap_or("");
-        assert!(message.contains("#a1b2c3"));
-        assert!(message.contains("不会再自动重试"));
-        // 国内版不会带设备名额语义
-        let cn = no_claim(Region::Cn, false, None, Some("a1b2c3".to_string()), None);
+        for region in [Region::Global, Region::Cn] {
+            let result = no_claim(region, false, None, Some("a1b2c3".to_string()), None);
+            assert_eq!(
+                result.get("deviceLimited").and_then(Value::as_bool),
+                Some(true),
+                "{} 的名额归因要带 deviceLimited",
+                region.label()
+            );
+            let message = result.get("msg").and_then(Value::as_str).unwrap_or("");
+            assert!(message.contains("#a1b2c3"));
+            assert!(message.contains("不会再自动重试"));
+            // 「名额已被领走」不能写成「已领取/已签到」：那会让账号被记成今天
+            // 已经领过（`checkin_completed_today` 按文案兜底），从而整天不再重试。
+            assert!(!message.contains("已领取"), "{} 不能冒称已领取", region.label());
+            assert!(!message.contains("已签到"), "{} 不能冒称已签到", region.label());
+        }
+        // 没有 holder 时国内版仍说「没有可领取的活动」（Free 账号没有活动行）
+        let cn = no_claim(Region::Cn, false, None, None, None);
         assert!(cn.get("deviceLimited").is_none());
-        assert!(cn.get("msg").and_then(Value::as_str).unwrap_or("").contains("没有可领取"));
+        assert!(cn
+            .get("msg")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .contains("没有可领取"));
     }
 
     #[test]
@@ -1020,6 +1090,33 @@ mod tests {
         // 已领取分支不受影响（幂等回放就绪时盲发摘要没有信息量）
         let claimed = no_claim(Region::Global, true, None, None, note);
         assert_eq!(claimed.get("msg").and_then(Value::as_str), Some("今日已领取"));
+    }
+
+    #[test]
+    fn only_already_claimed_is_treated_as_claimed() {
+        let response = |status: u16, body: Value| ApiResponse {
+            ok: (200..300).contains(&status),
+            status,
+            payload: Some(body),
+        };
+        // 今天已领（4xx 形态）
+        let already = response(409, json!({"result": "ALREADY_CLAIMED"}));
+        assert!(already_claimed_response(&already));
+        assert!(!campaign_not_active(&already));
+        // 活动批次过期：**不是**「已领取」，必须留给盲发兜底去换候选
+        let stale = response(
+            409,
+            json!({"errorCode": "CAMPAIGN_NOT_ACTIVE", "errorMessage": "Internal server error"}),
+        );
+        assert!(campaign_not_active(&stale));
+        assert!(!already_claimed_response(&stale));
+        // 嵌套在 data 下也认
+        let nested = response(409, json!({"data": {"errorCode": "CAMPAIGN_NOT_ACTIVE"}}));
+        assert!(campaign_not_active(&nested));
+        // 无 body 的 409：两种都不是（按失败处理，不能冒称已领取）
+        let bare = response(409, Value::Null);
+        assert!(!already_claimed_response(&bare));
+        assert!(!campaign_not_active(&bare));
     }
 
     #[test]
