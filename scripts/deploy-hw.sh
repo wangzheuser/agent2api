@@ -7,6 +7,7 @@ set -euo pipefail
 
 PROJECT_DIR="${AGENT2API_PROJECT_DIR:-/opt/docker_projects/agent2api}"
 COMPOSE_FILE="${AGENT2API_HW_COMPOSE:-$PROJECT_DIR/.deploy/docker-compose.huawei.yml}"
+ENV_FILE="${AGENT2API_HW_ENV_FILE:-$PROJECT_DIR/.env}"
 CONTAINER="${AGENT2API_CONTAINER:-agent2api}"
 BASE_URL="${AGENT2API_BASE_URL:-http://127.0.0.1:19050}"
 
@@ -21,6 +22,7 @@ usage() {
 环境变量：
   AGENT2API_PROJECT_DIR   项目目录，默认 /opt/docker_projects/agent2api
   AGENT2API_HW_COMPOSE    compose 文件，默认 .deploy/docker-compose.huawei.yml
+  AGENT2API_HW_ENV_FILE   变量来源文件，默认项目根目录的 .env（不存在则不传）
   AGENT2API_CONTAINER     容器名，默认 agent2api
   AGENT2API_BASE_URL      健康检查基址，默认 http://127.0.0.1:19050
 EOF
@@ -63,7 +65,13 @@ backup() {
 }
 
 up() {
-  docker compose -f "$COMPOSE_FILE" up -d
+  # docker compose 默认只读「compose 文件所在目录」的 .env，而项目的 .env 与
+  # backups/ 一样放在项目根目录 —— 不显式传 --env-file，compose 里的
+  # ${AGENT2API_ADMIN_USER:-} 之类会全部渲染成空串（面板管理员、验证码开关、
+  # 自更新开关都跟着失效）。这里把根 .env 明确指定为变量来源。
+  local args=(-f "$COMPOSE_FILE")
+  [[ -f "$ENV_FILE" ]] && args=(--env-file "$ENV_FILE" "${args[@]}")
+  docker compose "${args[@]}" up -d
 }
 
 switch_tag() {

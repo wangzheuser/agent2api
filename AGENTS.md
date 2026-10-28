@@ -65,12 +65,26 @@ git 仓库，服务器上没有 `update_version.sh`，也不在服务器内构�
    - 备份 `data/`（SQLite 库）与 `.deploy/docker-compose.huawei.yml` 到
      `backups/agent2api-pre-<tag>-<UTC时间戳>/`（沿用既有命名）；
    - 更新 `.deploy/docker-compose.huawei.yml` 的 `image:` 为新 tag；
-   - `docker compose -f .deploy/docker-compose.huawei.yml up -d` 替换容器。
-3. 替换前确认服务器上没有正在运行的部署操作；不得执行 `docker compose down -v`、
+   - `docker compose --env-file .env -f .deploy/docker-compose.huawei.yml up -d` 替换容器。
+     `--env-file` 不能省：compose 默认只读「compose 文件所在目录」的 `.env`，也就是
+     `.deploy/.env`，而项目的变量文件在**项目根目录**。漏掉它时 compose 里所有
+     `${AGENT2API_*:-}`、`${ZCODE_*:-0}` 都渲染成默认值 —— 面板管理员变成空（回落到
+     库内注册的管理员）、ZCode 直连开关被静默压回 0，且 `docker compose config` 看不
+     出异常（渲染结果本身就是「合法」的默认值）。`scripts/deploy-hw.sh` 已固定传入。
+3. 面板管理员由根 `.env` 的 `AGENT2API_ADMIN_USER` / `AGENT2API_ADMIN_PASSWORD` 提供，
+   `access::verify_login` **环境变量优先**：一旦这对变量非空，面板登录只认它们，
+   库内注册的管理员（kv `panelAdmin`）与「首次注册」入口同时失效。改动后必须用
+   `POST /api/panel/login` 实测一次（登录需过 ALTCHA PoW：`GET /api/panel/captcha`
+   取 salt/challenge/maxnumber，枚举 n 使 `sha256(salt+n)==challenge`，payload 为
+   base64(JSON{algorithm,challenge,number,salt,signature})，放进登录体的 `captcha` 字段）。
+4. 替换前确认服务器上没有正在运行的部署操作；不得执行 `docker compose down -v`、
    全局 prune 或删除未知备份。
-4. 镜像内 `AGENT2API_SELF_UPDATE` 在华为云应保持默认关闭口径：面板内自更新只替换
-   容器文件、不更新 compose 镜像 tag，会造成版本漂移；版本一律走第 3.2 节的镜像替换。
-5. `update_version.sh`、`release.env`、`.deploy/status/` 等 us2 时代机制已废弃，
+5. 镜像内 `AGENT2API_SELF_UPDATE` 在华为云应保持 `0`：面板内自更新只替换
+   容器文件、不更新 compose 镜像 tag，会造成版本漂移；版本一律走本节第 2 步的镜像替换。
+   注意本仓库当前**没有**把它接进编译单元（`core/update/mod.rs` 未声明 `mod selfupdate;`，
+   `selfupdate.rs` 与 `selfupdate::enabled/supported/apply` 均无调用点），所以设 `0`
+   目前只是把口径写明确保将来接线时默认关闭，而不是修一个已存在的行为。
+6. `update_version.sh`、`release.env`、`.deploy/status/` 等 us2 时代机制已废弃，
    不适用于华为云。
 
 ### 3.3 部署验收
@@ -91,7 +105,7 @@ git 仓库，服务器上没有 `update_version.sh`，也不在服务器内构�
 
 部署失败时保留现场，记录失败阶段（构建、传输、备份或容器替换）。回滚 = 把
 `.deploy/docker-compose.huawei.yml` 的 `image:` 改回上一个 tag 后
-`docker compose -f .deploy/docker-compose.huawei.yml up -d`；数据库异常时优先用
+`docker compose --env-file .env -f .deploy/docker-compose.huawei.yml up -d`；数据库异常时优先用
 `backups/` 里最近的版本化备份恢复 `data/`。不得删除未知备份，不得全局 prune。
 回滚后重新验证容器、健康端点、认证边界和既有业务路径。
 
