@@ -102,7 +102,14 @@ async fn reconcile_saved_conversation(
         .as_str()
         .or_else(|| saved["outcome"]["conversationId"].as_str())
     else {
-        return ReconcileDecision::Unresolved;
+        // 没留下会话 ID 时无法核对。上游会留下大量不会再被推进的 working/creating
+        // 僵尸会话，因此「列表里还有活跃会话」不能作为上次创建成功的证据；把这一天
+        // 让给重试，重复创建的风险由创建阶段的 ACTIVE_LIMIT 清理兜住。
+        logging::verbose(
+            "[Checkin]",
+            "上次网页会话没有留下会话 ID，按可重试处理（僵尸活跃会话不作为创建成功的证据）",
+        );
+        return ReconcileDecision::Retry;
     };
     let Ok(conversation_id) = conversation_id(&Value::String(saved_id.to_string())) else {
         return ReconcileDecision::Retry;
@@ -118,6 +125,13 @@ async fn reconcile_saved_conversation(
     let status = detail
         .ok()
         .and_then(|value| value.get("status").and_then(Value::as_str).map(str::to_string));
+    logging::verbose(
+        "[Checkin]",
+        &format!(
+            "网页会话 {conversation_id} 核对状态：{}",
+            status.as_deref().unwrap_or("未知")
+        ),
+    );
     match status.as_deref() {
         Some("completed") => {
             let mut outcome = serde_json::from_value::<Outcome>(saved["outcome"].clone())
@@ -130,6 +144,15 @@ async fn reconcile_saved_conversation(
             ReconcileDecision::Completed(outcome, saved_day)
         }
         Some("failed") | Some("error") | Some("cancelled") | Some("canceled") => {
+            ReconcileDecision::Retry
+        }
+        // 进程在对话进行中被中断后，上游没有客户端推动，会话会一直停在
+        // working/creating/pending，当天每次重试都会卡在「待核对」。这类会话
+        // 已经不可能再完成，停掉它（并删除）后允许今天重新创建。
+        Some("working" | "creating" | "pending")
+            if saved_day == chrono::Utc::now().format("%Y-%m-%d").to_string() =>
+        {
+            release_conversation(client, origin, uid, token, &conversation_id, true, safety).await;
             ReconcileDecision::Retry
         }
         _ if saved_day < chrono::Utc::now().format("%Y-%m-%d").to_string() => {
@@ -521,16 +544,14 @@ async fn execute(
         persistence,
     )
     .await;
-    // 只清理失败/中断留下的会话：`completed` 的会话不再占用「活跃会话」名额，
-    // 成功后再补一次 /stop 既没有收益，还可能吃掉本轮剩余的时间预算把成功翻成超时。
-    if let (true, Some(conversation_id)) = (result.is_err(), outcome.conversation_id.as_deref()) {
+    if let Some(conversation_id) = outcome.conversation_id.as_deref() {
         release_conversation(
             client,
             origin,
             uid,
             token,
             conversation_id,
-            true,
+            result.is_err(),
             None,
         )
         .await;
@@ -640,19 +661,14 @@ async fn execute_inner(
         .await?;
     // 建会话体里的 model 只是 manifest；网页端还会在 ACP 中显式钉住本轮模型，
     // 否则上游可能按账号默认模型执行，保活会误扣积分。
-    // 不认这个方法的实现可能既不回包也不报错，所以给它单独的短上限——
-    // 设置失败只是回到「按账号默认模型执行」，不能让整轮保活拖到 TURN_TIMEOUT。
-    let pinned = tokio::time::timeout(
-        Duration::from_secs(15),
-        channel.rpc(
+    if let Err(error) = channel
+        .rpc(
             3,
             "session/set_model",
             json!({"sessionId":session_id,"modelId":model}),
-        ),
-    )
-    .await
-    .unwrap_or_else(|_| Err("设置模型请求超时，本轮继续".to_string()));
-    if let Err(error) = pinned {
+        )
+        .await
+    {
         logging::verbose("[Checkin]", &format!("网页保活设置免费模型失败，本轮继续：{error}"));
     }
     channel.output_chunks = 0;

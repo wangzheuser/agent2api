@@ -71,8 +71,6 @@ async fn web_activity_persists_before_create_and_never_recreates_unknown_result(
     task_state::install(Some(db.clone()));
     let store = AccountStore::with_db(Some(db.clone()));
     for (name, status, payload, phase, first_hits, paused) in [
-        ("unknown-502", 502, json!({"msg":"unknown"}), "uncertain", 1, false),
-        ("missing-id", 200, json!({"code":0,"data":{}}), "uncertain", 1, false),
         ("created-id", 200, json!({"code":0,"data":{"id":"fixture-created-id"}}), "uncertain", 2, false),
         ("error-with-id", 429, json!({"code":6021,"data":{"id":"fixture-created-id"}}), "uncertain", 1, false),
         ("reject-429", 429, json!({"msg":"rate limited"}), "rejected", 1, false),
@@ -94,15 +92,12 @@ async fn web_activity_persists_before_create_and_never_recreates_unknown_result(
                     return (StatusCode::OK, json!({"code":0,"data":{}}).to_string());
                 }
                 seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let state = task_state::read(&key).unwrap().value.unwrap();
                 if method == axum::http::Method::GET {
-                    assert_eq!(state["phase"], "conversation_created");
-                    assert_eq!(state["conversationId"], "fixture-created-id");
-                    (StatusCode::BAD_GATEWAY, json!({"msg":"session unavailable"}).to_string())
-                } else {
-                    assert_eq!(state["phase"], "pending_create");
-                    (StatusCode::from_u16(status).unwrap(), payload.to_string())
+                    return (StatusCode::BAD_GATEWAY, json!({"msg":"session unavailable"}).to_string());
                 }
+                let state = task_state::read(&key).unwrap().value.unwrap();
+                assert_eq!(state["phase"], "pending_create");
+                (StatusCode::from_u16(status).unwrap(), payload.to_string())
             }
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -121,15 +116,11 @@ async fn web_activity_persists_before_create_and_never_recreates_unknown_result(
         task_state::clear_cooldown(&key).unwrap();
         let restored_store = AccountStore::with_db(Some(db.clone()));
         assert!(!run_with_origin(&restored_store, &session, "fixture", &origin).await.success);
-        let expected_hits = if paused {
-            first_hits
-        } else if phase == "uncertain" && matches!(name, "unknown-502" | "missing-id") {
-            first_hits
-        } else if phase == "uncertain" {
-            first_hits + 2
-        } else {
-            3
-        };
+        // 三轮调用：带会话 ID 的状态每次只多一次详情核对，不会重建；上游拒绝
+        // （rejected）没有留下会话 ID，每次都会重建。
+        let keeps_id = name.contains("with-id") || name == "created-id";
+        assert!(keeps_id || phase == "rejected" || paused, "{name}");
+        let expected_hits = if paused { first_hits } else { first_hits + 2 };
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), expected_hits, "{name}");
         server.abort();
     }
@@ -435,4 +426,116 @@ async fn missing_login_fails_without_network_and_releases_reservation() {
     assert!(!first.success);
     assert_eq!(first.error.as_deref(), Some("账号未登录"));
     assert_eq!(run(&store, &session, "fixture-model").await.error, first.error);
+}
+
+#[tokio::test]
+async fn stale_working_conversation_is_released_before_recreating() {
+    static DATABASE: std::sync::OnceLock<(crate::server::db::Db, crate::server::db::test_temp::TempDb)> = std::sync::OnceLock::new();
+    let (db, _) = DATABASE.get_or_init(|| crate::server::db::test_temp::TempDb::open("web-activity-stale"));
+    task_state::install(Some(db.clone()));
+    let store = AccountStore::with_db(Some(db.clone()));
+    let session = json!({"provider":"workbuddy-intl","account":{"uid":"reconcile-stale"},"auth":{"accessToken":"fixture"}});
+    let key = state_key(&session).unwrap();
+    let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    task_state::store_value(
+        &key,
+        json!({"day":day,"phase":"conversation_created","conversationId":"fixture-stale-id"}),
+    )
+    .unwrap();
+    let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen = calls.clone();
+    let app = Router::new().fallback(move |method: axum::http::Method, uri: Uri| {
+        let seen = seen.clone();
+        async move {
+            let path = uri.path().to_string();
+            seen.lock().unwrap().push(format!("{} {}", method, path));
+            if path.ends_with("/stop") || path.ends_with("/delete") {
+                return (StatusCode::OK, json!({"code":0,"data":{}}).to_string());
+            }
+            if method == axum::http::Method::GET && path.contains("/conversations/fixture-stale-id") {
+                // 进程中断后上游会话停在 working，永远不会自己结束。
+                return (StatusCode::OK, json!({"code":0,"data":{"status":"working"}}).to_string());
+            }
+            (StatusCode::BAD_GATEWAY, json!({"msg":"create unavailable"}).to_string())
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let outcome = run_with_origin(&store, &session, "fixture", &origin).await;
+
+    let recorded = calls.lock().unwrap().clone();
+    assert_eq!(
+        recorded.iter().filter(|call| call.ends_with("/stop")).count(),
+        1,
+        "僵死的 working 会话必须被结束：{recorded:?}"
+    );
+    assert_eq!(
+        recorded.iter().filter(|call| call.ends_with("/delete")).count(),
+        1,
+        "僵死的 working 会话必须被删除：{recorded:?}"
+    );
+    assert!(
+        recorded.iter().any(|call| call == "POST /console/as/conversations/"),
+        "停掉僵死会话后当天必须允许重新创建：{recorded:?}"
+    );
+    assert_ne!(
+        outcome.error.as_deref(),
+        Some("上次网页会话创建或执行结果待核对，不自动创建新会话"),
+        "不能整天卡在待核对"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn unconfirmed_create_without_id_recreates_and_survives_zombie_conversations() {
+    static DATABASE: std::sync::OnceLock<(crate::server::db::Db, crate::server::db::test_temp::TempDb)> = std::sync::OnceLock::new();
+    let (db, _) = DATABASE.get_or_init(|| crate::server::db::test_temp::TempDb::open("web-activity-live"));
+    task_state::install(Some(db.clone()));
+    let store = AccountStore::with_db(Some(db.clone()));
+    let session = json!({"provider":"workbuddy-intl","account":{"uid":"reconcile-live"},"auth":{"accessToken":"fixture"}});
+    let key = state_key(&session).unwrap();
+    let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    task_state::store_value(
+        &key,
+        json!({"day":day,"phase":"uncertain","outcome":{
+            "success":false,"conversationId":Value::Null,"status":"","outputChunks":0,
+            "turnCompleted":false,"elapsedMs":0,"error":"创建网页会话请求未确认，创建结果待核对"
+        }}),
+    )
+    .unwrap();
+    let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen = calls.clone();
+    let app = Router::new().fallback(move |method: axum::http::Method, uri: Uri| {
+        let seen = seen.clone();
+        async move {
+            let path = uri.path().to_string();
+            seen.lock().unwrap().push(format!("{} {path}", method));
+            if method == axum::http::Method::GET && path.ends_with("/conversations/") {
+                // 上游长期堆积不会再被推进的 working 僵尸会话，不能把它们当作
+                // 「上次创建成功」的证据，否则账号会整天无法完成日活。
+                return (
+                    StatusCode::OK,
+                    json!({"code":0,"data":{"conversations":[
+                        {"id":"zombie-id","status":"working","name":PROMPT}
+                    ]}})
+                    .to_string(),
+                );
+            }
+            (StatusCode::OK, json!({"code":0,"data":{"id":"brand-new-id"}}).to_string())
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    run_with_origin(&store, &session, "fixture", &origin).await;
+
+    let recorded = calls.lock().unwrap().clone();
+    assert!(
+        recorded.iter().any(|call| call == "POST /console/as/conversations/"),
+        "没有会话 ID 时必须允许当天重建：{recorded:?}"
+    );
+    server.abort();
 }

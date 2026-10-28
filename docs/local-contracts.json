@@ -37,7 +37,7 @@
       "id": "workbuddy-background-risk-idempotency",
       "level": "P0",
       "status": "必须保留",
-      "behavior": "国际活跃任务收到明确拒绝后停止后续模型、网页会话和上报；当天实际活跃成功独立于奖励到账记录并持久去重；自建会话创建意图与ID持久化，未知结果不自动新建或删除用户会话。旧成长与新入口共享身份租约和待核实保护，人工确认不重发业务；Token刷新取消后释放占位。",
+      "behavior": "国际活跃任务收到明确拒绝后停止后续模型、网页会话和上报；当天实际活跃成功独立于奖励到账记录并持久去重；自建会话创建意图与ID持久化，留下会话ID的未知结果不自动新建或删除用户会话；没有留下会话ID的待核对结果，以及上游长期停在 working/creating/pending 的僵死会话，先停用清理再允许当天重建，不让当天永久卡在待核对。旧成长与新入口共享身份租约和待核实保护，人工确认不重发业务；Token刷新取消后释放占位。",
       "source_commits": ["067f19e863543cda6163d03aca8c98ad6d4ac9f1"],
       "implementation": [
         "desktop-tauri/src-tauri/server/src/server/core/billing/activity.rs",
@@ -54,6 +54,8 @@
         {"id":"case-workbuddy-refresh-cancel-release","kind":"rust","path":"desktop-tauri/src-tauri/server/src/server/core/auth.rs","name":"server::core::auth::refresh_reservation_tests::cancelled_refresh_releases_its_reservation"},
         {"id":"case-workbuddy-web-daily-persistence","kind":"rust","path":"desktop-tauri/src-tauri/server/src/server/core/billing/web_activity/tests.rs","name":"server::core::billing::web_activity::tests::web_activity_daily_success_and_uncertainty_survive_date_rollover"},
         {"id":"case-workbuddy-web-unknown-create","kind":"rust","path":"desktop-tauri/src-tauri/server/src/server/core/billing/web_activity/tests.rs","name":"server::core::billing::web_activity::tests::web_activity_persists_before_create_and_never_recreates_unknown_result"},
+        {"id":"case-workbuddy-web-stale-working-release","kind":"rust","path":"desktop-tauri/src-tauri/server/src/server/core/billing/web_activity/tests.rs","name":"server::core::billing::web_activity::tests::stale_working_conversation_is_released_before_recreating"},
+        {"id":"case-workbuddy-web-uncertain-without-id-retry","kind":"rust","path":"desktop-tauri/src-tauri/server/src/server/core/billing/web_activity/tests.rs","name":"server::core::billing::web_activity::tests::unconfirmed_create_without_id_recreates_and_survives_zombie_conversations"},
         {"id":"case-workbuddy-legacy-batch-terminal","kind":"rust","path":"desktop-tauri/src-tauri/server/src/server/core/providers/workbuddy/growth/mod.rs","name":"server::core::providers::workbuddy::growth::safety_tests::legacy_growth_rejection_stops_tasks_fallback_and_lottery_without_false_pause"},
         {"id":"case-workbuddy-growth-success-shape","kind":"rust","path":"desktop-tauri/src-tauri/server/src/server/core/providers/workbuddy/growth/mod.rs","name":"server::core::providers::workbuddy::growth::safety_tests::growth_success_requires_zero_or_absent_business_code"}
       ]
