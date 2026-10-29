@@ -1,7 +1,9 @@
-"""本地权威门禁的命令矩阵测试；不启动 Rust、Node 或浏览器。"""
+"""本地权威门禁的命令矩阵与分组编排测试；不启动 Rust、Node 或浏览器。"""
 import importlib.util
 from pathlib import Path
+import sys
 import unittest
+from unittest.mock import patch
 
 
 spec = importlib.util.spec_from_file_location('local_gates', Path(__file__).with_name('local-merge-gates.py'))
@@ -30,6 +32,45 @@ class LocalMergeGatesTests(unittest.TestCase):
         self.assertIn('candidate-node', frontend_names)
         self.assertIn('baseline-rust', server_names)
         self.assertIn('baseline-frontend', frontend_names)
+
+    def test_group_selection_is_explicit_and_all_is_stable(self):
+        self.assertEqual(local_gates.selected_groups('contracts'), ('contracts',))
+        self.assertEqual(local_gates.selected_groups('server'), ('server',))
+        self.assertEqual(local_gates.selected_groups('frontend'), ('frontend',))
+        self.assertEqual(local_gates.selected_groups('all'), ('contracts', 'server', 'frontend'))
+        with self.assertRaisesRegex(ValueError, '未知门禁组'):
+            local_gates.selected_groups('unknown')
+
+    def test_single_group_does_not_execute_other_groups(self):
+        matrix = {group: [(group + '-step', [sys.executable, '-c', 'pass'])]
+                  for group in local_gates.GROUPS}
+        calls = []
+
+        def fake_run_group(_root, _report, group, _steps):
+            calls.append(group)
+            return [{'group': group, 'name': group + '-step', 'exit': 0,
+                     'stdout': 'out', 'stderr': 'err'}]
+
+        with patch.object(local_gates, 'run_group', side_effect=fake_run_group):
+            results = local_gates.run_selected_groups(Path('.'), Path('.verify'), matrix, 'server')
+        self.assertEqual(calls, ['server'])
+        self.assertEqual([item['group'] for item in results], ['server'])
+
+    def test_all_stops_before_expensive_groups_when_contracts_fail(self):
+        matrix = {group: [(group + '-step', [sys.executable, '-c', 'pass'])]
+                  for group in local_gates.GROUPS}
+        calls = []
+
+        def fake_run_group(_root, _report, group, _steps):
+            calls.append(group)
+            return [{'group': group, 'name': group + '-step',
+                     'exit': 7 if group == 'contracts' else 0,
+                     'stdout': 'out', 'stderr': 'err'}]
+
+        with patch.object(local_gates, 'run_group', side_effect=fake_run_group):
+            results = local_gates.run_selected_groups(Path('.'), Path('.verify'), matrix, 'all')
+        self.assertEqual(calls, ['contracts'])
+        self.assertEqual(results[0]['exit'], 7)
 
 
 if __name__ == '__main__':

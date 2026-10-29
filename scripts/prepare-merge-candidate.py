@@ -11,6 +11,7 @@ PROTECTED_CONTROL_FILES = {
     'AGENTS.md',
     'docs/local-contracts.json',
     'scripts/check-merge-contracts.py',
+    'scripts/check-merge-impact-review.py',
     'scripts/local-merge-gates.py',
     'scripts/merge-flow.py',
     'scripts/replay-merge-baseline.py',

@@ -302,33 +302,49 @@ bash scripts/release.sh vX.Y.Z <run-id>   # 或显式指定 run
 
 `scripts/merge-flow.py` 是标准库薄记录入口，不替 AI 做业务判断，也不自动 merge、stage、commit 或 push。每轮在被忽略的诊断目录保留独立记录，续作复用同一记录：
 
-每轮先用 `scripts/prepare-merge-candidate.py` 从冻结的 H 创建隔离 worktree；脚本先拒绝上游删除 `AGENTS.md`、`docs/local-contracts.json` 或合并门禁脚本，再创建候选。主工作区只允许保留冻结时已存在的未跟踪诊断文件，不能在主工作区进入 `MERGE_HEAD`。在候选 worktree 内先 freeze，再运行 `preflight` 固化快照，然后执行 `git merge --no-commit --no-ff <U>` 并解决冲突。合并完成后运行 `check-merge-closure.py`；注册、迁移、桌面登录接线或生成产物闭包失败时，不得进入 Rust/前端长门禁。
+每轮先用 `scripts/prepare-merge-candidate.py` 从冻结的 H 创建隔离 worktree；脚本先拒绝上游删除 `AGENTS.md`、`docs/local-contracts.json`、`scripts/check-merge-impact-review.py` 或其它合并门禁脚本，再创建候选。主工作区只允许保留冻结时已存在的未跟踪诊断文件，不能在主工作区进入 `MERGE_HEAD`。在候选 worktree 内先 freeze，再运行 `preflight` 固化快照，然后执行 `git merge --no-commit --no-ff <U>` 并解决冲突。合并完成后运行 `check-merge-closure.py`；注册、迁移、桌面登录接线或生成产物闭包失败时，不得进入 Rust/前端长门禁。
 
 ```sh
-python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json freeze --upstream upstream/main
+python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json freeze --upstream <U>
 # 读取上游/本地历史、预演、按调用链实施；不切换当前工作分支。
-# 先生成产物并明确暂存本轮文件；其他任务有改动时使用隔离候选，不替别人stash或提交。
+# 先生成产物并明确暂存本轮文件；其他任务有改动时使用隔离候选，不替别人 stash 或提交。
 python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json preflight
 git merge --no-commit --no-ff <U>
 python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json impact
 python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json overlap
-# 对每个共同修改路径明确取舍；重复能力默认以上游实现为权威
+# 对每个共同修改路径明确取舍；重复能力默认以上游实现为权威。
 python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json overlap \
   --decision <path>=upstream_equivalent
 python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json plan
-python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json run --name integration-closure -- python scripts/check-merge-closure.py --base-ref <H> --report diagnostic-artifacts/<本轮>/integration-closure.json
+python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json run --name integration-closure -- \
+  python scripts/check-merge-closure.py --base-ref <H> \
+  --report diagnostic-artifacts/<本轮>/integration-closure.json
+# impact-review.md 必须包含绑定当前 tree、H/U/B、plan/overlap digest 和逐路径证据的结构块。
+python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json run --name impact-review -- \
+  python scripts/check-merge-impact-review.py \
+  --record diagnostic-artifacts/<本轮>/run.json \
+  --review diagnostic-artifacts/<本轮>/impact-review.md \
+  --report diagnostic-artifacts/<本轮>/impact-review.json
+python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json run --name contracts-p0 -- \
+  python scripts/local-merge-gates.py --base-ref <H> --group contracts \
+  --report-dir diagnostic-artifacts/<本轮>/gates-contracts
+python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json run --name server -- \
+  python scripts/local-merge-gates.py --base-ref <H> --group server \
+  --report-dir diagnostic-artifacts/<本轮>/gates-server
+python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json run --name frontend -- \
+  python scripts/local-merge-gates.py --base-ref <H> --group frontend \
+  --report-dir diagnostic-artifacts/<本轮>/gates-frontend
+# 若 plan 要求 generated-artifacts，再记录重建后工作树无漂移的独立回执。
+python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json run --name generated-artifacts -- \
+  git diff --exit-code -- desktop-tauri/ui/islands/ui.js desktop-tauri/ui/islands/ui.css
 python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json status
-python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json run --name local-gates -- python scripts/local-merge-gates.py --base-ref <H>
-python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json run --name tools -- python -B -m unittest discover -s scripts -p 'test_*merge*.py' -v
-python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json run --name server --cwd desktop-tauri/src-tauri -- cargo test -p agent2api-server --locked
-# 独立且不写源码的验收可合并启动，JSON 数组元素为 name/cwd/argv。
-python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json run-batch --tasks diagnostic-artifacts/<本轮>/gates.json
-# 按同样方式记录清单检查、完整Node TAP、前端typecheck/build、浏览器、H重放和新增专项验收。
-python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json seal --required tools server <本轮其他必需验收名>
-# 已执行 plan 时可省略 --required；显式参数只能增加验收项，不能缩减计划必需 gate。
+# 独立且不写源码的专项验收可用 run-batch；不得与会修改源码/索引的命令并行。
+python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json run-batch \
+  --tasks diagnostic-artifacts/<本轮>/gates.json
+# 已执行 plan 时省略 --required，自动使用完整必需 gate；显式参数只能增加，不能缩减。
 python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json seal
 python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json check
-# 用户授权提交/push后执行；提交树须仍等于封存的候选tree。
+# 用户授权提交/push后执行；提交树须仍等于封存的候选 tree。
 python scripts/merge-flow.py --record diagnostic-artifacts/<本轮>/run.json check --commit HEAD
 ```
 

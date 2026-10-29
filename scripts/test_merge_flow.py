@@ -190,7 +190,10 @@ class MergeFlowTests(unittest.TestCase):
         snapshot = flow.status(self.root, self.path, self.record)
         self.assertEqual(snapshot['phase'], 'planned')
         self.assertEqual(snapshot['next_action'], 'resolve first impacted domain')
-        self.assertEqual(self.record['plan']['required_gates'], ['impact-review'])
+        self.assertEqual(
+            self.record['plan']['required_gates'],
+            ['impact-review', 'integration-closure'],
+        )
         self.assertTrue((self.path.parent / 'plan.json').is_file())
 
     def test_batch_runs_independent_gates_and_records_each_receipt(self):
@@ -259,8 +262,14 @@ class MergeFlowTests(unittest.TestCase):
         self.assertEqual(record['plan']['overlap_unresolved'], ['source.py'])
         self.assertEqual(self.run_check_for(record, path), 0)
         flow.execute(self.root, path, record, 'impact-review', '.', [sys.executable, '-c', 'assert True'])
+        flow.execute(self.root, path, record, 'integration-closure', '.', [sys.executable, '-c', 'assert True'])
         with self.assertRaisesRegex(ValueError, '重复功能决策'):
-            flow.seal(self.root, path, record, ['business', 'impact-review'])
+            flow.seal(
+                self.root,
+                path,
+                record,
+                ['business', 'impact-review', 'integration-closure'],
+            )
 
     def run_check_for(self, record, path, code='assert True'):
         return flow.execute(self.root, path, record, 'business', '.', [sys.executable, '-c', code])
@@ -272,7 +281,13 @@ class MergeFlowTests(unittest.TestCase):
         self.assertEqual(record['overlap']['unresolved'], [])
         self.assertEqual(self.run_check_for(record, path), 0)
         flow.execute(self.root, path, record, 'impact-review', '.', [sys.executable, '-c', 'assert True'])
-        flow.seal(self.root, path, record, ['business', 'impact-review'])
+        flow.execute(self.root, path, record, 'integration-closure', '.', [sys.executable, '-c', 'assert True'])
+        flow.seal(
+            self.root,
+            path,
+            record,
+            ['business', 'impact-review', 'integration-closure'],
+        )
         (self.root / 'source.py').write_text('candidate = True\n', encoding='utf-8')
         self.git('add', 'source.py')
         with self.assertRaisesRegex(ValueError, '重复功能分析'):

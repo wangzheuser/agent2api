@@ -394,9 +394,9 @@ def plan(root, path, record):
             if changed_path:
                 domains.setdefault(domain_for(changed_path), set()).add(changed_path)
     domain_rows = [{'id': ident, 'paths': sorted(paths)} for ident, paths in sorted(domains.items())]
-    required = ['impact-review']
-    if 'release-metadata' in domains:
-        required.append('integration-closure')
+    # 注册、迁移、登录接线、生成产物和版本闭包是每轮候选的固定前置门禁，
+    # 不能只在版本元数据变更时才要求。
+    required = ['impact-review', 'integration-closure']
     if any(item['level'] == 'P0' for item in impacted):
         required.append('contracts-p0')
     kinds = {test.get('kind') for item in contracts if contract_matches(item, all_paths)

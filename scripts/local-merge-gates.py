@@ -11,6 +11,9 @@ import subprocess
 import sys
 
 
+GROUPS = ('contracts', 'server', 'frontend')
+
+
 def command_name(name):
     if os.name == 'nt' and name == 'npm':
         return 'npm.cmd'
@@ -113,6 +116,37 @@ def run_group(root, report_dir, group, steps):
     return results
 
 
+def selected_groups(selection):
+    if selection == 'all':
+        return GROUPS
+    if selection not in GROUPS:
+        raise ValueError(f'未知门禁组: {selection}')
+    return (selection,)
+
+
+def run_selected_groups(root, report_dir, matrix, selection):
+    """Run one independently receipted group, or the legacy all-groups flow."""
+    groups = selected_groups(selection)
+    if selection != 'all':
+        return run_group(root, report_dir, selection, matrix[selection])
+
+    all_results = []
+    contract_results = run_group(root, report_dir, 'contracts', matrix['contracts'])
+    all_results.extend(contract_results)
+    if any(item['exit'] for item in contract_results):
+        print('LOCAL_GATES: contracts failed; server/frontend gates were not started', file=sys.stderr)
+        return all_results
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = {pool.submit(run_group, root, report_dir, group, matrix[group]): group
+                   for group in groups if group != 'contracts'}
+        for future in as_completed(futures):
+            all_results.extend(future.result())
+    order = {group: index for index, group in enumerate(GROUPS)}
+    all_results.sort(key=lambda item: (order[item['group']], item['name']))
+    return all_results
+
+
 def validate_base(root, base_ref, candidate):
     if git(root, 'rev-parse', '--is-shallow-repository').strip() != b'false':
         raise ValueError('需要完整 Git 历史；先补齐 shallow clone')
@@ -141,6 +175,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument('--base-ref', required=True, help='合并前本地 H；不能使用候选 HEAD')
+    parser.add_argument('--group', choices=(*GROUPS, 'all'), default='all',
+                        help='只运行一个可独立记录的门禁组；默认 all 保持完整门禁行为')
     parser.add_argument('--report-dir', type=Path, help='证据目录，默认写入 .verify/local-merge-gates')
     args = parser.parse_args()
     root = args.root.resolve()
@@ -150,34 +186,41 @@ def main():
                   datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')).resolve()
     report_dir.mkdir(parents=True, exist_ok=True)
     matrix = command_matrix(root, base, report_dir)
-    all_results = []
+    all_results = run_selected_groups(root, report_dir, matrix, args.group)
 
-    contract_results = run_group(root, report_dir, 'contracts', matrix['contracts'])
-    all_results.extend(contract_results)
-    if any(item['exit'] for item in contract_results):
-        print('LOCAL_GATES: contracts failed; server/frontend gates were not started', file=sys.stderr)
+    after_tree = None
+    tree_error = None
+    try:
+        after_tree = candidate_tree(root)
+    except (ValueError, subprocess.CalledProcessError) as error:
+        tree_error = str(error)
+    summary = {
+        'group': args.group,
+        'selected_groups': list(selected_groups(args.group)),
+        'base_ref': base,
+        'candidate_tree': before_tree,
+        'candidate_tree_after': after_tree,
+        'tree_error': tree_error,
+        'tree_unchanged': after_tree == before_tree and tree_error is None,
+        'report_dir': str(report_dir),
+        'results': all_results,
+        'passed': sum(item['exit'] == 0 for item in all_results),
+        'failed': sum(item['exit'] != 0 for item in all_results),
+    }
+    (report_dir / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2) + '\n',
+                                              encoding='utf-8')
+    if tree_error:
+        print(f'LOCAL_GATES: FAIL candidate tree unavailable after gates: {tree_error}', file=sys.stderr)
         return 1
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = {pool.submit(run_group, root, report_dir, group, matrix[group]): group
-                   for group in ('server', 'frontend')}
-        for future in as_completed(futures):
-            all_results.extend(future.result())
-    all_results.sort(key=lambda item: (item['group'], item['name']))
-    after_tree = candidate_tree(root)
     if before_tree != after_tree:
         print(f'LOCAL_GATES: FAIL candidate tree changed {before_tree} -> {after_tree}', file=sys.stderr)
         return 1
-    summary = {'base_ref': base, 'candidate_tree': after_tree,
-               'report_dir': str(report_dir), 'results': all_results,
-               'passed': sum(item['exit'] == 0 for item in all_results),
-               'failed': sum(item['exit'] != 0 for item in all_results)}
-    (report_dir / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2) + '\n',
-                                              encoding='utf-8')
     if summary['failed']:
-        print(f"LOCAL_GATES: FAIL {summary['failed']} failed; evidence={report_dir}", file=sys.stderr)
+        print(f"LOCAL_GATES: FAIL group={args.group}; {summary['failed']} failed; evidence={report_dir}",
+              file=sys.stderr)
         return 1
-    print(f"LOCAL_GATES: PASS {summary['passed']} gates; base={base}; evidence={report_dir}")
+    print(f"LOCAL_GATES: PASS group={args.group}; {summary['passed']} gates; "
+          f"base={base}; tree={after_tree}; evidence={report_dir}")
     return 0
 
 
