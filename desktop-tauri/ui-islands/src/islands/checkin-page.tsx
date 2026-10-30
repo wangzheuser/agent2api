@@ -492,19 +492,19 @@ function PlanRow({ row }: {
             ? <Badge variant='success' shape='tag' title={t('本地台账里今天（北京时间）领过的套餐：{plans}', { plans: claimedIds.join(t('、')) })}>
               {t('今天已领 {n} 份', { n: claimedIds.length })}
             </Badge>
-            : <Badge variant='outline' shape='tag' title={t('本地台账里今天还没领过；活动期内每天发一份新套餐')}>{t('今天未领')}</Badge>}
+            : <Badge variant='outline' shape='tag' title={t('本地台账里今天还没领过；可领套餐以上游当前活动投放为准')}>{t('今天未领')}</Badge>}
         </div>
         <div className='ck-prov-desc'>
           {claimed
-            ? t('点「套餐明细」看领到了哪几份、什么时候生效；活动期内每天可再领')
-            // 自动领取任务的结论优先：它能说清「上游今天没放新套餐 / 上游未开放 /
+            ? t('点「套餐明细」看领到了哪几份、什么时候生效及当前可领活动')
+            // 自动领取任务的结论优先：它能说清「当前无投放 / 活动查询失败 /
             // 本地领取失败」，比只说「上次领取 X」有用得多（任务还没跑过时回落到
             // 原来那句）。
             : row.lastClaimResult
               ? row.lastClaimResult
               : row.claimAt
                 ? t('上次领取 {time} · 领取需通过滑块验证码', { time: formatTime(row.claimAt) })
-                : t('限时体验套餐（start-plan），活动期内每天一份 · 领取需滑块验证码')}
+                : t('限时体验套餐（start-plan），以上游当前投放为准 · 领取需滑块验证码')}
         </div>
       </div>
       <div className='ck-prov-right'>

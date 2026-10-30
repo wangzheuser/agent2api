@@ -15,10 +15,7 @@
      ① 探测  POST /api/accounts/{id}/zcode-claim/preview   —— 不要验证码
      ② 领取  POST /api/accounts/{id}/zcode-claim           —— **要**验证码
 
-   探测在**结果为空**时会先补报一次激活事件（`app_launch` / `app_daily_active`）
-   再重探一遍 —— 领取资格由激活事件发放，而本网关不跑官方客户端，那一步不会自动
-   发生（见后端 `providers::zcode::activation`）。所以「探测」在那一档不是纯只读；
-   响应里的 `activated` / `activationError` 如实说明这次报了没报，界面不读它也不影响。
+   探测只读取客户端活动投放接口；空投放不补报激活，也不代表已经领取。
 
    上游的领取接口通常要求 `X-Aliyun-Captcha-Verify-Param`（阿里云无痕验证），
    而解它的唯一可行方式是在 webview 里跑阿里云官方 SDK —— 那正是
@@ -32,11 +29,10 @@
    本模块只做网络与验证码，**不再自己弹确认框**（旧版那套「探测 → 原生确认框 →
    领取」已拆掉：确认框里既看不到逐份状态、也显示不了刚领到还没生效的套餐）。
 
-   ── 404 与「业务失败」都不是错误（后端已归一）───────────────
-     · `deployed: false`（上游活动接口未部署）→ 说一句「当前没有可领套餐」；
-     · 领取返回 `ok: false` + `failure`（如 `already_claimed` / `quota_exhausted`
-       / `captcha`）→ 按 `failureLabel` 提示。这两种都不该报红。
-       只有 HTTP 非 2xx（账号不存在 / 缺 jwt / 网络故障）才当失败处理。
+   ── 投放查询错误与领取业务结果分开 ──────────────────────────
+   探测只认完整活动投放响应；404、缺数据、网络与鉴权失败均抛错。
+   领取返回 `ok: false` + `failure`（如 already_claimed / quota_exhausted）时，
+   按 failureLabel 展示对应业务结果，不把它混成探测失败。
 
    ── 返回值：把业务结果交回调用方 ────────────────────────────
    `preview()` 把后端的探测响应原样 return、失败时 **throw**（界面把错误渲染在

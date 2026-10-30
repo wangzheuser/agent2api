@@ -1,7 +1,7 @@
 //! ZCode 手动与定时领取共用的账号上下文及落库逻辑。
 use super::account_store::AccountStore;
 use super::providers::zcode::{
-    claim::{self, ClaimFailure, ClaimOutcome, PreviewOutcome},
+    claim::{self, ClaimFailure, ClaimOutcome},
     region::Region,
 };
 use super::task_state::{self, Claim, ManualBackoff};
@@ -142,12 +142,10 @@ struct Report {
     already: usize,
     skipped: usize,
     failed: usize,
-    /// 探测成功但上游 `plans[]` 为空。与「已领过」「没资格」「上游没开活动」都不是
+    /// 活动投放中没有领取动作。与「已领过」「没资格」都不是
     /// 一码事：上游不给新套餐时本地无可动作，但**必须说出来**，否则一轮自动领取
     /// 只留下一句「领取 0 份」，用户分不清是排队等着、已经领过了，还是逻辑坏了。
     empty_preview: usize,
-    /// 上游对该地区根本没部署领取接口（preview 404），与「探测为空」区分开。
-    not_deployed: usize,
     error: Option<String>,
 }
 
@@ -169,14 +167,9 @@ impl Report {
             "检查 {} 个账号，领取 {} 份，已领取 {} 份，跳过 {} 项，失败 {} 项",
             self.checked, self.claimed, self.already, self.skipped, self.failed
         );
-        // 两个「什么都没发生」的分支单列出来：它们是上游状态，不是本地失败，
-        // 但恰恰是用户最需要看见的那句话（以前这里一律显示「领取 0 份」）。
-        if self.not_deployed > 0 {
-            return format!("{base}，上游未开放领取 {} 个（preview 404）", self.not_deployed);
-        }
         if self.empty_preview > 0 {
             return format!(
-                "{base}，无可领套餐 {} 个（上游 preview 返回空列表：今日可能已领过，或新一期尚未放出）",
+                "{base}，无可领套餐 {} 个（上游活动投放未下发领取动作）",
                 self.empty_preview
             );
         }
@@ -191,11 +184,8 @@ impl Report {
         if let Some(error) = &self.error {
             return error.clone();
         }
-        if self.not_deployed > 0 {
-            return "上游未开放套餐领取（preview 404）".to_string();
-        }
         if self.empty_preview > 0 {
-            return "本期无可领套餐（上游没发新套餐：已领过或尚未放出）".to_string();
+            return "本期无可领套餐（上游活动投放未下发领取动作）".to_string();
         }
         if self.claimed > 0 {
             return format!("已领取 {} 份", self.claimed);
@@ -280,29 +270,37 @@ async fn scan_account(
 ) -> Result<Report, String> {
     let target = load_target(store, id).map_err(|(_, message)| message)?;
     let proxy = claim_proxy(store, id);
-    // 探测成功就算「检查过这个账号」。这个计数以前只在 `run_auto` 外层累加，
-    // `scan_account` 返回的子报告里恒为 0，于是账号级状态永远显示「检查 0 个账号」。
-    let mut report = Report {
-        checked: 1,
-        ..Report::default()
-    };
-    let mut plans = match claim::preview(
+    let plans = claim::preview(
         target.region,
         &target.jwt,
         target.device_mid.as_deref(),
         proxy.as_ref(),
     )
     .await
-    {
-        Ok(PreviewOutcome::Plans(plans)) => plans,
-        Ok(PreviewOutcome::NotDeployed) => {
-            report.not_deployed = 1;
-            return Ok(report);
-        }
-        Err(error) => return Err(format!("套餐探测失败（HTTP {}）", error.status_code)),
-    };
+    .map_err(|error| error.message)?;
+    scan_plans(store, id, &target, manual, retry, plans, |plan_id| {
+        let target = &target;
+        async move { request_claim(store, id, target, &plan_id, manual).await }
+    }).await
+}
+
+async fn scan_plans<F, Fut>(
+    store: &AccountStore,
+    id: &str,
+    target: &ClaimTarget,
+    manual: bool,
+    retry: &mut serde_json::Map<String, Value>,
+    mut plans: Vec<claim::ClaimablePlan>,
+    mut request: F,
+) -> Result<Report, String>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<ClaimOutcome>, String>>,
+{
+    let mut report = Report { checked: 1, ..Report::default() };
     plans.sort_by(|a, b| b.priority.cmp(&a.priority));
-    retry.retain(|id, _| plans.iter().any(|plan| &plan.plan_id == id));
+    // 投放是增量消息：某轮未再次投放，不代表已登记的失败冷却失效。
+    retry.retain(|_, at| at.as_i64().is_some_and(|at| at > logging::now_ms()));
     // 上游这次没给任何套餐：本地无可动作，但要如实记一笔（见 `empty_preview`）。
     if plans.is_empty() {
         report.empty_preview = 1;
@@ -329,7 +327,7 @@ async fn scan_account(
             report.skipped += 1;
             continue;
         }
-        let outcome = match request_claim(store, id, &target, &plan.plan_id, manual).await {
+        let outcome = match request(plan.plan_id.clone()).await {
             Ok(Some(outcome)) => outcome,
             Ok(None) => break,
             Err(error) => {
@@ -480,7 +478,6 @@ pub async fn run_auto(store: &AccountStore, manual: bool) -> Result<String, Stri
         total.skipped += report.skipped;
         total.failed += report.failed;
         total.empty_preview += report.empty_preview;
-        total.not_deployed += report.not_deployed;
     }
     let summary = total.summary();
     logging::log_with_level(
@@ -494,6 +491,179 @@ pub async fn run_auto(store: &AccountStore, manual: bool) -> Result<String, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn account_fixture(region: Region, label: &str) -> (AccountStore, String, crate::server::db::test_temp::TempDb) {
+        use super::super::providers::zcode::credentials::ZcodeCredentials;
+        let (db, temp) = crate::server::db::test_temp::TempDb::open(label);
+        let store = AccountStore::with_db(Some(db));
+        let credentials = ZcodeCredentials {
+            region, user_id: "test".into(), jwt: "fixture".into(),
+            access_token: "fixture".into(), device_mid: String::new(),
+        };
+        store.add_zcode_account(&credentials, Some("fixture"), "test").unwrap();
+        (store, credentials.account_id(), temp)
+    }
+
+    fn offer(id: &str, priority: i64) -> claim::ClaimablePlan {
+        claim::ClaimablePlan {
+            plan_id: id.into(), name: id.into(), description: String::new(), priority,
+        }
+    }
+
+    fn rejected(plan_id: String, failure: ClaimFailure, ends_at: Option<i64>) -> ClaimOutcome {
+        ClaimOutcome::Failed {
+            plan_id, failure, code: 1005, message: "fixture".into(), failure_ends_at: ends_at,
+        }
+    }
+
+    #[tokio::test]
+    async fn marketing_auto_claim_orders_deduplicates_and_persists_both_regions() {
+        for region in Region::ALL {
+            let (store, id, _temp) = account_fixture(region, "zcode-marketing-auto-success");
+            let target = load_target(&store, &id).unwrap();
+            assert!(store.mark_zcode_claim(&id, "old", logging::now_ms() - 86_400_000));
+            let mut retry = serde_json::Map::new();
+            retry.insert("cooling".into(), json!(logging::now_ms() + 60_000));
+            let plans = vec![offer("new", 1), offer("old", 100), offer("cooling", 50), offer("remote", 90)];
+            let mut called = Vec::new();
+            let report = scan_plans(&store, &id, &target, false, &mut retry, plans.clone(), |plan_id| {
+                called.push(plan_id.clone());
+                std::future::ready(Ok(Some(if plan_id == "remote" {
+                    rejected(plan_id, ClaimFailure::AlreadyClaimed, None)
+                } else {
+                    ClaimOutcome::Claimed { plan_id, starts_at: None, ends_at: None }
+                })))
+            }).await.unwrap();
+            assert_eq!(called, ["remote", "new"]);
+            assert_eq!((report.claimed, report.already, report.skipped, report.failed), (1, 2, 1, 0));
+            let record = store.zcode_account_record(&id).unwrap();
+            assert_eq!(super::super::providers::zcode::plan_of(&record), "start-plan");
+            for plan_id in ["old", "remote", "new"] {
+                assert!(already_recorded(&record, plan_id));
+            }
+            let repeat = scan_plans(&store, &id, &target, false, &mut retry, plans, |_| async {
+                panic!("recorded or cooling plans must not be submitted again")
+            }).await.unwrap();
+            assert_eq!((repeat.claimed, repeat.already, repeat.skipped), (0, 3, 1));
+        }
+    }
+
+    #[tokio::test]
+    async fn marketing_auto_claim_keeps_failure_cooldowns_across_empty_deliveries() {
+        let (store, id, _temp) = account_fixture(Region::ALL[0], "zcode-marketing-auto-cooldown");
+        let target = load_target(&store, &id).unwrap();
+        let mut retry = serde_json::Map::new();
+        let now = logging::now_ms();
+        let window = now / 1000 + 7200;
+        for (name, failure, end, minimum) in [
+            ("quota", ClaimFailure::QuotaExhausted, Some(window), window * 1000),
+            ("ineligible", ClaimFailure::Ineligible, None, now + 60 * 60_000),
+            ("risk", ClaimFailure::RiskBlocked, None, now + RISK_BLOCK_RETRY_MS),
+        ] {
+            let report = scan_plans(&store, &id, &target, false, &mut retry, vec![offer(name, 1)], |plan_id| {
+                std::future::ready(Ok(Some(rejected(plan_id, failure, end))))
+            }).await.unwrap();
+            assert_eq!(report.failed, 1);
+            assert_eq!(report.claimed, 0);
+            assert!(retry[name].as_i64().unwrap() >= minimum);
+            assert!(!already_recorded(&store.zcode_account_record(&id).unwrap(), name));
+        }
+        let expected = retry.clone();
+        retry.insert("expired".into(), json!(now - 1));
+        let empty = scan_plans(&store, &id, &target, false, &mut retry, vec![], |_| async {
+            panic!("empty marketing must never request a claim")
+        }).await.unwrap();
+        assert_eq!(empty.empty_preview, 1);
+        assert!(empty.error.is_none());
+        assert_eq!(retry, expected);
+        let held = scan_plans(&store, &id, &target, false, &mut retry, vec![offer("risk", 1)], |_| async {
+            panic!("a redelivered plan must retain its failure cooldown")
+        }).await.unwrap();
+        assert_eq!(held.skipped, 1);
+    }
+
+    #[tokio::test]
+    async fn marketing_auto_claim_stops_on_errors_cancellation_and_disabled_account() {
+        let (store, id, _temp) = account_fixture(Region::ALL[1], "zcode-marketing-auto-stop");
+        let target = load_target(&store, &id).unwrap();
+        let mut retry = serde_json::Map::new();
+        for outcome in [
+            Err("captcha or network unavailable".to_string()),
+            Ok(None),
+            Ok(Some(rejected("first".into(), ClaimFailure::Captcha, None))),
+        ] {
+            let mut calls = 0;
+            let report = scan_plans(&store, &id, &target, false, &mut retry,
+                vec![offer("first", 2), offer("second", 1)], |_| {
+                    calls += 1;
+                    std::future::ready(outcome.clone())
+                }).await.unwrap();
+            assert_eq!(calls, 1);
+            assert_eq!(report.failed, usize::from(!matches!(outcome, Ok(None))));
+            assert_eq!(report.claimed, 0);
+            assert!(!already_recorded(&store.zcode_account_record(&id).unwrap(), "first"));
+        }
+        let mut calls = 0;
+        scan_plans(&store, &id, &target, false, &mut retry,
+            vec![offer("first", 2), offer("second", 1)], |plan_id| {
+                calls += 1;
+                store.update_account(&id, &json!({"enabled": false})).unwrap();
+                std::future::ready(Ok(Some(ClaimOutcome::Claimed { plan_id, starts_at: None, ends_at: None })))
+            }).await.unwrap();
+        assert_eq!(calls, 1);
+        scan_plans(&store, &id, &target, true, &mut retry, vec![offer("first", 1)], |_| async {
+            panic!("disabled accounts must not submit even manual claims")
+        }).await.unwrap();
+    }
+
+    #[test]
+    fn marketing_auto_claim_obeys_switch_without_mutating_host_config() {
+        const CHILD: &str = "AGENT2API_TEST_MARKETING_AUTO_SWITCH";
+        // 配置是进程全局状态，独立子进程只写临时库，避免影响并行测试或本机配置。
+        if std::env::var_os(CHILD).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "server::core::zcode_claim::tests::marketing_auto_claim_obeys_switch_without_mutating_host_config", "--nocapture"])
+                .env(CHILD, "1").status().unwrap().success());
+            return;
+        }
+        let (db, _temp) = crate::server::db::test_temp::TempDb::open("zcode-marketing-auto-switch");
+        config::init(Some(db.clone()));
+        task_state::install(Some(db.clone()));
+        let store = AccountStore::with_db(Some(db));
+        let set_enabled = |enabled| assert!(config::set_scheduled_task(
+            config::KEY_ZCODE_AUTO_CLAIM,
+            config::IntervalTaskPatch { enabled: Some(enabled), interval: None }, 1, 1440,
+        ));
+        set_enabled(false);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (accounts, id, _account_temp) = account_fixture(Region::ALL[0], "zcode-marketing-auto-switch-account");
+            let target = load_target(&accounts, &id).unwrap();
+            let mut retry = serde_json::Map::new();
+            let stopped = scan_plans(&accounts, &id, &target, false, &mut retry, vec![offer("first", 1)], |_| async {
+                panic!("disabled auto claim must not submit")
+            }).await.unwrap();
+            assert_eq!(stopped.claimed, 0);
+            assert!(run_auto(&store, false).await.unwrap().contains("检查 0 个账号"));
+            let update = super::super::update::UpdateManager::new(std::env::temp_dir());
+            let summary = super::super::scheduled_tasks::run_now(
+                &store, &update, super::super::scheduled_tasks::TASK_ZCODE_AUTO_CLAIM,
+            ).await.unwrap();
+            let state = task_state::read(config::KEY_ZCODE_AUTO_CLAIM).unwrap();
+            assert!(summary.contains("检查 0 个账号"));
+            assert_eq!(state.last_result.as_deref(), Some(summary.as_str()));
+            assert!(state.last_success_at > 0 && !state.running());
+            set_enabled(true);
+            let mut calls = 0;
+            let report = scan_plans(&accounts, &id, &target, false, &mut retry,
+                vec![offer("first", 2), offer("second", 1)], |plan_id| {
+                    calls += 1;
+                    set_enabled(false);
+                    std::future::ready(Ok(Some(ClaimOutcome::Claimed { plan_id, starts_at: None, ends_at: None })))
+                }).await.unwrap();
+            assert_eq!((calls, report.claimed), (1, 1));
+        });
+    }
 
     #[test]
     fn explicit_claim_direct_preserves_the_inference_proxy() {
@@ -565,8 +735,7 @@ mod tests {
     }
 
     #[test]
-    fn summary_separates_empty_preview_from_not_deployed() {
-        // 有套餐在列时是原来的口径，不会被两个「什么都没发生」分支污染
+    fn summary_separates_empty_marketing_from_claims_and_errors() {
         let claimed = Report {
             checked: 1,
             claimed: 1,
@@ -588,27 +757,19 @@ mod tests {
         let text = empty.summary();
         assert!(text.starts_with("检查 1 个账号，领取 0 份"), "{text}");
         assert!(text.contains("无可领套餐 1 个"), "{text}");
-        assert!(text.contains("preview 返回空列表"), "{text}");
+        assert!(text.contains("上游活动投放未下发领取动作"), "{text}");
         assert!(empty.error.is_none());
 
-        // 上游压根没部署领取接口：与「探测为空」分开说
-        let missing = Report {
+        let failed = Report {
             checked: 1,
-            not_deployed: 1,
+            failed: 1,
+            error: Some("套餐活动投放探测失败（HTTP 404）".to_string()),
             ..Report::default()
         };
-        let text = missing.summary();
-        assert!(text.contains("上游未开放领取 1 个（preview 404）"), "{text}");
+        let text = failed.summary();
+        assert!(text.contains("失败 1 项"), "{text}");
         assert!(!text.contains("无可领套餐"), "{text}");
-
-        // 两种「什么都没发生」不会同时出现（探测只有一条路径）
-        let both = Report {
-            checked: 1,
-            empty_preview: 1,
-            not_deployed: 1,
-            ..Report::default()
-        };
-        assert!(both.summary().contains("上游未开放领取 1 个（preview 404）"));
+        assert!(failed.account_note().contains("HTTP 404"));
     }
 
     /// 账号卡片上的那一行是**另一套口径**：它放进签到中心的账号行，
@@ -631,16 +792,9 @@ mod tests {
         };
         let note = empty.account_note();
         assert!(note.contains("本期无可领套餐"), "{note}");
-        assert!(note.contains("已领过或尚未放出"), "{note}");
+        assert!(note.contains("上游活动投放未下发领取动作"), "{note}");
         // 卡片口径不带整轮计数（那是 `summary` 的事）
         assert!(!note.contains("检查 1 个账号"), "{note}");
-
-        let missing = Report {
-            checked: 1,
-            not_deployed: 1,
-            ..Report::default()
-        };
-        assert_eq!(missing.account_note(), "上游未开放套餐领取（preview 404）");
 
         // 台账里已有本期记录 / 仍在退避 / 真失败
         let already = Report {

@@ -1316,7 +1316,7 @@
       "id": "zcode-claim-dedup",
       "level": "P0",
       "status": "必须保留",
-      "behavior": "两地区领取资格与开关有效，历史套餐去重不阻挡新套餐，领取成功后持久化通道切换和账本。上游 preview 返回空列表、上游未部署领取接口、确实领取成功这三种结果必须在账号状态里分开表述，且空列表不算失败。同一结论必须能在签到中心的账号行看到（任务状态 `zcodeClaim:<id>` → `lastClaimResult`），卡片口径用短句，不带整轮计数。",
+      "behavior": "两地区领取资格与开关有效，仅通过客户端 marketing/touch 的当前领取动作发现套餐；历史套餐去重不阻挡新套餐，领取成功或上游确认已领取后持久化通道切换和账本。完整空投放、探测失败与确实领取必须在账号状态里分开表述，空投放不算失败且保留有效失败冷却，HTTP 404 不再视为未部署成功。同一结论必须能在签到中心的账号行看到（任务状态 `zcodeClaim:<id>` → `lastClaimResult`），卡片口径用短句，不带整轮计数。",
       "source_commits": [
         "9973da5",
         "2562e7e"
@@ -1348,7 +1348,7 @@
         {
           "kind": "rust",
           "path": "desktop-tauri/src-tauri/server/src/server/core/zcode_claim.rs",
-          "name": "server::core::zcode_claim::tests::summary_separates_empty_preview_from_not_deployed",
+          "name": "server::core::zcode_claim::tests::summary_separates_empty_marketing_from_claims_and_errors",
           "id": "case-zcode-claim-empty-preview-reported"
         },
         {
@@ -1362,6 +1362,92 @@
           "path": "desktop-tauri/src-tauri/server/src/server/core/zcode_claim.rs",
           "name": "server::core::zcode_claim::tests::account_note_speaks_in_one_short_sentence",
           "id": "case-zcode-claim-account-note"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/zcode_claim.rs",
+          "name": "server::core::zcode_claim::tests::marketing_auto_claim_orders_deduplicates_and_persists_both_regions",
+          "id": "case-zcode-marketing-auto-orders-deduplicates-and-persists-both-regions"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/zcode_claim.rs",
+          "name": "server::core::zcode_claim::tests::marketing_auto_claim_keeps_failure_cooldowns_across_empty_deliveries",
+          "id": "case-zcode-marketing-auto-keeps-failure-cooldowns-across-empty-deliveries"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/zcode_claim.rs",
+          "name": "server::core::zcode_claim::tests::marketing_auto_claim_stops_on_errors_cancellation_and_disabled_account",
+          "id": "case-zcode-marketing-auto-stops-on-errors-cancellation-and-disabled-account"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/zcode_claim.rs",
+          "name": "server::core::zcode_claim::tests::marketing_auto_claim_obeys_switch_without_mutating_host_config",
+          "id": "case-zcode-marketing-auto-obeys-switch-without-mutating-host-config"
+        }
+      ],
+      "evolution": {
+        "baseline_sha256": "2b0e8a843f1704c57660559c40c5a16e6ef092a7b4ff0ae94c3b1b7a84059aeb",
+        "reason": "用户授权唯一使用客户端活动投放接口，退休旧探测及404未部署中性语义；保留去重、开关、记账及账号展示。",
+        "review": "2026-10-30 独立审阅者 Darwin（01a18bbe-b3bf-7383-8ca4-a3ed55ee7339）确认授权覆盖旧探测及404中性语义退出；去重、开关、记账与稳定ID未削弱，复审无未解决发现。源码哈希和完整边界见 diagnostic-artifacts/20261030-zcode-real-probe/marketing-only-review.md。",
+        "business_change": {
+          "authorization": "用户：我希望不要保留旧的探测，只使用客户端最新的这个活动投放接口（并且移除旧的无用代码）；并且确保定时任务中zcode自动领取套餐的功能正常。",
+          "reason": "旧billing探测已无有效data，改为仅使用客户端活动投放，不将查询错误包装成空投放。",
+          "previous_behavior": "两地区领取资格与开关有效，历史套餐去重不阻挡新套餐，领取成功后持久化通道切换和账本。上游 preview 返回空列表、上游未部署领取接口、确实领取成功这三种结果必须在账号状态里分开表述，且空列表不算失败。同一结论必须能在签到中心的账号行看到（任务状态 `zcodeClaim:<id>` → `lastClaimResult`），卡片口径用短句，不带整轮计数。"
+        },
+        "test_moves": [
+          {
+            "from": "case-zcode-claim-empty-preview-reported",
+            "to": [
+              "case-zcode-claim-empty-preview-reported"
+            ],
+            "mode": "replacement",
+            "reason": "仅移除已授权退休的404未部署中性断言，保留领取计数和空列表断言，增加404必须失败断言。"
+          }
+        ]
+      }
+    },
+    {
+      "id": "zcode-claim-marketing-preview",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "两地区手动与定时探测唯一使用客户端 marketing/touch，沿用领取链路既定出口及稳定设备标识，仅从当前投放按钮提取 claim_zcode_plan。完整空投放不补报激活，HTTP错误、缺字段、鉴权或风控错误不得冒充空套餐；不读取成功弹窗里的后续动作，不执行活动 URL 或远程资源。界面展示实际零份或投放的套餐，不承诺次日发放；旧 billing 探测、回退及其专属UI和模型删除。",
+      "source_commits": [
+        "9973da5"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/claim.rs",
+        "desktop-tauri/src-tauri/server/src/server/api/zcode_claim.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/zcode_claim.rs",
+        "desktop-tauri/ui-islands/src/islands/zcode-plans-modal.tsx",
+        "desktop-tauri/ui-islands/src/islands/checkin-page.tsx",
+        "desktop-tauri/ui-islands/src/islands/accounts-domain.ts"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/claim.rs",
+          "name": "server::core::providers::zcode::claim::tests::marketing_preview_requires_account_jwt",
+          "id": "case-zcode-marketing-fallback-boundary"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/claim.rs",
+          "name": "server::core::providers::zcode::claim::tests::marketing_preview_distinguishes_real_empty_from_incomplete_responses",
+          "id": "case-zcode-marketing-empty-vs-invalid"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/claim.rs",
+          "name": "server::core::providers::zcode::claim::tests::marketing_preview_uses_only_live_claim_buttons_and_preserves_plan_ids",
+          "id": "case-zcode-marketing-live-claim-buttons"
+        },
+        {
+          "kind": "browser",
+          "path": "desktop-tauri/ui-islands/tests/zcode-plans.browser.cjs",
+          "id": "case-zcode-marketing-preview-dialog"
         }
       ]
     },

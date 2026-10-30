@@ -224,8 +224,7 @@ const BRIDGE_JS: &str = r#"
     // 契约（详见 `api/zcode_claim.rs` 的模块头）：
     //   · captchaConfig 拿阿里云风控配置（前端用它初始化滑块 SDK）；
     //     返回 `{enabled:false}` 表示上游此刻不要验证码 —— 前端**不该**弹滑块；
-    //   · preview 只读探测，返回 `{plans:[...], deployed}`；
-    //     `deployed:false` = 活动接口尚未部署（开抢前的正常状态，不是错误）；
+    //   · preview 只读活动投放，返回 `{plans:[...], probeSource}`，查询失败原样报错；
     //   · claim 真正领取；`captchaVerifyParam` **可以为空**（上游此刻不要验证码
     //     时就不带那个头，见 `claim::claim` 的注释）。**业务失败也走 200**，
     //     由 `ok:false` + `failure` 表达（前端据此选提示文案）；返回里的

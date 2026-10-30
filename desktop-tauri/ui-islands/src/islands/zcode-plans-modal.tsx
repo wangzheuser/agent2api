@@ -26,7 +26,7 @@ import { errorMessage, shared } from './accounts-shared'
  * 与已过期，状态按后端给的三态标签渲染）。
  *
  * ── 两份清单的来源完全不同（别混）────────────────────────────
- *   · 可领取：`zcodeClaimPreview`（**实时探测上游**，不要验证码，见 ui/zcode-claim.js）；
+ *   · 可领取：`zcodeClaimPreview`（只读客户端活动投放，不要验证码，见 ui/zcode-claim.js）；
  *   · 我的套餐：余额读数里的 `plans` 数组（后端 `providers::zcode::balance` 归一，
  *     本条链路的 `source` = `zcode.z.ai/billing`）。它只在查过余额之后才有值，
  *     所以第一次打开时若还没有读数，这里会**静默补查一次**（单账号，与签到后的
@@ -56,23 +56,17 @@ type Entitlement = {
   effectiveAt?: number | null
 }
 
-/** 可领取的一份套餐（后端 `api::zcode_claim::plan_to_json`，时间是 unix 秒） */
+/** 活动投放中的可领取套餐（后端 `api::zcode_claim::plan_to_json`） */
 type PreviewPlan = {
   planId?: string
   name?: string
   description?: string
   priority?: number
-  startsAt?: number | null
-  endsAt?: number | null
-  entitlements?: Entitlement[]
 }
 
 /** 探测响应（后端 `preview`） */
 type PreviewResult = {
-  deployed?: boolean
   plans?: PreviewPlan[]
-  activated?: boolean | null
-  activationError?: string | null
 }
 
 /** 余额读数里的一份套餐（后端 `providers::zcode::balance` 的 `plans` 数组，unix 秒） */
@@ -154,16 +148,6 @@ function entitlementText(item: Entitlement): string {
 /** 一份套餐的权益行（没有可读权益时返回空串，调用处据此省略那一行） */
 function entitlementLine(plan: { entitlements?: Entitlement[] }): string {
   return (plan.entitlements || []).map(entitlementText).filter(Boolean).join(t('、'))
-}
-
-/** 一份套餐的时间窗（`开始 → 到期`；只有一个时只说那一个） */
-function windowText(plan: { startsAt?: number | null; endsAt?: number | null }): string {
-  const start = stampText(plan.startsAt)
-  const end = stampText(plan.endsAt)
-  if (start && end) return `${start} → ${end}`
-  if (end) return t('到期 {time}', { time: end })
-  if (start) return t('开始 {time}', { time: start })
-  return ''
 }
 
 /**
@@ -339,21 +323,15 @@ function PlansModal({ options, onClose }: { options: OpenOptions; onClose: () =>
                 <Button variant='outline' size='xs' className='ml-2'
                   onClick={() => void loadPreview()}>{t('重试')}</Button>
               </div>
-            ) : !preview.result.deployed ? (
-              <p className='py-1 text-[12.5px] text-muted-foreground'>
-                {t('当前没有可领取的套餐（活动尚未开始）')}
-              </p>
             ) : (preview.result.plans || []).length === 0 ? (
               <p className='py-1 text-[12.5px] text-muted-foreground'>
-                {t('当前没有可领取的套餐（活动期内每天发一份，明天可再领）')}
+                {`${t('可领取的套餐')}：0`}
               </p>
             ) : (
               <ul className='m-0 list-none p-0'>
                 {(preview.result.plans || []).map(plan => {
                   const planId = String(plan.planId || '')
                   const taken = claimed.includes(planId)
-                  const entitlements = entitlementLine(plan)
-                  const window_ = windowText(plan)
                   return (
                     <li key={planId || plan.name}
                       className='flex items-start justify-between gap-3 border-b border-hairline py-2 last:border-b-0'>
@@ -364,8 +342,6 @@ function PlansModal({ options, onClose }: { options: OpenOptions; onClose: () =>
                             ? <Badge variant='success' shape='tag'>{t('今日已领')}</Badge>
                             : null}
                         </div>
-                        {window_ ? <div className='text-[12px] text-muted-foreground'>{window_}</div> : null}
-                        {entitlements ? <div className='text-[12px] text-muted-foreground'>{entitlements}</div> : null}
                         {plan.description ? <div className='text-[12px] text-muted-foreground'>{plan.description}</div> : null}
                       </div>
                       <Button variant='outline' size='xs' className='flex-none'
@@ -381,14 +357,6 @@ function PlansModal({ options, onClose }: { options: OpenOptions; onClose: () =>
                 })}
               </ul>
             )}
-            <p className='mt-1.5 text-[11.5px] text-muted-foreground'>
-              {t('活动期内每天发一份新套餐；同一份当天重复领取会提示「已领取过」，次日可再领。领取要走一次人机验证（滑块）。')}
-            </p>
-            {preview.status === 'ready' && preview.result.activationError ? (
-              <p className='text-[11.5px] text-muted-foreground'>
-                {t('（激活事件补报失败，可能影响领取资格：{message}）', { message: preview.result.activationError })}
-              </p>
-            ) : null}
           </section>
 
           <section>
@@ -427,7 +395,7 @@ function PlansModal({ options, onClose }: { options: OpenOptions; onClose: () =>
                   const planId = String(plan.planId || '')
                   const state = String(plan.state || 'unknown')
                   const entitlements = entitlementLine(plan)
-                  // 时间行走 `planTimeText`（待生效 + 到期），**不用** `windowText`：
+                  // 时间行走 `planTimeText`（待生效 + 到期）：
                   // 后者的前半段是套餐级 `startsAt` = 领取时间，官方卡片不展示它
                   const window_ = planTimeText(plan)
                   const claimedAt = planId && account?.claimPlans

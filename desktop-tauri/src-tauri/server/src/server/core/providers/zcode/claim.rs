@@ -13,19 +13,17 @@
 //! 本家的界面据此按自然日落一次状态（`claimAt`），见
 //! `core::account_store::StoredAccount::claim_at`。
 //!
-//! ── 上游协议（两个接口，抄自 ZCode 客户端的 `manualClaimPlan`）──
-//! 参考实现：`Acankao/zcode-api` 的 `src/claim/client.ts`，本模块是它的移植；
-//! 字段与失败语义另有官方仓库（`zai-org/ZCode`）可对照。
+//! ── 上游协议（与 ZCode 客户端的活动投放和领取动作一致）──────
+//! 只从当前投放按钮的 `claim_zcode_plan` 动作读取套餐 ID，不执行活动资源或 URL。
 //!
 //! ```text
-//!   探测  GET  {zcode}/api/v1/zcode-plan/billing/preview?app_version=&platform=
+//!   探测  GET  {zcode}/api/v1/marketing/touch?seq=
 //!   领取  POST {zcode}/api/v1/zcode-plan/billing/claim   body {"plan_id": "..."}
 //! ```
 //!
 //! ── 头集合是「极简 + 一处硬要求」─────────────────────────────
-//! preview 与 claim 都只必要地带 `Authorization: Bearer {jwt}`（探测允许匿名），
-//! claim 另加 Content-Type 与验证码参数。早先版本发过整套身份头（`X-Device-Mid`
-//! 等），两者在不同活动期都出现过。
+//! 探测与领取都带账号 JWT 和稳定的 `X-Device-Mid`。探测另带版本与语言，
+//! 领取另带 Content-Type 与验证码参数；空投放只表示当前没下发领取动作。
 //!
 //! **`X-Device-Mid` 现在是硬要求**（2026-09-28 实测）：缺它、或值不是 UUID 形态，
 //! 网关一律回 `400 {"code":3001,"msg":"parameter error"}` —— 连**匿名探测**也一样
@@ -245,8 +243,8 @@ pub async fn refresh_app_version() -> String {
 }
 
 /// 探测与领取的路径（参考实现 `client.ts` 的常量）
-const PREVIEW_PATH: &str = "/api/v1/zcode-plan/billing/preview";
 const CLAIM_PATH: &str = "/api/v1/zcode-plan/billing/claim";
+const MARKETING_PATH: &str = "/api/v1/marketing/touch";
 
 /// 客户端配置（风控参数藏在它的 `data.configs.captcha` 里）
 const CLIENT_CONFIGS_PATH: &str = "/api/v1/client/configs";
@@ -414,11 +412,7 @@ pub fn os_category() -> &'static str {
     }
 }
 
-/// 一条可领取的套餐（上游 `plans[]` 的归一形态）。
-///
-/// 字段保留上游语义：`starts_at` / `ends_at` 是 **unix 秒**（不是毫秒）——
-/// 领取链路全程用秒，换算成毫秒只在展示层做，混用会让「有效期到 1970 年」
-/// 这类错误悄悄发生。
+/// 一条活动投放中的可领取套餐；实际权益与有效期由领取结果和余额接口提供。
 #[derive(Clone, Debug)]
 pub struct ClaimablePlan {
     /// 上游套餐 id（领取时原样回传）
@@ -429,46 +423,6 @@ pub struct ClaimablePlan {
     pub description: String,
     /// 优先级（同一批多个套餐时，取最大的那个）
     pub priority: i64,
-    /// 生效时间（unix 秒；有些期次的活动套餐是「先领、稍后生效」，因此可能缺失）
-    pub starts_at: Option<i64>,
-    /// 失效时间（unix 秒）
-    pub ends_at: Option<i64>,
-    /// 权益条目（进日志与界面，让用户看到领到了什么）
-    pub entitlements: Vec<PlanEntitlement>,
-}
-
-/// 套餐里的一条权益
-#[derive(Clone, Debug)]
-pub struct PlanEntitlement {
-    /// 权益展示名（缺失时回落到 id）
-    pub show_name: String,
-    /// 计量单位（`tokens` / `requests` …）
-    pub unit_type: String,
-    /// 授予量（`0` = 上游没给数字）
-    pub grant_units: i64,
-    /// 周期（`one_time` = 一次性发放，`daily` = 每天续发）。
-    ///
-    /// 界面拿它区分「活动送的一次性额度」与「每日额度」（Start Plan 的两条权益
-    /// 就是 `daily`）—— 2026-09-28 那期 Trust Build 是一次性 1 亿，
-    /// 每天一个新套餐，所以两者都可能在同一天出现。
-    pub period: String,
-    /// 生效时间（unix 秒；缺失表示随套餐立即生效）
-    pub effective_at: Option<i64>,
-}
-
-/// 探测的结果。
-///
-/// ── 为什么 404 要单独成一档（这是最容易漏的一处）─────────────
-/// 参考实现在 `scheduler.ts` 里明确写着：**404 是「活动还没上线」的正常状态**
-/// （活动开抢前，接口尚未部署），要按**正常节奏**轮询而不是走错误退避。
-/// 若把 404 当失败处理，退避会让轮询节奏越来越慢，恰好错过开抢那一刻 ——
-/// 这个功能的价值全在「上新瞬间抢到」，慢一拍就没意义了。
-#[derive(Clone, Debug)]
-pub enum PreviewOutcome {
-    /// 拿到了可领取的套餐（可能是空列表：接口通了但当前没有可领的）
-    Plans(Vec<ClaimablePlan>),
-    /// 404：活动接口尚未部署（开抢前的预期状态）
-    NotDeployed,
 }
 
 /// 领取的失败语义（参考实现 `ClaimFailureKind` 的移植）
@@ -603,74 +557,137 @@ pub fn outcome_hold(outcome: &ClaimOutcome) -> NextAttempt {
     }
 }
 
-/// 探测当前可领取的套餐。
-///
-/// `jwt` 为空时按上游语义发**匿名探测**（参考实现：匿名 preview 不带头）。
-/// 匿名也能看到「有没有活动」，因此调度可以在登录态失效时继续探测；
-/// 但真正领取必须有 JWT（见 [`claim`]）。
-///
-/// `device_mid` **事实上是必需的**（2026-09-28 起上游这么要求，见模块头）：
-/// 调用方（`api::zcode_claim`）保证传进来的一定是 UUID 形态的稳定标识，
-/// 这里只在真的没有时才省略那个头 —— 那种情况会稳定拿到 3001，
-/// 而那正是「谁漏了这一步」的信号，不该由本函数偷偷补一个随机值（现编的值
-/// 每次都不一样，风控看到的是「同一个账号天天换设备」）。
+/// 按账号读取客户端活动投放；调用方负责提供持久化的稳定设备标识。
 pub async fn preview(
     region: Region,
     jwt: &str,
     device_mid: Option<&str>,
     proxy: Option<&ResolvedProxy>,
-) -> Result<PreviewOutcome, GatewayError> {
-    refresh_app_version().await;
-    let url = format!(
-        "{}{PREVIEW_PATH}?app_version={}&platform={}",
-        region.zcode_origin(),
-        urlencode(&app_version()),
-        urlencode(platform())
-    );
-    let mut headers: Vec<(String, String)> = Vec::new();
-    // 匿名探测：一个头都不带（**不是**带一个空 Bearer）
-    if !jwt.trim().is_empty() {
-        headers.push(("Authorization".to_string(), format!("Bearer {}", jwt.trim())));
+) -> Result<Vec<ClaimablePlan>, GatewayError> {
+    if jwt.trim().is_empty() {
+        return Err(GatewayError::with_status(401, "登录态为空，无法探测套餐活动"));
     }
+    refresh_app_version().await;
+    let mut headers = vec![
+        ("Authorization".to_string(), format!("Bearer {}", jwt.trim())),
+        ("X-ZCode-App-Version".to_string(), app_version()),
+        ("X-Client-Language".to_string(), "zh-CN".to_string()),
+    ];
     if let Some(mid) = device_mid.map(str::trim).filter(|value| !value.is_empty()) {
         headers.push(("X-Device-Mid".to_string(), mid.to_string()));
     }
 
+    let url = format!(
+        "{}{MARKETING_PATH}?seq={}",
+        region.zcode_origin(),
+        logging::now_ms()
+    );
     let response = send_raw("GET", &url, None, &headers, proxy, Some(REQUEST_TIMEOUT_MS))
         .await
         .map_err(|error| {
-            if error.is_timeout() {
-                GatewayError::with_status(504, "套餐探测超时")
-            } else {
-                GatewayError::with_status(502, format!("套餐探测失败: {error}"))
-            }
+            GatewayError::with_status(
+                if error.is_timeout() { 504 } else { 502 },
+                "套餐活动投放探测请求失败",
+            )
         })?;
-
-    // 404 单独成一档（见 `PreviewOutcome::NotDeployed` 的文档）
-    if response.status == 404 {
-        return Ok(PreviewOutcome::NotDeployed);
-    }
-    if response.status == 401 {
-        return Err(GatewayError::with_status(401, "登录态已失效，无法探测套餐"));
+    if !(200..300).contains(&response.status) {
+        return Err(GatewayError::with_status(
+            if response.status == 401 { 401 } else { 502 },
+            format!("套餐活动投放探测失败（HTTP {}）", response.status),
+        ));
     }
     let payload = response
         .payload
-        .ok_or_else(|| GatewayError::with_status(502, "套餐探测：上游响应不是 JSON"))?;
-    let code = business_code(&payload).unwrap_or(0);
-    let data = payload.get("data");
-    if !(200..300).contains(&response.status) || code != 0 || data.is_none() {
-        let message = error_message(&payload, response.status);
-        return Err(GatewayError::with_status(
-            502,
-            format!("套餐探测失败（{code}）：{message}"),
-        ));
+        .ok_or_else(|| GatewayError::with_status(502, "套餐活动投放探测：上游响应不是 JSON"))?;
+    parse_marketing_preview(&payload)
+}
+
+fn parse_marketing_preview(payload: &Value) -> Result<Vec<ClaimablePlan>, GatewayError> {
+    let invalid =
+        || GatewayError::with_status(502, "套餐活动投放探测：上游数据不完整，无法确认可领状态");
+    let data = payload.get("data").ok_or_else(invalid)?;
+    if business_code(payload) != Some(0)
+        || data.get("server_time").and_then(Value::as_f64).is_none()
+        || !matches!(
+            data.get("language").and_then(Value::as_str),
+            Some("zh-CN" | "en-US")
+        )
+    {
+        return Err(invalid());
     }
-    let plans = data
-        .and_then(|value| value.get("plans"))
+    let deliveries = data
+        .get("deliveries")
         .and_then(Value::as_array)
-        .map(|items| items.iter().filter_map(parse_plan).collect())
-        .unwrap_or_default();
-    Ok(PreviewOutcome::Plans(plans))
+        .ok_or_else(invalid)?;
+    if deliveries.len() > 32 {
+        return Err(invalid());
+    }
+    fn identifier(value: Option<&Value>) -> Option<&str> {
+        value
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty() && text.chars().count() <= 128)
+    }
+    fn plain_text<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+        let text = value.get(key)?;
+        (text.get("format")?.as_str()? == "plaintext")
+            .then(|| text.get("content")?.as_str())
+            .flatten()
+            .filter(|text| text.chars().count() <= 20_000)
+    }
+    let mut plans: Vec<ClaimablePlan> = Vec::new();
+    for delivery in deliveries {
+        let position = delivery
+            .get("resource_position")
+            .and_then(Value::as_str)
+            .ok_or_else(invalid)?;
+        if !matches!(position, "banner" | "popup")
+            || identifier(delivery.get("campaign_id")).is_none()
+        {
+            return Err(invalid());
+        }
+        let priority = delivery
+            .get("priority")
+            .and_then(Value::as_i64)
+            .filter(|priority| (0..=100).contains(priority))
+            .ok_or_else(invalid)?;
+        let content = delivery.get(position).ok_or_else(invalid)?;
+        let buttons = content
+            .get("buttons")
+            .and_then(Value::as_array)
+            .ok_or_else(invalid)?;
+        if buttons.len() > if position == "banner" { 2 } else { 4 } {
+            return Err(invalid());
+        }
+        // 只认客户端展示按钮的领取动作，不执行 URL、资源脚本或领取后的 success_popup。
+        for button in buttons {
+            let action = button.get("action").ok_or_else(invalid)?;
+            let action_type = action
+                .get("type")
+                .and_then(Value::as_str)
+                .ok_or_else(invalid)?;
+            if action_type != "claim_zcode_plan" {
+                continue;
+            }
+            let plan_id = identifier(action.get("args").and_then(|args| args.get("plan_id")))
+                .ok_or_else(invalid)?;
+            if let Some(plan) = plans.iter_mut().find(|plan| plan.plan_id == plan_id) {
+                plan.priority = plan.priority.max(priority);
+                continue;
+            }
+            let name = plain_text(content, "title")
+                .filter(|text| !text.trim().is_empty())
+                .unwrap_or(plan_id);
+            let description = plain_text(content, "description").unwrap_or("");
+            plans.push(ClaimablePlan {
+                plan_id: plan_id.to_string(),
+                name: name.to_string(),
+                description: description.to_string(),
+                priority,
+            });
+        }
+    }
+    Ok(plans)
 }
 
 /// 领取一个套餐。
@@ -814,87 +831,6 @@ fn error_message(payload: &Value, status: u16) -> String {
     format!("HTTP {status}")
 }
 
-/// 上游 `plans[]` 里的一条 → [`ClaimablePlan`]（缺 `plan_id` 的条目丢弃）
-fn parse_plan(raw: &Value) -> Option<ClaimablePlan> {
-    let plan_id = raw.get("plan_id").and_then(Value::as_str)?.trim().to_string();
-    if plan_id.is_empty() {
-        return None;
-    }
-    let name = raw
-        .get("name")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(&plan_id)
-        .to_string();
-    let entitlements = raw
-        .get("entitlements")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| {
-                    let show_name = item
-                        .get("show_name")
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())?
-                        .to_string();
-                    Some(PlanEntitlement {
-                        show_name,
-                        unit_type: item
-                            .get("unit_type")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .trim()
-                            .to_string(),
-                        grant_units: item.get("grant_units").and_then(Value::as_i64).unwrap_or(0),
-                        period: item
-                            .get("period")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .trim()
-                            .to_string(),
-                        // 生效时间（unix 秒）：品类同 [`unix_seconds_of`]。
-                        // `0` 是官方文档里的「立即生效」哨兵值，原样带出 —— 判定在
-                        // 余额侧（`balance::plan_effective_times` 只收 > 0 的）
-                        effective_at: item.get("effective_at").and_then(unix_seconds_of),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    Some(ClaimablePlan {
-        plan_id,
-        name,
-        description: raw
-            .get("description")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim()
-            .to_string(),
-        priority: raw.get("priority").and_then(Value::as_i64).unwrap_or(0),
-        starts_at: raw.get("starts_at").and_then(unix_seconds_of),
-        ends_at: raw.get("ends_at").and_then(unix_seconds_of),
-        entitlements,
-    })
-}
-
-/// 一个 unix 秒字段 → `i64`。
-///
-/// 上游这几个时间字段的官方类型是 `number | string | null`
-/// （`ZaiStartPlanPlan` / `entitlements[].effective_at` 在官方源码里就是这么写的），
-/// 只看 `as_i64` 会让**字符串形态**整条消失 —— 生效时间一丢，界面就退回
-/// 「按领取时间 / 立即生效」猜，那正是「生效时间显示成领取时间」那类 bug 的来源。
-/// 与余额侧的 `number_of` 同一条取值口径。
-fn unix_seconds_of(value: &Value) -> Option<i64> {
-    match value {
-        Value::Number(number) => number.as_i64(),
-        Value::String(text) => text.trim().parse::<i64>().ok(),
-        _ => None,
-    }
-}
-
 /// 从一批可领套餐里挑出目标：指定了 `plan_id` 就取它，否则取优先级最高的。
 ///
 /// 参考实现的选取口径：`planId` 配置为空时按 `priority` 降序取第一个。
@@ -940,6 +876,79 @@ pub(super) fn urlencode(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn marketing_preview_requires_account_jwt() {
+        for region in Region::ALL {
+            let error = preview(region, " ", None, None).await.unwrap_err();
+            assert_eq!(error.status_code, 401);
+        }
+    }
+
+    #[test]
+    fn marketing_preview_distinguishes_real_empty_from_incomplete_responses() {
+        let payload = json!({
+            "code": 0, "msg": "",
+            "data": {"server_time": 1793340575, "language": "zh-CN", "deliveries": []}
+        });
+        assert!(parse_marketing_preview(&payload).unwrap().is_empty());
+        for invalid in [
+            json!({"code": 0}),
+            json!({"code": 0, "data": null}),
+            json!({"code": 0, "data": {}}),
+            json!({"data": {"server_time": 1, "language": "zh-CN", "deliveries": []}}),
+            json!({"code": 3012, "data": {"server_time": 1, "language": "zh-CN", "deliveries": []}}),
+            json!({"code": 0, "data": {"server_time": 1, "language": "unknown", "deliveries": []}}),
+            json!({"code": 0, "data": {"server_time": 1, "language": "zh-CN", "deliveries": null}}),
+        ] {
+            assert!(parse_marketing_preview(&invalid).is_err(), "{invalid}");
+        }
+        let mut malformed = payload.clone();
+        malformed["data"]["deliveries"] = json!([{"resource_position": "popup"}]);
+        assert!(parse_marketing_preview(&malformed).is_err());
+    }
+
+    #[test]
+    fn marketing_preview_uses_only_live_claim_buttons_and_preserves_plan_ids() {
+        let mut payload = json!({
+            "code": 0,
+            "data": {
+                "server_time": 1793340575, "language": "en-US",
+                "deliveries": [
+                    {
+                        "campaign_id": "campaign-one", "resource_position": "banner", "priority": 4,
+                        "banner": {
+                            "buttons": [
+                                {"action": {"type": "open_url", "args": {"url": "https://example.com"}}},
+                                {"action": {"type": "claim_zcode_plan", "args": {"plan_id": "real-plan"}}}
+                            ],
+                            "success_popup": {
+                                "buttons": [{"action": {"type": "claim_zcode_plan", "args": {"plan_id": "not-live"}}}]
+                            }
+                        }
+                    },
+                    {
+                        "campaign_id": "campaign-two", "resource_position": "popup", "priority": 9,
+                        "popup": {
+                            "title": {"format": "html", "content": "<b>Do not render</b>"},
+                            "description": {"format": "markdown", "content": "[Do not render](https://example.com)"},
+                            "buttons": [{"action": {"type": "claim_zcode_plan", "args": {"plan_id": "real-plan"}}}]
+                        }
+                    }
+                ]
+            }
+        });
+        let plans = parse_marketing_preview(&payload).unwrap();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].plan_id, "real-plan");
+        assert_eq!(plans[0].name, "real-plan");
+        assert!(plans[0].description.is_empty());
+        assert_eq!(plans[0].priority, 9);
+
+        payload["data"]["deliveries"][0]["banner"]["buttons"][1]["action"]["args"]["plan_id"] =
+            json!(" ");
+        assert!(parse_marketing_preview(&payload).is_err());
+    }
 
     #[test]
     fn maps_risk_block_and_preserves_unknown_codes() {

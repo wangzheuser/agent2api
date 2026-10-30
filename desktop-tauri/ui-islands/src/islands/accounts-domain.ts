@@ -854,7 +854,7 @@ export function claimDoneTitle(account: AccountRecord | null | undefined): strin
   const planIds = claimedPlanIdsToday(account)
   const names = planIds.length ? `（${planIds.join('、')}）` : ''
   return `今天（北京时间 ${beijingDay()}）已领取 ${planIds.length} 份${names}；`
-    + '还有其他可领套餐时，点这里可以继续领；活动按自然日发新套餐，明天可再领'
+    + '还有其他可领套餐时，点这里可以继续领；可领套餐以上游当前活动投放为准'
 }
 
 /**
