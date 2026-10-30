@@ -479,8 +479,8 @@ pub async fn cancel_login(app: AppHandle) -> Result<Value, String> {
 /// 导出运行日志：拉取 JSONL 原文，弹系统保存框落盘。
 #[tauri::command]
 pub async fn export_logs(app: AppHandle) -> Result<Value, String> {
-    let text = gateway::call_text("GET", "/api/logs/download").await?;
-    let count = text.lines().filter(|line| !line.trim().is_empty()).count();
+    let stats = gateway::call("GET", "/api/logs/stats", None).await?;
+    let count = stats["total"].as_u64().unwrap_or(0);
     if count == 0 {
         return Ok(json!({ "count": 0 }));
     }
@@ -501,7 +501,7 @@ pub async fn export_logs(app: AppHandle) -> Result<Value, String> {
     let path = target
         .into_path()
         .map_err(|error| format!("保存路径无效: {error}"))?;
-    std::fs::write(&path, text.as_bytes()).map_err(|error| format!("写入日志文件失败: {error}"))?;
+    let count = gateway::download_logs(&path).await?;
     Ok(json!({ "count": count, "file": path.to_string_lossy() }))
 }
 

@@ -199,7 +199,7 @@ pub async fn action(store: AccountStore, body: Value) -> Result<Value, GrowthErr
             ))
         }
     };
-    let job = tokio::spawn(async move {
+    let job = crate::spawn_task(async move {
         let mut journal = Journal::new(&identity)?;
         if journal.value.get("legacyPending").is_some_and(|pending| !pending.is_null()) {
             return Err(GrowthError::new(409, "旧成长操作结果待核实，请先确认原操作结果"));
@@ -353,7 +353,7 @@ where
     task_state::store_value(&journal.key, journal.value.clone())
         .map_err(|error| GrowthError::new(500, error))?;
     // HTTP 断开不取消已经接单的写操作；进程中断则保留 legacyPending。
-    tokio::spawn(async move {
+    crate::spawn_task(async move {
         let result = match target(&store, &id) {
             Ok(current) if current.identity == identity => operation().await,
             _ => Err(GrowthError::new(409, "账号身份或安全状态已变化，未执行旧成长操作")),

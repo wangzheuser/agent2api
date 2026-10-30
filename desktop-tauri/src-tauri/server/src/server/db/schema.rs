@@ -238,7 +238,8 @@ pub fn is_reserved(key: &str) -> bool {
 /// 上游把该索引编号为 v9，本地发布线已占用 v9-v11，故以新版本追加。
 /// 版本 13：requests 路由回放字段。
 /// 版本 14：补回合并时丢失的签到记录表；兼容已到 v13 但缺表的存量库。
-pub const SCHEMA_VERSION: i64 = 16;
+/// 版本 17：日志增加任务归属、Unicode 搜索列及任务分页索引。
+pub const SCHEMA_VERSION: i64 = 17;
 
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
@@ -806,6 +807,43 @@ fn apply_version(conn: &Connection, version: i64) -> rusqlite::Result<()> {
             }
             conn.execute_batch(V14_SCHEMA)?;
             conn.execute_batch(V15_SCHEMA)
+        },
+        17 => {
+            // 稀疏历史库可能未建日志表，先补齐再扩展列。
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS logs (
+                    id INTEGER PRIMARY KEY, ts INTEGER NOT NULL,
+                    level TEXT NOT NULL, category TEXT NOT NULL,
+                    message TEXT NOT NULL, data TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(ts);
+                CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
+                CREATE INDEX IF NOT EXISTS idx_logs_category ON logs(category);"
+            )?;
+            for (column, ddl) in [
+                ("task_id", "ALTER TABLE logs ADD COLUMN task_id TEXT;"),
+                ("message_search", "ALTER TABLE logs ADD COLUMN message_search TEXT NOT NULL DEFAULT '';"),
+            ] {
+                let exists: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('logs') WHERE name=?1)",
+                    [column], |row| row.get(0),
+                )?;
+                if !exists { conn.execute_batch(ddl)?; }
+            }
+            conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_logs_task_id ON logs(task_id, id);")?;
+            // SQLite lower() 仅覆盖 ASCII；历史消息按运行期同一 Unicode 规则回填。
+            let mut after = 0i64;
+            loop {
+                let mut stmt = conn.prepare("SELECT id, message FROM logs WHERE id>?1 ORDER BY id LIMIT 500")?;
+                let rows = stmt.query_map([after], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                if rows.is_empty() { break; }
+                for (id, message) in rows {
+                    conn.execute("UPDATE logs SET message_search=?1 WHERE id=?2", rusqlite::params![message.to_lowercase(), id])?;
+                    after = id;
+                }
+            }
+            Ok(())
         },
         _ => Ok(()),
     }

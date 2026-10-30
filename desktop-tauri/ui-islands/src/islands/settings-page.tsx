@@ -2105,7 +2105,7 @@ function RetentionConfirmDialog({ confirm }: { confirm: { head: string } | null 
       {/* 旧 .modal-confirm 把宽度收到 440px（这类框只有一段话加两个按钮，620px 太宽） */}
       <DialogContent className='w-[min(440px,calc(100vw-48px))]' initialFocus={cancelRef}>
         <DialogHeader>
-          <DialogTitle>{t('确认缩短保留天数')}</DialogTitle>
+          <DialogTitle>{t('确认缩小数据保留范围')}</DialogTitle>
         </DialogHeader>
         <DialogBody>
           <div className='danger-zone'>

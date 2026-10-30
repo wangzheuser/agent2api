@@ -280,6 +280,83 @@ pub async fn call_text(method: &str, path: &str) -> Result<String, String> {
         .map_err(|error| format!("读取响应失败: {error}"))
 }
 
+pub async fn download_logs(path: &std::path::Path) -> Result<usize, String> {
+    let response = request_builder("GET", "/api/logs/download", None)?
+        .send().await.map_err(|error| describe_transport_error(&error))?;
+    save_log_export(response, path).await
+}
+
+struct PendingLogExport {
+    file: Option<tokio::fs::File>,
+    path: PathBuf,
+}
+
+impl Drop for PendingLogExport {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+async fn save_log_export(mut response: reqwest::Response, path: &std::path::Path) -> Result<usize, String> {
+    use tokio::io::AsyncWriteExt;
+    if !response.status().is_success() {
+        return Err(format!("导出失败：HTTP {}", response.status().as_u16()));
+    }
+    let mut nonce = [0u8; 16];
+    getrandom::getrandom(&mut nonce).map_err(|e| format!("生成导出临时文件名失败：{e}"))?;
+    let name: String = nonce.iter().map(|v| format!("{v:02x}")).collect();
+    let temp = path.with_file_name(format!(".agent2api-logs-{name}.tmp"));
+    let file = tokio::fs::OpenOptions::new().write(true).create_new(true).open(&temp).await
+        .map_err(|e| format!("创建导出临时文件失败：{e}"))?;
+    let mut pending = PendingLogExport { file: Some(file), path: temp };
+    let mut count = 0;
+    while let Some(chunk) = response.chunk().await.map_err(|e| format!("读取导出流失败，未覆盖目标文件：{e}"))? {
+        count += chunk.iter().filter(|b| **b == b'\n').count();
+        pending.file.as_mut().unwrap().write_all(&chunk).await.map_err(|e| format!("写入导出文件失败：{e}"))?;
+    }
+    pending.file.as_mut().unwrap().flush().await.map_err(|e| format!("导出文件写入未完成：{e}"))?;
+    drop(pending.file.take());
+    // 同目录 rename 原子替换；任何接收或写入失败都保留用户已有文件。
+    tokio::fs::rename(&pending.path, path).await.map_err(|e| format!("替换导出文件失败：{e}"))?;
+    Ok(count)
+}
+
+#[cfg(test)]
+mod log_export_tests {
+    use super::*;
+
+    async fn response(body: &'static [u8], length: usize) -> reqwest::Response {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 2048];
+            stream.read(&mut request).await.unwrap();
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+        });
+        reqwest::Client::builder().no_proxy().build().unwrap().get(format!("http://{addr}")).send().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn failed_stream_preserves_existing_file_and_success_atomically_replaces_it() {
+        let dir = std::env::temp_dir().join(format!("agent2api-export-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("logs.jsonl");
+        std::fs::write(&path, "valuable old file").unwrap();
+        assert!(save_log_export(response(b"partial\n", 100).await, &path).await.is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "valuable old file");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        assert_eq!(save_log_export(response(b"{}\n{}\n", 6).await, &path).await.unwrap(), 2);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}\n{}\n");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+}
+
 fn describe_transport_error(error: &reqwest::Error) -> String {
     if error.is_timeout() {
         "连接本地代理超时".to_string()

@@ -15,7 +15,7 @@
 //!
 //! 日志参数解析是本文件的重点：查询串里的值都是字符串，
 //! 与 Node 的 `Number(...)` / `Math.min(Math.max(...))` 语义要一一对上
-//! （NaN 视作缺省、limit 夹在 1..MAX_ENTRIES）。
+//! （NaN 视作缺省、单次查询 limit 夹在 1..MAX_QUERY_LIMIT）。
 //!
 //! `start` / `end`（毫秒时间戳）是**新增的可选**参数，Node 版没有：
 //! 日志页的时间筛选需要它。解析规则与报表 API 一致 —— 非法（空串 / 非数字）
@@ -78,13 +78,13 @@ fn parse_number(value: Option<&String>) -> Option<f64> {
 }
 
 /// limit 的生效值，逐例对齐 Node 版
-/// `Math.min(Math.max(Number(limit) || 200, 1), MAX_ENTRIES)`：
+/// `Math.min(Math.max(Number(limit) || 200, 1), MAX_QUERY_LIMIT)`：
 ///   - 缺省 / 非数字 / 0 → 200（JS 里 `0 || 200` 得 200，0 不是有效 limit）
-///   - 负数 → 1；超上限 → MAX_ENTRIES
+///   - 负数 → 1；超上限 → MAX_QUERY_LIMIT
 fn effective_limit(raw: Option<&String>) -> usize {
     let parsed = parse_number(raw).unwrap_or(0.0);
     let base = if parsed == 0.0 { 200.0 } else { parsed };
-    base.max(1.0).min(logs_store::MAX_ENTRIES as f64) as usize
+    base.max(1.0).min(logs_store::MAX_QUERY_LIMIT as f64) as usize
 }
 
 /// GET /api/logs
@@ -96,6 +96,10 @@ pub async fn query_logs(State(_state): State<ServerState>, Query(params): Query<
 
     let query = LogQuery {
         limit: Some(effective_limit(params.get("limit"))),
+        offset: params.get("offset").and_then(|v| v.parse().ok()).unwrap_or(0),
+        snapshot_id: params.get("snapshotId").and_then(|v| v.parse().ok()),
+        snapshot_epoch: params.get("snapshotEpoch").cloned(),
+        task_id: params.get("taskId").cloned(),
         // level/category 的合法性校验在 LogStore 内（未知值不参与过滤）
         level: params.get("level").cloned(),
         category: params.get("category").cloned(),
@@ -106,7 +110,10 @@ pub async fn query_logs(State(_state): State<ServerState>, Query(params): Query<
         end: parse_query_ms(params.get("end")),
     };
 
-    let result = store.query(&query);
+    let result = match tokio::task::spawn_blocking(move || store.query(&query)).await {
+        Ok(result) => result,
+        Err(_) => return crate::server::errors::management_error(500, "日志查询执行失败"),
+    };
     let mut data = match serde_json::to_value(&result) {
         Ok(value) => value,
         Err(error) => {
@@ -126,7 +133,11 @@ pub async fn stats_logs(State(_state): State<ServerState>) -> Response {
         Ok(store) => store,
         Err(response) => return response,
     };
-    let mut data = match serde_json::to_value(store.stats()) {
+    let stats = match tokio::task::spawn_blocking(move || store.stats()).await {
+        Ok(stats) => stats,
+        Err(_) => return crate::server::errors::management_error(500, "日志统计执行失败"),
+    };
+    let mut data = match serde_json::to_value(stats) {
         Ok(value) => value,
         Err(error) => {
             logging::log("[Logs]", &format!("❌ 日志统计序列化失败: {error}"));
@@ -152,9 +163,21 @@ pub async fn clear_logs(State(_state): State<ServerState>, Query(params): Query<
         Err(response) => return response,
     };
     let non_empty = |key: &str| params.get(key).map_or(false, |value| !value.trim().is_empty());
+    // 查询兼容旧客户端的宽松解析；删除必须拒绝被忽略的非法条件，不能退化为全清。
+    for (key, valid) in [
+        ("level", !non_empty("level") || logs_store::LEVELS.contains(&params["level"].trim().to_lowercase().as_str())),
+        ("category", !non_empty("category") || logs_store::CATEGORIES.iter().any(|(key, _)| *key == params["category"].trim().to_lowercase())),
+        ("start", !non_empty("start") || parse_query_ms(params.get("start")).is_some()),
+        ("end", !non_empty("end") || parse_query_ms(params.get("end")).is_some()),
+    ] {
+        if !valid {
+            return crate::server::errors::management_error(400, format!("无效的日志筛选条件：{key}"));
+        }
+    }
     let has_filters = non_empty("level")
         || non_empty("category")
         || non_empty("keyword")
+        || non_empty("taskId")
         || non_empty("start")
         || non_empty("end");
 
@@ -170,7 +193,10 @@ pub async fn clear_logs(State(_state): State<ServerState>, Query(params): Query<
                 "未指定筛选条件：要清空全部日志请显式带 all=1",
             );
         }
-        let stats = store.clear();
+        let stats = match tokio::task::spawn_blocking(move || store.clear()).await {
+            Ok(stats) => stats,
+            Err(_) => return crate::server::errors::management_error(500, "日志清空执行失败"),
+        };
         logging::log("[Logs]", "运行日志已清空");
         return match serde_json::to_value(stats) {
             Ok(value) => ok_json(value),
@@ -182,8 +208,12 @@ pub async fn clear_logs(State(_state): State<ServerState>, Query(params): Query<
     }
 
     let query = LogQuery {
-        // 删除没有分页概念：limit 不参与（过滤链在 Query::matches，不含 limit）
+        // 删除没有分页概念：复用 SQL 筛选，但不受 limit 或 snapshot 限制。
         limit: None,
+        offset: 0,
+        snapshot_id: None,
+        snapshot_epoch: None,
+        task_id: params.get("taskId").cloned(),
         level: params.get("level").cloned(),
         category: params.get("category").cloned(),
         keyword: params.get("keyword").cloned(),
@@ -191,7 +221,10 @@ pub async fn clear_logs(State(_state): State<ServerState>, Query(params): Query<
         start: parse_query_ms(params.get("start")),
         end: parse_query_ms(params.get("end")),
     };
-    let (removed, stats) = store.clear_where(&query);
+    let (removed, stats) = match tokio::task::spawn_blocking(move || store.clear_where(&query)).await {
+        Ok(result) => result,
+        Err(_) => return crate::server::errors::management_error(500, "日志筛选清空执行失败"),
+    };
     logging::log(
         "[Logs]",
         &format!("已按筛选条件清空 {removed} 条日志"),
@@ -217,13 +250,25 @@ pub async fn download_logs(State(_state): State<ServerState>) -> Response {
         Ok(store) => store,
         Err(response) => return response,
     };
-    let body = store.to_jsonl();
+    let (sender, receiver) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(2);
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        // 慢客户端不能无限期占用读快照，阻止 WAL 回收。
+        let send = |batch| runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(60), sender.send(batch)).await
+                .map_err(|_| "导出传输超时".to_string())?
+                .map_err(|_| "导出已取消".to_string())
+        });
+        if let Err(error) = store.export_jsonl(|batch| send(Ok(batch.into()))) {
+            let _ = send(Err(std::io::Error::other(error)));
+        }
+    });
     let filename = format!("workbuddy-logs-{}.jsonl", file_stamp());
 
     let mut response = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/x-ndjson; charset=utf-8")
-        .body(Body::from(body))
+        .body(Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(receiver)))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
 
     // 文件名/长度用 HeaderValue 构造（含非 ASCII 的兜底不 panic）
@@ -233,8 +278,7 @@ pub async fn download_logs(State(_state): State<ServerState>) -> Response {
     response
 }
 
-/// 给响应体补上 levels / categories / max 三个字典字段
-/// （对应 Node 版 `{ ...data, levels: LEVELS, categories: CATEGORIES, max: MAX_ENTRIES }`）
+/// 补齐筛选字典与当前存储容量；查询页大小不参与容量显示。
 fn attach_dictionary(object: &mut serde_json::Map<String, Value>) {
     object.insert(
         "levels".to_string(),
@@ -245,9 +289,13 @@ fn attach_dictionary(object: &mut serde_json::Map<String, Value>) {
         categories.insert(key.to_string(), Value::String(label.to_string()));
     }
     object.insert("categories".to_string(), Value::Object(categories));
+    let tasks: serde_json::Map<String, Value> = crate::server::core::scheduled_tasks::TASKS.iter()
+        .filter(|t| t.runner == crate::server::core::scheduled_tasks::Runner::Backend)
+        .map(|t| (t.id.to_string(), json!(t.label))).collect();
+    object.insert("tasks".into(), Value::Object(tasks));
     object.insert(
         "max".to_string(),
-        Value::Number(Number::from(logs_store::MAX_ENTRIES as u64)),
+        Value::Number(Number::from(crate::server::config::retention_settings().log_max_entries)),
     );
 }
 

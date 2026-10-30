@@ -448,8 +448,9 @@ pub async fn put_retention(State(state): State<ServerState>, body: Bytes) -> Res
     // 为什么先收集再写：三项里有一项非法时整体不落盘，避免出现
     // 「日志天数改了、明细天数没改」的半套设置（用户以为保存失败，实际生效了一半）
     let mut patch = RetentionPatch::default();
-    let mut targets: [(&str, Option<&Value>, &mut Option<i64>); 3] = [
+    let mut targets: [(&str, Option<&Value>, &mut Option<i64>); 4] = [
         (KEY_LOG_RETENTION_DAYS, object.get(KEY_LOG_RETENTION_DAYS), &mut patch.log_days),
+        (config::KEY_LOG_MAX_ENTRIES, object.get(config::KEY_LOG_MAX_ENTRIES), &mut patch.log_max_entries),
         (
             KEY_REQUEST_RETENTION_DAYS,
             object.get(KEY_REQUEST_RETENTION_DAYS),
@@ -470,47 +471,33 @@ pub async fn put_retention(State(state): State<ServerState>, body: Bytes) -> Res
         if value.is_null() {
             continue;
         }
-        match parse_days(key, value) {
+        let parsed = if *key == config::KEY_LOG_MAX_ENTRIES {
+            parse_retention_number(key, value, config::LOG_MIN_ENTRIES, config::LOG_MAX_ENTRIES)
+        } else { parse_days(key, value) };
+        match parsed {
             Ok(days) => **slot = Some(days),
             Err(message) => return errors::management_error(400, message),
         }
     }
 
-    // 三项都没给：不写盘（空 PUT 不该在 config.json 里留下痕迹），
-    // 也不记「已更新」日志（什么都没改，日志里不该出现一次伪更新），但仍返回当前值 ——
-    // 空 PUT 的语义就是「读一次当前设置」，调用方不用为此换成 GET
-    let updated =
-        patch.log_days.is_some() || patch.request_days.is_some() || patch.daily_days.is_some();
-    if updated {
-        if !config::set_retention(patch) {
-            // 写盘失败：内存快照已更新（本次运行仍生效），但重启后会回到旧值 ——
-            // 必须让用户知道，否则「改了设置重启又变回去」会被当成玄学问题
-            logging::log("[Config]", "⚠️  保留期写入 config.json 失败，本次运行内仍生效");
-        }
-        // ── 立即清理（两种数据各自的时机不同，这里一次触发）──
-        // 请求统计：prune() 内部**动态取**保留期回调，所以取到的就是刚写入的值
-        state.request_stats().prune();
-        // 事件日志：LogStore 的保留天数同样走回调（见 `LogStore::with_db` 的注释），
-        // prune 返回裁掉的条数，打一行控制台便于确认「改小天数确实删了东西」
-        if let Some(store) = logging::store_ref() {
-            let removed = store.prune();
-            if removed > 0 {
-                logging::console_line("[Logs]", &format!("按保留期清理了 {removed} 条过期日志"));
-            }
-        }
+    let updated = patch.log_days.is_some() || patch.log_max_entries.is_some() || patch.request_days.is_some() || patch.daily_days.is_some();
+    if !updated { return ok_json(retention_json(config::retention_settings())); }
+    let result = tokio::task::spawn_blocking(move || -> Result<Value, String> {
+        if !config::set_retention(patch) { return Err("保留设置保存失败，未更改生效配置或裁剪历史".into()); }
+        let store = logging::store_ref().ok_or("配置已保存，但日志模块不可用，历史清理未完成")?;
+        let removed = store.try_prune().map_err(|e| format!("配置已保存，但历史日志清理失败：{e}"))?;
+        if patch.request_days.is_some() || patch.daily_days.is_some() { state.request_stats().prune(); }
+        let settings = config::retention_settings();
+        logging::log("[Config]", &format!("数据保留设置已更新：事件日志 {} 天 / 最多 {} 条；清理 {} 条事件日志", settings.log_days, settings.log_max_entries, removed));
+        let mut response = retention_json(settings);
+        response["removedLogs"] = json!(removed);
+        Ok(response)
+    }).await;
+    match result {
+        Ok(Ok(data)) => ok_json(data),
+        Ok(Err(message)) => errors::management_error(500, message),
+        Err(_) => errors::management_error(500, "保留设置处理异常，请刷新确认实际配置"),
     }
-
-    let settings = config::retention_settings();
-    if updated {
-        logging::log(
-            "[Config]",
-            &format!(
-                "数据保留期已更新: 事件日志 {} 天 / 请求日志 {} 天 / 按天聚合 {} 天",
-                settings.log_days, settings.request_days, settings.daily_days
-            ),
-        );
-    }
-    ok_json(retention_json(settings))
 }
 
 /// 三档保留天数的响应体（GET 与 PUT 共用，保证两边键名完全一致）。
@@ -523,6 +510,7 @@ pub async fn put_retention(State(state): State<ServerState>, body: Bytes) -> Res
 fn retention_json(settings: RetentionSettings) -> Value {
     json!({
         KEY_LOG_RETENTION_DAYS: settings.log_days,
+        config::KEY_LOG_MAX_ENTRIES: settings.log_max_entries,
         KEY_REQUEST_RETENTION_DAYS: settings.request_days,
         KEY_DAILY_RETENTION_DAYS: settings.daily_days,
     })
@@ -534,29 +522,10 @@ fn retention_json(settings: RetentionSettings) -> Value {
 /// 字符串 `"30"` 视为非法 —— 那是调用方把配置当字符串传，静默接受会让
 /// 「前端传错类型」这类 bug 一直藏着。
 fn parse_days(key: &str, value: &Value) -> Result<i64, String> {
-    let number = match value {
-        Value::Number(number) => number,
-        other => {
-            return Err(format!(
-                "{key} 必须是 {RETENTION_MIN_DAYS}-{RETENTION_MAX_DAYS} 的整数（收到: {other}）"
-            ))
-        }
-    };
-    let days = number.as_i64().or_else(|| {
-        number
-            .as_f64()
-            .filter(|raw| raw.is_finite() && raw.fract() == 0.0)
-            .map(|raw| raw as i64)
-    });
-    let Some(days) = days else {
-        return Err(format!(
-            "{key} 必须是 {RETENTION_MIN_DAYS}-{RETENTION_MAX_DAYS} 的整数（收到: {number}）"
-        ));
-    };
-    if !(RETENTION_MIN_DAYS..=RETENTION_MAX_DAYS).contains(&days) {
-        return Err(format!(
-            "{key} 超出范围: {days}（合法范围 {RETENTION_MIN_DAYS}-{RETENTION_MAX_DAYS} 天）"
-        ));
-    }
-    Ok(days)
+    parse_retention_number(key, value, RETENTION_MIN_DAYS, RETENTION_MAX_DAYS)
+}
+
+fn parse_retention_number(key: &str, value: &Value, min: i64, max: i64) -> Result<i64, String> {
+    let number = value.as_i64().or_else(|| value.as_f64().filter(|n| n.is_finite() && n.fract() == 0.0).map(|n| n as i64));
+    number.filter(|n| (min..=max).contains(n)).ok_or_else(|| format!("{key} 必须是 {min}-{max} 的整数"))
 }

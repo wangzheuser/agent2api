@@ -38,6 +38,7 @@ pub const DEFAULT_LOCALE: &str = "zh-CN";
 
 /// 事件日志（统一库的 `logs` 表）保留天数
 pub const KEY_LOG_RETENTION_DAYS: &str = "logRetentionDays";
+pub const KEY_LOG_MAX_ENTRIES: &str = "logMaxEntries";
 /// 请求日志（统一库的 `requests` 表）保留天数
 pub const KEY_REQUEST_RETENTION_DAYS: &str = "requestRetentionDays";
 /// 按天聚合（统一库的 `request_daily` 表）保留天数
@@ -467,6 +468,9 @@ impl Default for AccountSelectionStrategy {
 /// 走接口的非法值给 400（用户当场能改），手改文件的非法值回落到默认（不打扰）。
 pub const RETENTION_MIN_DAYS: i64 = 1;
 pub const RETENTION_MAX_DAYS: i64 = 3650;
+pub const DEFAULT_LOG_MAX_ENTRIES: i64 = 1000;
+pub const LOG_MIN_ENTRIES: i64 = 1;
+pub const LOG_MAX_ENTRIES: i64 = 100_000;
 
 /// 三档保留天数（设置页「数据保留」区域）。
 ///
@@ -474,6 +478,7 @@ pub const RETENTION_MAX_DAYS: i64 = 3650;
 /// 裁剪时各自取用），打包成一个 `Copy` 值让调用方一次拿到、不必多次读锁。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetentionSettings {
+    pub log_max_entries: i64,
     /// 事件日志保留天数
     pub log_days: i64,
     /// 请求日志保留天数
@@ -485,6 +490,7 @@ pub struct RetentionSettings {
 impl Default for RetentionSettings {
     fn default() -> Self {
         Self {
+            log_max_entries: DEFAULT_LOG_MAX_ENTRIES,
             log_days: DEFAULT_LOG_RETENTION_DAYS,
             request_days: DEFAULT_REQUEST_RETENTION_DAYS,
             daily_days: DEFAULT_DAILY_RETENTION_DAYS,
@@ -496,6 +502,7 @@ impl Default for RetentionSettings {
 /// `None` = 这一项不动（对应「允许部分字段」的契约）。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RetentionPatch {
+    pub log_max_entries: Option<i64>,
     pub log_days: Option<i64>,
     pub request_days: Option<i64>,
     pub daily_days: Option<i64>,

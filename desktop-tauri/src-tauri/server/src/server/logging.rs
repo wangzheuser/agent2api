@@ -23,6 +23,29 @@ use serde_json::Value;
 use crate::server::db::Db;
 use crate::server::logs_store::{LogEntry, LogStore, NewEntry};
 
+tokio::task_local! {
+    static TASK_ID: &'static str;
+}
+
+pub fn current_task_id() -> Option<&'static str> {
+    TASK_ID.try_with(|id| *id).ok()
+}
+
+pub async fn task_scope<F: std::future::Future>(id: &'static str, future: F) -> F::Output {
+    TASK_ID.scope(id, future).await
+}
+
+/// spawn 不继承 task-local；在创建 future 时捕获，而不是在子任务内读取。
+pub fn inherit_task<F: std::future::Future>(future: F) -> impl std::future::Future<Output = F::Output> {
+    let task = current_task_id();
+    async move {
+        match task {
+            Some(id) => task_scope(id, future).await,
+            None => future.await,
+        }
+    }
+}
+
 /// 标签 → 日志分类，与桌面端筛选下拉一致（照抄 Node 版 TAG_CATEGORY）。
 /// 后续切片使用新标签时必须在这里登记，否则会落到默认分类 server。
 ///
@@ -82,9 +105,11 @@ pub fn init_store(db: Option<Db>, verbose: bool) -> bool {
     if STORE.get().is_some() {
         return false;
     }
-    let _ = STORE.set(LogStore::with_db(db, || {
+    let store = LogStore::with_db(db, || {
         crate::server::config::retention_settings().log_days
-    }));
+    });
+    store.prune();
+    let _ = STORE.set(store);
     true
 }
 

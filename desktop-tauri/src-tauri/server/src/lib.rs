@@ -45,6 +45,7 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
+    let future = server::logging::inherit_task(future);
     match Handle::try_current() {
         Ok(handle) => handle.spawn(future),
         Err(_) => global_runtime().spawn(future),

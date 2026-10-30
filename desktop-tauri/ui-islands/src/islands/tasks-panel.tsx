@@ -119,6 +119,7 @@ type SharedWindow = {
   wbLogsPanel?: {
     /** 跳转入口：预设分类并切到日志页 */
     showCategory?: (category: string) => unknown
+    showTask?: (taskId: string) => unknown
     applyAutoRefresh?: (task: IntervalTask | null) => unknown
   }
   wbRequestsPanel?: { applyAutoRefresh?: (task: IntervalTask | null) => unknown }
@@ -530,6 +531,11 @@ function TasksPanel() {
           <div className='task-state'>{taskStateText(task)}</div>
         </div>
         <div className='task-actions'>
+          {task.runner === 'backend' ? (
+            <Button size='sm' variant='outline' onClick={() => void shared().wbLogsPanel?.showTask?.(task.id)}>
+              {t('查看日志')}
+            </Button>
+          ) : null}
           <span className='task-interval'>
             <span className='task-interval-label'>{t('每')}</span>
             {/* 单位是后端的固定属性（'seconds' | 'minutes'），不是一个可选字段：

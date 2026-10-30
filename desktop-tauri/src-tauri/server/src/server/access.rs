@@ -343,7 +343,7 @@ pub fn clear_access_tokens() {
 /// 启动时把库里的刷新令牌载入内存（`bootstrap` 完成后调用一次；
 /// 整库恢复后由 `db::backup::import_from_file` 再调一次完成重装）。
 pub fn load_refresh_tokens() {
-    let Some(loaded) = db().and_then(|db| {
+    let records = db().and_then(|db| {
         db.with(|conn| {
             conn.query_row(
                 "SELECT value FROM kv WHERE key = ?1",
@@ -353,12 +353,8 @@ pub fn load_refresh_tokens() {
             .ok()
         })
         .flatten()
-    }) else {
-        return;
-    };
-    let Ok(records) = serde_json::from_str::<Vec<RefreshRecord>>(&loaded) else {
-        return;
-    };
+    }).and_then(|loaded| serde_json::from_str::<Vec<RefreshRecord>>(&loaded).ok())
+        .unwrap_or_default();
     match refresh_tokens().lock() {
         Ok(mut table) => *table = records,
         Err(poisoned) => *poisoned.into_inner() = records,

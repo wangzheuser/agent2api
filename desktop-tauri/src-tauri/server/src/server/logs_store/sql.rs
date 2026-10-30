@@ -45,7 +45,7 @@ use super::{level_rank, LogEntry, Query, CATEGORIES, LEVELS};
 pub(super) const NEXT_ID_KEY: &str = "logsNextId";
 
 /// 一行的列顺序（所有 SELECT 都按这个顺序取，`decode_row` 依赖它）
-const COLUMNS: &str = "id, ts, level, category, message, data";
+const COLUMNS: &str = "id, ts, level, category, message, data, task_id";
 
 /// 行 → `LogEntry`。
 ///
@@ -64,6 +64,7 @@ fn decode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LogEntry> {
     let data: Option<String> = row.get(5)?;
     Ok(LogEntry {
         // id 是分配出来的正整数（见模块头），负数不可能出现
+        task_id: row.get(6)?,
         id: id.max(0) as u64,
         ts,
         level,
@@ -120,43 +121,21 @@ fn group_counts(conn: &Connection, sql: &str) -> rusqlite::Result<Vec<(String, i
     Ok(out)
 }
 
-/// 全部日志，按 id 升序 —— `to_jsonl` 的导出顺序（旧的「文件顺序」）。
-pub(super) fn select_all_asc(conn: &Connection) -> rusqlite::Result<Vec<LogEntry>> {
-    let sql = format!("SELECT {COLUMNS} FROM logs ORDER BY id ASC");
-    let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query([])?;
-    let mut out = Vec::new();
-    while let Some(row) = rows.next()? {
-        out.push(decode_row(row)?);
-    }
-    Ok(out)
+/// 导出每批最多 500 条；快照上界不随并发追加移动。
+pub(super) fn select_export_batch(conn: &Connection, after: u64, snapshot: u64) -> rusqlite::Result<Vec<LogEntry>> {
+    let mut stmt = conn.prepare(&format!("SELECT {COLUMNS} FROM logs WHERE id>?1 AND id<=?2 ORDER BY id LIMIT 500"))?;
+    let rows = stmt.query_map(params![after.min(i64::MAX as u64) as i64, snapshot.min(i64::MAX as u64) as i64], decode_row)?.collect();
+    rows
 }
 
 // ─── 筛选条件 → SQL ─────────────────────────────────────────
 
-/// 一次查询的**筛选计划**：能下推给 SQL 的条件进 `WHERE`，不能的在 Rust 侧。
-///
-/// ── 为什么关键词必须留在 Rust 侧（这是本层最需要解释的取舍）────
-/// 现在用的是 `message.to_lowercase().contains(keyword)`（先 `to_lowercase` 再
-/// 子串匹配，两边都按 **Unicode** 折叠大小写）。SQLite 的 `LIKE` 默认
-/// **只对 ASCII 大小写不敏感**（`A`–`Z`），对 `İ` / `Σ` 这类非 ASCII 字符
-/// 的行为与 Rust 的 `to_lowercase` 不同；`instr()` 更是完全区分大小写。
-/// 用 `LIKE` 会让「带非 ASCII 大小写的日志搜不出来/搜错」，
-/// 这是**可观察的行为差异**，所以关键词一律取回来在 Rust 里过滤。
-/// 代价是 `LIMIT` 没法下推（必须「先过滤再取最新 N 条」），见
-/// [`select_matching_desc`] 的说明 —— 表上限 500 行，这个代价可以忽略。
-///
-/// `Query::matches`（旧实现在内存里跑的那条过滤链）被本结构取代：
-/// `query` 与 `clear_where` **共用同一份**计划（都调 [`select_matching_desc`]），
-/// 于是「查询里看到的 N 条」与「删除时删掉的那 N 条」必然是同一批 ——
-/// 这正是旧注释强调的「两处手写必然漂移」，现在由结构保证而不是靠纪律。
+/// 查询、计数和删除共用 SQL 条件；搜索列由 Rust Unicode 小写规则生成。
 pub(super) struct FilterPlan {
     /// `WHERE ...` 片段；无条件时为空串
     where_sql: String,
     /// 与 `where_sql` 里的 `?` 一一对应的绑定值
     binds: Vec<SqlValue>,
-    /// 关键词（已 trim + `to_lowercase`）；`None` = 该条件不生效
-    keyword: Option<String>,
 }
 
 impl FilterPlan {
@@ -216,61 +195,40 @@ impl FilterPlan {
             binds.push(SqlValue::Integer(to));
         }
 
-        let where_sql = if fragments.is_empty() {
-            String::new()
-        } else {
-            format!(" WHERE {}", fragments.join(" AND "))
-        };
-
-        // ⑥ 关键词：见类型头部的说明，只能在 Rust 侧过滤
-        let keyword = query
-            .keyword
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_lowercase);
-
-        Self { where_sql, binds, keyword }
-    }
-
-    /// 这条消息是否命中关键词（`None` = 该条件不生效，恒真）。
-    ///
-    /// 与旧实现逐字相同：`message.to_lowercase().contains(&关键词小写形态)`。
-    fn matches_keyword(&self, message: &str) -> bool {
-        match &self.keyword {
-            Some(want) => message.to_lowercase().contains(want),
-            None => true,
+        if let Some(task) = query.task_id.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+            fragments.push("task_id = ?".to_string());
+            binds.push(SqlValue::Text(task.to_string()));
         }
+        if let Some(snapshot) = query.snapshot_id {
+            fragments.push("id <= ?".to_string());
+            binds.push(SqlValue::Integer(snapshot.min(i64::MAX as u64) as i64));
+        }
+        if let Some(keyword) = query.keyword.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+            fragments.push("instr(message_search, ?) > 0".to_string());
+            binds.push(SqlValue::Text(keyword.to_lowercase()));
+        }
+        let where_sql = if fragments.is_empty() { String::new() } else { format!(" WHERE {}", fragments.join(" AND ")) };
+        Self { where_sql, binds }
     }
+
 }
 
-/// 命中筛选的日志，按 id **降序**（最新在前）。
-///
-/// ── 为什么不在 SQL 里 LIMIT ─────────────────────────────────
-/// 两个原因，都是「与旧实现逐字一致」要求的：
-///   1. 关键词只能在 Rust 侧过滤（`FilterPlan` 的类型注释）；
-///   2. `QueryResult.matched` 要的是**命中总数**，与 limit 无关 —— 本来就得把
-///      命中行全数出来。
-/// 表上限 `MAX_ENTRIES = 500` 行，全量取出后由调用方切片。旧实现在内存里
-/// 也是对 500 条跑一遍过滤链，扫描量没有变化。
-pub(super) fn select_matching_desc(
-    conn: &Connection,
-    plan: &FilterPlan,
-) -> rusqlite::Result<Vec<LogEntry>> {
-    let sql = format!(
-        "SELECT {COLUMNS} FROM logs{} ORDER BY id DESC",
-        plan.where_sql
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query(params_from_iter(plan.binds.iter()))?;
-    let mut out = Vec::new();
-    while let Some(row) = rows.next()? {
-        let entry = decode_row(row)?;
-        if plan.matches_keyword(&entry.message) {
-            out.push(entry);
-        }
-    }
-    Ok(out)
+pub(super) fn count_matching(conn: &Connection, plan: &FilterPlan) -> rusqlite::Result<usize> {
+    let count: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM logs{}", plan.where_sql), params_from_iter(plan.binds.iter()), |row| row.get(0))?;
+    Ok(count.max(0) as usize)
+}
+
+pub(super) fn select_page(conn: &Connection, plan: &FilterPlan, limit: usize, offset: usize) -> rusqlite::Result<Vec<LogEntry>> {
+    let mut binds = plan.binds.clone();
+    binds.push(SqlValue::Integer(limit as i64));
+    binds.push(SqlValue::Integer(offset.min(i64::MAX as usize) as i64));
+    let mut stmt = conn.prepare(&format!("SELECT {COLUMNS} FROM logs{} ORDER BY id DESC LIMIT ? OFFSET ?", plan.where_sql))?;
+    let rows = stmt.query_map(params_from_iter(binds.iter()), decode_row)?.collect();
+    rows
+}
+
+pub(super) fn delete_matching(conn: &Connection, plan: &FilterPlan) -> rusqlite::Result<usize> {
+    conn.execute(&format!("DELETE FROM logs{}", plan.where_sql), params_from_iter(plan.binds.iter()))
 }
 
 // ─── 写入与删除 ─────────────────────────────────────────────
@@ -278,7 +236,7 @@ pub(super) fn select_matching_desc(
 /// 插入一条日志（id 由调用方先用 [`allocate_next_id`] 取好）。
 pub(super) fn insert(conn: &Connection, entry: &LogEntry) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO logs (id, ts, level, category, message, data) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO logs (id, ts, level, category, message, data, task_id, message_search) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         params![
             entry.id as i64,
             entry.ts,
@@ -286,6 +244,8 @@ pub(super) fn insert(conn: &Connection, entry: &LogEntry) -> rusqlite::Result<()
             entry.category,
             entry.message,
             encode_data(entry.data.as_ref()),
+            entry.task_id,
+            entry.message.to_lowercase(),
         ],
     )?;
     Ok(())
@@ -352,40 +312,12 @@ pub(super) fn raise_next_id(conn: &Connection, value: u64) -> rusqlite::Result<(
     Ok(())
 }
 
-/// 按 id 删除一批行，返回实际删掉的条数。
-///
-/// 占位符按 id 个数生成（不是把 id 拼进 SQL）—— 列表长度由命中行数决定，
-/// 值本身永远走绑定参数。
-pub(super) fn delete_by_ids(conn: &Connection, ids: &[u64]) -> rusqlite::Result<usize> {
-    if ids.is_empty() {
-        return Ok(0);
-    }
-    let placeholders = vec!["?"; ids.len()].join(", ");
-    let sql = format!("DELETE FROM logs WHERE id IN ({placeholders})");
-    let binds: Vec<SqlValue> = ids
-        .iter()
-        .map(|id| SqlValue::Integer(*id as i64))
-        .collect();
-    conn.execute(&sql, params_from_iter(binds.iter()))
-}
-
-/// 删掉 `ts < cutoff` 的行，返回删除条数。
-///
-/// `keep_id` 是「即使超期也必须留下」的那一条（`append` 传刚写入的 id）：
-/// `append` 的契约是「返回写入的条目」，不能返回一条当场被删掉的记录。
-/// 传 `None`（`prune` 的路径）表示不做例外。
+/// 按日志时间删掉 `ts < cutoff` 的行，返回删除条数。
 pub(super) fn delete_expired(
     conn: &Connection,
     cutoff: i64,
-    keep_id: Option<u64>,
 ) -> rusqlite::Result<usize> {
-    match keep_id {
-        Some(id) => conn.execute(
-            "DELETE FROM logs WHERE ts < ?1 AND id <> ?2",
-            params![cutoff, id as i64],
-        ),
-        None => conn.execute("DELETE FROM logs WHERE ts < ?1", params![cutoff]),
-    }
+    conn.execute("DELETE FROM logs WHERE ts < ?1", params![cutoff])
 }
 
 /// 容量裁剪：只保留 id 最大的 `max` 条，返回删除条数。
@@ -394,9 +326,11 @@ pub(super) fn delete_expired(
 /// 用它排序会裁掉真正的新日志。旧实现是 `entries.drain(0..溢出)`，
 /// 而数组顺序就是 id 顺序，两者等价。
 pub(super) fn trim_to_capacity(conn: &Connection, max: usize) -> rusqlite::Result<usize> {
+    let excess = count_all(conn)?.saturating_sub(max);
+    if excess == 0 { return Ok(0); }
     conn.execute(
-        "DELETE FROM logs WHERE id NOT IN (SELECT id FROM logs ORDER BY id DESC LIMIT ?1)",
-        params![max as i64],
+        "DELETE FROM logs WHERE id IN (SELECT id FROM logs ORDER BY id ASC LIMIT ?1)",
+        params![excess as i64],
     )
 }
 

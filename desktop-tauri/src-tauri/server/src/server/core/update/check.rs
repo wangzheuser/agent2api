@@ -172,27 +172,32 @@ impl UpdateManager {
                 return Err(UpdateError::new(state.waiting_message()));
             }
         };
-        let outcome = self.fetch_release(current_version).await;
-        let interval = config::scheduled_settings().update_check.interval * 60_000;
-        match outcome {
-            Ok((release, retry_at)) => {
-                self.lock().latest = release.clone();
-                let result = self.build_check_result(current_version);
-                let summary = if result.get("hasUpdate").and_then(Value::as_bool) == Some(true) {
-                    format!("发现新版本 {}", result["latestVersion"].as_str().unwrap_or(""))
-                } else {
-                    "已完成版本检查".to_string()
-                };
-                let state = guard.finish(true, summary, Some(json!({ "release": release })), retry_at, interval)
-                    .map_err(|error| UpdateError::new(error))?;
-                Ok(self.checked_result(current_version, &state))
+        logging::task_scope(config::KEY_UPDATE_CHECK, async {
+            logging::log_with_level("[Update]", "软件版本检查开始执行", "info");
+            let outcome = self.fetch_release(current_version).await;
+            let interval = config::scheduled_settings().update_check.interval * 60_000;
+            match outcome {
+                Ok((release, retry_at)) => {
+                    self.lock().latest = release.clone();
+                    let result = self.build_check_result(current_version);
+                    let summary = if result.get("hasUpdate").and_then(Value::as_bool) == Some(true) {
+                        format!("发现新版本 {}", result["latestVersion"].as_str().unwrap_or(""))
+                    } else {
+                        "已完成版本检查".to_string()
+                    };
+                    logging::log_with_level("[Update]", &summary, "info");
+                    let state = guard.finish(true, summary, Some(json!({ "release": release })), retry_at, interval)
+                        .map_err(|error| UpdateError::new(error))?;
+                    Ok(self.checked_result(current_version, &state))
+                }
+                Err((error, retry_at)) => {
+                    logging::log_with_level("[Update]", &format!("软件版本检查失败：{}", error.message), "error");
+                    guard.finish(false, format!("检查失败：{}", error.message), None, retry_at, interval)
+                        .map_err(|error| UpdateError::new(error))?;
+                    Err(error)
+                }
             }
-            Err((error, retry_at)) => {
-                guard.finish(false, format!("检查失败：{}", error.message), None, retry_at, interval)
-                    .map_err(|error| UpdateError::new(error))?;
-                Err(error)
-            }
-        }
+        }).await
     }
 
     /// 拉一次最新 Release，并把**上游给的冷却截止**一并带回。

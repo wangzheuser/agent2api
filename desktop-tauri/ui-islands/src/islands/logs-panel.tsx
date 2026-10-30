@@ -6,7 +6,7 @@ import {
   SegmentedControl, type SegmentedControlOption,
 } from '@ui'
 import {
-  CLIENT_PAGE_SIZES,
+  SERVER_PAGE_SIZES,
   TableFooter,
   readPageSize,
   writePageSize,
@@ -14,43 +14,7 @@ import {
 } from './table-shell'
 import { t } from '../i18n'
 
-/**
- * Agent2API · 系统事件日志面板（筛选 / 分页 / 导出 / 清空）—— React 岛。
- *
- * 替换 ui/logs-panel.js（那份自持筛选、页码与轮询，用 innerHTML 拼 .log-row 那套老类名）。对外
- * 接口与原实现**完全一致**（见文件末尾），调用点一行都不用改：app.js:122 load() / app.js:254
- * lastStats() / tasks-panel.js:512 applyAutoRefresh() / tasks-panel.js:710
- * showCategory('checkin') / upgrade-panel.js:71 load()。
- *
- * ── 数据口径（照旧，别改）──────────────────────────────────
- * 系统事件（GET /api/logs）一次拉满后端上限 500 条（`logs_store::MAX_ENTRIES`），翻页纯在前端算
- * —— 交互即时，也不会和轮询抢状态。网关的模型请求明细不在这页，在「请求日志」页。分类字典里的
- * 「脱敏」保留着是为了让**历史**条目仍能筛出来看（那一类不再有新条目，逐请求的命中明细在请求
- * 日志的「敏」标签里）。
- *
- * ── 自动刷新的间隔从哪来 ──────────────────────────────────
- * 不写死：由「定时任务」页配置（config.json 的 `scheduledTasks.logsAutoRefresh`）。本面板启动时
- * 自读一次（syncAutoRefresh），之后接受那边推送（applyAutoRefresh）；兜底 1 秒 = 后端默认值。
- *
- * ── 边界：页面骨架照抄 index.html，控件换组件库 ────────────────
- * 本岛接管 `<section class="page" data-page="logs">`，清空子节点后把 React root 直接建在**这个
- * section 上**（不套宿主 div：页面 CSS 用 `.page[data-page="logs"] .panel` 这组直接子选择器分配
- * 高度，中间插一层会打断它）。保留的页面布局类：`.panel` `.panel-head` `.panel-body`
- * `.panel-foot` `.head-actions` `.log-filters` `.log-list` `.log-row`（含 `.log-rail`
- * `.log-dot` `.log-main` `.log-line` `.log-cat` `.log-lvl` `.msg` `.log-extra-wrap` `.extra`
- * `.time`）`.log-empty` `.spacer` —— 布局不是「组件」，换成
- * Tailwind 会让这一页与其它页长得不一样（样式在 ui/css/page-logs.css 与 layout.css）。控件一律
- * 换：button → Button、`.badge` → Badge、原生 `<select>` → Select 一族、搜索框 → InputGroup 一族
- * （图标 ⌕，与 input-control.tsx 用法一致）、时间档位 → SegmentedControl（不再调 wbSegmented，
- * 也不再留 `#logs-range` 那个挂载点）、分页栏 → 通用表格页脚（islands/table-shell.tsx：
- * 读数 / 每页条数 / 跳页 / 翻页器五张表一套，边界判断与读数收在组件里）。
- *
- * ── 坑：带 Tailwind display 工具类的元素上 hidden 无效 ─────────
- * 组件库的工具类是**分层 + !important** 的，tokens.css 的 `[hidden] { display:none !important }`
- * 未分层；按 Cascade 5，important 的层序反转 —— 分层压过未分层。所以组件库控件上的显隐一律用
- * **条件渲染**表达（本文件的显隐只有条件渲染与 disabled）。轮询定时器与关键词防抖都长在组件里，
- * 卸载时一并清掉（旧实现是 stopAuto 收表）。
- */
+/** 系统事件日志：服务端分页与快照，筛选、导出和清空共用现有桥接入口。 */
 
 /* ─── 类型 ─────────────────────────────────── */
 
@@ -59,13 +23,13 @@ import { t } from '../i18n'
  * data 是附加数据：429 换号带 from/to、模型目录刷新带 model、限流带 resetAtText。
  */
 type LogEntry = {
-  id?: number; ts?: number; level?: string; category?: string; message?: string
+  id?: number; ts?: number; level?: string; category?: string; message?: string; taskId?: string
   data?: { from?: string; to?: string; model?: string; resetAtText?: string; status?: string | number } | null
 }
 
 /** GET /api/logs 的响应：后端另附 levels / categories / max 三个字典字段 */
 type LogQueryResult = {
-  entries?: LogEntry[]; total?: number; matched?: number
+  entries?: LogEntry[]; total?: number; matched?: number; max?: number; snapshotId?: number; snapshotEpoch?: string; snapshotReset?: boolean; tasks?: Record<string, string>
   /** 日志文件路径；后端给了才改写页脚那句默认文案 */
   file?: string
   categories?: Record<string, string>
@@ -143,14 +107,7 @@ function toast(message: string, kind?: 'err' | 'ok'): void {
 
 /** 自动刷新间隔兜底值（毫秒），1 秒 = 后端默认间隔（`DEFAULT_LOGS_AUTO_REFRESH_SECONDS`） */
 const DEFAULT_AUTO_REFRESH_MS = 1_000
-/**
- * 每页条数的档位：本页是**客户端分页**（一次拉满 FETCH_LIMIT 条，翻页只重绘、
- * 不打接口），所以给到「全部」这一档也没有额外开销 —— 与请求日志（服务端真分页、
- * 没有「全部」）的差别就在这里，见 table-shell 的文件头。
- */
-const PAGE_SIZES = CLIENT_PAGE_SIZES
-/** 系统事件单次拉取上限（后端上限）：一次拿全，总页数才对得上真实结果 */
-const FETCH_LIMIT = 500
+const PAGE_SIZES: PageSizeChoice[] = [...SERVER_PAGE_SIZES, 500, 1000, 2000, 5000, 10000]
 /** 时间档位的持久化键（请求日志页的档位在 requests-panel，两键独立） */
 const EVENT_RANGE_KEY = 'workbuddy-desktop-logs-range'
 /** 三个筛选的持久化键（走 wbFilterMemory，空串 = 「全部」） */
@@ -158,7 +115,7 @@ const FILTERS_KEY = 'workbuddy-desktop-logs-filters'
 /** 关键词输入的防抖：避免每敲一个字就打一次接口 */
 const KEYWORD_DEBOUNCE_MS = 300
 /** 页脚那句默认路径：后端没给 file 时保持页面上原来的文案 */
-const DEFAULT_FILE = '~/.agent2api/logs.jsonl'
+const DEFAULT_FILE = '~/.agent2api/agent2api.db'
 
 /**
  * 合法的时间档位，与后端 /api/stats/summary 的白名单同字面量（报表页也是这一组）。默认
@@ -230,11 +187,13 @@ type PanelHandle = {
   load(options?: LoadOptions): Promise<void>
   render(data?: LogQueryResult | null): void
   showCategory(category: string): Promise<void>
+  showTask(taskId: string): Promise<void>
   applyAutoConfig(ms: number, enabled: boolean): void
 }
 let handle: PanelHandle | null = null
 /** 挂载前收到的 showCategory / render：挂载后立刻补发（正常路径用不到，兜底） */
 let pendingCategory: string | null = null
+let pendingTask: string | null = null
 let pendingRender: { data: LogQueryResult | null } | null = null
 
 /** 上次会话的筛选是否已经灌进界面（只灌一次，见 readSavedFilters） */
@@ -244,8 +203,8 @@ let filtersTouched = false
 
 /* ─── 纯函数：筛选、时间、文案 ─────────────────── */
 
-type Filters = { level: string; category: string; keyword: string }
-const DEFAULT_FILTERS: Filters = { level: '', category: '', keyword: '' }
+type Filters = { level: string; category: string; keyword: string; taskId: string }
+const DEFAULT_FILTERS: Filters = { level: '', category: '', keyword: '', taskId: '' }
 
 /**
  * 读上次会话的筛选。
@@ -265,6 +224,7 @@ function readSavedFilters(): Filters {
     level: LEVEL_OPTIONS.some(item => item.value === saved.level) ? saved.level : '',
     category: saved.category,
     keyword: saved.keyword,
+    taskId: saved.taskId || '',
   }
 }
 
@@ -274,6 +234,7 @@ function persistFilters(filters: Filters): void {
     level: filters.level || '',
     category: filters.category || '',
     keyword: filters.keyword.trim() || '',
+    taskId: filters.taskId || '',
   })
 }
 
@@ -351,9 +312,8 @@ function entriesOf(result: LogQueryResult | null | undefined): LogEntry[] {
 }
 
 /** 总页数按条目数算；日志被清空或筛选变严后页码会越界，夹回有效范围 */
-function clampPage(page: number, entries: LogEntry[], size: PageSizeChoice): number {
-  const pageCount = Math.max(1, size === 'all' ? 1 : Math.ceil(entries.length / size))
-  return Math.min(Math.max(1, page), pageCount)
+function clampPage(page: number, matched: number, size: number): number {
+  return Math.min(Math.max(1, page), Math.max(1, Math.ceil(matched / size)))
 }
 
 /** 后端字典里有没有这个分类（= 旧实现「下拉里存在这个 option」的判据） */
@@ -377,6 +337,7 @@ function baseParams(filters: Filters, range: string): URLSearchParams {
   const start = rangeStart(range)
   if (filters.level) params.set('level', filters.level)
   if (filters.category) params.set('category', filters.category)
+  if (filters.taskId) params.set('taskId', filters.taskId)
   if (keyword) params.set('keyword', keyword)
   // 时间条件与级别 / 分类 / 关键词是「与」关系（后端逐层收紧过滤链）。只传下界不传上界：闭开
   // 区间 [start, end) 的上界缺省即「到此刻为止」，比拿 Date.now() 当 end 更稳 —— 不会因为本地
@@ -385,10 +346,12 @@ function baseParams(filters: Filters, range: string): URLSearchParams {
   return params
 }
 
-/** 列表查询串（含 limit）：一次拿全，总页数才对得上真实结果 */
-function queryParams(filters: Filters, range: string): string {
+function queryParams(filters: Filters, range: string, page: number, size: number, snapshot: number, epoch: string): string {
   const params = baseParams(filters, range)
-  params.set('limit', String(FETCH_LIMIT))
+  params.set('limit', String(size))
+  params.set('offset', String((page - 1) * size))
+  if (page > 1 && snapshot > 0) params.set('snapshotId', String(snapshot))
+  if (page > 1 && epoch) params.set('snapshotEpoch', epoch)
   return params.toString()
 }
 
@@ -493,11 +456,11 @@ async function showCategory(category: string): Promise<void> {
  */
 type PanelData = {
   entries: LogEntry[]; total: number; matched: number
-  file: string; categories: Record<string, string>; loaded: boolean
+  file: string; categories: Record<string, string>; tasks: Record<string, string>; max: number; snapshotId: number; snapshotEpoch: string; loaded: boolean
 }
 
 const EMPTY_DATA: PanelData = {
-  entries: [], total: 0, matched: 0, file: DEFAULT_FILE, categories: {}, loaded: false,
+  entries: [], total: 0, matched: 0, file: DEFAULT_FILE, categories: {}, tasks: {}, max: 1000, snapshotId: 0, snapshotEpoch: '', loaded: false,
 }
 
 /** load / render 的入参：silent = 轮询等静默刷新（失败不打扰界面）；resetPage = 筛选变了 */
@@ -515,6 +478,10 @@ function fromResult(result: LogQueryResult | null | undefined, prev: PanelData):
     file: result?.file || prev.file,
     // 字典只填一次（旧实现的 dataset.filled='1'）：它是静态的，重拉没有新信息
     categories: Object.keys(prev.categories).length ? prev.categories : readCategories(result?.categories),
+    tasks: readCategories(result?.tasks) || prev.tasks,
+    max: Number(result?.max) || prev.max,
+    snapshotId: Number(result?.snapshotId) || 0,
+    snapshotEpoch: result?.snapshotEpoch || '',
     loaded: true,
   }
 }
@@ -532,7 +499,7 @@ function LogsPanel() {
   const [range, setRange] = React.useState<string>(readRange)
   const [page, setPage] = React.useState(1)
   /** 每页条数（页脚可换，存盘记住）：与 page 一样落一份 ref，异步回调读得到最新值 */
-  const [size, setSize] = React.useState<PageSizeChoice>(() => readPageSize('logs'))
+  const [size, setSize] = React.useState<number>(() => Number(readPageSize('logs', PAGE_SIZES)))
   /** 在途操作：按钮文案与禁用都看它（互斥守卫读的是模块级 panelBusy） */
   const [busy, setBusy] = React.useState<{ which: 'clear' | 'export'; label: string } | null>(null)
   /** 自动刷新配置：挂载前的推送已经写在模块级变量里，这里取的就是最新的那份 */
@@ -558,6 +525,8 @@ function LogsPanel() {
   const pageRef = React.useRef(page)
   const sizeRef = React.useRef(size)
   const dataRef = React.useRef(data)
+  const requestRef = React.useRef(0)
+  const inflightRef = React.useRef(0)
 
   const applyFilters = React.useCallback((patch: Partial<Filters>): Filters => {
     const next = { ...filtersRef.current, ...patch }
@@ -567,7 +536,7 @@ function LogsPanel() {
   }, [])
   const applyRange = React.useCallback((next: string) => { rangeRef.current = next; setRange(next) }, [])
   const applyPage = React.useCallback((next: number) => { pageRef.current = next; setPage(next) }, [])
-  const applySize = React.useCallback((next: PageSizeChoice) => {
+  const applySize = React.useCallback((next: number) => {
     sizeRef.current = next
     setSize(next)
     writePageSize('logs', next)
@@ -582,7 +551,7 @@ function LogsPanel() {
     filtersRestored = true
     if (filtersTouched) return
     const saved = memory.load(FILTERS_KEY, { ...DEFAULT_FILTERS })
-    applyFilters({ level: saved.level, category: saved.category, keyword: saved.keyword })
+    applyFilters({ level: saved.level, category: saved.category, keyword: saved.keyword, taskId: saved.taskId || '' })
   }, [applyFilters])
 
   /* ─── 加载 ─────────────────────────────── */
@@ -598,18 +567,24 @@ function LogsPanel() {
     // 兜一次间隔配置（同步过一次就立刻返回）与筛选记忆的补读
     void syncAutoRefresh()
     restoreSavedFilters()
-    const query = queryParams(filtersRef.current, rangeRef.current)
+    const query = queryParams(filtersRef.current, rangeRef.current, pageRef.current, sizeRef.current, dataRef.current.snapshotId, dataRef.current.snapshotEpoch)
+    const request = ++requestRef.current
+    inflightRef.current += 1
     const pageBefore = pageRef.current
     try {
       const api = shared().workbuddyDesktop
       if (!api) throw new Error(t('后端桥不可用'))
       const [result, nextStats] = await Promise.all([api.getLogs(query), api.getLogStats()])
+      if (request !== requestRef.current) return
       // 重写列表会把滚动弹回顶部：轮询刷新时把读到的位置还回去，否则每隔一个刷新周期就
       // 把正在看日志的人踢回页首。换筛选 / 页码被夹回则一律回顶。
       const keepTop = resetPage ? 0 : (listRef.current?.scrollTop ?? 0)
       const next = fromResult(result, dataRef.current)
       applyData(next)
-      applyPage(clampPage(pageRef.current, entriesOf(result), sizeRef.current))
+      if (result?.snapshotReset) applyPage(1)
+      const corrected = clampPage(pageRef.current, next.matched, sizeRef.current)
+      applyPage(corrected)
+      if (corrected !== pageBefore) { void loadPanel({ silent: true }); return }
       pendingScrollRef.current = pageRef.current === pageBefore ? keepTop : 0
       applyStats(nextStats)
       // 存过的分类可能已经不在后端字典里（字典随版本变过）：旧实现那种情况下对原生 select 赋值
@@ -622,13 +597,14 @@ function LogsPanel() {
         void loadPanel({ resetPage: true })
       }
     } catch (error) {
+      if (request !== requestRef.current) return
       if (!silent) {
         console.warn('读取运行日志失败:', errorMessage(error))
         // 非静默失败按旧实现清成空态；silent 的轮询失败保留上一次的数据（别闪空）
         applyData(fromResult(null, dataRef.current))
-        applyPage(clampPage(pageRef.current, [], sizeRef.current))
+        applyPage(clampPage(pageRef.current, 0, sizeRef.current))
       }
-    }
+    } finally { inflightRef.current -= 1 }
   }, [applyData, applyPage, restoreSavedFilters])
 
   /** 外部直接塞一份结果（契约里的 render）：与 load 落地口径一致，但不动滚动位置 */
@@ -636,7 +612,7 @@ function LogsPanel() {
     // 不带参数 = 只重绘（旧实现翻页时这么调）：React 里状态没变就没有重绘的必要
     if (result === undefined) return
     applyData(fromResult(result, dataRef.current))
-    applyPage(clampPage(pageRef.current, entriesOf(result), sizeRef.current))
+    applyPage(clampPage(pageRef.current, Number(result?.matched) || 0, sizeRef.current))
   }, [applyData, applyPage])
 
   /**
@@ -649,13 +625,22 @@ function LogsPanel() {
   const showCategoryImpl = React.useCallback(async (category: string): Promise<void> => {
     if (!hasCategory(dataRef.current.categories, category)) await loadPanel({ silent: true })
     if (!hasCategory(dataRef.current.categories, category)) return
-    const next = applyFilters({ category })
+    const next = applyFilters({ category, taskId: '' })
     persistFilters(next)
     applyPage(1)
     // applyFilters 已经同步更新了 ref，这一次请求读到的就是新分类
     await loadPanel({ resetPage: true })
     shared().wbApp?.showPage?.('logs', { persist: true })
   }, [applyFilters, applyPage, loadPanel])
+
+  const showTaskImpl = React.useCallback(async (taskId: string): Promise<void> => {
+    filtersTouched = true
+    persistFilters(applyFilters({ ...DEFAULT_FILTERS, taskId }))
+    applyRange('all')
+    persistRange('all')
+    await loadPanel({ resetPage: true })
+    shared().wbApp?.showPage?.('logs', { persist: true })
+  }, [applyFilters, applyRange, loadPanel])
 
   /* ─── 挂载 / 卸载 ───────────────────────── */
 
@@ -664,6 +649,7 @@ function LogsPanel() {
       load: loadPanel,
       render: renderData,
       showCategory: showCategoryImpl,
+      showTask: showTaskImpl,
       applyAutoConfig: (ms, enabled) => setAuto({ ms, enabled }),
     }
     // 挂载前就来的调用先补发（正常路径用不到：岛的挂载早于任何用户操作）
@@ -673,7 +659,11 @@ function LogsPanel() {
       renderData(queued.data)
     }
     const queuedCategory = pendingCategory
-    if (queuedCategory !== null) {
+    if (pendingTask !== null) {
+      const task = pendingTask
+      pendingTask = null
+      void showTaskImpl(task)
+    } else if (queuedCategory !== null) {
       pendingCategory = null
       // showCategory 自己会拉一次，首屏那次加载就省掉（两次并发请求会互相覆盖）
       void showCategoryImpl(queuedCategory)
@@ -688,7 +678,7 @@ function LogsPanel() {
       if (keywordTimerRef.current !== null) window.clearTimeout(keywordTimerRef.current)
       keywordTimerRef.current = null
     }
-  }, [loadPanel, renderData, showCategoryImpl])
+  }, [loadPanel, renderData, showCategoryImpl, showTaskImpl])
 
   /**
    * 轮询定时器：配置一变就重排（旧实现的 startAuto 每次先 stopAuto），卸载时清表。三个前置条件
@@ -701,7 +691,7 @@ function LogsPanel() {
       // 只在日志页可见时轮询，避免后台无谓请求（旧实现的早退条件，一条都不能少）
       if (document.hidden || shared().wbApp?.currentPage !== 'logs') return
       // 上一轮还没回来就跳过这一拍（见 polling 的说明）
-      if (polling) return
+      if (polling || inflightRef.current > 0) return
       polling = true
       void loadPanel({ silent: true }).finally(() => { polling = false })
     }, auto.ms)
@@ -785,28 +775,21 @@ function LogsPanel() {
     })
   }
 
-  /**
-   * 翻页只重绘：整窗口的数据已经在 data.entries 里，不必再打一次接口。
-   * 新一页从顶部开始读，否则会停在上一页的滚动位置。
-   */
   function gotoPage(target: number): void {
-    const next = clampPage(target, dataRef.current.entries, sizeRef.current)
+    const next = clampPage(target, dataRef.current.matched, sizeRef.current)
     if (next === pageRef.current) return
     applyPage(next)
     pendingScrollRef.current = 0
+    void loadPanel()
   }
 
-  /**
-   * 换每页条数：页码按「当前第一条」换算，用户不会被甩回第一页 ——
-   * 停在第 3 页（每页 50，即第 101 条）改成每页 100，应当落在第 2 页的第 101 条上。
-   */
   function onSizeChange(next: PageSizeChoice): void {
-    if (next === sizeRef.current) return
-    const total = dataRef.current.entries.length
-    const first = total ? (pageRef.current - 1) * (sizeRef.current === 'all' ? total : sizeRef.current) : 0
+    if (next === 'all' || next === sizeRef.current) return
+    const first = (pageRef.current - 1) * sizeRef.current
     applySize(next)
-    applyPage(next === 'all' ? 1 : Math.floor(first / next) + 1)
+    applyPage(Math.floor(first / next) + 1)
     pendingScrollRef.current = 0
+    void loadPanel()
   }
 
   /* ─── 筛选控件的事件 ─────────────────────── */
@@ -843,15 +826,11 @@ function LogsPanel() {
   /* ─── 渲染 ─────────────────────────────── */
 
   const entries = data.entries
-  const paged = size !== 'all'
-  const pageCount = Math.max(1, paged ? Math.ceil(entries.length / size) : 1)
+  const pageCount = Math.max(1, Math.ceil(data.matched / size))
   const currentPage = Math.min(Math.max(1, page), pageCount)
-  const rows = paged
-    ? entries.slice((currentPage - 1) * size, currentPage * size)
-    : entries
-  /** 本页显示的区间（1 起闭区间）：给页脚的「当前第 a–b 条」用 */
-  const pageRangeStart = entries.length ? (paged ? (currentPage - 1) * size + 1 : 1) : 0
-  const pageRangeEnd = entries.length ? (paged ? pageRangeStart + rows.length - 1 : entries.length) : 0
+  const rows = entries
+  const pageRangeStart = entries.length ? (currentPage - 1) * size + 1 : 0
+  const pageRangeEnd = entries.length ? pageRangeStart + rows.length - 1 : 0
   const categories = data.categories
 
   /**
@@ -859,9 +838,7 @@ function LogsPanel() {
    * 脱敏」的读数 —— 随「不看脱敏」开关一起移除，现在这两个数字就是后端给的原值。
    * 加载完之前保持骨架里那枚「—」。
    */
-  const badgeText = data.matched === data.total
-    ? t('{n} 条', { n: data.total })
-    : t('{matched} / {total} 条', { matched: data.matched, total: data.total })
+  const badgeText = t('已存储 {total} 条／上限 {max} 条', { total: data.total, max: data.max })
 
   /** 顶栏那枚是本页徽标的镜像（app.js 的 renderTopbarStatus 按 id 读文案与配色）：文案一变
    *  就让它跟上，否则要等下一次主状态轮询（20 秒）才同步。 */
@@ -905,7 +882,7 @@ function LogsPanel() {
         <Badge id='logs-badge' variant='outline' data-tone=''>{data.loaded ? badgeText : '—'}</Badge>
         <div className='head-actions'>
           <Button id='btn-logs-export' variant='outline' disabled={busy !== null}
-            onClick={() => void exportLogs()}>{busyExport ? busy?.label : t('导出')}</Button>
+            onClick={() => void exportLogs()}>{busyExport ? busy?.label : t('导出全部')}</Button>
           <Button id='btn-logs-clear' variant='destructive' disabled={busy !== null}
             onClick={() => void clearLogs()}>{busyClear ? busy?.label : t('清空')}</Button>
         </div>
@@ -949,6 +926,15 @@ function LogsPanel() {
               ))}
             </SelectContent>
           </Select>
+          <Select value={filters.taskId} onValueChange={next => onSelectChange({ taskId: String(next ?? '') })}>
+            <SelectTrigger id='logs-task' className='min-w-[150px]' aria-label={t('按定时任务筛选')}>
+              <SelectValue>{filters.taskId ? (data.tasks[filters.taskId] || filters.taskId) : t('全部定时任务')}</SelectValue>
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value=''>{t('全部定时任务')}</SelectItem>
+              {Object.entries(data.tasks).map(([value, label]) => <SelectItem key={value} value={value}>{t(label)}</SelectItem>)}
+            </SelectContent>
+          </Select>
           {/* 搜索框：InputGroup + addon 图标（与 input-control.tsx 的用法一致）。w-auto flex-auto
               压掉组件库的 w-full（tailwind-merge 按同类属性判胜），让它继续当筛选行里唯一的弹性项
               —— 旧 CSS 的 `.log-filters input[type="search"] { flex: 1 1 140px }` 会被分层
@@ -968,13 +954,9 @@ function LogsPanel() {
         </div>
       </div>
 
-      {/* 读数 / 每页条数 / 跳页 / 翻页器交给通用表格外壳（table-shell.tsx）：五张表一套。
-          翻页只重绘不打接口（数据一次拉满，见 gotoPage），换档位同理 —— 所以这里能给出
-          「全部」那一档。页脚左侧原先还有两句说明（日志文件路径 / 429 切换文案），
-          按用户要求移除；`#logs-file` 那个元素随之消失，全仓无其它引用。 */}
       <TableFooter
-        total={entries.length}
-        range={paged ? { start: pageRangeStart, end: pageRangeEnd } : null}
+        total={data.matched}
+        range={{ start: pageRangeStart, end: pageRangeEnd }}
         page={currentPage}
         pageCount={pageCount}
         size={size}
@@ -1024,11 +1006,17 @@ declare global {
       applyAutoRefresh(task: IntervalTask | null): void
       /** 跳转入口：预设分类并切页（tasks-panel.js:710 的「查看签到日志」） */
       showCategory(category: string): Promise<void>
+  showTask(taskId: string): Promise<void>
     }
   }
 }
 
-window.wbLogsPanel = { load, render, lastStats, applyAutoRefresh, showCategory }
+async function showTask(taskId: string): Promise<void> {
+  if (!handle) { pendingTask = taskId; return }
+  await handle.showTask(taskId)
+}
+
+window.wbLogsPanel = { load, render, lastStats, applyAutoRefresh, showCategory, showTask }
 
 // 首屏加载不在这里发：由组件的挂载 effect 负责（挂载前的 load() 调用会被那次覆盖，见模块级
 // load 的说明）。自动刷新先按兜底值起表，读到配置后 applyAutoRefresh 会重启定时器。

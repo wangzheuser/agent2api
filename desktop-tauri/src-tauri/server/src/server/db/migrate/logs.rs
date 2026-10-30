@@ -91,7 +91,7 @@ pub(super) fn legacy_file(dir: &Path) -> Option<PathBuf> {
 /// 得到不同的 level/category」。
 ///
 /// ── 导入后为什么要裁一遍 ────────────────────────────────────
-/// 旧文件里可能含着已经超出保留期、或超出 `MAX_ENTRIES` 的行（旧实现是靠
+/// 旧文件里可能含着已经超出保留期、或超出当前容量的行（旧实现是靠
 /// 启动时的 `load()` 把内存裁到合规，文件下一次写入才收敛 —— 所以**盘上
 /// 留着超期行是常态**）。直接整批搬进来会让迁移后的库里立刻超限。
 /// 裁法与运行期同源：先按时间（`logs_store::LogStore::retention_cutoff_ms`
@@ -186,6 +186,7 @@ fn parse_jsonl(text: &str) -> Vec<LogEntry> {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("server");
         parsed.push(LogEntry {
+            task_id: None,
             // id 缺失时按**行号**兜底 —— 旧 `load()` 就是
             // `parsed.len() as u64 + 1`（注意是「已收下的条数」而不是原始行号：
             // 坏行跳过后序号会往前挤，与旧实现一致）
@@ -271,8 +272,8 @@ fn write_logs(conn: &Connection, entries: &[LogEntry]) -> rusqlite::Result<(usiz
         // —— 覆盖会丢掉库里那条（它可能带着运行期补充的信息），
         // 而两份内容本就同源，忽略是唯一安全的选择。
         let changed = tx.execute(
-            "INSERT OR IGNORE INTO logs (id, ts, level, category, message, data) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT OR IGNORE INTO logs (id, ts, level, category, message, data, message_search) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 id,
                 entry.ts,
@@ -280,6 +281,7 @@ fn write_logs(conn: &Connection, entries: &[LogEntry]) -> rusqlite::Result<(usiz
                 entry.category,
                 entry.message,
                 entry.data.as_ref().map(|item| item.to_string()),
+                entry.message.to_lowercase(),
             ],
         )?;
         if changed > 0 {
@@ -306,16 +308,14 @@ fn write_logs(conn: &Connection, entries: &[LogEntry]) -> rusqlite::Result<(usiz
         .and_then(|naive| chrono::TimeZone::from_local_datetime(&chrono::Local, &naive).earliest())
         .map(|value| chrono::DateTime::timestamp_millis(&value))
         .unwrap_or(0);
+    // 先保存本批高水位，超期记录全部被删也不能复用历史 ID。
+    let max: Option<i64> = tx.query_row("SELECT MAX(id) FROM logs", [], |row| row.get(0))?;
+    logs_store::sql_raise_next_id(&tx, max.unwrap_or(0).max(0) as u64 + 1)?;
     tx.execute("DELETE FROM logs WHERE ts < ?1", params![cutoff])?;
     tx.execute(
         "DELETE FROM logs WHERE id NOT IN (SELECT id FROM logs ORDER BY id DESC LIMIT ?1)",
-        params![logs_store::MAX_ENTRIES as i64],
+        params![settings.log_max_entries],
     )?;
-    // 高水位抬到 MAX(id) + 1（理由见函数说明）。`raise_next_id` 只在更高时才写，
-    // 所以这里给它「下一个可用 id」而不是「当前最大 id」。
-    let max: Option<i64> = tx.query_row("SELECT MAX(id) FROM logs", [], |row| row.get(0))?;
-    let next = max.unwrap_or(0).max(0) as u64 + 1;
-    logs_store::sql_raise_next_id(&tx, next)?;
     tx.commit()?;
     Ok((imported, skipped))
 }
@@ -386,6 +386,29 @@ fn find_free_id(used: &HashSet<i64>, start: u64) -> Option<i64> {
         candidate += 1;
     }
     None
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_import_uses_current_capacity_and_preserves_expired_id_high_water() {
+        let (db, _temp) = crate::server::db::test_temp::TempDb::open("legacy-log-capacity");
+        let lines = (1..=1500).map(|id| serde_json::json!({
+            "id":id,"ts":crate::server::logging::now_ms(),"message":"Ä legacy"
+        }).to_string()).collect::<Vec<_>>().join("\n");
+        let entries = parse_jsonl(&lines);
+        db.with(|conn| write_logs(conn, &entries)).unwrap().unwrap();
+        let store = logs_store::LogStore::with_db(Some(db.clone()), || 30);
+        assert_eq!(store.len(), 1000);
+        assert_eq!(store.query(&logs_store::Query { keyword:Some("ä legacy".into()), ..Default::default() }).matched, 1000);
+        let expired = parse_jsonl("{\"id\":99999,\"ts\":1,\"message\":\"expired\"}");
+        db.with(|conn| write_logs(conn, &expired)).unwrap().unwrap();
+        let new = store.append(logs_store::NewEntry { level:"info",category:"server",message:"after import",data:None,ts:None }).unwrap();
+        assert!(new.id > 99999);
+        assert!(store.query(&logs_store::Query::default()).entries.iter().all(|entry| entry.task_id.is_none()));
+    }
 }
 
 // 这里原本有一个 `count_logs`（「表非空即跳过」的幂等闸门）。**已删除**：

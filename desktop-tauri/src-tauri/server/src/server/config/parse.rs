@@ -122,6 +122,7 @@ pub(super) fn days_field(map: &Map<String, Value>, key: &str, default: i64) -> i
 pub(super) fn retention_from(map: &Map<String, Value>) -> RetentionSettings {
     let defaults = RetentionSettings::default();
     RetentionSettings {
+        log_max_entries: bounded_int_field(map, KEY_LOG_MAX_ENTRIES, defaults.log_max_entries, LOG_MIN_ENTRIES, LOG_MAX_ENTRIES),
         log_days: days_field(map, KEY_LOG_RETENTION_DAYS, defaults.log_days),
         request_days: days_field(map, KEY_REQUEST_RETENTION_DAYS, defaults.request_days),
         daily_days: days_field(map, KEY_DAILY_RETENTION_DAYS, defaults.daily_days),

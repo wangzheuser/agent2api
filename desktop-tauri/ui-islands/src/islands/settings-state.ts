@@ -917,6 +917,11 @@ function askRetentionShrink(head: string): Promise<boolean> {
 
 /** 改小保留期会立即删数据，文案必须点名「删的是哪一档」 */
 function shrinkPromptHead(field: NumberField, previous: number | null, days: number): string {
+  if (field.key === 'logMaxEntries') {
+    return previous === null
+      ? t('没能读到当前日志上限，改为 {count} 条可能删除超出的历史日志。', { count: days })
+      : t('事件日志上限将从 {previous} 条改为 {count} 条，超出的最旧日志会立即删除。', { previous, count: days })
+  }
   return previous === null
     ? t('没能读到「{label}」的当前值，改为 {days} 天可能会删除超出的历史数据。', {
       label: field.label, days,
@@ -935,7 +940,7 @@ export async function saveRetentionField(field: NumberField, raw: string): Promi
   // 遮罩已经挡住了页面，走到这里只剩键盘 Tab 之类的少数路径，挡一下成本极低。
   if (snapshot.retentionConfirm) return
 
-  const parsed = parseInteger(raw, field.min, field.max, t('天数'))
+  const parsed = parseInteger(raw, field.min, field.max, field.key === 'logMaxEntries' ? t('条数') : t('天数'))
   if (!parsed.ok) { toast(parsed.message, 'err'); return }
 
   const known = snapshot.retention.values?.[field.key]
@@ -967,11 +972,16 @@ async function commitRetention(field: NumberField, days: number, shrinking: bool
   if (optimistic) publish({ retention: { status: 'ready', values: { ...optimistic, [field.key]: days } } })
   try {
     const saved = await shared().workbuddyDesktop?.saveRetention({ [field.key]: days })
+    void window.wbLogsPanel?.load({ resetPage: true })
     // PUT 契约上返回生效后的**三项**值，正常情况下用响应刷新即可，不必再跑一趟 GET
     renderRetention(saved)
     const values = snapshot.retention.values
     if (RETENTION_FIELDS.every(item => Number.isInteger(values?.[item.key]))) {
       const applied = values?.[field.key] ?? days
+      if (field.key === 'logMaxEntries') {
+        toast(t('✅ 日志上限已设为 {count} 条，保存后立即生效', { count: applied }))
+        return
+      }
       toast(shrinking
         ? t('✅ 已保留 {days} 天，超出部分已清理', { days: applied })
         : t('✅ 已保留 {days} 天', { days: applied }))
@@ -980,6 +990,12 @@ async function commitRetention(field: NumberField, days: number, shrinking: bool
     // 响应里三项没齐（换壳后接口形状变了之类）：退回一次 GET 补齐，
     // 宁可多跑一趟，也不能停在「界面说改了、其实没读到真值」的状态
     await loadRetention()
+    if (field.key === 'logMaxEntries') {
+      const applied = snapshot.retention.values?.[field.key]
+      if (applied !== days) throw new Error(t('未能确认日志上限已保存，请刷新后重试'))
+      toast(t('✅ 日志上限已设为 {count} 条，保存后立即生效', { count: applied }))
+      return
+    }
     // 这里提示用户填的值：GET 也没读到真值时，报后端返回的值反而更让人困惑
     toast(shrinking
       ? t('✅ 已保留 {days} 天，超出部分已清理', { days })

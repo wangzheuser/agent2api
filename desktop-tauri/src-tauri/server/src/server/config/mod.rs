@@ -1231,34 +1231,43 @@ pub fn update_raw_field(key: &str, value: Value) -> bool {
     })
 }
 
-/// 更新三档保留天数（`None` = 该项不动），返回是否写盘成功。
+/// 更新保留天数与日志容量（`None` = 该项不动），返回是否写盘成功。
 ///
 /// 调用方（`stats_api::put_retention`）**必须先校验范围**：本函数按「已合法」
 /// 处理，越界值会被 `days_field` 的回读逻辑丢弃（那会让用户以为设置生效了）。
 ///
-/// 内存快照与 raw 底稿一起改（与 `set_api_key` 同一模式）：前者让下一次裁剪
-/// 立刻用新值，后者保证写盘时不会把字段吃掉。无论写盘成功与否内存都已更新
-/// （与其它 setter 一致），所以「设置页保存 → 立即清理」不依赖磁盘 IO。
+/// 先持久化再发布内存快照，写入失败时不能触发历史清理。
 pub fn set_retention(patch: RetentionPatch) -> bool {
-    update(|config| {
-        let mut next = config.retention;
-        // 只写传进来的项：缺省项保持原值，也**不落盘**成默认值 ——
-        // 否则「只改日志天数」会把另外两项一并固化成默认值，抹掉用户设置
-        let mut apply = |key: &str, value: Option<i64>, slot: &mut i64| {
-            if let Some(days) = value {
-                config.raw.insert(key.to_string(), Value::from(days));
-                *slot = days;
-            }
-        };
-        apply(KEY_LOG_RETENTION_DAYS, patch.log_days, &mut next.log_days);
-        apply(
-            KEY_REQUEST_RETENTION_DAYS,
-            patch.request_days,
-            &mut next.request_days,
-        );
-        apply(KEY_DAILY_RETENTION_DAYS, patch.daily_days, &mut next.daily_days);
-        config.retention = next;
-    })
+    let Some(db) = db() else { return false };
+    // 恢复边界内不能发布旧配置；保持 LOGS → DB → CONFIG，锁内不记录日志。
+    let _logs_guard = crate::server::logging::store_ref().map(|logs| logs.guard());
+    db.with(|conn| {
+        let Ok(mut guard) = CONFIG.write() else { return false };
+        let mut config = guard.clone().unwrap_or_default();
+        {
+            let mut next = config.retention;
+            // 只写传进来的项：缺省项保持原值，也**不落盘**成默认值 ——
+            // 否则「只改日志天数」会把另外两项一并固化成默认值，抹掉用户设置
+            let mut apply = |key: &str, value: Option<i64>, slot: &mut i64| {
+                if let Some(days) = value {
+                    config.raw.insert(key.to_string(), Value::from(days));
+                    *slot = days;
+                }
+            };
+            apply(KEY_LOG_RETENTION_DAYS, patch.log_days, &mut next.log_days);
+            apply(KEY_LOG_MAX_ENTRIES, patch.log_max_entries, &mut next.log_max_entries);
+            apply(
+                KEY_REQUEST_RETENTION_DAYS,
+                patch.request_days,
+                &mut next.request_days,
+            );
+            apply(KEY_DAILY_RETENTION_DAYS, patch.daily_days, &mut next.daily_days);
+            config.retention = next;
+        }
+        let saved = sql::write_conn(conn, &config.raw).is_ok();
+        if saved { *guard = Some(config); }
+        saved
+    }).unwrap_or(false)
 }
 
 /// 更新一条间隔型任务（`None` = 该项不动），返回是否写盘成功。

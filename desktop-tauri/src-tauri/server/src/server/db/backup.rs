@@ -577,19 +577,29 @@ pub fn import_from_file(db: &Db, source: &Path, config_dir: &Path) -> Result<Val
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
+    // 覆盖与配置发布期间阻止日志写入/查询，避免旧保留策略误裁恢复的数据。
+    let logs = logging::store_ref().filter(|logs| logs.file() == db.file());
+    let logs_guard = logs.map(|logs| logs.guard());
     let safety = db
         .with_mut(|main| safety_backup(main, config_dir).and_then(|safety| {
             let backup = Backup::new(conn, main).map_err(|e| format!("初始化恢复失败: {e}"))?;
             complete_backup(&backup, "恢复主数据库")?;
+            if let Some(logs) = logs {
+                logs.invalidate_snapshot();
+            }
             Ok(safety)
         }))
         .unwrap_or_else(|| Err("数据库连接不可用，恢复未执行".to_string()));
     let safety = safety?;
 
-    // 锁已释放：重装内存态（config 快照、面板刷新令牌），短效令牌清空。
+    // DB 锁已释放，日志边界仍持有；先完成必要收尾，再处理可失败的日志清理。
     crate::server::config::reload();
     crate::server::access::load_refresh_tokens();
     crate::server::access::clear_access_tokens();
+    drop(logs_guard);
+    if let Some(logs) = logs {
+        logs.try_prune().map_err(|error| format!("数据库已恢复，但事件日志裁剪失败：{error}；替换前备份位于 {}", safety.display()))?;
+    }
 
     let safety_name = safety
         .file_name()

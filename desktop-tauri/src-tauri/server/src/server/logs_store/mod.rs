@@ -20,19 +20,7 @@
 //!   - `next_id` 不再靠 `load()` 扫最大值推导（见下面 `id` 一节）。
 //! 上述三个字段与 `COMPACT_STEP` 因此**全部删除**。
 //!
-//! ── `MAX_ENTRIES = 500` 保留（它是产品语义）────────────────────
-//! 容量上限不是文件机制的副产物，而是「日志页与导航徽标只关心最近 500 条」
-//! 这条产品约定，Node 版与改造前都有。它现在表现为一条 `DELETE`（见
-//! `sql::trim_to_capacity`），语义与旧实现的 `drain(0..溢出)` 逐字相同。
-//!
-//! ── 两个保留约束（取更严的那个）─────────────────────────────
-//!   - **时间维度**：可配置的保留天数（默认 30 天，见
-//!     `config::DEFAULT_LOG_RETENTION_DAYS`），管「最多多久」；
-//!   - **容量维度**：`MAX_ENTRIES = 500`，管「最多多少条」。
-//! 天数由外部回调提供（构造函数的第二个参数），**每次裁剪时动态取** ——
-//! 于是设置页改完天数下一次写入就生效，不需要重启进程；回调读的是
-//! `config::retention_settings()` 的内存快照（不读盘）。这条机制**保持不变**，
-//! 只是裁剪动作从「内存 retain」变成 SQL `DELETE`。
+//! 日志同时受保留天数与可配置条数限制；查询分页上限与存储容量独立。
 //!
 //! ── `id`：单调递增，且**只有 `clear()` 会回退**（本切片最需要小心的地方）──
 //! `id` 的单调性是**有消费方依赖的不变量**，不是实现细节：
@@ -60,6 +48,8 @@
 //! JSON 字段名与 Node 版一致：`id/ts/level/category/message/data`。
 
 mod sql;
+#[cfg(test)]
+mod tests;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
@@ -71,11 +61,8 @@ use serde_json::{Map, Value};
 use crate::server::config;
 use crate::server::db::Db;
 
-/// 日志表的行数上限（环形容量，超出丢最旧的）。
-///
-/// 名字里的 `ENTRIES` 沿用 Node 版 `MAX_ENTRIES` 的对外命名（`logs_api` 把它
-/// 当响应里的 `max` 字段透出），语义从「内存保留条数」变成「表里的行数上限」。
-pub const MAX_ENTRIES: usize = 500;
+/// 单次查询上限，不是存储容量。
+pub const MAX_QUERY_LIMIT: usize = 10_000;
 /// 日志级别，数值越大越严重（用于「该级别及以上」筛选）
 pub const LEVELS: [&str; 4] = ["debug", "info", "warn", "error"];
 /// 分类字典：与桌面端筛选下拉一致（key → 中文标签）。
@@ -109,6 +96,8 @@ const MAX_DATA_KEYS: usize = 24;
 /// 也仍是查询结果的元素类型。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LogEntry {
+    #[serde(default, rename = "taskId", skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
     pub id: u64,
     pub ts: i64,
     pub level: String,
@@ -125,6 +114,9 @@ pub struct QueryResult {
     pub entries: Vec<LogEntry>,
     pub total: usize,
     pub matched: usize,
+    pub snapshot_id: u64,
+    pub snapshot_epoch: String,
+    pub snapshot_reset: bool,
 }
 
 /// 统计结果：各级别/分类计数（导航徽标与筛选下拉用）
@@ -143,6 +135,10 @@ pub struct Stats {
 #[derive(Clone, Debug, Default)]
 pub struct Query {
     pub limit: Option<usize>,
+    pub offset: usize,
+    pub snapshot_id: Option<u64>,
+    pub snapshot_epoch: Option<String>,
+    pub task_id: Option<String>,
     /// 级别下限：debug < info < warn < error，选中级别及以上都返回
     pub level: Option<String>,
     pub category: Option<String>,
@@ -291,6 +287,7 @@ pub struct LogStore {
     /// 用 `Arc` 是为了让 `LogStore` 本身仍能放进 `OnceLock`（不需要 `&self`
     /// 生命周期）。
     get_retention_days: Arc<dyn Fn() -> i64 + Send + Sync>,
+    get_max_entries: Arc<dyn Fn() -> usize + Send + Sync>,
     /// 串行化「读-判断-写」这个周期。
     ///
     /// 真正把语句串起来的是 `Db` 内部那把锁（每个操作在一次 `Db::with` 调用里
@@ -298,6 +295,7 @@ pub struct LogStore {
     /// 保持原子 —— 与改造前那把锁保护的**周期**相同，只是保护的对象从
     /// 「内存 + 文件」换成了「数据库访问」。
     inner: Mutex<()>,
+    snapshot_epoch: RwLock<String>,
 }
 
 impl LogStore {
@@ -322,6 +320,14 @@ impl LogStore {
         db: Option<Db>,
         get_retention_days: impl Fn() -> i64 + Send + Sync + 'static,
     ) -> Self {
+        Self::with_limits(db, get_retention_days, || config::retention_settings().log_max_entries as usize)
+    }
+
+    pub fn with_limits(
+        db: Option<Db>,
+        get_retention_days: impl Fn() -> i64 + Send + Sync + 'static,
+        get_max_entries: impl Fn() -> usize + Send + Sync + 'static,
+    ) -> Self {
         let file_path = match db.as_ref() {
             Some(db) => db.file().to_path_buf(),
             None => config::config_dir().join(crate::server::db::FILE_NAME),
@@ -330,14 +336,21 @@ impl LogStore {
             db,
             file_path: RwLock::new(file_path),
             get_retention_days: Arc::new(get_retention_days),
+            get_max_entries: Arc::new(get_max_entries),
             inner: Mutex::new(()),
+            snapshot_epoch: RwLock::new(new_snapshot_epoch()),
         }
+    }
+
+    /// 清空/整库恢复会复用 ID。调用方在数据库锁内换代，不再取日志锁。
+    pub fn invalidate_snapshot(&self) {
+        *self.snapshot_epoch.write().unwrap_or_else(|e| e.into_inner()) = new_snapshot_epoch();
     }
 
     /// 取锁；锁中毒（某次持锁 panic）时接管继续用 —— 与 `AccountStore::guard`
     /// 同一取向：这把锁保护的是「周期」而不是数据本身，锁内没有会被 panic
     /// 打断的中间态；真正的数据一致性由数据库事务保证。
-    fn guard(&self) -> MutexGuard<'_, ()> {
+    pub(crate) fn guard(&self) -> MutexGuard<'_, ()> {
         match self.inner.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -428,24 +441,24 @@ impl LogStore {
             .unwrap_or(0)
     }
 
-    /// 立即按当前保留天数裁剪（供「改小保留天数后立即清理」用）。
-    ///
-    /// 只按**时间维度**裁：容量维度（`MAX_ENTRIES`）在 `append` 里已经守住，
-    /// 且改保留天数不会让条数超限。返回裁掉的条数（供调用方打一行控制台日志，
-    /// 确认「改小天数确实删了东西」）。
-    ///
-    /// 与改造前的分工**一字未变**：那里是「内存 retain + 立刻整文件落盘」，
-    /// 这里是「一条 DELETE」——「立刻生效」在数据库上天然成立（没有延迟落盘
-    /// 这一说），所以那段「为什么必须立即落盘而不是等下次写入」的注释不再需要。
-    ///
-    /// 降级：库不可用时返回 0（「没删掉东西」是唯一诚实的答案 ——
-    /// 谎报一个删除条数会让设置页显示「已清理 N 条」而磁盘上什么也没发生）。
-    pub fn prune(&self) -> usize {
+    pub fn max_entries(&self) -> usize {
+        (self.get_max_entries)().clamp(config::LOG_MIN_ENTRIES as usize, config::LOG_MAX_ENTRIES as usize)
+    }
+
+    /// 显式清理返回错误，设置接口不能把裁剪失败伪装成零条。
+    pub fn try_prune(&self) -> Result<usize, String> {
         let guard = self.guard();
         let cutoff = self.retention_cutoff_ms();
-        self.with_conn(&guard, |conn| sql::delete_expired(conn, cutoff, None))
-            .unwrap_or(0)
+        let max = self.max_entries();
+        self.with_conn_mut(&guard, |conn| {
+            let tx = conn.transaction()?;
+            let removed = sql::delete_expired(&tx, cutoff)? + sql::trim_to_capacity(&tx, max)?;
+            tx.commit()?;
+            Ok(removed)
+        }).ok_or_else(|| "日志裁剪失败：数据库不可用或写入失败".to_string())
     }
+
+    pub fn prune(&self) -> usize { self.try_prune().unwrap_or(0) }
 
     /// 追加一条日志，返回生成的条目。
     ///
@@ -458,17 +471,12 @@ impl LogStore {
     /// `load()` 那一步去收敛它们（那是文件时代特有的补偿机制）。
     ///
     /// ── 两个保留约束依次生效（取更严的那个）─────────────────────
-    /// ① 时间维度：删 `ts < cutoff` 的行。**例外：刚写入的这条**
-    ///    （按 id 精确排除）即使超期也留下 —— `append` 的契约是「返回写入的
-    ///    条目」，不能返回一条当场就被删掉的记录（`ts` 允许补写历史，
-    ///    所以「刚写的这条超期」是真实可达的）。这条例外逐字保留。
-    /// ② 容量维度：`MAX_ENTRIES`。**只在超限时**发那条 DELETE
+    /// ① 时间维度：删 `ts < cutoff` 的行，补写历史也按其日志时间执行保留规则。
+    /// ② 容量维度：当前配置上限。**只在超限时**发那条 DELETE
     ///    （改造前是 `if len > MAX` 才 drain，同样是按需）。
     ///
     /// ── 返回值的保证 ──────────────────────────────────────────
-    /// 只要插入成功就返回那条记录 —— 裁剪**不会**把它删掉：① 的例外按 id
-    /// 排除了它，② 保留的是 id 最大的 N 条而它刚拿到当前最大 id。
-    /// 因此返回值只依赖插入是否成功，不依赖后续裁剪的结果。
+    /// 事务成功后返回分配的记录；补写的超期记录可能已被同一事务裁掉。
     ///
     /// 降级：库不可用时返回 None（调用方 `logging::log` 本来就把返回值丢掉，
     /// 丢一条日志不影响任何业务）。
@@ -480,6 +488,7 @@ impl LogStore {
 
         let guard = self.guard();
         let cutoff = self.retention_cutoff_ms();
+        let max = self.max_entries();
         let ts = entry.ts.unwrap_or_else(crate::server::logging::now_ms);
         let level = normalize_level(entry.level);
         let category = normalize_category(entry.category);
@@ -490,89 +499,48 @@ impl LogStore {
             // id 由 kv 里的高水位分配（不能靠 rowid 自增：它会复用被删掉的号，
             // 见 `sql.rs` 模块头的实测结论）
             let id = sql::allocate_next_id(&tx)?;
-            let record = LogEntry { id, ts, level, category, message: text, data };
+            let record = LogEntry { id, ts, level, category, message: text, data, task_id: crate::server::logging::current_task_id().map(str::to_string) };
             sql::insert(&tx, &record)?;
-            sql::delete_expired(&tx, cutoff, Some(id))?;
-            if sql::count_all(&tx)? > MAX_ENTRIES {
-                sql::trim_to_capacity(&tx, MAX_ENTRIES)?;
-            }
+            sql::delete_expired(&tx, cutoff)?;
+            sql::trim_to_capacity(&tx, max)?;
             tx.commit()?;
             Ok(record)
         })
     }
 
-    /// 查询：按级别（含以上）、分类、关键词、起始 id、时间区间过滤，
-    /// 倒序返回最新在前。
-    /// `limit` 语义与 Node 版一致：对过滤结果取**最后** N 条（即最新的 N 条）。
-    ///
-    /// `start` / `end` 是**新增的可选**条件（闭开区间 `[start, end)`，
-    /// 单位毫秒）：不传时（None）过滤链与以前完全一致 —— 这是向后兼容的关键，
-    /// 老调用方与老前端拿到的结果不会因为多了时间维度而变。
-    ///
-    /// ── `limit` 的语义怎么保证与改造前逐字一致 ──────────────────
-    /// 旧实现是「对过滤结果取尾部 N 条」（数组按写入顺序排，尾部即最新），
-    /// 再 `reverse()` 成倒序。现在 `sql::select_matching_desc` 返回的是
-    /// **按 id 降序的全部命中行**（已经是最新在前），这里只做一次
-    /// `truncate(size)` ——「截前 N 条」等价于旧实现的「取尾部 N 条再倒序」。
-    /// **关键词过滤发生在截断之前**（在 SQL 取回那一步就过滤掉了，见
-    /// `sql::FilterPlan`），与旧实现「先跑完整过滤链再切片」的顺序相同。
-    ///
-    /// 降级：库不可用时返回全空（`QueryResult` 三个字段都是自然的空值形态：
-    /// 前端把空 entries 渲染成「暂无日志」，不会崩也不会误报有内容）。
+    /// 一个读事务内完成快照、总数和当前页，不能拉回全部记录再切片。
     pub fn query(&self, query: &Query) -> QueryResult {
         let guard = self.guard();
-        let plan = sql::FilterPlan::of(query);
-        let loaded = self.with_conn(&guard, |conn| {
-            let total = sql::count_all(conn)?;
-            let entries = sql::select_matching_desc(conn, &plan)?;
-            Ok((total, entries))
-        });
-        let Some((total, filtered)) = loaded else {
-            return QueryResult { entries: Vec::new(), total: 0, matched: 0 };
-        };
-
-        let matched = filtered.len();
-        // limit 缺省 200，并夹在 [1, MAX_ENTRIES]（对应 Node 版 Math.min/Math.max）
-        let size = query.limit.unwrap_or(200).clamp(1, MAX_ENTRIES);
-        let mut entries = filtered;
-        entries.truncate(size);
-        QueryResult { entries, total, matched }
+        self.with_conn_mut(&guard, |conn| {
+            let snapshot_epoch = self.snapshot_epoch.read().unwrap_or_else(|e| e.into_inner()).clone();
+            let snapshot_reset = query.snapshot_epoch.as_ref().is_some_and(|epoch| epoch != &snapshot_epoch);
+            let tx = conn.transaction()?;
+            let total = sql::count_all(&tx)?;
+            let snapshot_id = if snapshot_reset { sql::max_id(&tx)? } else { query.snapshot_id.unwrap_or(sql::max_id(&tx)?) };
+            let mut snapshot = query.clone();
+            snapshot.snapshot_id = Some(snapshot_id);
+            let plan = sql::FilterPlan::of(&snapshot);
+            let matched = sql::count_matching(&tx, &plan)?;
+            let entries = sql::select_page(&tx, &plan, query.limit.unwrap_or(200).clamp(1, MAX_QUERY_LIMIT), if snapshot_reset { 0 } else { query.offset })?;
+            tx.commit()?;
+            Ok(QueryResult { total, matched, entries, snapshot_id, snapshot_epoch, snapshot_reset })
+        }).unwrap_or(QueryResult { total: 0, matched: 0, entries: Vec::new(), snapshot_id: 0, snapshot_epoch: String::new(), snapshot_reset: false })
     }
 
-    /// 按筛选条件删除：返回（删除条数，删除后的统计）。
-    ///
-    /// 与 `clear()` 的差别：只删命中的条目，未命中的保留；**id 不回退**
-    /// （保持单调递增）—— 已读水位（导航徽标）依赖「新条目 id > 旧水位」，
-    /// 删除后这条性质依然成立。高水位存在 `kv` 里，删行根本不碰它。
-    ///
-    /// ── 过滤条件与 `query` 共用同一份构造 ──────────────────────
-    /// 两者都先用 `sql::FilterPlan::of(query)` 编译条件、再走同一个
-    /// `sql::select_matching_desc` ——「查询里看到的 N 条」与「这里删掉的 N 条」
-    /// 因此是**同一批**，不再需要靠两处手写保持一致（旧实现在内存里共用
-    /// `Query::matches`；现在共用的层次更靠下：连 SQL 的 WHERE 片段都是同一份）。
-    /// `limit` 不参与（`FilterPlan` 只编译筛选条件，它不算筛选）。
-    ///
-    /// 实现上「先按 id 查出命中的行、再按 id 删除」两步在**一个事务**里：
-    /// 关键词必须在 Rust 侧过滤（`sql.rs` 模块头有理由），所以没法把条件
-    /// 直接塞进一条 DELETE 的 WHERE。
-    ///
-    /// 降级：库不可用时返回 `(0, 空统计)` —— 「一条都没删」。
+    /// 删除使用完整筛选条件，不受分页和快照限制，也不生成海量 ID 占位符。
     pub fn clear_where(&self, query: &Query) -> (usize, Stats) {
         let removed = {
             let guard = self.guard();
-            let plan = sql::FilterPlan::of(query);
+            let mut filter = query.clone();
+            filter.snapshot_id = None;
+            let plan = sql::FilterPlan::of(&filter);
             self.with_conn_mut(&guard, |conn| {
                 let tx = conn.transaction()?;
-                let hits = sql::select_matching_desc(&tx, &plan)?;
-                let ids: Vec<u64> = hits.iter().map(|item| item.id).collect();
-                let removed = sql::delete_by_ids(&tx, &ids)?;
+                let removed = sql::delete_matching(&tx, &plan)?;
                 tx.commit()?;
                 Ok(removed)
-            })
-            .unwrap_or(0)
+            }).unwrap_or(0)
         };
-        // 统计在**新的**一次取锁里重取（`stats()` 自己也要取这把锁，而
-        // `std::sync::Mutex` 不可重入 —— 所以必须先放掉上面那把）
         (removed, self.stats())
     }
 
@@ -595,6 +563,7 @@ impl LogStore {
             by_category.insert(key.to_string(), Value::from(0));
         }
         let file = self.file().to_string_lossy().to_string();
+        let max = self.max_entries();
 
         let loaded = {
             let guard = self.guard();
@@ -609,7 +578,7 @@ impl LogStore {
         let Some((total, last_id, levels, categories)) = loaded else {
             return Stats {
                 total: 0,
-                max: MAX_ENTRIES,
+                max,
                 by_level,
                 by_category,
                 last_id: 0,
@@ -628,7 +597,7 @@ impl LogStore {
             let slot = by_category.entry(category).or_insert_with(|| Value::from(0));
             *slot = Value::from(count.max(0) as u64);
         }
-        Stats { total, max: MAX_ENTRIES, by_level, by_category, last_id, file }
+        Stats { total, max, by_level, by_category, last_id, file }
     }
 
     /// 清空：删掉全部日志并**把 id 重置为 1**，返回清空后的统计
@@ -659,25 +628,37 @@ impl LogStore {
                 sql::delete_all(&tx)?;
                 sql::reset_next_id(&tx)?;
                 tx.commit()?;
+                self.invalidate_snapshot();
                 Ok(())
             });
         }
         self.stats()
     }
 
-    /// 导出为 JSONL 文本（桌面端「导出」按钮用）。空日志返回空串。
-    ///
-    /// **格式一字未变**：一行一条 `LogEntry` 的 JSON（字段顺序由 `serde` 的
-    /// 结构体字段序决定，与改造前同一份 `render_jsonl` 序列化方式），
-    /// 空列表返回空串。数据来源从「内存快照」变成「按 id 升序的一次查询」——
-    /// 顺序与旧的「文件顺序」相同。
-    ///
-    /// 降级：库不可用时返回空串（导出一个空附件，比 500 更能说明「当前没有
-    /// 可导出的内容」；调用方 `download_logs` 直接把它当响应体）。
+    /// 独立只读事务固定导出快照，不占共享写连接；每批最多 500 条。
+    pub fn export_jsonl(&self, mut write: impl FnMut(String) -> Result<(), String>) -> Result<usize, String> {
+        let db = self.db.as_ref().ok_or("日志数据库不可用")?;
+        let mut conn = rusqlite::Connection::open_with_flags(db.file(), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| format!("打开日志导出快照失败：{error}"))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5)).map_err(|error| error.to_string())?;
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let snapshot = sql::max_id(&tx).map_err(|error| error.to_string())?;
+        let mut after = 0;
+        let mut count = 0;
+        loop {
+            let batch = sql::select_export_batch(&tx, after, snapshot).map_err(|error| format!("读取日志导出批次失败：{error}"))?;
+            let Some(last) = batch.last() else { break };
+            after = last.id;
+            count += batch.len();
+            write(render_jsonl(&batch))?;
+        }
+        Ok(count)
+    }
+
     pub fn to_jsonl(&self) -> String {
-        let guard = self.guard();
-        let entries = self.with_conn(&guard, sql::select_all_asc);
-        render_jsonl(&entries.unwrap_or_default())
+        let mut text = String::new();
+        let _ = self.export_jsonl(|batch| { text.push_str(&batch); Ok(()) });
+        text
     }
 
     /// 库里的条目数（Node 版 `createLogStore` 导出的 `get size()` 对等物；
@@ -696,6 +677,10 @@ impl LogStore {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+fn new_snapshot_epoch() -> String {
+    format!("{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos())
 }
 
 /// 把条目列表渲染成 JSONL 文本。空列表返回空串

@@ -2,6 +2,155 @@
   "schema_version": 1,
   "contracts": [
     {
+      "id": "event-log-capacity-retention",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "事件日志默认最多1000条，可配置1至100000；天数与条数同时约束，保存成功立即裁剪，保存失败不发布配置或误删。追加事务、启动、历史导入及备份恢复均应用当前限制；普通裁剪和筛选删除保持ID高水位，不改变请求日志或报表容量。",
+      "source_commits": [
+        "884e59f5827e86ce92c4b2f9f4e792280d77db75"
+      ],
+      "source_note": "本轮在该基线上的未提交扩展；未创建新提交。",
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/config/mod.rs",
+        "desktop-tauri/src-tauri/server/src/server/api/stats_api.rs",
+        "desktop-tauri/src-tauri/server/src/server/logs_store/mod.rs",
+        "desktop-tauri/src-tauri/server/src/server/db/schema.rs",
+        "desktop-tauri/src-tauri/server/src/server/db/migrate/logs.rs",
+        "desktop-tauri/src-tauri/server/src/server/db/backup.rs",
+        "desktop-tauri/src-tauri/server/src/server/access.rs",
+        "desktop-tauri/ui-islands/src/islands/settings-state.ts"
+      ],
+      "tests": [
+        {
+          "id": "case-log-restore-concurrent-policy",
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/logs_store/tests.rs",
+          "name": "server::logs_store::tests::restore_boundary_prevents_append_and_prune_from_caching_old_limits"
+        },
+        {
+          "id": "case-log-capacity-live-high-water",
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/logs_store/tests.rs",
+          "name": "server::logs_store::tests::capacity_changes_prune_immediately_without_resetting_ids"
+        },
+        {
+          "id": "case-log-age-count-atomic",
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/logs_store/tests.rs",
+          "name": "server::logs_store::tests::age_and_capacity_are_both_enforced_and_prune_errors_are_visible"
+        },
+        {
+          "id": "case-log-capacity-api-persistence",
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/logs_retention.rs",
+          "name": "retention_api_persists_immediately_and_never_prunes_on_failed_save"
+        },
+        {
+          "id": "case-log-legacy-import-capacity",
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/db/migrate/logs.rs",
+          "name": "server::db::migrate::logs::retention_tests::legacy_import_uses_current_capacity_and_preserves_expired_id_high_water"
+        },
+        {
+          "id": "case-log-retention-settings-browser",
+          "kind": "browser",
+          "path": "desktop-tauri/ui-islands/tests/task-logs.browser.cjs"
+        }
+      ]
+    },
+    {
+      "id": "event-log-task-attribution",
+      "level": "P1",
+      "status": "必须保留",
+      "behavior": "后台定时与手动执行日志以taskId结构化归属，跨spawn继承且并发不串号，自动积分sweeper覆盖开始和终态；未到期或冷却不伪造执行日志，业务成功、奖励到账及退避判据不变。历史日志不猜测归属；任务卡片可直达任务日志，三个前端刷新任务不列入业务筛选。",
+      "source_commits": [
+        "884e59f5827e86ce92c4b2f9f4e792280d77db75"
+      ],
+      "source_note": "本轮在该基线上的未提交扩展；未创建新提交。",
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/logging.rs",
+        "desktop-tauri/src-tauri/server/src/lib.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/scheduled_tasks.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/usage_query.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/workbuddy_growth.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/update/check.rs",
+        "desktop-tauri/ui-islands/src/islands/tasks-panel.tsx"
+      ],
+      "tests": [
+        {
+          "id": "case-log-concurrent-task-context",
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/logs_store/tests.rs",
+          "name": "server::logs_store::tests::concurrent_task_context_survives_spawn_and_never_leaks"
+        },
+        {
+          "id": "case-log-usage-sweeper-terminal",
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/usage_query.rs",
+          "name": "server::core::usage_query::task_log_tests::automatic_usage_sweeper_logs_start_and_failure_but_not_deferred_runs"
+        },
+        {
+          "id": "case-log-migration-unassigned",
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/logs_store/tests.rs",
+          "name": "server::logs_store::tests::migration_preserves_legacy_messages_and_leaves_task_unassigned"
+        },
+        {
+          "id": "case-log-task-navigation-browser",
+          "kind": "browser",
+          "path": "desktop-tauri/ui-islands/tests/task-logs.browser.cjs"
+        }
+      ]
+    },
+    {
+      "id": "event-log-paged-query-safe-export",
+      "level": "P1",
+      "status": "必须保留",
+      "behavior": "十万条事件日志按服务端分页查询，UI默认50且无全量显示；按用户补充要求支持20/50/100/200/500/1000/2000/5000/10000条，单次最多10000条，不改变其他页面规则。任务、时间、级别、分类、Unicode关键词AND筛选共用SQL。历史快照不因新增挤动，清空或恢复换代后重置；筛选清空删除所有命中且非法条件不退化为全清。批量流式导出全部记录固定一致性快照，失败不得覆盖已有导出文件。",
+      "source_commits": [
+        "884e59f5827e86ce92c4b2f9f4e792280d77db75"
+      ],
+      "source_note": "本轮在该基线上的未提交扩展；未创建新提交。",
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/logs_store/sql.rs",
+        "desktop-tauri/src-tauri/server/src/server/api/logs_api.rs",
+        "desktop-tauri/src-tauri/src/gateway.rs",
+        "desktop-tauri/src-tauri/src/commands.rs",
+        "desktop-tauri/ui-islands/src/islands/logs-panel.tsx"
+      ],
+      "tests": [
+        {
+          "id": "case-log-100k-query-export-clear",
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/logs_store/tests.rs",
+          "name": "server::logs_store::tests::hundred_thousand_logs_page_filter_export_and_delete_without_full_materialization"
+        },
+        {
+          "id": "case-log-export-consistent-snapshot",
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/logs_store/tests.rs",
+          "name": "server::logs_store::tests::export_snapshot_survives_append_prune_and_clear_without_mixing_generations"
+        },
+        {
+          "id": "case-log-page-generation-reset",
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/logs_store/tests.rs",
+          "name": "server::logs_store::tests::cleared_or_restored_log_ids_invalidate_history_page_snapshots"
+        },
+        {
+          "id": "case-log-desktop-atomic-export",
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/src/gateway.rs",
+          "name": "gateway::log_export_tests::failed_stream_preserves_existing_file_and_success_atomically_replaces_it"
+        },
+        {
+          "id": "case-log-server-pagination-browser",
+          "kind": "browser",
+          "path": "desktop-tauri/ui-islands/tests/task-logs.browser.cjs"
+        }
+      ]
+    },
+    {
       "id": "workbuddy-risk-terminal-safety",
       "level": "P0",
       "status": "必须保留",

@@ -348,6 +348,10 @@ fn round_succeeded(succeeded: usize, failed: usize) -> bool {
     failed == 0 || succeeded > 0
 }
 
+pub(crate) fn task_level(succeeded: usize, failed: usize) -> &'static str {
+    if failed == 0 { "info" } else if succeeded > 0 { "warn" } else { "error" }
+}
+
 async fn run_backend(
     store: &AccountStore,
     update: &UpdateManager,
@@ -361,7 +365,6 @@ async fn run_backend(
             .map_err(|error| error.message)?;
         return Ok(if info.get("hasUpdate").and_then(Value::as_bool) == Some(true) {
             let summary = format!("发现新版本 {}（当前 {current}）", info["latestVersion"].as_str().unwrap_or(""));
-            logging::log("[Update]", &summary);
             summary
         } else { "已完成版本检查".to_string() });
     }
@@ -379,89 +382,111 @@ async fn run_backend(
         Claim::Acquired(guard) => guard,
         Claim::Deferred(state) => return Err(state.waiting_message()),
     };
-    let (summary, success) = match task.id {
-        TASK_CREDENTIAL_MAINTENANCE => {
-            let results = crate::server::core::credential_maintenance::refresh_expiring_accounts(store).await;
-            let (refreshed, skipped, failed) = crate::server::core::credential_maintenance::summarize(&results);
-            let summary = format!("刷新 {refreshed} 个，跳过 {skipped} 个，失败 {failed} 个");
-            if refreshed > 0 || failed > 0 {
-                logging::log_with_level("[Maintenance]", &format!("凭证自动维护：{summary}"), if failed > 0 { "error" } else { "info" });
+    logging::task_scope(task.id, async {
+        logging::log_with_level("[Tasks]", &format!("{}开始执行（{}）", task.label, if manual { "手动触发" } else { "自动触发" }), "info");
+        let mut level = "info";
+        let outcome: Result<(String, bool), String> = async {
+            Ok(match task.id {
+                TASK_CREDENTIAL_MAINTENANCE => {
+                    let results = crate::server::core::credential_maintenance::refresh_expiring_accounts(store).await;
+                    let (refreshed, skipped, failed) = crate::server::core::credential_maintenance::summarize(&results);
+                    let summary = format!("刷新 {refreshed} 个，跳过 {skipped} 个，失败 {failed} 个");
+                    level = task_level(refreshed, failed);
+                    (summary, round_succeeded(refreshed, failed))
+                }
+                TASK_MODEL_REFRESH => {
+                    let results = if manual {
+                        crate::server::core::providers::adapter::refresh_implemented_forced(store, &serde_json::Map::new(), None).await
+                    } else {
+                        crate::server::core::providers::adapter::refresh_implemented(store).await
+                    };
+                    let count = |status: &str| results.iter().filter(|item| item["status"] == status).count();
+                    let (refreshed, skipped, failed) = (count("refreshed"), count("skipped"), count("failed"));
+                    // 全跳过的轮次（各家的间隔没到 / 没有可用登录态）在自动路径上是常态：
+                    // 被动刷新与手动刷新会先把间隔推走，这时「成功 0 家」看着像失败，
+                    // 所以这一档单独给一句话说清「本轮无事可做」。
+                    let summary = if refreshed == 0 && failed == 0 {
+                        format!("本轮无需刷新（跳过 {skipped} 家：未到间隔或没有可用登录态）")
+                    } else {
+                        format!("成功 {refreshed} 家，跳过 {skipped} 家，失败 {failed} 家")
+                    };
+                    // models.dev 元数据搭同一条任务（它回答的是同一件事的另一半：清单与
+                    // 元数据一起才是一份能用的模型表），但**排期独立** —— 各家的目录
+                    // 缓存 TTL 与它无关，一方被跳过不该连带另一方也不刷。
+                    //
+                    // 它的失败**不改变本任务的成败**：元数据是补充信息，为它把整轮标成
+                    // 失败会连带触发凭证那套失败冷却，进而拖住真正重要的模型清单刷新；
+                    // 失败原因如实写进摘要（用户看得到），这是「不静默」与「不误伤」的
+                    // 折中。
+                    let metadata = crate::server::core::model_meta::refresh(manual, interval_ms(task)).await;
+                    let metadata_note = match metadata.get("status").and_then(Value::as_str) {
+                        Some("refreshed") => format!(
+                            "；models.dev 元数据已更新 {} 条",
+                            metadata.get("count").and_then(Value::as_u64).unwrap_or(0)
+                        ),
+                        Some("failed") => format!(
+                            "；models.dev 元数据刷新失败（{}）",
+                            metadata.get("message").and_then(Value::as_str).unwrap_or("未知原因")
+                        ),
+                        // skipped（未到间隔 / 设置里关了）不写进摘要：那是常态，写进去只是噪音
+                        _ => String::new(),
+                    };
+                    // 与凭证维护 / 积分查询同一口径：某一家刷新失败只让它自己退避，
+                    // 只要有至少一家真拿到了新清单，整轮不算失败 —— 否则一条永久性的
+                    // 配置缺失（如「尚未添加 OfficeAce 账号」）会把整条任务指数退避到
+                    // 24 小时，其余 25 家的缓存跟着一起停更（实测 2026-10-27 华为云）。
+                    level = task_level(refreshed, failed);
+                    (format!("{summary}{metadata_note}"), round_succeeded(refreshed, failed))
+                }
+                TASK_USAGE_QUERY => {
+                    let report = crate::server::core::usage_query::query_all(store, None).await.map_err(|error| error.message)?;
+                    let rows = report["results"].as_array().cloned().unwrap_or_default();
+                    let ok = rows.iter().filter(|row| !row["usage"].is_null()).count();
+                    let failed = rows.len() - ok;
+                    level = task_level(ok, failed);
+                    (format!("成功 {ok} 个，失败 {failed} 个"), round_succeeded(ok, failed))
+                }
+                TASK_ZCODE_AUTO_CLAIM => {
+                    let summary = crate::server::core::zcode_claim::run_auto(store, manual).await?;
+                    // 单账号失败在账号排期里退避，扫描本身按配置继续发现新套餐。
+                    (summary, true)
+                }
+                TASK_CODEARTS_AUTO_CLAIM => {
+                    let summary = crate::server::core::providers::codearts::welfare::run_auto_claim(
+                        store,
+                        manual,
+                    )
+                    .await?;
+                    (summary, true)
+                }
+                TASK_WORKBUDDY_GROWTH => {
+                    match crate::server::core::workbuddy_growth::scheduled_run(store).await {
+                        Ok(summary) => (summary, true),
+                        Err(summary) => { level = "error"; (summary, false) },
+                    }
+                }
+                _ => return Err("未知后端任务".to_string()),
+            })
+        }.await;
+        match outcome {
+            Ok((summary, success)) => {
+                if let Err(error) = guard.finish(success, summary.clone(), None, 0, interval_ms(task)) {
+                    logging::log_with_level("[Tasks]", &format!("{}排期保存失败：{error}", task.label), "error");
+                    return Err(error);
+                }
+                // 领取任务已有按业务结果定级的汇总，不能再重复写一份。
+                if !matches!(task.id, TASK_ZCODE_AUTO_CLAIM | TASK_CODEARTS_AUTO_CLAIM) {
+                    logging::log_with_level("[Tasks]", &format!("{}完成：{summary}", task.label), level);
+                }
+                Ok(summary)
             }
-            (summary, round_succeeded(refreshed, failed))
-        }
-        TASK_MODEL_REFRESH => {
-            let results = if manual {
-                crate::server::core::providers::adapter::refresh_implemented_forced(store, &serde_json::Map::new(), None).await
-            } else {
-                crate::server::core::providers::adapter::refresh_implemented(store).await
-            };
-            let count = |status: &str| results.iter().filter(|item| item["status"] == status).count();
-            let (refreshed, skipped, failed) = (count("refreshed"), count("skipped"), count("failed"));
-            // 全跳过的轮次（各家的间隔没到 / 没有可用登录态）在自动路径上是常态：
-            // 被动刷新与手动刷新会先把间隔推走，这时「成功 0 家」看着像失败，
-            // 所以这一档单独给一句话说清「本轮无事可做」。
-            let summary = if refreshed == 0 && failed == 0 {
-                format!("本轮无需刷新（跳过 {skipped} 家：未到间隔或没有可用登录态）")
-            } else {
-                format!("成功 {refreshed} 家，跳过 {skipped} 家，失败 {failed} 家")
-            };
-            // models.dev 元数据搭同一条任务（它回答的是同一件事的另一半：清单与
-            // 元数据一起才是一份能用的模型表），但**排期独立** —— 各家的目录
-            // 缓存 TTL 与它无关，一方被跳过不该连带另一方也不刷。
-            //
-            // 它的失败**不改变本任务的成败**：元数据是补充信息，为它把整轮标成
-            // 失败会连带触发凭证那套失败冷却，进而拖住真正重要的模型清单刷新；
-            // 失败原因如实写进摘要（用户看得到），这是「不静默」与「不误伤」的
-            // 折中。
-            let metadata = crate::server::core::model_meta::refresh(manual, interval_ms(task)).await;
-            let metadata_note = match metadata.get("status").and_then(Value::as_str) {
-                Some("refreshed") => format!(
-                    "；models.dev 元数据已更新 {} 条",
-                    metadata.get("count").and_then(Value::as_u64).unwrap_or(0)
-                ),
-                Some("failed") => format!(
-                    "；models.dev 元数据刷新失败（{}）",
-                    metadata.get("message").and_then(Value::as_str).unwrap_or("未知原因")
-                ),
-                // skipped（未到间隔 / 设置里关了）不写进摘要：那是常态，写进去只是噪音
-                _ => String::new(),
-            };
-            // 与凭证维护 / 积分查询同一口径：某一家刷新失败只让它自己退避，
-            // 只要有至少一家真拿到了新清单，整轮不算失败 —— 否则一条永久性的
-            // 配置缺失（如「尚未添加 OfficeAce 账号」）会把整条任务指数退避到
-            // 24 小时，其余 25 家的缓存跟着一起停更（实测 2026-10-27 华为云）。
-            (format!("{summary}{metadata_note}"), round_succeeded(refreshed, failed))
-        }
-        TASK_USAGE_QUERY => {
-            let report = crate::server::core::usage_query::query_all(store, None).await.map_err(|error| error.message)?;
-            let rows = report["results"].as_array().cloned().unwrap_or_default();
-            let ok = rows.iter().filter(|row| !row["usage"].is_null()).count();
-            let failed = rows.len() - ok;
-            (format!("成功 {ok} 个，失败 {failed} 个"), round_succeeded(ok, failed))
-        }
-        TASK_ZCODE_AUTO_CLAIM => {
-            let summary = crate::server::core::zcode_claim::run_auto(store, manual).await?;
-            // 单账号失败在账号排期里退避，扫描本身按配置继续发现新套餐。
-            (summary, true)
-        }
-        TASK_CODEARTS_AUTO_CLAIM => {
-            let summary = crate::server::core::providers::codearts::welfare::run_auto_claim(
-                store,
-                manual,
-            )
-            .await?;
-            (summary, true)
-        }
-        TASK_WORKBUDDY_GROWTH => {
-            match crate::server::core::workbuddy_growth::scheduled_run(store).await {
-                Ok(summary) => (summary, true),
-                Err(summary) => (summary, false),
+            Err(error) => {
+                let _ = guard.finish(false, error.clone(), None, 0, interval_ms(task));
+                logging::log_with_level("[Tasks]", &format!("{}失败：{error}", task.label), "error");
+                Err(error)
             }
         }
-        _ => return Err("未知后端任务".to_string()),
-    };
-    guard.finish(success, summary.clone(), None, 0, interval_ms(task))?;
-    Ok(summary)
+    }).await
 }
 
 /// 调度循环：把后端任务按各自配置的间隔重复执行（由 `ServerState::bootstrap`

@@ -55,6 +55,46 @@ enum UsageFailure {
     Request(String, Option<String>),
 }
 
+#[cfg(test)]
+mod task_log_tests {
+    use super::*;
+
+    #[test]
+    fn automatic_usage_sweeper_logs_start_and_failure_but_not_deferred_runs() {
+        const CHILD: &str = "AGENT2API_TEST_USAGE_LOGS";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "server::core::usage_query::task_log_tests::automatic_usage_sweeper_logs_start_and_failure_but_not_deferred_runs", "--nocapture"])
+                .env(CHILD, "1").status().unwrap().success());
+            return;
+        }
+        let (db, _temp) = crate::server::db::test_temp::TempDb::open("usage-task-logs");
+        crate::server::config::init(Some(db.clone()));
+        task_state::install(Some(db.clone()));
+        usage_records::install(Some(db.clone()));
+        logging::init_store(Some(db.clone()), false);
+        let accounts = AccountStore::with_db(Some(db));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            // 没有账号或凭证，实际走 sweeper 共用的执行函数，绝不访问上游。
+            let account = json!({"id":"fixture-missing","provider":"workbuddy","hasCredentials":false,"usageQuery":{"enabled":true,"interval":600}});
+            let result = query_usage_for(&accounts, &account, false).await;
+            assert!(result["usage"].is_null() && result["error"].is_string());
+            let logs = logging::store_ref().unwrap();
+            let filter = crate::server::logs_store::Query { task_id:Some(crate::server::config::KEY_USAGE_QUERY.into()), ..Default::default() };
+            let entries = logs.query(&filter);
+            assert_eq!(entries.matched, 2);
+            assert_eq!(entries.entries[0].level, "error");
+            assert!(entries.entries[0].message.contains("积分查询失败"));
+            assert!(entries.entries[1].message.contains("积分查询开始"));
+            let deferred = query_usage_for(&accounts, &account, false).await;
+            assert_eq!(deferred["code"], "usage_deferred");
+            assert_eq!(logs.query(&filter).matched, 2);
+            assert!(logging::current_task_id().is_none());
+        });
+    }
+}
+
 /// 目标集合解析失败。
 ///
 /// core 不认识 axum，因此这里带 `message` / `status_code` 两个字段，由 api 层
@@ -147,51 +187,64 @@ async fn query_usage_for(store: &AccountStore, account: &Value, manual: bool) ->
         Ok(task_state::Claim::Deferred(state)) => return json!({"id":id,"usage":null,"error":state.waiting_message(),"code":"usage_deferred"}),
         Err(error) => return json!({"id":id,"usage":null,"error":error,"code":"usage_state_error"}),
     };
-    // 保存请求时间；提交时另验 claim 所有权，拒绝旧租约的迟到响应。
-    let attempted_at = logging::now_ms();
-    // 凭证与 provider 都从目标集合里的账号对象读，**不回读账号文件**：
-    // 20 个账号并发时那次回读会变成 20 次整库读盘，而答案已在手上。
-    // `hasCredentials` 是 store 逐条给出的统一判据（缺省视为有）。
-    let has_credentials = account.get("hasCredentials").and_then(Value::as_bool) != Some(false)
-        || account.pointer("/balanceQuery/scheme").is_some();
-    let outcome = if has_credentials {
-        let provider_id = account
-            .get("provider")
-            .and_then(Value::as_str)
-            .unwrap_or(crate::server::core::providers::DEFAULT_PROVIDER_ID);
-        query_usage_inner(store, provider_id, &id).await
-    } else {
-        Err(UsageFailure::NoCredentials)
-    };
-    let mut row = match outcome {
-        Ok(usage) => json!({ "id": id, "name": name, "usage": usage, "error": Value::Null }),
-        // Node 的这条早退 `return` **不含 name 键**（只有 catch 分支才带）
-        Err(UsageFailure::NoCredentials) => {
-            json!({ "id": id, "usage": Value::Null, "error": "没有可用凭证" })
+    let perform = async {
+        if logging::current_task_id().is_some() {
+            logging::log_with_level("[Usage]", &format!("账号 {id} 积分查询开始"), "info");
         }
-        Err(UsageFailure::Request(message, code)) => {
-            logging::verbose("[Accounts]", &format!("账号 {id} 余额查询失败: {message}"));
-            json!({ "id": id, "name": name, "usage": Value::Null, "error": message, "code": code })
+        // 保存请求时间；提交时另验 claim 所有权，拒绝旧租约的迟到响应。
+        let attempted_at = logging::now_ms();
+        // 凭证与 provider 都从目标集合里的账号对象读，**不回读账号文件**：
+        // 20 个账号并发时那次回读会变成 20 次整库读盘，而答案已在手上。
+        // `hasCredentials` 是 store 逐条给出的统一判据（缺省视为有）。
+        let has_credentials = account.get("hasCredentials").and_then(Value::as_bool) != Some(false)
+            || account.pointer("/balanceQuery/scheme").is_some();
+        let outcome = if has_credentials {
+            let provider_id = account
+                .get("provider")
+                .and_then(Value::as_str)
+                .unwrap_or(crate::server::core::providers::DEFAULT_PROVIDER_ID);
+            query_usage_inner(store, provider_id, &id).await
+        } else {
+            Err(UsageFailure::NoCredentials)
+        };
+        let mut row = match outcome {
+            Ok(usage) => json!({ "id": id, "name": name, "usage": usage, "error": Value::Null }),
+            // Node 的这条早退 `return` **不含 name 键**（只有 catch 分支才带）
+            Err(UsageFailure::NoCredentials) => {
+                json!({ "id": id, "usage": Value::Null, "error": "没有可用凭证" })
+            }
+            Err(UsageFailure::Request(message, code)) => {
+                logging::verbose("[Accounts]", &format!("账号 {id} 余额查询失败: {message}"));
+                json!({ "id": id, "name": name, "usage": Value::Null, "error": message, "code": code })
+            }
+        };
+        let queried_at = logging::now_ms();
+        row["queriedAt"] = json!(queried_at);
+        let outcome = usage_records::UsageOutcome {
+            usage: row.get("usage").filter(|value| !value.is_null()).cloned(),
+            error: row.get("error").and_then(Value::as_str).map(str::to_string),
+            code: row.get("code").and_then(Value::as_str).map(str::to_string),
+        };
+        let written = store.commit_usage_result(account, &outcome, queried_at, attempted_at, guard.ownership());
+        if !written {
+            row["usage"] = Value::Null;
+            row["error"] = json!("账号已改变或结果保存失败，请重新查询");
         }
+        let success = written && outcome.usage.is_some();
+        let summary = if success { "余额查询完成".to_string() } else { row["error"].as_str().unwrap_or("查询失败").to_string() };
+        if let Err(error) = guard.finish(success, summary, None, 0, interval) {
+            logging::log_with_level("[Usage]", &format!("账号 {id} 查询排期保存失败：{error}"), "error");
+        }
+        if logging::current_task_id().is_some() {
+            let message = if success { "积分查询完成".to_string() } else {
+                format!("积分查询失败：{}", row["error"].as_str().unwrap_or("查询失败"))
+            };
+            logging::log_with_level("[Usage]", &format!("账号 {id} {message}"), if success { "info" } else { "error" });
+        }
+        row
     };
-    let queried_at = logging::now_ms();
-    row["queriedAt"] = json!(queried_at);
-    let outcome = usage_records::UsageOutcome {
-        usage: row.get("usage").filter(|value| !value.is_null()).cloned(),
-        error: row.get("error").and_then(Value::as_str).map(str::to_string),
-        code: row.get("code").and_then(Value::as_str).map(str::to_string),
-    };
-    let written = store.commit_usage_result(account, &outcome, queried_at, attempted_at, guard.ownership());
-    if !written {
-        row["usage"] = Value::Null;
-        row["error"] = json!("账号已改变或结果保存失败，请重新查询");
-    }
-    let success = written && outcome.usage.is_some();
-    let summary = if success { "余额查询完成".to_string() } else { row["error"].as_str().unwrap_or("查询失败").to_string() };
-    if let Err(error) = guard.finish(success, summary, None, 0, interval) {
-        logging::verbose("[Usage]", &format!("查询排期保存失败：{error}"));
-    }
-    row
+    if manual { perform.await } else { logging::task_scope(crate::server::config::KEY_USAGE_QUERY, perform).await }
+
 }
 
 /// 查询一个账号的余额 / 积分（**按账号所属 provider 分流到适配器**）。
