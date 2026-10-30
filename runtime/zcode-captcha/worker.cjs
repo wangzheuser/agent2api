@@ -1,5 +1,6 @@
 // Docker 的独立 SDK 宿主。stdin/stdout 只传结构化消息，不接收账号凭据。
 const { BrowserHost } = require('./browser.cjs');
+const { browserProxy } = require('./proxy.cjs');
 const { createInterface } = require('node:readline');
 const { readFileSync } = require('node:fs');
 const { createServer } = require('node:http');
@@ -42,6 +43,7 @@ async function main() {
     if (closing) break;
     let timer;
     let result;
+    let route;
     try {
       const config = JSON.parse(line);
       if (!config.sceneId || !config.prefix || !config.region) throw new Error('config');
@@ -52,12 +54,14 @@ async function main() {
             browser = await host.start();
           }
           if (closing) throw new Error('closed');
-          context = await browser.newContext(config.proxy ? {
-            proxy: { ...config.proxy, bypass: '127.0.0.1,localhost' },
-          } : {});
+          route = await browserProxy(config.proxy ? {
+            ...config.proxy, bypass: '127.0.0.1,localhost',
+          } : null);
+          context = await browser.newContext(route.proxy ? { proxy: route.proxy } : {});
           const page = await context.newPage();
           await page.goto(`http://127.0.0.1:${server.address().port}/`, { timeout: 10000 });
-          const param = await page.evaluate(config => window.wbAliyunCaptcha.mintTraceless(config), config);
+          const sdkConfig = { prefix: config.prefix, sceneId: config.sceneId, region: config.region };
+          const param = await page.evaluate(config => window.wbAliyunCaptcha.mintTraceless(config), sdkConfig);
           return { param, region: config.region };
         })(),
         new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('deadline')), 50000); }),
@@ -70,6 +74,7 @@ async function main() {
       clearTimeout(timer);
       if (context) await context.close().catch(() => {});
       context = null;
+      if (route) await route.close().catch(() => {});
     }
     if (!closing) process.stdout.write(JSON.stringify(result) + '\n');
   }

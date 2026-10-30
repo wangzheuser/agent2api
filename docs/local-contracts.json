@@ -2,6 +2,27 @@
   "schema_version": 1,
   "contracts": [
     {
+      "id": "zcode-captcha-authenticated-socks-proxy",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "Headless 验证码生产者支持账号既定的带认证 SOCKS5 出口：仅在回环临时端口转接认证，目标 CONNECT 与 TLS 字节原样转发，凭据不交给浏览器或日志；认证失败不回退直连，结束或取消后关闭监听及连接，HTTP、无认证 SOCKS5 和无代理路径不变。",
+      "source_commits": [
+        "6e04a69be2195b119cefb82f68e1fa49143c9bf7"
+      ],
+      "source_note": "华为云首轮观察发现国际版账号的带认证 SOCKS5 被 Playwright 拒绝；服务器仅使用虚构凭据复现，不执行领取。用户要求不跑本地测试，本轮保留用例但本地不运行。",
+      "implementation": [
+        "runtime/zcode-captcha/worker.cjs",
+        "runtime/zcode-captcha/proxy.cjs"
+      ],
+      "tests": [
+        {
+          "kind": "node",
+          "path": "scripts/zcode-captcha-proxy.test.cjs",
+          "id": "case-zcode-captcha-authenticated-socks-proxy"
+        }
+      ]
+    },
+    {
       "id": "zcode-claim-interval-retry",
       "level": "P0",
       "status": "必须保留",
