@@ -2,6 +2,30 @@
   "schema_version": 1,
   "contracts": [
     {
+      "id": "zcode-claim-interval-retry",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "ZCode 全局及账号自动检查不做普通失败的指数长退避，失败状态仍如实保存，下次按配置间隔运行；恢复历史排期时移除旧普通冷却，保留在途租约、最短请求间隔及套餐级风控/配额窗口。立即执行可以重试旧普通失败，手动单套餐领取成功或上游确认已领取后同步账号排期与错误状态，不覆盖在途任务及其它套餐窗口；其他定时任务的退避语义不变。",
+      "source_commits": [
+        "9f27f6dc5a8b57ce4cee59def6cbf61b1541e4d5"
+      ],
+      "source_note": "用户于2026-10-30授权修复无需长退避，并要求跳过本地测试、直接提交推送后部署华为云观察；新增回归用例保留但本轮不运行。",
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/task_state.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/zcode_claim.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/scheduled_tasks.rs",
+        "desktop-tauri/src-tauri/server/src/server/api/zcode_claim.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/tests/zcode_interval_retry.rs",
+          "name": "zcode_interval_retry_recovers_old_backoff_without_losing_business_windows_or_leases",
+          "id": "case-zcode-interval-retry-recovery-and-safety"
+        }
+      ]
+    },
+    {
       "id": "event-log-capacity-retention",
       "level": "P0",
       "status": "必须保留",

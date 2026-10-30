@@ -259,6 +259,20 @@ pub fn note_external_run(key: &str, interval_ms: i64) -> Result<(), String> {
     .map(|_| ())
 }
 
+/// 外部动作已确认成功，清除旧错误；不覆盖在途执行或其它套餐的重试窗口。
+pub fn note_external_success(key: &str, summary: String, interval_ms: i64) -> Result<(), String> {
+    change(key, |state| {
+        if state.running() {
+            return;
+        }
+        let now = logging::now_ms();
+        state.adjust_clock(now);
+        state.last_attempt_at = now;
+        state.finish_at(now, true, summary, None, 0, interval_ms);
+    })
+    .map(|_| ())
+}
+
 /// 把排期置为「现在就到期」（用户在界面上刚把任务从关闭拨到开启时调用）。
 ///
 /// 与 `note_external_run` 的区别是**要不要顺延**：那一条是「刚真跑过一轮」，
@@ -294,9 +308,21 @@ pub fn clear_cooldown(key: &str) -> Result<(), String> {
 
 /// 改间隔以最近一次尝试/完成为起点，不因重启或开关切换重新计时。
 pub fn reschedule(key: &str, interval_ms: i64) -> Result<(), String> {
+    reschedule_with_backoff(key, interval_ms, true)
+}
+
+/// 按配置间隔恢复排期，移除历史指数退避；保留在途租约与业务状态。
+pub fn reschedule_on_interval(key: &str, interval_ms: i64) -> Result<(), String> {
+    reschedule_with_backoff(key, interval_ms, false)
+}
+
+fn reschedule_with_backoff(key: &str, interval_ms: i64, backoff: bool) -> Result<(), String> {
     change(key, |state| {
         let now = logging::now_ms();
         state.adjust_clock(now);
+        if !backoff {
+            state.retry_at = 0;
+        }
         state.interval_ms = interval_ms;
         let anchor = state.last_run_at.max(state.last_attempt_at);
         state.next_run_at = if anchor > 0 { anchor.saturating_add(interval_ms) } else { now };
@@ -419,12 +445,35 @@ impl RunGuard {
     pub(crate) fn ownership(&self) -> (&str, &str) { (&self.key, &self.owner) }
 
     pub fn finish(
+        self,
+        success: bool,
+        summary: String,
+        value: Option<Value>,
+        retry_at: i64,
+        interval_ms: i64,
+    ) -> Result<TaskState, String> {
+        self.finish_with_backoff(success, summary, value, retry_at, interval_ms, true)
+    }
+
+    /// 如实保留失败，但下一次仍按配置间隔运行，不做指数退避。
+    pub fn finish_on_interval(
+        self,
+        success: bool,
+        summary: String,
+        value: Option<Value>,
+        interval_ms: i64,
+    ) -> Result<TaskState, String> {
+        self.finish_with_backoff(success, summary, value, 0, interval_ms, false)
+    }
+
+    fn finish_with_backoff(
         mut self,
         success: bool,
         summary: String,
         value: Option<Value>,
         retry_at: i64,
         interval_ms: i64,
+        backoff: bool,
     ) -> Result<TaskState, String> {
         self.heartbeat.abort();
         let result = change(&self.key, |state| {
@@ -432,6 +481,10 @@ impl RunGuard {
                 return;
             }
             state.finish_at(logging::now_ms(), success, summary, value, retry_at, interval_ms);
+            if !backoff {
+                state.retry_at = 0;
+                state.next_run_at = state.last_run_at.saturating_add(interval_ms);
+            }
         });
         self.finished = result.is_ok();
         result

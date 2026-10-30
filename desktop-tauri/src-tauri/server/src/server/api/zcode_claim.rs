@@ -426,6 +426,18 @@ pub async fn claim_plan(
 fn record_claim(state: &ServerState, account_id: &str, plan_id: &str) -> i64 {
     let at = crate::server::logging::now_ms();
     if state.store().mark_zcode_claim(account_id, plan_id, at) {
+        let interval = crate::server::config::scheduled_settings().zcode_auto_claim.interval * 60_000;
+        if let Err(error) = crate::server::core::task_state::note_external_success(
+            &format!("zcodeClaim:{account_id}"),
+            format!("已领取套餐：{plan_id}"),
+            interval,
+        ) {
+            crate::server::logging::log_with_level(
+                "[Claim]",
+                &format!("账号 {account_id} 已领取，但调度状态同步失败：{error}"),
+                "warn",
+            );
+        }
         at
     } else {
         crate::server::logging::verbose(

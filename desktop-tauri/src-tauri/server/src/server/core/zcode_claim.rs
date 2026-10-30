@@ -430,16 +430,25 @@ pub async fn run_auto(store: &AccountStore, manual: bool) -> Result<String, Stri
             continue;
         };
         let key = format!("zcodeClaim:{id}");
-        task_state::reschedule(&key, interval)?;
+        task_state::reschedule_on_interval(&key, interval)?;
         let mut retry = task_state::read(&key)?
             .value
             .and_then(|v| v.as_object().cloned())
             .unwrap_or_default();
-        let guard = match task_state::claim(&key, interval, manual, ManualBackoff::Respect, 1_000)?
+        let guard = match task_state::claim(&key, interval, manual, ManualBackoff::Bypass, 1_000)?
         {
             Claim::Acquired(guard) => guard,
-            Claim::Deferred(_) => {
+            Claim::Deferred(state) => {
                 total.skipped += 1;
+                logging::log_with_level(
+                    "[Claim]",
+                    &format!(
+                        "ZCode 自动领取账号 {id} 跳过：{}，距下次可检查 {} 秒",
+                        if state.running() { "正在执行" } else { "尚未到检查间隔" },
+                        (state.due_at() - logging::now_ms()).max(0).saturating_add(999) / 1000,
+                    ),
+                    "info",
+                );
                 continue;
             }
         };
@@ -463,11 +472,10 @@ pub async fn run_auto(store: &AccountStore, manual: bool) -> Result<String, Stri
             }
             _ => report.account_note(),
         };
-        guard.finish(
+        guard.finish_on_interval(
             report.error.is_none(),
             summary.clone(),
             Some(json!(retry)),
-            0,
             interval,
         )?;
         if report.error.is_some() {

@@ -375,7 +375,7 @@ async fn run_backend(
     //   · 记「上游配额桶什么时候恢复」的（检查更新）—— 提前打一次只会再吃一次
     //     403 并把恢复时刻重新顶到未来，如实告诉用户还要等多久更有用。
     let backoff = match task.id {
-        TASK_MODEL_REFRESH | TASK_CREDENTIAL_MAINTENANCE | TASK_USAGE_QUERY => task_state::ManualBackoff::Bypass,
+        TASK_MODEL_REFRESH | TASK_CREDENTIAL_MAINTENANCE | TASK_USAGE_QUERY | TASK_ZCODE_AUTO_CLAIM => task_state::ManualBackoff::Bypass,
         _ => task_state::ManualBackoff::Respect,
     };
     let guard = match task_state::claim(task.id, interval_ms(task), manual, backoff, 1_000)? {
@@ -470,7 +470,12 @@ async fn run_backend(
         }.await;
         match outcome {
             Ok((summary, success)) => {
-                if let Err(error) = guard.finish(success, summary.clone(), None, 0, interval_ms(task)) {
+                let finished = if task.id == TASK_ZCODE_AUTO_CLAIM {
+                    guard.finish_on_interval(success, summary.clone(), None, interval_ms(task))
+                } else {
+                    guard.finish(success, summary.clone(), None, 0, interval_ms(task))
+                };
+                if let Err(error) = finished {
                     logging::log_with_level("[Tasks]", &format!("{}排期保存失败：{error}", task.label), "error");
                     return Err(error);
                 }
@@ -481,7 +486,11 @@ async fn run_backend(
                 Ok(summary)
             }
             Err(error) => {
-                let _ = guard.finish(false, error.clone(), None, 0, interval_ms(task));
+                if task.id == TASK_ZCODE_AUTO_CLAIM {
+                    let _ = guard.finish_on_interval(false, error.clone(), None, interval_ms(task));
+                } else {
+                    let _ = guard.finish(false, error.clone(), None, 0, interval_ms(task));
+                }
                 logging::log_with_level("[Tasks]", &format!("{}失败：{error}", task.label), "error");
                 Err(error)
             }
@@ -506,7 +515,12 @@ pub fn spawn(store: AccountStore, update: UpdateManager) {
         // 启动即跑一次，与改造前一致），跑过的沿用「上次尝试 + 间隔」——
         // 已经到期的自然落到过去，这一轮就补上。
         for task in TASKS.iter().filter(|task| task.runner == Runner::Backend && task.id != TASK_USAGE_QUERY) {
-            if let Err(error) = task_state::reschedule(&state_key(task.id), interval_ms(task)) {
+            let restored = if task.id == TASK_ZCODE_AUTO_CLAIM {
+                task_state::reschedule_on_interval(&state_key(task.id), interval_ms(task))
+            } else {
+                task_state::reschedule(&state_key(task.id), interval_ms(task))
+            };
+            if let Err(error) = restored {
                 logging::log("[Tasks]", &format!("恢复「{}」排期失败：{error}", task.label));
             }
         }
