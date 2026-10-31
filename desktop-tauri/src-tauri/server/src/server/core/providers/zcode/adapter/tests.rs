@@ -1,6 +1,7 @@
 use super::*;
 use crate::server::core::protocol::{anthropic, responses};
-use crate::server::core::providers::adapter::ReasoningPatch;
+use crate::server::core::providers::adapter::{ReasoningPatch, UpstreamStopReason};
+use crate::server::core::providers::readiness;
 use serde_json::json;
 
 #[test]
@@ -16,6 +17,113 @@ fn direct_egress_requires_start_plan_and_explicit_enable() {
         assert!(!start_plan_direct(&json!({}), flag));
     }
 }
+
+#[test]
+fn gateway_html_errors_preserve_status_without_holding_the_provider_gate() {
+    let _slot = readiness::lock_for_tests();
+    readiness::clear_for_tests();
+    for adapter in [&ZCODE_ADAPTER, &ZCODE_INTL_ADAPTER] {
+        for status in [502, 503, 504] {
+            let class = adapter.classify_error(status, &json!({"message": edge::ALB_BAD_GATEWAY}));
+            let UpstreamErrorClass::Fatal {
+                status: actual,
+                message,
+                upstream_code,
+            } = class else {
+                panic!("普通网关 HTML 应保留为普通错误，实际 {class:?}");
+            };
+            assert_eq!(actual, status);
+            assert_eq!(
+                message,
+                format!("上游返回 {status}: {}", edge::ALB_BAD_GATEWAY.trim())
+            );
+            assert_eq!(upstream_code, None);
+            for region in Region::ALL {
+                assert!(!readiness::gated(region.provider_id()));
+                assert!(edge::gate_error(region.provider_id()).is_none());
+            }
+        }
+    }
+}
+
+#[test]
+fn known_edge_templates_hold_only_the_matching_region() {
+    let _slot = readiness::lock_for_tests();
+    for adapter in [&ZCODE_ADAPTER, &ZCODE_INTL_ADAPTER] {
+        for status in [403, 405, 502, 503] {
+            readiness::clear_for_tests();
+            let class = adapter.classify_error(status, &json!({"message": edge::REAL_PAGE}));
+            let UpstreamErrorClass::Terminal {
+                kind,
+                status: actual,
+                upstream_code,
+                ..
+            } = class else {
+                panic!("已知边缘模板应保留通道保护，实际 {class:?}");
+            };
+            assert_eq!(kind, UpstreamStopReason::ChannelRefused);
+            assert_eq!(actual, status);
+            assert_eq!(upstream_code, None);
+            for region in Region::ALL {
+                let held = region == adapter.region();
+                assert_eq!(readiness::gated(region.provider_id()), held);
+                assert_eq!(edge::gate_error(region.provider_id()).is_some(), held);
+            }
+        }
+    }
+    readiness::clear_for_tests();
+}
+
+#[test]
+fn business_errors_keep_their_classification_without_holding_the_gate() {
+    let _slot = readiness::lock_for_tests();
+    readiness::clear_for_tests();
+    for adapter in [&ZCODE_ADAPTER, &ZCODE_INTL_ADAPTER] {
+        assert!(matches!(
+            adapter.classify_error(401, &json!({"message": "token expired"})),
+            UpstreamErrorClass::TokenExpired { .. }
+        ));
+        for (status, body, expected_code) in [
+            (429, json!({"message": "quota exceeded"}), None),
+            (
+                502,
+                json!({"code": 1005, "message": edge::REAL_PAGE}),
+                Some(1005),
+            ),
+        ] {
+            let class = adapter.classify_error(status, &body);
+            let UpstreamErrorClass::QuotaLimited {
+                status,
+                upstream_code,
+                ..
+            } = class else {
+                panic!("额度错误应保留原分类，实际 {class:?}");
+            };
+            assert_eq!(status, 429);
+            assert_eq!(upstream_code, expected_code);
+        }
+        for code in [3007, 3012] {
+            let class =
+                adapter.classify_error(405, &json!({"code": code, "message": edge::REAL_PAGE}));
+            let UpstreamErrorClass::Fatal {
+                status,
+                upstream_code,
+                message,
+            } = class else {
+                panic!("带业务码的 HTML 不应归类为边缘拦截，实际 {class:?}");
+            };
+            assert_eq!(status, 405);
+            assert_eq!(upstream_code, Some(code));
+            assert!(message.contains(edge::REAL_PAGE));
+            assert!(message.contains(super::super::plan::code_hint(code).unwrap()));
+        }
+        for region in Region::ALL {
+            assert!(!readiness::gated(region.provider_id()));
+            assert!(edge::gate_error(region.provider_id()).is_none());
+        }
+    }
+}
+
 fn ingress(protocol: &str, model: &str, effort: Option<&str>, stream: bool) -> Value {
     let mut body = json!({"model": model, "stream": stream,
         "messages": [{"role": "user", "content": "hello"}]});

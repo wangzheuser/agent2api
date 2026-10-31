@@ -331,18 +331,8 @@ impl ProviderAdapter for ZcodeAdapter {
             Some(hint) => format!("上游返回 {status}: {raw}（{hint}）"),
             None => format!("上游返回 {status}: {raw}"),
         };
-        // ── 边缘拦截页（HTML，非业务 JSON）───────────────────────────
-        // 2026-10-25 的生产故障就在这里被判错：那一页 HTML
-        // （`<!doctypehtml>…<title>405</title>…data-spm="a3c0e"`）没有 `code`
-        // 字段，于是落到兜底的 `Fatal`，编排层据此「换个账号再试」—— 而这类
-        // 拦截按**出口/源站**生效，换账号只是把第二个账号也喂给拦截器一次
-        // （`requests` 表里那轮 36 条 405 全是 `attempts=2`，两个账号各中一次）。
-        // 现在改判 `Terminal/ChannelRefused`：不换号、不原地重发，并升起这道
-        // 通道的本地闸门（详见 `super::edge` 的模块头）。
-        //
-        // 判据刻意不认具体状态码：同一层还会回 403 / 502 / 503，而「响应体是
-        // 一页 HTML」才是它区别于业务响应的稳定特征。体里一旦解析出业务码，
-        // 就说明业务层答过话，继续走下面的常规分类。
+        // 仅已知 ESA 模板进入 Terminal 与本地闸门；普通 ALB HTML 502
+        // 保留状态和原文，继续走常规分类及既有有限重试，不推断为风控拦截。
         if edge::is_edge_page(status, code, &raw) {
             return edge::blocked_class(self.region.provider_id(), status, code);
         }

@@ -2,6 +2,83 @@
   "schema_version": 1,
   "contracts": [
     {
+      "id": "zcode-edge-page-classification",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "ZCode 两地区仅在HTTP>=400、无业务码、HTML同时包含已采集ESA元数据name=data-spm/content=a3c0e及405页面标题时触发Terminal/ChannelRefused和现有120秒通道闸门；普通ALB 502及未知HTML保留上游状态和错误内容，沿用既有有限重试预算及直接换号配置，不因此生成本地556。业务JSON、401、429、3007、3012保留原处理；模板匹配不冒充封禁原因确认，闸门到期放行下一次请求而非后台主动探测，不新增输出后的EOF整轮重放。",
+      "source_commits": [
+        "0ea9ca732b780212974264ba585a28b1534aa639"
+      ],
+      "source_note": "2026-10-31用户批准最小修复计划；本轮为该基线上的未提交修复。回归样本为脱敏ESA模板及本机采集的164字节ALB 502页面；按用户要求补齐用例但不在本机运行测试，不提交、推送、部署或发起模型请求。",
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/edge.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/adapter.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/upstream/provider_loop.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/edge.rs",
+          "name": "server::core::providers::zcode::edge::edge_page::the_real_interception_page_is_recognized",
+          "id": "case-zcode-edge-known-esa-template"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/edge.rs",
+          "name": "server::core::providers::zcode::edge::edge_page::a_gateway_page_needs_both_known_template_features",
+          "id": "case-zcode-edge-reject-ordinary-gateway-html"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/edge.rs",
+          "name": "server::core::providers::zcode::edge::edge_page::an_html_prefix_with_multibyte_text_is_safe",
+          "id": "case-zcode-edge-unicode-html-prefix"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/edge.rs",
+          "name": "server::core::providers::zcode::edge::edge_page::business_errors_are_not_edge_pages",
+          "id": "case-zcode-edge-preserve-business-codes"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/edge.rs",
+          "name": "server::core::providers::zcode::edge::edge_page::the_client_message_does_not_invent_a_cause",
+          "id": "case-zcode-edge-evidence-bounded-message"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/edge.rs",
+          "name": "server::core::providers::zcode::edge::edge_page::an_interception_page_holds_the_provider_gate",
+          "id": "case-zcode-edge-retain-gate-protection"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/adapter/tests.rs",
+          "name": "server::core::providers::zcode::adapter::tests::gateway_html_errors_preserve_status_without_holding_the_provider_gate",
+          "id": "case-zcode-gateway-error-no-local-556"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/adapter/tests.rs",
+          "name": "server::core::providers::zcode::adapter::tests::known_edge_templates_hold_only_the_matching_region",
+          "id": "case-zcode-edge-region-isolated-gates"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/adapter/tests.rs",
+          "name": "server::core::providers::zcode::adapter::tests::business_errors_keep_their_classification_without_holding_the_gate",
+          "id": "case-zcode-edge-business-classification"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/upstream/provider_loop.rs",
+          "name": "server::core::upstream::provider_loop::local_failure::gateway_failures_stop_retrying_when_the_existing_budget_is_empty",
+          "id": "case-zcode-gateway-existing-retry-budget"
+        }
+      ]
+    },
+    {
       "id": "zcode-captcha-authenticated-socks-proxy",
       "level": "P0",
       "status": "必须保留",

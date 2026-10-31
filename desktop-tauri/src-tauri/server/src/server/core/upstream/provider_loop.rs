@@ -2526,6 +2526,28 @@ mod local_failure {
     use super::readiness;
     use super::TRANSIENT_RETRY_STATUSES;
     use super::direct_switch_status;
+    use super::{fallback_retry_advice, transient_retry_advice, UpstreamErrorClass};
+
+    #[test]
+    fn gateway_failures_stop_retrying_when_the_existing_budget_is_empty() {
+        for status in [502, 503, 504] {
+            let class = UpstreamErrorClass::Fatal {
+                status,
+                message: "Bad Gateway".into(),
+                upstream_code: None,
+            };
+            for remaining in [0, 1, 3] {
+                assert_eq!(
+                    transient_retry_advice(status, remaining).is_some(),
+                    remaining > 0
+                );
+                assert_eq!(
+                    fallback_retry_advice(&class, remaining, status).is_some(),
+                    remaining > 0
+                );
+            }
+        }
+    }
 
     #[test]
     fn a_local_failure_is_never_resent_in_place() {
