@@ -665,6 +665,8 @@ fn claim_result(
                 } else {
                     logging::log("[Accounts]", &format!("账号 {display}: 签到成功"));
                 }
+            } else if claim.get("claimAccepted").and_then(Value::as_bool) == Some(true) {
+                logging::log("[Accounts]", &format!("账号 {display}: 领取确认状态（{msg}）"));
             } else {
                 logging::log(
                     "[Accounts]",
@@ -706,6 +708,10 @@ fn claim_result(
 /// 实测见过自动签到 4 个账号全部未领取、17 秒后手动逐个重试全部成功
 /// （批次撞上上游风控），所以判据必须收紧到「上游说签过了」。
 pub(crate) fn checkin_completed_today(claim: &Value) -> bool {
+    if ["samePersonLimited", "deviceLimited"].iter()
+        .any(|key| claim.get(*key).and_then(Value::as_bool) == Some(true)) {
+        return false;
+    }
     if claim.get("success").and_then(Value::as_bool) == Some(true) {
         return true;
     }
@@ -763,6 +769,10 @@ pub fn day_completed(row: &Value) -> bool {
 /// 判据刻意与 [`checkin_completed_today`] 相反且**只认中性文案**：把失败
 /// （网络错误 / 凭证失效）也当成 pending 会让坏账号整天反复重试打上游。
 pub fn claim_pending(claim: &Value) -> bool {
+    // Acknowledged POSTs need observation, not another automatic POST.
+    if claim.get("claimAccepted").and_then(Value::as_bool) == Some(true) {
+        return false;
+    }
     if checkin_completed_today(claim) {
         return false;
     }
@@ -1300,4 +1310,31 @@ mod tests {
             .expect_err("500 不该被容错放行");
 
     }
+    #[test]
+    fn qoder_claim_confirmation_does_not_invent_new_credit() {
+        let result = json!({"success":false,"status":"claimed","claimAccepted":true,
+            "claimConfirmed":true,"creditIncreaseObserved":false,"rewardPoints":null});
+        assert!(checkin_completed_today(&result));
+        assert!(!claim_pending(&result));
+        assert_eq!(result["rewardPoints"],Value::Null);
+    }
+
+    #[test]
+    fn qoder_accepted_unconfirmed_is_not_automatically_reposted() {
+        let result = json!({"success":false,"claimAccepted":true,"claimUnconfirmed":true,
+            "status":"claim_confirmation_pending","msg":"领取接口已接受，活动状态待核实"});
+        assert!(!checkin_completed_today(&result));
+        assert!(!claim_pending(&result));
+    }
+
+    #[test]
+    fn qoder_limit_flag_beats_ambiguous_already_claimed_message() {
+        for key in ["samePersonLimited","deviceLimited"] {
+            let mut result = json!({"success":false,"msg":"名额已领取，本账号未领取"});
+            result[key]=json!(true);
+            assert!(!checkin_completed_today(&result));
+            assert!(!claim_pending(&result));
+        }
+    }
+
 }

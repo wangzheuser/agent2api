@@ -32,8 +32,8 @@
 //! `Cosy-MachineType`，由本机 Qoder 客户端 / qodercli 的 UMID 组件生成，见
 //! `risk.rs`）的请求下发「每天领 100 Credits」活动：不带风控头时活动列表里
 //! 永远只有 `VIEW_DETAILS` 促销 —— 本家旧注释「国际版没有签到计划」的真正
-//! 原因就是缺头，不是没活动。风控身份按 **uid** 生成，而 uid 在活动列表的
-//! **顶层字段**里，所以顺序必须是：先拉一次拿 uid → 叠风控头重拉 → 再领。
+//! 原因就是缺头，不是没活动。先拉一次拿 uid → 叠风控头重拉 → 再领。
+//! 国内版读取得到本机官方身份时同样携带，读取失败保留最小头路径。
 //! legacy 的 `daily-check-in` 路径两个地区都已停用（国际版 404、中国版恒
 //! `DISABLED`），一次都不碰。
 //!
@@ -89,8 +89,6 @@ const STATUS_CLAIMABLE: &str = "CLAIMABLE";
 const STATUS_CLAIMED: &str = "CLAIMED";
 /// 领取响应的 `result` 字段（上游在并发/重放时会给这个值）
 const RESULT_ALREADY_CLAIMED: &str = "ALREADY_CLAIMED";
-/// 上游没给 `benefit.amount` 时的缺省奖励额（实测就是 100）
-const DEFAULT_REWARD: f64 = 100.0;
 /// 上游 409 的「活动批次已过期」业务码（活动批次轮换，id 需重学）
 const CAMPAIGN_NOT_ACTIVE_TAG: &str = "CAMPAIGN_NOT_ACTIVE";
 /// 上游领取响应的「同一人今天已经领过」业务码（见 [`FAILURE_SAME_PERSON`] 的说明）
@@ -393,44 +391,63 @@ pub async fn claim_daily_checkin(
     }
     let list = auth::payload(response, "签到活动查询")?;
 
-    // ── 国际版：先拿顶层 uid，叠风控头重拉一次（中国版不需要）────
-    // 401 重拉后的重试同样要叠头 —— 那时令牌换了，但流程不变。
-    // 首段（最小头）列表以 `alt_list` 传给收尾：上游按请求形态分桶时，
-    // 它可能给出风控头形态看不到的活动行（盲发候选的一部分）。
-    let mut headers = endpoints::sash_headers(&credentials.access_token);
-    let mut risk_note: Option<String> = None;
-    if region == Region::Global {
-        let uid = list.get("uid").and_then(Value::as_str).unwrap_or("").trim().to_string();
-        let (augmented, note) = risk::augment_headers(headers, region, &uid).await;
-        headers = augmented;
-        risk_note = note;
-        let second = fetch_campaigns_with(&credentials, proxy.as_ref(), &headers).await?;
+    // 国内版原有最小头已返回有效每日活动时，保留这条已能工作的链路。
+    if !needs_identity_refetch(region, &list, chrono::Utc::now().timestamp()) {
+        let headers = endpoints::sash_headers(&credentials.access_token);
+        return claim_from(store, region, account_id, credentials, proxy, list, None, headers, None).await;
+    }
+    let uid = list
+        .get("uid")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|uid| !uid.is_empty())
+        .unwrap_or(&credentials.user_id);
+    let (mut headers, risk_note) = campaign_identity_headers(&credentials, uid).await;
+    let use_identity = region == Region::Global || risk_note.is_none();
+    // 一次签到只采集一份身份；列表、领取、确认及 401 重试不能中途换设备。
+    if use_identity {
+        let mut second = fetch_campaigns_with(&credentials, proxy.as_ref(), &headers).await?;
         if second.status == 401 && credentials.can_refresh() {
             credentials = refresh::ensure_fresh(store, region, account_id, true).await?;
-            let third = fetch_campaigns(&credentials, proxy.as_ref()).await?;
-            let third = intl_refetch(&credentials, proxy.as_ref(), third).await?;
-            return claim_from(store, region, account_id, credentials, proxy, third, Some(&list), risk_note).await;
+            replace_campaign_token(&mut headers, &credentials.access_token);
+            second = fetch_campaigns_with(&credentials, proxy.as_ref(), &headers).await?;
         }
         let second = auth::payload(second, "签到活动查询（风控重拉）")?;
-        return claim_from(store, region, account_id, credentials, proxy, second, Some(&list), risk_note).await;
+        return claim_from(store, region, account_id, credentials, proxy, second, Some(&list), headers, risk_note).await;
     }
 
-    claim_from(store, region, account_id, credentials, proxy, list, None, risk_note).await
+    // 国内版缺少官方组件或读取失败时不发送半套身份，保持原有最小头行为。
+    claim_from(store, region, account_id, credentials, proxy, list, None, headers, risk_note).await
 }
 
-/// 国际版的活动列表重取（叠风控头）。首段的 `uid` 缺失（上游没给）时按空
-/// uid 走 —— 风控身份生成不出来，头束退化为「只有客户端身份」，与缺组件
-/// 同一表现（上游不下发积分活动，落到 `no_claim` 的说明文案）。
-async fn intl_refetch(
+fn needs_identity_refetch(region: Region, list: &Value, now: i64) -> bool {
+    region == Region::Global || !list.get("campaigns").and_then(Value::as_array).is_some_and(|rows| {
+        rows.iter().any(|row| {
+            row.get("actionType").and_then(Value::as_str) == Some(ACTION_CLAIM_BENEFIT)
+                && matches!(row.get("claimStatus").and_then(Value::as_str), Some(STATUS_CLAIMABLE | STATUS_CLAIMED))
+                && campaign_is_active(row, now)
+        })
+    })
+}
+
+async fn campaign_identity_headers(
     credentials: &Credentials,
-    proxy: Option<&ResolvedProxy>,
-    first: ApiResponse,
-) -> Result<Value, GatewayError> {
-    let first = auth::payload(first, "签到活动查询")?;
-    let uid = first.get("uid").and_then(Value::as_str).unwrap_or("").trim().to_string();
-    let (headers, _) = risk::augment_headers(endpoints::sash_headers(&credentials.access_token), credentials.region, &uid).await;
-    let second = fetch_campaigns_with(credentials, proxy, &headers).await?;
-    auth::payload(second, "签到活动查询（风控重拉）")
+    uid: &str,
+) -> (Vec<(String, String)>, Option<String>) {
+    let base = endpoints::sash_headers(&credentials.access_token);
+    if credentials.region == Region::Global {
+        return risk::augment_headers(base, credentials.region, uid).await;
+    }
+    let (headers, note) = risk::augment_native_headers(base, credentials.region, uid).await;
+    if note.is_some() {
+        return (endpoints::sash_headers(&credentials.access_token), note);
+    }
+    (headers, note)
+}
+
+fn replace_campaign_token(headers: &mut Vec<(String, String)>, token: &str) {
+    headers.retain(|(name, _)| !name.eq_ignore_ascii_case("authorization"));
+    headers.push(("authorization".to_string(), format!("Bearer {token}")));
 }
 
 /// 台账用的**设备级**标识：同一台机器上的所有账号共用这一个值。
@@ -451,6 +468,7 @@ async fn claim_from(
     proxy: Option<ResolvedProxy>,
     list: Value,
     alt_list: Option<&Value>,
+    mut headers: Vec<(String, String)>,
     risk_note: Option<String>,
 ) -> Result<Value, GatewayError> {
     let display = account_id;
@@ -497,13 +515,6 @@ async fn claim_from(
         ),
     );
 
-    // 国际版风控头用的账号 uid（活动列表顶层字段；中国版不需要风控头）
-    let risk_uid = if region == Region::Global {
-        Some(list.get("uid").and_then(Value::as_str).unwrap_or("").trim().to_string())
-    } else {
-        None
-    };
-
     let Some(target) = claimable else {
         // ── 盲发直领兜底（依据见模块头）─────────────────────────
         // 「列表里没有 CLAIMABLE 行」≠「领不到」：上游按请求形态分桶隐藏活动行，
@@ -531,19 +542,14 @@ async fn claim_from(
                     &mut credentials,
                     proxy.as_ref(),
                     campaign_id,
-                    risk_uid.as_deref(),
+                    &mut headers,
                 )
                 .await
                 {
                     Ok(value) => {
-                        let success = value.get("success").and_then(Value::as_bool) == Some(true);
-                        let already =
-                            value.get("alreadyCompleted").and_then(Value::as_bool) == Some(true);
-                        if success || already {
-                            return Ok(value);
-                        }
-                        // 上游按「人」拦了这份每日积分：换候选也不会变，直接收工。
-                        if value.get("samePersonLimited").and_then(Value::as_bool) == Some(true) {
+                        // Accepted / confirmed claims are terminal even when credit
+                        // evidence is pending. Preserve their state; never POST another candidate.
+                        if evidence::stops_claim_attempts(&value) {
                             return Ok(value);
                         }
                         // 未完成/未确认：记失败，试下一个候选
@@ -603,7 +609,7 @@ async fn claim_from(
         &mut credentials,
         proxy.as_ref(),
         campaign_id,
-        risk_uid.as_deref(),
+        &mut headers,
     )
     .await
 }
@@ -613,12 +619,36 @@ fn truncate_str(text: &str, limit: usize) -> String {
     text.chars().take(limit).collect()
 }
 
-/// 领取单个活动并确认（正常可见路径与盲发兜底共用）。
-///
-/// 返回签到结果 JSON（success / alreadyCompleted / …，形状见 [`claim_daily_checkin`]）；
-/// `Err` 表示传输层 / 上游拒绝（HTTP 非 2xx），错误信息带响应体摘要 —— 盲发候选
-/// 的 409 `CAMPAIGN_NOT_ACTIVE`（活动批次轮换）与 409 其它（设备/风控拒绝）靠它
-/// 区分。成功时把活动 id 记入本地学习表（`campaign_ids`），国际版另落设备台账。
+#[path = "claim_evidence.rs"]
+mod evidence;
+
+/// Optional direct quota observation: never refresh credentials, query plans, or
+/// turn a missing bucket / failed request into an invented zero baseline.
+async fn fetch_credit_quota(
+    credentials: &Credentials,
+    proxy: Option<&ResolvedProxy>,
+) -> Option<evidence::QuotaSnapshot> {
+    let response = auth::request(
+        "GET",
+        &format!("{}/api/v2/quota/usage", credentials.region.open_api()),
+        None,
+        &endpoints::open_api_headers(Some(&credentials.access_token)),
+        proxy,
+    ).await.ok()?;
+    if !response.ok { return None; }
+    evidence::quota_snapshot(response.payload.as_ref()?)
+}
+
+fn quota_evidence_value(value: Option<evidence::QuotaSnapshot>) -> Value {
+    match value {
+        Some(value) => json!({"total":value.total,"remaining":value.remaining,"unit":"credits"}),
+        None => Value::Null,
+    }
+}
+
+/// One ordinary claim attempt: acceptance, campaign confirmation, and quota
+/// observations are separate. Unknown reward evidence never becomes a default
+/// amount, and an accepted request is terminal even while confirmation is pending.
 async fn claim_one(
     store: &AccountStore,
     region: Region,
@@ -626,201 +656,90 @@ async fn claim_one(
     credentials: &mut Credentials,
     proxy: Option<&ResolvedProxy>,
     campaign_id: &str,
-    risk_uid: Option<&str>,
+    headers: &mut Vec<(String, String)>,
 ) -> Result<Value, GatewayError> {
-    let display = account_id;
-    let url = format!(
-        "{}{}/{}/claim",
-        region.open_api(),
-        endpoints::CAMPAIGNS_PATH,
-        campaign_id
-    );
-    let mut headers = endpoints::sash_headers(&credentials.access_token);
-    if region == Region::Global {
-        let (augmented, _) = risk::augment_headers(headers, region, risk_uid.unwrap_or("")).await;
-        headers = augmented;
-    }
-    let mut claim = claim_campaign(&url, credentials, proxy, &headers).await?;
-    // 上游 409 有两种完全不同的含义：`ALREADY_CLAIMED`（今天已经领过）与
-    // `CAMPAIGN_NOT_ACTIVE`（活动批次已轮换，id 过期）。以前把「409」整体当成
-    // 「已领取」，于是盲发兜底试到过期 id 时，会把「上游拒绝了这次领取」误报成
-    // 「今日已领取」—— 用户看到的是「已领取」，实际一分没到账（2026-10-28 实测：
-    // 同一账号先拿到 `BLOCKED/SAME_PERSON_ALREADY_CLAIMED`，紧接着过期 id 的
-    // 409 把结果覆盖成「今日已领取」）。
-    let not_active = campaign_not_active(&claim);
-    // 上游并发/重放时给 409 + `{"result":"ALREADY_CLAIMED"}`（参考实现实测），
-    // 那不是失败，是「今天已经领过了」。
-    if !claim.ok && !not_active && already_claimed_response(&claim) {
-        logging::log(
-            "[Checkin]",
-            &format!(
-                "Qoder 签到结果（账号={}，地区={}，状态=already_claimed，说明=今日已领取）",
-                display,
-                region.label()
-            ),
-        );
-        return Ok(json!({
-            "success": false,
-            "alreadyCompleted": true,
-            "msg": "今日已领取",
-        }));
-    }
+    let before = fetch_credit_quota(credentials, proxy).await;
+    let url = format!("{}{}/{}/claim", region.open_api(), endpoints::CAMPAIGNS_PATH, campaign_id);
+    let mut claim = claim_campaign(&url, credentials, proxy, headers).await?;
+    // Classify only the final response, including the one normal auth retry.
     if claim.status == 401 && credentials.can_refresh() {
         *credentials = refresh::ensure_fresh(store, region, account_id, true).await?;
-        // 重签一个新头束（令牌换了，旧头的 Bearer 已失效）
-        let mut fresh_headers = endpoints::sash_headers(&credentials.access_token);
-        if region == Region::Global {
-            let (augmented, _) =
-                risk::augment_headers(fresh_headers, region, risk_uid.unwrap_or("")).await;
-            fresh_headers = augmented;
-        }
-        claim = claim_campaign(&url, credentials, proxy, &fresh_headers).await?;
+        replace_campaign_token(headers, &credentials.access_token);
+        claim = claim_campaign(&url, credentials, proxy, headers).await?;
+    }
+    if has_business_code(&claim, FAILURE_SAME_PERSON_TAG) {
+        return Ok(json!({
+            "success":false,"samePersonLimited":true,"failureCode":FAILURE_SAME_PERSON_TAG,
+            "msg":"上游返回同人领取限制，本账号本次未领取；未将其标为已完成"
+        }));
+    }
+    if !campaign_not_active(&claim)
+        && (already_claimed_response(&claim)
+            || claim.payload.as_ref().is_some_and(evidence::already_claimed)) {
+        return Ok(json!({
+            "success":false,"alreadyCompleted":true,"msg":"今日已领取",
+            "rewardPoints":Value::Null,"creditIncreaseObserved":false
+        }));
     }
     if !claim.ok {
-        // 带响应体摘要（TWA describe_blind_failure 同款）：让 409 的两种业务
-        // 形态在错误信息里可读、可分类。
         let head = response_head(&claim);
         return Err(GatewayError::with_status(
             i32::from(claim.status),
             format!("Qoder 签到领取失败（HTTP {}）{head}", claim.status),
         ));
     }
-    let body = claim
-        .payload
-        .filter(Value::is_object)
-        .ok_or_else(|| GatewayError::with_status(502, "Qoder 签到领取未返回有效 JSON 对象"))?;
+    let body = claim.payload.filter(Value::is_object)
+        .ok_or_else(|| GatewayError::with_status(502,"Qoder 签到领取未返回有效 JSON 对象"))?;
     let claim_body = nested_data(&body);
-
     if claim_body.get("status").and_then(Value::as_str) != Some(STATUS_CLAIMED) {
-        let status = claim_body
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or("未知");
-        let failure = claim_body
-            .get("failureCode")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim();
-        // `BLOCKED` + `SAME_PERSON_ALREADY_CLAIMED`：上游按「人」发每日积分
-        // （同一出口 IP / 同一台机器算同一个人），本机今天已经有一个账号领走了
-        // 那唯一一份，其余账号当天一律被拦。这不是「本账号已签到」，也不是可以
-        // 重试的失败 —— 换候选、换时间都不会改变判定，所以直接给出归因结果。
-        if failure.eq_ignore_ascii_case(FAILURE_SAME_PERSON_TAG) {
-            logging::log(
-                "[Checkin]",
-                &format!(
-                    "Qoder 签到结果（账号={}，地区={}，状态=same_person_blocked，失败码={}）",
-                    display,
-                    region.label(),
-                    failure
-                ),
-            );
-            return Ok(json!({
-                "success": false,
-                "samePersonLimited": true,
-                "failureCode": failure,
-                "msg": "上游按「人」每天只发一份每日积分（SAME_PERSON_ALREADY_CLAIMED）：今天这份已被本机另一个账号领走，本账号今天领不到；同机多账号需每天轮换谁先领，明天会自动换下一个账号",
-            }));
-        }
-        logging::log(
-            "[Checkin]",
-            &format!(
-                "Qoder 签到结果（账号={}，地区={}，状态=claim_not_completed，上游状态={}，失败码={}）",
-                display,
-                region.label(),
-                status,
-                if failure.is_empty() { "无" } else { failure }
-            ),
-        );
-        return Ok(json!({ "success": false, "msg": format!("签到未完成（上游状态 {status}）") }));
+        return Ok(json!({"success":false,"msg":"上游未确认本次领取"}));
     }
-    if claim_body
-        .get("replayed")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        logging::log(
-            "[Checkin]",
-            &format!(
-                "Qoder 签到结果（账号={}，地区={}，状态=already_claimed，说明=今日已领取）",
-                display,
-                region.label()
-            ),
-        );
+    let reward = evidence::credit_reward(claim_body);
+    // An accepted POST is never re-sent merely because confirmation is delayed.
+    // A failed / stale confirmation remains structured pending evidence.
+    let confirmed = match fetch_campaigns_with(credentials, proxy, headers).await {
+        Ok(response) => auth::payload(response,"签到领取确认").ok()
+            .is_some_and(|value| campaign_status(nested_data(&value),campaign_id,STATUS_CLAIMED)),
+        Err(_) => false,
+    };
+    if !confirmed {
         return Ok(json!({
-            "success": false,
-            "alreadyCompleted": true,
-            "msg": "今日已领取",
+            "success":false,"claimAccepted":true,"claimConfirmed":false,"claimUnconfirmed":true,
+            "status":"claim_confirmation_pending","reportedReward":reward,"rewardPoints":Value::Null,
+            "creditIncreaseObserved":false,"grantReceiptVerified":false,
+            "msg":"领取接口已接受，活动状态待核实；暂不计新增积分"
         }));
     }
-
-    // POST 返回 CLAIMED 只代表接口接受了领取；再查一次活动状态，避免把
-    // 2xx 或延迟响应误报成已经到账。失败时不写本地完成标记，后续轮询可重试。
-    // 国际版确认也必须带同一套风控头；普通请求只返回 VIEW_DETAILS，
-    // 会把已成功领取误判成「领取后状态未确认」。
-    let confirmed = if region == Region::Global {
-        let (confirmed_headers, _) =
-            risk::augment_headers(endpoints::sash_headers(&credentials.access_token), region, risk_uid.unwrap_or("")).await;
-        fetch_campaigns_with(credentials, proxy, &confirmed_headers).await?
+    let mut after = fetch_credit_quota(credentials, proxy).await;
+    if !evidence::credit_increase_observed(claim_body,true,before,after) {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        after = fetch_credit_quota(credentials, proxy).await;
+    }
+    let increased = evidence::credit_increase_observed(claim_body,true,before,after);
+    let msg = if increased {
+        format!("活动领取已确认，观察到资源包额度增加 {} credits",reward.unwrap_or(0.0))
     } else {
-        fetch_campaigns(credentials, proxy).await?
+        "活动领取已确认，新增积分尚未核实；不重复发起领取".to_string()
     };
-    let confirmed = auth::payload(confirmed, "签到领取确认")?;
-    if !campaign_status(nested_data(&confirmed), campaign_id, STATUS_CLAIMED) {
-        logging::log(
-            "[Checkin]",
-            &format!(
-                "Qoder 签到结果（账号={}，地区={}，状态=claim_unconfirmed，说明=领取后状态未确认）",
-                display,
-                region.label()
-            ),
-        );
-        return Ok(json!({
-            "success": false,
-            "msg": "签到未完成（领取后状态未确认）",
-        }));
-    }
-
-    let reward = claim_body
-        .get("benefit")
-        .and_then(|benefit| benefit.get("amount"))
-        .and_then(Value::as_f64)
-        .unwrap_or(DEFAULT_REWARD);
-    let valid_days = claim_body
-        .get("benefit")
-        .and_then(|benefit| benefit.get("validity"))
-        .and_then(|validity| validity.get("days"))
-        .and_then(Value::as_f64);
-    // 文案不重复「签到成功」：调用方 `claim_result` 已经用它作日志前缀
-    // （「账号 X: 签到成功（…）」），这里只说领到了什么。
-    let msg = match valid_days {
-        Some(days) if days > 0.0 => format!("获得 {reward} credits，{days} 天有效"),
-        _ => format!("获得 {reward} credits"),
-    };
-    // 学习表：两种形态都看不到活动行的账号（或下次运行）凭这个 id 直领
-    campaign_ids::remember(region, campaign_id);
-    // 台账记两个地区：上游按「人」发每日积分（同一台机器/同一出口 IP 算一个人），
-    // 国内版和国际版都一样（2026-10-28 实测国内版也是「先到先得、其余 BLOCKED」）。
-    // 记下今天这台机器的名额归谁，本机其它账号才能被准确归因成「名额已被 #x 领走」，
-    // 而不是被当成「窗口没开」反复重试。
+    // Preserve existing bookkeeping, without changing identity or eligibility.
+    campaign_ids::remember(region,campaign_id);
     if let Some(device) = device_key() {
-        device_claims::record(region, &device, account_id, campaign_id);
+        device_claims::record(region,&device,account_id,campaign_id);
     }
-    logging::log(
-        "[Checkin]",
-        &format!(
-            "Qoder 签到结果（账号={}，地区={}，状态=claimed_confirmed，奖励={} credits，valid_days={}）",
-            display,
-            region.label(),
-            reward,
-            valid_days.map(|days| days.to_string()).unwrap_or_else(|| "unknown".to_string())
-        ),
-    );
+    logging::log("[Checkin]",&format!(
+        "Qoder 签到确认（账号={}，地区={}，活动已领取=true，额度增长已观察={}）",
+        account_id,region.label(),increased
+    ));
     Ok(json!({
-        "success": true,
-        "msg": msg,
-        "rewardPoints": reward,
-        "unit": "credits",
+        "success":increased,"status":"claimed","claimAccepted":true,"claimConfirmed":true,
+        "creditIncreaseObserved":increased,"grantReceiptVerified":false,
+        "msg":msg,"rewardPoints":if increased { reward } else { None },
+        "reportedReward":reward,"unit":reward.map(|_|"credits"),
+        "creditEvidence":{
+            "source":"quota_delta","attribution":"correlated_not_independent_receipt",
+            "before":quota_evidence_value(before),"after":quota_evidence_value(after),
+            "observedTotalDelta":evidence::observed_delta(before,after)
+        }
     }))
 }
 
@@ -1009,6 +928,54 @@ fn no_claim(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_refetch_preserves_cn_campaigns_and_requires_intl_identity() {
+        let now = 1_700_000_000;
+        for status in [STATUS_CLAIMABLE, STATUS_CLAIMED] {
+            let list = json!({"campaigns": [{
+                "actionType": ACTION_CLAIM_BENEFIT,
+                "claimStatus": status,
+                "startAt": now - 1,
+                "endAt": now + 1
+            }]});
+            assert!(!needs_identity_refetch(Region::Cn, &list, now));
+            assert!(needs_identity_refetch(Region::Global, &list, now));
+            assert!(needs_identity_refetch(Region::Cn, &list, now + 2));
+        }
+        assert!(needs_identity_refetch(Region::Cn, &json!({"campaigns": []}), now));
+        assert!(needs_identity_refetch(Region::Cn, &json!({"campaigns": [{
+            "actionType": "VIEW_DETAILS", "claimStatus": STATUS_CLAIMABLE
+        }]}), now));
+    }
+
+    #[tokio::test]
+    async fn cn_native_identity_failure_keeps_minimal_headers() {
+        let credentials = Credentials::from_payload(&json!({
+            "mode": "cn", "accessToken": "test-device-token"
+        })).expect("fixture credentials");
+        // 空 uid 保证不启动真实组件；即使本机安装了 Qoder 也不会采集硬件身份。
+        let (headers, note) = campaign_identity_headers(&credentials, "").await;
+        assert!(note.is_some());
+        assert_eq!(headers, endpoints::sash_headers(&credentials.access_token));
+        assert!(!headers.iter().any(|(name, _)| name.to_ascii_lowercase().starts_with("cosy-machine")));
+    }
+
+    #[test]
+    fn campaign_token_refresh_preserves_identity_snapshot() {
+        let mut headers = endpoints::sash_headers("old-token");
+        for field in ["Cosy-MachineId", "Cosy-MachineToken", "Cosy-MachineCode", "Cosy-MachineType"] {
+            headers.push((field.to_string(), format!("fixture-{field}")));
+        }
+        let identity: Vec<_> = headers.iter().filter(|(name, _)| !name.eq_ignore_ascii_case("authorization")).cloned().collect();
+        // 清理大小写不同的旧鉴权头，同时保留原始身份与非鉴权头的顺序。
+        headers.push(("Authorization".to_string(), "Bearer duplicate".to_string()));
+        replace_campaign_token(&mut headers, "fresh-token");
+        replace_campaign_token(&mut headers, "newest-token");
+        assert_eq!(headers.iter().filter(|(name, _)| name.eq_ignore_ascii_case("authorization")).count(), 1);
+        assert_eq!(headers.last(), Some(&("authorization".to_string(), "Bearer newest-token".to_string())));
+        assert_eq!(headers.iter().filter(|(name, _)| !name.eq_ignore_ascii_case("authorization")).cloned().collect::<Vec<_>>(), identity);
+    }
 
     #[test]
     fn campaign_window_rejects_future_and_expired_rows() {

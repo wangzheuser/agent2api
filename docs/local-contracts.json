@@ -1421,7 +1421,7 @@
       "id": "qoder-intl-device-quota",
       "level": "P1",
       "status": "必须保留",
-      "behavior": "每日积分按「人」发放（同一台机器/同一出口 IP 算一个人）：领取成功后写设备台账（只落账号哈希，保留最近 14 天），国内版与国际版都写；同机其它账号当日归因为「名额已被占用」并停止自动重试，不冒充窗口未开、也不冒充「今日已领取」；批量签到按最久未签到轮换，两个地区都轮换（国内版在自己原有的位置上换位，不影响其它提供商的相对顺序）；领取响应的 409 必须按业务码区分 ALREADY_CLAIMED（今日已领）与 CAMPAIGN_NOT_ACTIVE（活动批次过期，留给盲发兜底换候选），不能把 409 整体当成已领取；BLOCKED + SAME_PERSON_ALREADY_CLAIMED 记为「本机名额已被占用」而非「已签到」；设备身份按账号持久分配，缺失账号身份时退回设备级；设备风控身份由桥按机器产出（同机各账号三件套完全一致），所以按地区只缓存一份，旧版按账号的文件首次升级时认下其中最新的一份、不轮换身份；UMID 组件默认只认本地区的客户端与 qodercli（国际版 ~/.qoder、国内版 ~/.qoder-cn），不再跨地区回落，仅 AGENT2API_QODER_UMID_CROSS_REGION=1 时恢复旧行为；合成身份必须复刻官方组件形态（令牌 3f5800 头、类型 91 标记、代码 00 标记），缺任一标记上游会把设备定向活动行静默过滤。",
+      "behavior": "每日积分按「人」发放（同一台机器/同一出口 IP 算一个人）：领取成功后写设备台账（只落账号哈希，保留最近 14 天），国内版与国际版都写；同机其它账号当日归因为「名额已被占用」并停止自动重试，不冒充窗口未开、也不冒充「今日已领取」；批量签到按最久未签到轮换，两个地区都轮换（国内版在自己原有的位置上换位，不影响其它提供商的相对顺序）；领取响应的 409 必须按业务码区分 ALREADY_CLAIMED（今日已领）与 CAMPAIGN_NOT_ACTIVE（活动批次过期，留给盲发兜底换候选），不能把 409 整体当成已领取；BLOCKED + SAME_PERSON_ALREADY_CLAIMED 记为「本机名额已被占用」而非「已签到」；设备身份按账号持久分配，缺失账号身份时退回设备级；设备风控身份由桥按机器产出（同机各账号三件套完全一致），所以按地区只缓存一份，旧版按账号的文件首次升级时认下其中最新的一份、不轮换身份；UMID 组件默认只认本地区的客户端与 qodercli（国际版 ~/.qoder、国内版 ~/.qoder-cn），不再跨地区回落，仅 AGENT2API_QODER_UMID_CROSS_REGION=1 时恢复旧行为；合成身份必须复刻官方组件形态（令牌 3f5800 头、类型 91 标记、代码 00 标记），缺任一标记上游会把设备定向活动行静默过滤。；领取接受、活动确认与额度增长观察分层，未知金额或单位不默认奖励，已接受领取不自动重发。",
       "source_commits": [
         "15a54a2431cbb34818001d576d28dc2d082b83af"
       ],
@@ -1430,7 +1430,8 @@
         "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/checkin.rs",
         "desktop-tauri/src-tauri/server/src/server/core/billing/checkin.rs",
         "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/machine.rs",
-        "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/risk.rs"
+        "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/risk.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/claim_evidence.rs"
       ],
       "tests": [
         {
@@ -1552,6 +1553,66 @@
           "path": "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/risk.rs",
           "name": "server::core::providers::qoder::risk::tests::legacy_per_account_identity_is_adopted_not_rotated",
           "id": "case-qoder-identity-legacy-adopt"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/claim_evidence.rs",
+          "name": "server::core::providers::qoder::checkin::evidence::tests::credit_reward_requires_explicit_positive_credit_benefit",
+          "id": "case-qoder-credit-credit-reward-requires-explicit-positive-credit-benefit"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/claim_evidence.rs",
+          "name": "server::core::providers::qoder::checkin::evidence::tests::already_claimed_2xx_body_is_not_new_reward_without_replayed",
+          "id": "case-qoder-credit-already-claimed-2xx-body-is-not-new-reward-without-replayed"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/claim_evidence.rs",
+          "name": "server::core::providers::qoder::checkin::evidence::tests::blocked_replayed_response_does_not_mean_this_account_claimed",
+          "id": "case-qoder-credit-blocked-replayed-response-does-not-mean-this-account-claimed"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/claim_evidence.rs",
+          "name": "server::core::providers::qoder::checkin::evidence::tests::missing_quota_or_unit_stays_unknown_not_zero",
+          "id": "case-qoder-credit-missing-quota-or-unit-stays-unknown-not-zero"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/claim_evidence.rs",
+          "name": "server::core::providers::qoder::checkin::evidence::tests::claimed_without_balance_increase_is_not_credited",
+          "id": "case-qoder-credit-claimed-without-balance-increase-is-not-credited"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/claim_evidence.rs",
+          "name": "server::core::providers::qoder::checkin::evidence::tests::missing_replay_metadata_and_replays_never_report_new_credit",
+          "id": "case-qoder-credit-missing-replay-metadata-and-replays-never-report-new-credit"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/claim_evidence.rs",
+          "name": "server::core::providers::qoder::checkin::evidence::tests::accepted_without_credit_evidence_ends_candidate_iteration",
+          "id": "case-qoder-credit-accepted-without-credit-evidence-ends-candidate-iteration"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/billing/checkin.rs",
+          "name": "server::core::billing::checkin::tests::qoder_claim_confirmation_does_not_invent_new_credit",
+          "id": "case-qoder-claim-confirmation-does-not-invent-new-credit"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/billing/checkin.rs",
+          "name": "server::core::billing::checkin::tests::qoder_accepted_unconfirmed_is_not_automatically_reposted",
+          "id": "case-qoder-accepted-unconfirmed-is-not-automatically-reposted"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/billing/checkin.rs",
+          "name": "server::core::billing::checkin::tests::qoder_limit_flag_beats_ambiguous_already_claimed_message",
+          "id": "case-qoder-limit-flag-beats-ambiguous-already-claimed-message"
         }
       ]
     },
@@ -3344,6 +3405,51 @@
           "kind": "rust",
           "path": "desktop-tauri/src-tauri/server/src/server/errors.rs",
           "name": "server::errors::tests::retry_after_header_only_appears_when_requested"
+        }
+      ]
+    },
+    {
+      "id": "qoder-native-identity-compat",
+      "level": "P1",
+      "status": "必须保留",
+      "behavior": "在原有按账号逻辑 ID、按机器真实 UMID 缓存及同人拒绝语义不变的基础上，兼容官方 CLI 的 Unix 缓存文件与 Windows 平台架构目录，按组件文件修改时间选择最近落地版本；国内版最小头已返回有效每日活动时保留既有路径，没有有效活动才补查本机官方身份，身份缺失或生成失败则保持最小头，不接入合成身份开关；一次签到内查询、领取、确认和鉴权刷新复用同一份身份，刷新仅替换 Authorization，不把身份变化或 HTTP 成功当作积分到账。",
+      "source_commits": [
+        "a0acd2beede65e9fea60ec2d867c4283f70c9d21"
+      ],
+      "implementation": [
+        "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/risk.rs",
+        "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/checkin.rs"
+      ],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/checkin.rs",
+          "name": "server::core::providers::qoder::checkin::tests::native_refetch_preserves_cn_campaigns_and_requires_intl_identity",
+          "id": "qoder-native-cn-existing-campaign"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/checkin.rs",
+          "name": "server::core::providers::qoder::checkin::tests::cn_native_identity_failure_keeps_minimal_headers",
+          "id": "qoder-native-cn-no-identity"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/checkin.rs",
+          "name": "server::core::providers::qoder::checkin::tests::campaign_token_refresh_preserves_identity_snapshot",
+          "id": "qoder-native-header-snapshot"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/risk.rs",
+          "name": "server::core::providers::qoder::risk::tests::cli_runtime_supports_unix_files_and_selects_newest_matching_build",
+          "id": "qoder-native-unix-cli-layout"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/qoder/risk.rs",
+          "name": "server::core::providers::qoder::risk::tests::cli_runtime_supports_windows_bundles_and_rejects_wrong_arch",
+          "id": "qoder-native-windows-cli-layout"
         }
       ]
     }

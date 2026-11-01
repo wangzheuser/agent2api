@@ -5,8 +5,8 @@
 //! 国际版服务端**只对带风控头的请求**下发「每天领 100 Credits」的活动
 //! （campaign）：不带时 `GET /sash/api/v1/me/campaigns` 里永远只有
 //! `VIEW_DETAILS` 促销 —— 这正是本家旧注释「国际版没有签到计划」的真正
-//! 原因（缺头，不是没活动）。中国版不需要风控头就能领，两个分支见
-//! `checkin.rs`。
+//! 原因（缺头，不是没活动）。中国版保留可用的最小头链路；无活动时可补查
+//! 本机官方身份，读不到时不发送半套身份，两个分支见 `checkin.rs`。
 //!
 //! ── 三个值从哪来 ────────────────────────────────────────────
 //! 由 Qoder 的 **UMID 程序**（`runtime-info`）在本机生成：
@@ -20,8 +20,8 @@
 //! `--account-stdin` 并把 `{"account":"<uid>"}` 写进 stdin），第一行输出
 //! JSON `{machineToken, machineCode, machineType}`。`env` 是环境编号：
 //! 客户端组件国际版 3 / 中国版 0；qodercli 组件国际版 4（SINGAPORE）/
-//! 中国版 0。**同variant组件缺失时回落另一 variant 的**（CreditDaddy 的
-//! `riskRunner` 同款：协议一致，只有 env 编号不同）。
+//! 中国版 0（官方 qodercli 1.1.81 仍使用该编号）。默认只发现同地区组件，
+//! 跨地区回落需显式开启 `AGENT2API_QODER_UMID_CROSS_REGION`。
 //!
 //! ── 缓存 ────────────────────────────────────────────────────
 //! 客户端每 60±5 分钟轮换一次身份，这里保守缓存 50 分钟（按 region）。
@@ -207,7 +207,7 @@ fn app_component(region: Region) -> Option<Component> {
 ///
 /// 注意布局与客户端不同：qodercli 把 runtime-info 直接解在 `umid-<平台>-<哈希>/`
 /// 目录下（旁边还有 sgsdk.dll），**不再套一层 `umid/`** —— 客户端那层目录来自
-/// `resources/umid/`，两边不能共用同一个查找函数。
+/// `resources/umid/`；Linux / macOS 则直接使用 `runtime-info-<平台>-<架构>-<哈希>` 文件。
 fn cli_component(region: Region) -> Option<Component> {
     let env = if region == Region::Global { 4 } else { 0 };
     let (own, other) = if region == Region::Global { (".qoder", ".qoder-cn") } else { (".qoder-cn", ".qoder") };
@@ -219,24 +219,45 @@ fn cli_component(region: Region) -> Option<Component> {
     let home = home_dir();
     for dir in homes {
         let bin = home.join(dir).join(".bin");
-        let Ok(entries) = std::fs::read_dir(&bin) else { continue };
-        let mut dirs: Vec<PathBuf> = entries
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.is_dir()
-                    && path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| name.starts_with("umid-"))
-            })
-            .collect();
-        dirs.sort();
-        if let Some(exe) = dirs.into_iter().map(|dir| dir.join(exe_name)).find(|path| exists(path)) {
+        if let Some(exe) = cli_runtime_in(&bin, std::env::consts::OS, std::env::consts::ARCH, exe_name) {
             return Some(Component { exe, env, source: "cli" });
         }
     }
     None
+}
+
+fn cli_runtime_in(bin: &Path, os: &str, arch: &str, exe_name: &str) -> Option<PathBuf> {
+    let platform = match os {
+        "windows" => "win32",
+        "macos" => "darwin",
+        other => other,
+    };
+    let arch = match arch {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        other => other,
+    };
+    let prefix = if platform == "win32" {
+        format!("umid-{platform}-{arch}-")
+    } else {
+        format!("runtime-info-{platform}-{arch}-")
+    };
+    std::fs::read_dir(bin)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            if !name.starts_with(&prefix) || name.ends_with(".tmp") {
+                return None;
+            }
+            let path = if platform == "win32" { entry.path().join(exe_name) } else { entry.path() };
+            let meta = std::fs::metadata(&path).ok()?;
+            meta.is_file().then_some((meta.modified().unwrap_or(std::time::UNIX_EPOCH), path))
+        })
+        // 哈希字典序不是版本顺序；官方 CLI 更新后优先使用最新落地的组件。
+        .max()
+        .map(|(_, path)| path)
 }
 
 /// 网关数据目录里安装的组件（data 来源，Linux/Docker 的
@@ -605,13 +626,12 @@ pub async fn augment_headers(
     region: Region,
     uid: &str,
 ) -> (Vec<(String, String)>, Option<String>) {
-    headers.push(("Cosy-Version".to_string(), client_version(region)));
-
     // 实验开关：按账号合成整套身份（默认关闭）。打开后不再依赖本机 UMID 组件，
     // 每个账号呈现一份稳定但**非本机真实**的设备身份。开关的判定依据与风险见
     // `machine::synthetic_identity_enabled` 的说明 —— 必须先跑对照实验确认
     // 合成身份能另开一份设备名额，否则只会得到「列表里没有可领活动」。
     if machine::synthetic_identity_enabled() && !uid.trim().is_empty() {
+        headers.push(("Cosy-Version".to_string(), client_version(region)));
         headers.push(("Cosy-MachineOS".to_string(), machine_os()));
         if let Ok(id) = machine::device_id(region, uid) {
             headers.push(("Cosy-MachineId".to_string(), id));
@@ -627,6 +647,16 @@ pub async fn augment_headers(
         return (headers, None);
     }
 
+    augment_native_headers(headers, region, uid).await
+}
+
+/// 国内版只使用本机官方身份，不扩展既有国际版实验开关的适用范围。
+pub(super) async fn augment_native_headers(
+    mut headers: Vec<(String, String)>,
+    region: Region,
+    uid: &str,
+) -> (Vec<(String, String)>, Option<String>) {
+    headers.push(("Cosy-Version".to_string(), client_version(region)));
     match identity(region, uid).await {
         Some(risk) => {
             // 参考 qoder2api-hub：只有官方 UMID 生成的真实身份可用时才发
@@ -634,9 +664,8 @@ pub async fn augment_headers(
             // 过滤可领取活动，表现为 HTTP 200 但列表里没有 CLAIM_BENEFIT。
             headers.push(("Cosy-MachineOS".to_string(), machine_os()));
             // 设备标识按**账号**绑定（`machine::device_id`：一次分配、落盘持久、
-            // 永不轮换）。同一台机器上的多个账号因此各自呈现一台稳定设备，
-            // 而不是共用同一个 id 被上游当成同一台设备（国际版每设备每日只下发
-            // 一个账号的积分活动）。拿不到账号身份时退回设备级 machine_id。
+            // 永不轮换）。这只是逻辑标识，不会把同机账号变成不同的真实设备，
+            // 也不能据此推导奖励资格。拿不到账号身份时退回设备级 machine_id。
             if let Ok(id) = machine::device_id(region, uid) {
                 headers.push(("Cosy-MachineId".to_string(), id));
             }
@@ -882,6 +911,45 @@ impl<R: std::io::Read> BytesToVec for flate2::read::GzDecoder<R> {
 mod tests {
     use super::{identity_cache_key, majority_identity, persisted_identity_path, RiskIdentity};
     use crate::server::logging;
+
+    #[test]
+    fn cli_runtime_supports_unix_files_and_selects_newest_matching_build() {
+        let dir = std::env::temp_dir().join(format!("qoder-cli-layout-{}-{}", std::process::id(), logging::now_ms()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        for (os, platform, arch, sdk_arch) in [
+            ("linux", "linux", "x86_64", "x64"),
+            ("macos", "darwin", "aarch64", "arm64"),
+        ] {
+            let old = dir.join(format!("runtime-info-{platform}-{sdk_arch}-zzzz"));
+            let new = dir.join(format!("runtime-info-{platform}-{sdk_arch}-aaaa"));
+            for (path, age) in [(&old, 20), (&new, 10)] {
+                let file = std::fs::File::create(path).expect("create runtime fixture");
+                let modified = std::time::SystemTime::now() - std::time::Duration::from_secs(age);
+                file.set_times(std::fs::FileTimes::new().set_modified(modified)).expect("set fixture time");
+            }
+            std::fs::write(dir.join(format!("runtime-info-{platform}-{sdk_arch}-latest.tmp")), b"partial").unwrap();
+            std::fs::write(dir.join(format!("runtime-info-{platform}-other-latest")), b"wrong arch").unwrap();
+            assert_eq!(super::cli_runtime_in(&dir, os, arch, "runtime-info"), Some(new));
+        }
+        std::fs::remove_dir_all(dir).expect("remove fixtures");
+    }
+
+    #[test]
+    fn cli_runtime_supports_windows_bundles_and_rejects_wrong_arch() {
+        let dir = std::env::temp_dir().join(format!("qoder-cli-win-layout-{}-{}", std::process::id(), logging::now_ms()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let wanted = dir.join("umid-win32-x64-aaaa").join("runtime-info.exe");
+        let other = dir.join("umid-win32-arm64-zzzz").join("runtime-info.exe");
+        for path in [&wanted, &other] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"fixture").unwrap();
+        }
+        assert_eq!(super::cli_runtime_in(&dir, "windows", "x86_64", "runtime-info.exe"), Some(wanted));
+        assert_eq!(super::cli_runtime_in(&dir, "windows", "aarch64", "runtime-info.exe"), Some(other));
+        assert!(super::cli_runtime_in(&dir, "windows", "x86", "runtime-info.exe").is_none());
+        assert!(super::cli_runtime_in(&dir.join("missing"), "windows", "x86_64", "runtime-info.exe").is_none());
+        std::fs::remove_dir_all(dir).expect("remove fixtures");
+    }
 
     fn identity(brand: &str, vm_type_code: i64) -> RiskIdentity {
         RiskIdentity {
