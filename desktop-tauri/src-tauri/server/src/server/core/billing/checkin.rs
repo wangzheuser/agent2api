@@ -35,10 +35,13 @@
 //! 口径不同 ——
 //! 两个动作的「不适用」集合本来就不一样。
 
+use std::collections::BTreeMap;
+
 use serde_json::{json, Value};
 
 use crate::server::core::account_store::AccountStore;
 use crate::server::core::billing::BillingService;
+use crate::server::core::providers::qoder::{device_claims, endpoints::Region as QoderRegion};
 use crate::server::logging;
 
 /// 签到路径上的错误。对应 Node 版抛出的 AccountStoreError：
@@ -261,29 +264,62 @@ pub fn resolve_checkin_targets(
 /// 跑，排在前面的账号每天都会先抢到名额，排在后面的账号**永远领不到** ——
 /// 这不是「限制」而是调度缺陷。
 ///
-/// 这里把账号按「最久没签到」排到前面（`checkinAt` 升序，从未签到 = 0 最先），
-/// 于是每日名额在账号之间轮换：今天 A、明天 B、后天 C。
+/// ── 轮换键为什么是设备台账，而不是 `checkinAt`（2026-11-02 修正）──────
+/// 旧实现按账号的 `checkinAt` 升序排（最久没签到的在前）。问题在于 `checkinAt`
+/// 是**展示**信号：写入判据把「今日已领取」也算完成，而 Qoder 的活动行是
+/// **设备共享**的 —— 一个账号领到后，同机其余账号的列表行也翻成 `CLAIMED`，
+/// 于是它们同样回「今日已领取」。结果赢家与输家被同时打上当天时间戳、整组键
+/// 相同，排序退化为 `priority` 固定序，同一个账号天天先跑。2026-11-02 用两台
+/// 机器的 `checkin_records` + 台账复核：本地国内版 10-23 / 10-24 / 10-26 / 11-02
+/// 四天的执行顺序完全相同，正是 `priority` 序；10-27 三个国际版账号全部
+/// 「今日已领取」而台账零记录、零 `success`，同一天一分没到账。
+///
+/// 现在改用 [`device_claims::recent_holder_at`] 给出的「该账号最近一次**真实
+/// 领取**时刻」：台账只在「领取 + 回查确认」成功后写入，不会被「已领取」的设备级
+/// 回显污染。于是每日名额在账号之间轮换：今天 A、明天 B、后天 C。
 ///  - 国际版整组排到最前（先抢当天名额），组内轮换；
-///  - 国内版在**自己原有的位置上**轮换取值，不影响其它提供商的相对顺序。
-/// 其它提供商不受影响（保持原有相对顺序）。
+///  - 国内版在**自己原有的位置上**轮换取值，不影响其它提供商的相对顺序；
+///  - 台账为空（新装 / 被删 / 该账号从未领到）→ 键为 0，按 `priority` 兜底，
+///    与改造前的兜底行为一致。
+///
+/// 其它提供商不受影响（继续按各自原有顺序，不看这份 Qoder 台账）。
 ///
 /// 单账号手动签到（`resolve_checkin_targets` 的 `id` 分支）不经过这里，
 /// 用户点哪个就签哪个。
 fn rotate_qoder_claims(eligible: &mut [Value]) {
-    // 国际版优先（先抢当天名额），组内按 checkinAt 升序轮换
+    let global = device_claims::recent_holder_at(QoderRegion::Global);
+    let cn = device_claims::recent_holder_at(QoderRegion::Cn);
+    rotate_qoder_claims_with(eligible, &cn, &global);
+}
+
+/// [`rotate_qoder_claims`] 的纯函数形态：台账索引由调用方给出，便于单测。
+fn rotate_qoder_claims_with(
+    eligible: &mut [Value],
+    cn: &BTreeMap<String, i64>,
+    global: &BTreeMap<String, i64>,
+) {
+    // 国际版优先（先抢当天名额），组内按台账最近领取时刻升序轮换
     eligible.sort_by_key(|account| {
         if provider_of(account) == "qoder-intl" {
-            (0u8, rotation_key(account))
+            (0u8, rotation_key(account, global))
         } else {
             (1u8, (0, 0))
         }
     });
-    rotate_within(eligible, "qoder");
+    rotate_within(eligible, "qoder", cn);
 }
 
-/// 轮换排序键：`(上次签到时间, 优先级)` —— 越久没签的越靠前。
-fn rotation_key(account: &Value) -> (i64, i64) {
-    let last = account.get("checkinAt").and_then(Value::as_i64).unwrap_or(0);
+/// 轮换排序键：`(最近一次真实领取时刻, 优先级)` —— 越久没领到的越靠前。
+///
+/// 键**刻意不读 `checkinAt`**（理由见 [`rotate_qoder_claims`]）：那个字段会被
+/// 「今日已领取」的设备级回显写成今天，一读就把整组抹平。台账里没有这个账号
+/// （从未领到，或台账被删）→ 0，排在所有领过的人前面；此时同键者按 `priority`。
+fn rotation_key(account: &Value, holders: &BTreeMap<String, i64>) -> (i64, i64) {
+    let last = account
+        .get("id")
+        .and_then(Value::as_str)
+        .map(|id| holders.get(&device_claims::account_hash(id)).copied().unwrap_or(0))
+        .unwrap_or(0);
     let priority = account.get("priority").and_then(Value::as_i64).unwrap_or(0);
     (last, priority)
 }
@@ -292,7 +328,7 @@ fn rotation_key(account: &Value) -> (i64, i64) {
 ///
 /// 换位而不换区：其它提供商项一个都不动，避免为了国内版轮换把 unrelated 的
 /// 账号顺序也改掉（那会让用户的批次顺序莫名其妙地变）。
-fn rotate_within(eligible: &mut [Value], provider: &str) {
+fn rotate_within(eligible: &mut [Value], provider: &str, holders: &BTreeMap<String, i64>) {
     let slots: Vec<usize> = (0..eligible.len())
         .filter(|&index| provider_of(&eligible[index]) == provider)
         .collect();
@@ -300,7 +336,7 @@ fn rotate_within(eligible: &mut [Value], provider: &str) {
         return;
     }
     let mut ordered: Vec<Value> = slots.iter().map(|&index| eligible[index].clone()).collect();
-    ordered.sort_by_key(rotation_key);
+    ordered.sort_by_key(|account| rotation_key(account, holders));
     for (slot, value) in slots.into_iter().zip(ordered) {
         eligible[slot] = value;
     }
@@ -920,17 +956,24 @@ pub async fn run_checkin(
 mod tests {
     use super::*;
 
+    /// 台账里的账号哈希索引（单测用：把「账号 id → 最近领取时刻」摊成台账形态）。
+    fn holders(pairs: &[(&str, i64)]) -> BTreeMap<String, i64> {
+        pairs.iter().map(|(id, at)| (device_claims::account_hash(id), *at)).collect()
+    }
+
     #[test]
     fn qoder_intl_rotation_prefers_the_account_that_waited_longest() {
         let mut rows = vec![
-            json!({"id": "intl-a", "provider": "qoder-intl", "priority": 10, "checkinAt": 1_700_000_000_000i64}),
-            json!({"id": "intl-b", "provider": "qoder-intl", "priority": 11, "checkinAt": 0}),
-            json!({"id": "intl-c", "provider": "qoder-intl", "priority": 12, "checkinAt": 1_600_000_000_000i64}),
+            json!({"id": "intl-a", "provider": "qoder-intl", "priority": 10}),
+            json!({"id": "intl-b", "provider": "qoder-intl", "priority": 11}),
+            json!({"id": "intl-c", "provider": "qoder-intl", "priority": 12}),
             json!({"id": "cn-1", "provider": "qoder", "priority": 1}),
         ];
-        rotate_qoder_claims(&mut rows);
+        // 台账只记「真实领取」：intl-b 从未领过 → 最先；intl-c 比 intl-a 更久没领
+        let global = holders(&[("intl-a", 1_700_000_000_000), ("intl-c", 1_600_000_000_000)]);
+        rotate_qoder_claims_with(&mut rows, &BTreeMap::new(), &global);
         let order: Vec<&str> = rows.iter().filter_map(|row| row.get("id").and_then(Value::as_str)).collect();
-        // 从未签到的最先，其次是最久没签到的；国内版保持原顺序
+        // 从未领取的最先，其次是最久没领到的；国内版保持原顺序
         assert_eq!(order, vec!["intl-b", "intl-c", "intl-a", "cn-1"]);
     }
 
@@ -939,9 +982,10 @@ mod tests {
         let mut rows = vec![
             json!({"id": "wb-1", "provider": "workbuddy", "priority": 5}),
             json!({"id": "wb-2", "provider": "workbuddy", "priority": 9}),
-            json!({"id": "intl-a", "provider": "qoder-intl", "priority": 1, "checkinAt": 5}),
+            json!({"id": "intl-a", "provider": "qoder-intl", "priority": 1}),
         ];
-        rotate_qoder_claims(&mut rows);
+        let global = holders(&[("intl-a", 5)]);
+        rotate_qoder_claims_with(&mut rows, &BTreeMap::new(), &global);
         let order: Vec<&str> = rows.iter().filter_map(|row| row.get("id").and_then(Value::as_str)).collect();
         // 国际版优先抢设备名额；其它提供商相对顺序不变
         assert_eq!(order, vec!["intl-a", "wb-1", "wb-2"]);
@@ -953,7 +997,8 @@ mod tests {
             json!({"id": "intl-a", "provider": "qoder-intl", "priority": 20}),
             json!({"id": "intl-b", "provider": "qoder-intl", "priority": 10}),
         ];
-        rotate_qoder_claims(&mut rows);
+        // 台账为空（新装 / 被删）→ 按优先级兜底，与改造前一致
+        rotate_qoder_claims_with(&mut rows, &BTreeMap::new(), &BTreeMap::new());
         let order: Vec<&str> = rows.iter().filter_map(|row| row.get("id").and_then(Value::as_str)).collect();
         // 都没签过 → 按优先级
         assert_eq!(order, vec!["intl-b", "intl-a"]);
@@ -966,28 +1011,55 @@ mod tests {
     fn qoder_cn_rotation_shares_the_daily_quota() {
         let mut rows = vec![
             json!({"id": "wb-1", "provider": "workbuddy", "priority": 1}),
-            json!({"id": "cn-a", "provider": "qoder", "priority": 7, "checkinAt": 1_700_000_000_000i64}),
+            json!({"id": "cn-a", "provider": "qoder", "priority": 7}),
             json!({"id": "wb-2", "provider": "workbuddy", "priority": 2}),
             json!({"id": "cn-b", "provider": "qoder", "priority": 9}),
         ];
-        rotate_qoder_claims(&mut rows);
+        let cn = holders(&[("cn-a", 1_700_000_000_000)]);
+        rotate_qoder_claims_with(&mut rows, &cn, &BTreeMap::new());
         let order: Vec<&str> = rows.iter().filter_map(|row| row.get("id").and_then(Value::as_str)).collect();
         // 从未领过的 cn-b 顶到 cn-a 原来的位置；其它提供商一个都没动
         assert_eq!(order, vec!["wb-1", "cn-b", "wb-2", "cn-a"]);
     }
 
-    /// 轮换只看「谁最久没领」：刚领过的账号自动排到国内版末尾，保证名额在
-    /// 账号之间轮转（否则固定优先级会让同一账号天天先领）。
+    /// 轮换只看「谁最久没**真领到**」：刚领过的账号自动排到国内版末尾，保证名额
+    /// 在账号之间轮转（否则固定优先级会让同一账号天天先领）。
     #[test]
     fn qoder_cn_rotation_moves_the_freshest_claim_last() {
         let mut rows = vec![
-            json!({"id": "cn-old", "provider": "qoder", "checkinAt": 1_600_000_000_000i64}),
-            json!({"id": "cn-new", "provider": "qoder", "checkinAt": 1_700_000_000_000i64}),
+            json!({"id": "cn-old", "provider": "qoder"}),
+            json!({"id": "cn-new", "provider": "qoder"}),
             json!({"id": "cn-never", "provider": "qoder"}),
         ];
-        rotate_qoder_claims(&mut rows);
+        let cn = holders(&[("cn-old", 1_600_000_000_000), ("cn-new", 1_700_000_000_000)]);
+        rotate_qoder_claims_with(&mut rows, &cn, &BTreeMap::new());
         let order: Vec<&str> = rows.iter().filter_map(|row| row.get("id").and_then(Value::as_str)).collect();
         assert_eq!(order, vec!["cn-never", "cn-old", "cn-new"]);
+    }
+
+    /// 回归：`checkinAt` 被「今日已领取」的设备级回显写成今天时，**不能**影响轮换。
+    ///
+    /// 2026-11-02 实测：本地国内版三个账号在某天被同时写成当天时间戳（赢家真领到，
+    /// 其余账号只拿到「今日已领取」回显），旧实现据此排序 → 三个键相同 → 退化成
+    /// `priority` 固定序 → 同一个账号天天先领。现在键只读台账，所以这种情况必须
+    /// 仍然按「谁最久没真领到」排。
+    #[test]
+    fn qoder_rotation_ignores_checkin_at_polluted_by_already_claimed() {
+        let today = 1_790_000_000_000i64;
+        let mut rows = vec![
+            json!({"id": "cn-a", "provider": "qoder", "priority": 7, "checkinAt": today}),
+            json!({"id": "cn-b", "provider": "qoder", "priority": 8, "checkinAt": today}),
+            json!({"id": "cn-c", "provider": "qoder", "priority": 9, "checkinAt": today}),
+        ];
+        // 台账只认真实领取：cn-b 今天领到了，cn-a / cn-c 只是被回显污染
+        let cn = holders(&[("cn-b", today)]);
+        rotate_qoder_claims_with(&mut rows, &cn, &BTreeMap::new());
+        let order: Vec<&str> = rows.iter().filter_map(|row| row.get("id").and_then(Value::as_str)).collect();
+        assert_eq!(
+            order,
+            vec!["cn-a", "cn-c", "cn-b"],
+            "真领到的 cn-b 排最后；被「已领取」污染的 checkinAt 不得参与排序"
+        );
     }
 
     /// 「上游按人每天一份，今天已被别的账号领走」不是「等窗口」也不是「已签到」：

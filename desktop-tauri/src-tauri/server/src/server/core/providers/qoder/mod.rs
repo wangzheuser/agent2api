@@ -55,7 +55,9 @@ pub mod checkin;
 pub mod context;
 pub mod credentials;
 pub mod cosy;
-mod device_claims;
+// `pub(crate)`：签到轮换键要读这份台账（`billing::checkin::rotate_qoder_claims`），
+// 见 `device_claims::recent_holder_at` 的说明。对外仍是内部模块。
+pub(crate) mod device_claims;
 pub mod endpoints;
 pub mod errors;
 mod machine;

@@ -67,7 +67,8 @@ impl Default for ClaimsFile {
     }
 }
 
-fn account_hash(account_id: &str) -> String {
+/// 账号 id → 台账里的账号哈希（`billing::checkin` 的轮换键要按同一口径查表）。
+pub(crate) fn account_hash(account_id: &str) -> String {
     let digest = sha2::Sha256::digest(account_id.as_bytes());
     digest.iter().take(12).map(|byte| format!("{byte:02x}")).collect()
 }
@@ -150,6 +151,48 @@ pub fn today(region: Region, device_id: &str) -> Option<Claim> {
 /// 这个账号哈希是不是今天这台设备的领取者
 pub fn claimed_by(claim: &Claim, account_id: &str) -> bool {
     claim.account == account_hash(account_id)
+}
+
+/// 本机某地区「每个账号最近一次**真实领取**的时刻」（账号哈希 → 毫秒）。
+///
+/// ── 为什么签到轮换要用它，而不是账号的 `checkinAt`（2026-11-02 实测）──
+/// `checkinAt` 是**展示**信号，它的写入判据把「今日已领取」也算完成
+/// （见 `billing::checkin::checkin_completed_today`）。但 Qoder 的活动行是
+/// **设备共享**的：同一台机器上只要有一个账号领到，其余账号的列表行也翻成
+/// `CLAIMED`，于是它们同样回「今日已领取」—— 而这些账号本身一分没到账。
+///
+/// 拿 `checkinAt` 当轮换键的后果（用两台机器的 `checkin_records` 与台账复核）：
+/// 赢家和输家被同时打上当天时间戳 → 整组键相同 → 排序退化成 `priority` 固定序
+/// → 同一个账号天天排第一、天天先领，其余账号永远轮不到。2026-10-27 本地三个
+/// 国际版账号全部「今日已领取」而台账零记录、零 `success`，就是这种误判的一天。
+///
+/// 本台账只由 [`record`] 写入，而 [`record`] 只在「领取 + 回查确认」之后被调用
+/// （见 `qoder::checkin::claim_one`），所以它天然只含**真实到账**，不会把
+/// 「设备名额被别的账号领走」记成自己的完成。
+///
+/// 台账缺失 / 为空 / 解析失败时返回空表 —— 调用方（轮换）退化为按优先级排序，
+/// 与改造前的兜底行为一致，不会引入新的乱序。
+pub fn recent_holder_at(region: Region) -> BTreeMap<String, i64> {
+    holder_index(&load(&claims_path()), region)
+}
+
+/// 从台账内容抽出某地区「账号哈希 → 最近一次领取时刻」。纯函数，便于单测。
+///
+/// 同一天可能被重复写入（以最后一次为准），跨天取最大 `at`；台账已按日期裁剪到
+/// [`RETAIN_DAYS`]，所以这里看到的就是最近两周内的真实领取。
+fn holder_index(file: &ClaimsFile, region: Region) -> BTreeMap<String, i64> {
+    let prefix = format!("{}:", region.id());
+    let mut out: BTreeMap<String, i64> = BTreeMap::new();
+    for (key, claim) in &file.claims {
+        if !key.starts_with(&prefix) {
+            continue;
+        }
+        let slot = out.entry(claim.account.clone()).or_insert(0);
+        if claim.at > *slot {
+            *slot = claim.at;
+        }
+    }
+    out
 }
 
 fn prune(file: &mut ClaimsFile, today: &str) {
@@ -235,5 +278,40 @@ mod tests {
         assert_eq!(file.claims.len(), RETAIN_DAYS);
         assert!(file.claims.keys().any(|key| key.ends_with("2026-09-20")));
         assert!(!file.claims.keys().any(|key| key.ends_with("2026-09-01")));
+    }
+
+    /// 轮换键的取数口径：**按地区分开**、**每个账号取最近一次**、**没领过的不出现**。
+    #[test]
+    fn holder_index_is_per_region_and_keeps_the_latest_claim() {
+        let mut file = ClaimsFile::default();
+        let put = |file: &mut ClaimsFile, region, account: &str, date: &str, at: i64| {
+            file.claims.insert(
+                entry_key(region, "device-1", date),
+                Claim { account: account_hash(account), at, campaign: "c".into() },
+            );
+        };
+        put(&mut file, Region::Cn, "account-a", "2026-10-30", 300);
+        // 同一账号更晚的一次领取必须覆盖掉早的那次
+        put(&mut file, Region::Cn, "account-a", "2026-11-01", 900);
+        put(&mut file, Region::Cn, "account-b", "2026-10-31", 500);
+        // 另一个地区同一天同一账号：不能串到国内版里
+        put(&mut file, Region::Global, "account-a", "2026-11-02", 1200);
+
+        let cn = holder_index(&file, Region::Cn);
+        assert_eq!(cn.len(), 2, "只统计本地区的账号");
+        assert_eq!(cn.get(&account_hash("account-a")), Some(&900), "取最近一次");
+        assert_eq!(cn.get(&account_hash("account-b")), Some(&500));
+
+        let global = holder_index(&file, Region::Global);
+        assert_eq!(global.len(), 1);
+        assert_eq!(global.get(&account_hash("account-a")), Some(&1200));
+    }
+
+    /// 台账缺失 / 为空时给出空表：轮换必须退化为按优先级，而不是 panic 或乱序。
+    #[test]
+    fn holder_index_is_empty_for_an_empty_ledger() {
+        for region in Region::ALL {
+            assert!(holder_index(&ClaimsFile::default(), region).is_empty());
+        }
     }
 }
