@@ -142,6 +142,9 @@ struct Report {
     already: usize,
     skipped: usize,
     failed: usize,
+    /// 本轮没有重新提交，但可领套餐仍受上次失败的冷却约束。
+    cooling: usize,
+    cooling_note: Option<String>,
     /// 活动投放中没有领取动作。与「已领过」「没资格」都不是
     /// 一码事：上游不给新套餐时本地无可动作，但**必须说出来**，否则一轮自动领取
     /// 只留下一句「领取 0 份」，用户分不清是排队等着、已经领过了，还是逻辑坏了。
@@ -160,20 +163,53 @@ fn failure_detail(failure: ClaimFailure, code: i64, message: &str) -> String {
     }
 }
 
+/// 兼容旧版 `{planId: 毫秒}`；新记录额外保存失败原因，不能只剩一段匿名冷却。
+fn retry_at(value: &Value) -> i64 {
+    value.as_i64()
+        .or_else(|| value.get("retryAt").and_then(Value::as_i64))
+        .unwrap_or(0)
+}
+
+fn remember_failure(retry: &mut serde_json::Map<String, Value>, plan_id: String, at: i64, detail: &str) {
+    retry.insert(plan_id, json!({"retryAt": at, "detail": detail}));
+}
+
+fn cooldown_note(value: &Value) -> String {
+    let detail = value.get("detail").and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or("上次领取未成功");
+    let until = chrono::DateTime::from_timestamp_millis(retry_at(value))
+        .map(|time| time.with_timezone(&chrono::Local).format("%m-%d %H:%M:%S %:z").to_string())
+        .unwrap_or_else(|| "未知时间".to_string());
+    format!("{detail}；重试冷却至 {until}")
+}
+
 impl Report {
+    fn succeeded(&self) -> bool {
+        self.error.is_none() && self.failed == 0 && self.cooling == 0
+    }
+
+    fn result(&self) -> Result<String, String> {
+        let summary = self.summary();
+        if self.succeeded() { Ok(summary) } else { Err(summary) }
+    }
+
     /// 整轮口径：定时任务页的那一行、`run_auto` 的日志。
     fn summary(&self) -> String {
-        let base = format!(
+        let mut summary = format!(
             "检查 {} 个账号，领取 {} 份，已领取 {} 份，跳过 {} 项，失败 {} 项",
             self.checked, self.claimed, self.already, self.skipped, self.failed
         );
-        if self.empty_preview > 0 {
-            return format!(
-                "{base}，无可领套餐 {} 个（上游活动投放未下发领取动作）",
-                self.empty_preview
-            );
+        if self.cooling > 0 {
+            summary.push_str(&format!("，领取失败冷却中 {} 项（非领取成功）", self.cooling));
         }
-        base
+        if self.empty_preview > 0 {
+            summary.push_str(&format!(
+                "，无可领套餐 {} 个（上游活动投放未下发领取动作）",
+                self.empty_preview
+            ));
+        }
+        summary
     }
 
     /// 账号口径：签到中心那张卡上的一行字，要短、要能直接回答「为什么没领到」。
@@ -183,6 +219,9 @@ impl Report {
     fn account_note(&self) -> String {
         if let Some(error) = &self.error {
             return error.clone();
+        }
+        if let Some(note) = &self.cooling_note {
+            return note.clone();
         }
         if self.empty_preview > 0 {
             return "本期无可领套餐（上游活动投放未下发领取动作）".to_string();
@@ -213,7 +252,7 @@ async fn request_claim(
     let proxy = claim_proxy(store, id);
     let config = claim::captcha_config(target.region, proxy.as_ref())
         .await
-        .map_err(|error| format!("获取验证码配置失败（HTTP {}）", error.status_code))?;
+        .map_err(|error| format!("获取验证码配置失败（HTTP {}）：{}", error.status_code, error.message))?;
     let proof = match config.filter(|config| config.enabled) {
         Some(config) => crate::server::captcha_worker::proof_for_claim(store, id, &config).await?,
         None => (String::new(), String::new()),
@@ -300,7 +339,7 @@ where
     let mut report = Report { checked: 1, ..Report::default() };
     plans.sort_by(|a, b| b.priority.cmp(&a.priority));
     // 投放是增量消息：某轮未再次投放，不代表已登记的失败冷却失效。
-    retry.retain(|_, at| at.as_i64().is_some_and(|at| at > logging::now_ms()));
+    retry.retain(|_, value| retry_at(value) > logging::now_ms());
     // 上游这次没给任何套餐：本地无可动作，但要如实记一笔（见 `empty_preview`）。
     if plans.is_empty() {
         report.empty_preview = 1;
@@ -318,13 +357,12 @@ where
             report.already += 1;
             continue;
         }
-        if retry
-            .get(&plan.plan_id)
-            .and_then(Value::as_i64)
-            .unwrap_or(0)
-            > logging::now_ms()
+        if let Some(value) = retry.get(&plan.plan_id)
+            .filter(|value| retry_at(value) > logging::now_ms())
         {
             report.skipped += 1;
+            report.cooling += 1;
+            report.cooling_note = Some(cooldown_note(value));
             continue;
         }
         let outcome = match request(plan.plan_id.clone()).await {
@@ -378,6 +416,8 @@ where
             } => {
                 report.failed += 1;
                 let detail = failure_detail(failure, code, &message);
+                // 业务失败不能因本轮扫描完成而被记成账号领取成功。
+                report.error = Some(detail.clone());
                 logging::log(
                     "[Claim]",
                     &format!(
@@ -394,12 +434,14 @@ where
                             .map(|at| at.saturating_mul(1000))
                             .filter(|at| *at > logging::now_ms())
                             .unwrap_or_else(|| logging::now_ms() + 60 * 60_000);
-                        retry.insert(plan.plan_id, json!(at));
+                        remember_failure(retry, plan.plan_id, at, &detail);
                     }
                     ClaimFailure::RiskBlocked => {
-                        retry.insert(
+                        remember_failure(
+                            retry,
                             plan.plan_id,
-                            json!(logging::now_ms().saturating_add(RISK_BLOCK_RETRY_MS)),
+                            logging::now_ms().saturating_add(RISK_BLOCK_RETRY_MS),
+                            &detail,
                         );
                     }
                     ClaimFailure::NotFound | ClaimFailure::Unavailable => {}
@@ -473,7 +515,7 @@ pub async fn run_auto(store: &AccountStore, manual: bool) -> Result<String, Stri
             _ => report.account_note(),
         };
         guard.finish_on_interval(
-            report.error.is_none(),
+            report.succeeded(),
             summary.clone(),
             Some(json!(retry)),
             interval,
@@ -485,15 +527,17 @@ pub async fn run_auto(store: &AccountStore, manual: bool) -> Result<String, Stri
         total.already += report.already;
         total.skipped += report.skipped;
         total.failed += report.failed;
+        total.cooling += report.cooling;
         total.empty_preview += report.empty_preview;
     }
     let summary = total.summary();
     logging::log_with_level(
         "[Claim]",
         &format!("ZCode 自动检查完成：{summary}"),
-        if total.failed > 0 { "error" } else { "info" },
+        if total.succeeded() { "info" } else { "error" },
     );
-    Ok(summary)
+    // 调度器的失败路径同样使用 finish_on_interval：保留错误但不扩大检查间隔。
+    total.result()
 }
 
 #[cfg(test)]
@@ -573,7 +617,9 @@ mod tests {
             }).await.unwrap();
             assert_eq!(report.failed, 1);
             assert_eq!(report.claimed, 0);
-            assert!(retry[name].as_i64().unwrap() >= minimum);
+            assert!(retry_at(&retry[name]) >= minimum);
+            assert!(retry[name]["detail"].as_str().is_some_and(|text| text.contains(failure.label())));
+            assert!(!report.succeeded());
             assert!(!already_recorded(&store.zcode_account_record(&id).unwrap(), name));
         }
         let expected = retry.clone();
@@ -860,6 +906,82 @@ mod tests {
         let note = last_claim_note(&store, &id);
         assert!(note.contains("最近一次领取：3 小时前（plan-x）"), "{note}");
         assert_eq!(last_claim_note(&store, "missing"), "账号记录已不存在");
+    }
+
+    #[tokio::test]
+    async fn risk_block_reason_survives_restart_and_cooldown_without_claiming() {
+        for region in Region::ALL {
+            let (store, id, _temp) = account_fixture(region, "zcode-risk-state");
+            let target = load_target(&store, &id).unwrap();
+            let mut retry = serde_json::Map::new();
+            let before = logging::now_ms();
+            let failed = scan_plans(&store, &id, &target, false, &mut retry,
+                vec![offer("blocked", 1)], |plan_id| async {
+                    Ok(Some(ClaimOutcome::Failed {
+                        plan_id, failure: ClaimFailure::RiskBlocked, code: 3012,
+                        message: "request has been blocked due to unusual activity.".into(),
+                        failure_ends_at: None,
+                    }))
+                }).await.unwrap();
+            assert!(!failed.succeeded());
+            assert!(failed.account_note().contains("3012"));
+            assert!(failed.result().is_err());
+            assert!(retry_at(&retry["blocked"]) >= before + RISK_BLOCK_RETRY_MS);
+            // 模拟重启后的 JSON 落库/恢复；原始业务原因和六小时窗口都须保留。
+            let saved = serde_json::to_string(&retry).unwrap();
+            let mut restored = serde_json::from_str(&saved).unwrap();
+            let held = scan_plans(&store, &id, &target, false, &mut restored,
+                vec![offer("blocked", 1)], |_| async {
+                    panic!("a risk-blocked plan must not submit during its cooldown")
+                }).await.unwrap();
+            assert_eq!((held.failed, held.skipped, held.cooling), (0, 1, 1));
+            assert!(!held.succeeded());
+            assert!(held.result().unwrap_err().contains("领取失败冷却中 1 项"));
+            assert!(held.account_note().contains("3012"));
+            assert!(held.account_note().contains("重试冷却至"));
+            assert_eq!(retry, restored, "检查本身不得刷新冷却截止时间");
+            assert!(!already_recorded(&store.zcode_account_record(&id).unwrap(), "blocked"));
+            restored.get_mut("blocked").unwrap()["retryAt"] = json!(logging::now_ms() - 1);
+            let recovered = scan_plans(&store, &id, &target, false, &mut restored,
+                vec![offer("blocked", 1)], |plan_id| async {
+                    Ok(Some(ClaimOutcome::Claimed {plan_id, starts_at: None, ends_at: None}))
+                }).await.unwrap();
+            assert!(recovered.succeeded());
+            assert_eq!(recovered.claimed, 1);
+            assert!(already_recorded(&store.zcode_account_record(&id).unwrap(), "blocked"));
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_numeric_cooldown_remains_effective_without_inventing_a_cause() {
+        let (store, id, _temp) = account_fixture(Region::ALL[1], "zcode-legacy-cooldown");
+        let target = load_target(&store, &id).unwrap();
+        let mut retry = serde_json::Map::new();
+        let until = logging::now_ms() + RISK_BLOCK_RETRY_MS;
+        retry.insert("legacy".into(), json!(until));
+        let report = scan_plans(&store, &id, &target, false, &mut retry,
+            vec![offer("legacy", 1)], |_| async {
+                panic!("legacy cooldown must still suppress submissions")
+            }).await.unwrap();
+        assert_eq!(report.cooling, 1);
+        assert!(!report.succeeded());
+        assert!(report.account_note().contains("上次领取未成功"));
+        assert!(!report.account_note().contains("3012"));
+        assert_eq!(retry["legacy"], until);
+    }
+
+    #[test]
+    fn failed_or_cooling_rounds_do_not_report_business_success() {
+        for report in [
+            Report { failed: 1, ..Report::default() },
+            Report { cooling: 1, ..Report::default() },
+            Report { claimed: 1, failed: 1, ..Report::default() },
+        ] {
+            assert!(report.result().is_err());
+        }
+        // 正常空投放不是错误；已领过也不重试。
+        assert!(Report { empty_preview: 1, ..Report::default() }.result().is_ok());
+        assert!(Report { already: 1, ..Report::default() }.result().is_ok());
     }
 
     #[test]

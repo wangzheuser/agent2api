@@ -332,7 +332,43 @@ pub async fn captcha_config(
                 GatewayError::with_status(502, format!("获取风控配置失败: {error}"))
             }
         })?;
+    checked_captcha_config(response)
+}
+
+/// 配置请求失败或信封残缺时停止领取，不能静默降级成“不需要验证码”。
+fn checked_captcha_config(
+    response: crate::server::core::auth_http::ApiResponse,
+) -> Result<Option<CaptchaConfig>, GatewayError> {
+    if !(200..300).contains(&response.status) {
+        return Err(GatewayError::with_status(
+            502,
+            format!("获取风控配置失败（HTTP {}）", response.status),
+        ));
+    }
     let payload = response.payload.unwrap_or(Value::Null);
+    if business_code(&payload) != Some(0) {
+        let code = business_code(&payload).map(|code| code.to_string())
+            .unwrap_or_else(|| "缺失".to_string());
+        return Err(GatewayError::with_status(
+            502,
+            format!("获取风控配置失败（上游码 {code}）"),
+        ));
+    }
+    let configs = payload.pointer("/data/configs").filter(|value| value.is_object())
+        .ok_or_else(|| GatewayError::with_status(502, "获取风控配置失败：上游配置不完整"))?;
+    if let Some(config) = parse_captcha_config(&payload) {
+        // 保留完整配置里的 skip_model_request，领取开关与推理免码开关互相独立。
+        return Ok(Some(config));
+    }
+    if let Some(captcha) = configs.get("captcha") {
+        // 显式关闭可不带初始化参数；启用或缺 enabled 时，三项参数须可用。
+        if captcha.get("enabled").and_then(Value::as_bool) == Some(false) {
+            return Ok(None);
+        }
+        if parse_captcha_config(&payload).is_none() {
+            return Err(GatewayError::with_status(502, "获取风控配置失败：验证码配置不完整"));
+        }
+    }
     Ok(parse_captcha_config(&payload))
 }
 
@@ -876,6 +912,47 @@ pub(super) fn urlencode(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn captcha_config_errors_never_disable_verification() {
+        use crate::server::core::auth_http::ApiResponse;
+        let valid = json!({"code":0,"data":{"configs":{"captcha":{
+            "enabled":true,"region":"sgp","prefix":"fixture","sceneId":"fixture"
+        }}}});
+        for (status, payload) in [
+            (405, Some(valid.clone())),
+            (200, None),
+            (200, Some(json!({"code":3001,"msg":"parameter error"}))),
+            (200, Some(json!({"code":0}))),
+            (200, Some(json!({"code":0,"data":{"configs":{"captcha":{"enabled":true}}}}))),
+        ] {
+            let error = checked_captcha_config(ApiResponse {
+                status, ok: (200..300).contains(&status), payload,
+            }).unwrap_err();
+            assert_eq!(error.status_code, 502);
+        }
+        let config = checked_captcha_config(ApiResponse {
+            status:200, ok:true, payload:Some(valid),
+        }).unwrap().unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.region, "sgp");
+        let disabled_full = checked_captcha_config(ApiResponse {
+            status:200, ok:true,
+            payload:Some(json!({"code":0,"data":{"configs":{"captcha":{
+                "enabled":false,"skip_model_request":true,"prefix":"fixture","sceneId":"fixture","region":"sgp"
+            }}}})),
+        }).unwrap().unwrap();
+        assert!(!disabled_full.enabled);
+        assert!(disabled_full.skip_model_request, "领取开关不能丢失独立的推理免码配置");
+        assert!(checked_captcha_config(ApiResponse {
+            status:200, ok:true,
+            payload:Some(json!({"code":0,"data":{"configs":{"captcha":{"enabled":false}}}})),
+        }).unwrap().is_none());
+        assert!(checked_captcha_config(ApiResponse {
+            status:200, ok:true,
+            payload:Some(json!({"code":0,"data":{"configs":{}}})),
+        }).unwrap().is_none());
+    }
 
     #[tokio::test]
     async fn marketing_preview_requires_account_jwt() {

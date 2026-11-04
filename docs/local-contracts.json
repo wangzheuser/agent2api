@@ -2,6 +2,23 @@
   "schema_version": 1,
   "contracts": [
     {
+      "id": "zcode-claim-captcha-config-errors",
+      "level": "P0",
+      "status": "必须保留",
+      "behavior": "ZCode 领取读取验证码配置时，HTTP错误、业务错误、非JSON及缺失data/configs均显式失败，不降级为免验证码。启用但初始化字段残缺时停止领取；显式关闭及合法无captcha段保持原语义，完整配置保留独立的skip_model_request推理免码开关。",
+      "source_commits": ["630a9a20dc7f039f885515f5b1310a18c85f0b24"],
+      "source_note": "2026-11-03用户要求GitHub检索、本地既有账号验证及代码修复；当前为该基线上的未提交修复。",
+      "implementation": ["desktop-tauri/src-tauri/server/src/server/core/providers/zcode/claim.rs"],
+      "tests": [
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/providers/zcode/claim.rs",
+          "name": "server::core::providers::zcode::claim::tests::captcha_config_errors_never_disable_verification",
+          "id": "case-zcode-claim-captcha-errors-not-disabled"
+        }
+      ]
+    },
+    {
       "id": "zcode-edge-page-classification",
       "level": "P0",
       "status": "必须保留",
@@ -95,6 +112,7 @@
         {
           "kind": "node",
           "path": "scripts/zcode-captcha-proxy.test.cjs",
+          "name": "captcha authenticated SOCKS bridge preserves credentials destination bytes and cleanup",
           "id": "case-zcode-captcha-authenticated-socks-proxy"
         }
       ]
@@ -1660,7 +1678,7 @@
       "id": "zcode-claim-dedup",
       "level": "P0",
       "status": "必须保留",
-      "behavior": "两地区领取资格与开关有效，仅通过客户端 marketing/touch 的当前领取动作发现套餐；历史套餐去重不阻挡新套餐，领取成功或上游确认已领取后持久化通道切换和账本。完整空投放、探测失败与确实领取必须在账号状态里分开表述，空投放不算失败且保留有效失败冷却，HTTP 404 不再视为未部署成功。同一结论必须能在签到中心的账号行看到（任务状态 `zcodeClaim:<id>` → `lastClaimResult`），卡片口径用短句，不带整轮计数。",
+      "behavior": "两地区领取资格与开关有效，仅通过客户端 marketing/touch 的当前领取动作发现套餐；历史套餐去重不阻挡新套餐，领取成功或上游确认已领取后持久化通道切换和账本。完整空投放、探测失败与确实领取必须在账号状态里分开表述，空投放不算失败且保留有效失败冷却，HTTP 404 不再视为未部署成功。同一结论必须能在签到中心的账号行看到（任务状态 `zcodeClaim:<id>` → `lastClaimResult`），卡片口径用短句，不带整轮计数。领取失败和仍在套餐级失败冷却中的账号不记为业务成功，失败原因及冷却截止时间跨轮次保留；旧数字窗口仍有效，正常空投放保持中性，检查间隔和原有六小时风控窗口不变。",
       "source_commits": [
         "9973da5",
         "2562e7e"
@@ -1730,6 +1748,24 @@
           "path": "desktop-tauri/src-tauri/server/src/server/core/zcode_claim.rs",
           "name": "server::core::zcode_claim::tests::marketing_auto_claim_obeys_switch_without_mutating_host_config",
           "id": "case-zcode-marketing-auto-obeys-switch-without-mutating-host-config"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/zcode_claim.rs",
+          "name": "server::core::zcode_claim::tests::risk_block_reason_survives_restart_and_cooldown_without_claiming",
+          "id": "case-zcode-claim-risk-reason-and-deadline-persist"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/zcode_claim.rs",
+          "name": "server::core::zcode_claim::tests::legacy_numeric_cooldown_remains_effective_without_inventing_a_cause",
+          "id": "case-zcode-claim-legacy-numeric-cooldown"
+        },
+        {
+          "kind": "rust",
+          "path": "desktop-tauri/src-tauri/server/src/server/core/zcode_claim.rs",
+          "name": "server::core::zcode_claim::tests::failed_or_cooling_rounds_do_not_report_business_success",
+          "id": "case-zcode-claim-business-failure-not-scan-success"
         }
       ],
       "evolution": {
